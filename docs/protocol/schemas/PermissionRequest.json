@@ -1,0 +1,23 @@
+{
+  "type": "object",
+  "properties": {
+    "toolName": {
+      "type": "string",
+      "default": ""
+    },
+    "inputPreview": {
+      "type": "string",
+      "default": ""
+    },
+    "requestId": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    }
+  },
+  "description": "The opaque public handle for a server-initiated request, carried on the\n`request/*` params themselves.\n\nWithout it a client that answers the raw round-trip and *also* discovers\nthe same request through `session/getPendingRequests` has no way to tell\nthe two descriptions apart, so it either renders the prompt twice or drops\nthe original responder — and dropping a responder **declines** the request.\nThe value is the same opaque handle `PendingRequestDto.requestId` carries,\nand is bound to the engine instance that minted it. It is **never** parsed:\nits internal shape is not part of the contract.\n\nAdditive and optional: a legacy engine omits it, and a client that has\nnever heard of it ignores it.",
+  "title": "PermissionRequest",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

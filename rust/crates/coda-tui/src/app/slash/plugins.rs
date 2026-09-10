@@ -11,24 +11,6 @@ use crate::config;
 use crate::transcript::NoticeLevel;
 
 impl App {
-    /// `/setup` — re-run the setup wizard.
-    pub(super) fn cmd_setup(&mut self) {
-        use crate::setup;
-        let providers = setup::provider_selection_prompt();
-        self.output(format!(
-            "Setup wizard\n\
-             \n\
-             {providers}\n\
-             \n\
-             Choose a provider and run /login <id> to authenticate.\n\
-             \n\
-             {}",
-            "[SEAM: OAuth login handoff requires coda-auth login RPCs, \
-             being added by another agent.  Once available, /login will \
-             complete the authentication flow interactively.]"
-        ));
-    }
-
     /// `/init` — ask the agent to generate a CLAUDE.md for this project.
     pub(super) async fn cmd_init(&mut self) {
         let claude_md = self.paths.project_root.join("CLAUDE.md");
@@ -87,8 +69,17 @@ impl App {
             _ => MktOp::BadUsage,
         };
 
-        if let MktOp::Unsupported(sub) = op {
-            self.notice(
+        // A write to the marketplace file only means anything when this
+        // client owns the files the engine reads. Refused *before* the
+        // filesystem is touched, never as a silent local edit that the
+        // engine will never see.
+        if matches!(op, MktOp::Add(_) | MktOp::Remove(_))
+            && !self.allow_local_maintenance("Marketplace management")
+        {
+            return;
+        }
+
+        if let MktOp::Unsupported(sub) = op {            self.notice(
                 format!("/{sub} is not yet available in the Rust front-end. Use the C# coda tool."),
                 NoticeLevel::Warning,
             );
@@ -166,6 +157,14 @@ impl App {
             }
             _ => PluginOp::BadUsage,
         };
+
+        // Enabling or disabling a plugin writes this machine's settings file.
+        // Refused before the write when the engine is not this client's.
+        if matches!(op, PluginOp::SetEnabled(..))
+            && !self.allow_local_maintenance("Plugin management")
+        {
+            return;
+        }
 
         if let PluginOp::Unsupported(sub) = op {
             self.notice(

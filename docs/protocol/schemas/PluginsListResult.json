@@ -1,0 +1,45 @@
+{
+  "type": "object",
+  "properties": {
+    "plugins": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/WirePlugin"
+      }
+    }
+  },
+  "title": "PluginsListResult",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "WirePlugin": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "trusted": {
+          "type": "boolean",
+          "default": false
+        },
+        "isExternal": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [
+        "name"
+      ]
+    }
+  }
+}

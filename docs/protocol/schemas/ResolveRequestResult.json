@@ -1,0 +1,33 @@
+{
+  "type": "object",
+  "properties": {
+    "ok": {
+      "type": "boolean"
+    },
+    "state": {
+      "$ref": "#/$defs/RequestResolutionState"
+    },
+    "requestId": {
+      "type": "string"
+    },
+    "outcome": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "ok",
+    "state",
+    "requestId",
+    "outcome"
+  ],
+  "title": "ResolveRequestResult",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "RequestResolutionState": {
+      "type": "string",
+      "enum": [
+        "resolved"
+      ]
+    }
+  }
+}

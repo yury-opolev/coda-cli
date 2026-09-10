@@ -1,0 +1,19 @@
+{
+  "type": "object",
+  "properties": {
+    "plan": {
+      "type": "string",
+      "default": ""
+    },
+    "requestId": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "See [`PermissionRequest::request_id`].",
+      "default": null
+    }
+  },
+  "title": "PlanApprovalRequest",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

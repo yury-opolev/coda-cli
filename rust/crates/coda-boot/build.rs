@@ -1,13 +1,11 @@
 //! Stamps the build with the version from the repository's `version.json`.
 //!
-//! `version.json` is shared with the C# build, so the Rust binary continues the
-//! same version line rather than restarting at the crate's own `0.1.0`. A
-//! restart would read as a *downgrade* to anything comparing versions, and
-//! would be baffling for anyone moving across from the C# build.
-//!
-//! Reading the file here rather than taking it from an environment variable
-//! means a plain `cargo build` reports the right version too, not just builds
-//! driven through `build.ps1`.
+//! Mirrors `coda-tui/build.rs`: `version.json` is shared with the C# build, so
+//! every Rust binary continues the same version line rather than each crate
+//! restarting at its own `0.1.0`. `coda-boot` is the one place this is done —
+//! `coda-tui`'s own copy was removed in favour of `coda_boot::version()`, so
+//! `coda`, `coda-tui` and `coda-engine` all report the same string from the
+//! same source rather than three copies that could drift.
 
 use std::path::PathBuf;
 

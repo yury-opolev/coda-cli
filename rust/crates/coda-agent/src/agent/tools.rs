@@ -28,6 +28,12 @@ use super::ToolActivity;
 pub(crate) struct ToolBatchResult {
     pub result_blocks: Vec<Content>,
     pub abort_reason: Option<String>,
+    /// Set when a tool raised [`coda_tool::ToolControl::AbortRun`]: the run
+    /// must stop with a typed failure and **no** follow-up model request.
+    ///
+    /// Distinct from `abort_reason` (the hook `continue:false` path), which
+    /// ends the run as an ordinary, successful completion.
+    pub control_abort: Option<String>,
 }
 
 /// Context that stays constant for the entire batch.
@@ -122,7 +128,34 @@ impl<'a> BatchContext<'a> {
 ///
 /// §1.6: "Tools run strictly SERIALLY, in the model's requested order — a
 /// single `for i in 0..tool_uses.len()`.  Nothing parallelizes."
+///
+/// Emits `ToolBatchStarted`/`ToolBatchEnded` around the whole batch — the
+/// `coda-serve` state sink uses this pair to enter/leave `runningTools`.
+/// `ToolBatchEnded` fires exactly once, on every exit path (success, error,
+/// cancellation), because it wraps the call to [`run_tools_body`] rather than
+/// living inline in a function with early returns.
 pub(crate) async fn run_tools(
+    tool_uses: &[Content],
+    activity: &ToolActivity,
+    sink: &dyn AgentSink,
+    ctx: &BatchContext<'_>,
+    cancel: CancellationToken,
+) -> Result<ToolBatchResult, AgentError> {
+    let batch_id = activity.batch_id().to_owned();
+    let call_ids: Vec<String> = tool_uses
+        .iter()
+        .filter_map(|b| match b {
+            Content::ToolUse { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    sink.emit(AgentEvent::ToolBatchStarted { batch_id: batch_id.clone(), call_ids });
+    let result = run_tools_body(tool_uses, activity, sink, ctx, cancel).await;
+    sink.emit(AgentEvent::ToolBatchEnded { batch_id });
+    result
+}
+
+async fn run_tools_body(
     tool_uses: &[Content],
     _activity: &ToolActivity,
     sink: &dyn AgentSink,
@@ -131,6 +164,7 @@ pub(crate) async fn run_tools(
 ) -> Result<ToolBatchResult, AgentError> {
     let mut results: Vec<Content> = Vec::with_capacity(tool_uses.len());
     let abort_reason: Option<String> = None;
+    let mut control_abort: Option<String> = None;
 
     // Pre-pass: queue every call before executing any.
     for block in tool_uses.iter() {
@@ -266,9 +300,33 @@ pub(crate) async fn run_tools(
         });
 
         results.push(make_result_block(id, &tool_result.content, tool_result.is_error, terminal_status, correlation.clone()));
+
+        // A typed terminal control signal (today: an unanswered operator
+        // question). The result block above is still recorded — a `tool_use`
+        // without a matching `tool_result` is not a valid conversation — but
+        // nothing after it runs, and the caller turns this into a typed
+        // failure rather than a completion. Every remaining call in the batch
+        // is explicitly skipped rather than silently dropped.
+        if let Some(reason) = tool_result.abort_reason() {
+            control_abort = Some(reason.to_owned());
+            for later in tool_uses.iter().skip(i + 1) {
+                if let Content::ToolUse { id: sid, name: sname, correlation: scorr, .. } = later {
+                    let msg = "Skipped: the run stopped before this tool started.";
+                    sink.emit(AgentEvent::ToolResult {
+                        tool_name: sname.clone(),
+                        content: msg.into(),
+                        is_error: true,
+                        status: ToolCallStatus::Skipped,
+                        correlation: scorr.clone(),
+                    });
+                    results.push(make_result_block(sid, msg, true, ToolCallStatus::Skipped, scorr.clone()));
+                }
+            }
+            break;
+        }
     }
 
-    Ok(ToolBatchResult { result_blocks: results, abort_reason })
+    Ok(ToolBatchResult { result_blocks: results, abort_reason, control_abort })
 }
 
 /// Execute a tool with an optional wall-clock ceiling.

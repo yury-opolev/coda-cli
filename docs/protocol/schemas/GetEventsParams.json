@@ -1,0 +1,23 @@
+{
+  "type": "object",
+  "properties": {
+    "engineInstanceId": {
+      "type": "string",
+      "default": ""
+    },
+    "afterCursor": {
+      "type": "integer",
+      "format": "int64",
+      "default": 0
+    },
+    "limit": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    }
+  },
+  "title": "GetEventsParams",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

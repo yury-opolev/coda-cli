@@ -1,27 +1,52 @@
 //! [`CredentialManager`] — the façade consumers use.
 //!
 //! Registers providers, loads/persists credentials, and auto-refreshes on
-//! every read.  Per-provider refreshes are coalesced via a `tokio::sync::Mutex`
-//! gate so a burst of N concurrent 401s triggers exactly ONE token refresh:
+//! every read.
+//!
+//! # Single-flight
+//!
+//! Per-provider refreshes are coalesced via a `tokio::sync::Mutex` gate so a
+//! burst of N concurrent 401s triggers exactly ONE token refresh:
 //!
 //! 1. All N tasks race to acquire the gate.
 //! 2. The winner re-reads the stored credential and, if still expired, calls
 //!    `provider.refresh` and stores the result.
 //! 3. Each subsequent waiter re-reads inside the lock, finds a fresh token,
 //!    and returns it immediately without another network call.
+//!
+//! # Committing a refresh
+//!
+//! That gate is process-local, and a refresh takes as long as the network
+//! does. Meanwhile the user may log out, or sign a different account in, from
+//! the TUI or from another engine process sharing the profile. So the result
+//! of a refresh is not simply written: it is committed through a
+//! [`CommitCoordinator`], which serializes the commit sections of everyone
+//! sharing the profile, and the write only happens if the stored value is
+//! still the one the refresh started from. If it was deleted the refresh is
+//! abandoned (a logout is never undone); if it was replaced the newer value is
+//! returned to the caller (an older account never overwrites a newer one).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
+use crate::coordination::{CommitCoordinator, LocalCoordinator, AUTH_COMMIT_KEY};
 use crate::credential::Credential;
-use crate::error::AuthError;
+use crate::error::{sanitize_key, AuthError};
 use crate::provider::AuthProvider;
-use crate::store::CredentialStore;
+use crate::store::{AuthStorage, CredentialStore};
 
 /// Key used to store a credential in the backing store.
 fn store_key(provider_id: &str) -> String {
     format!("llmauth:{provider_id}")
 }
+
+/// The provider ids this product stores credentials for.
+///
+/// The engine builds one manager per provider, so a manager cannot rely on its
+/// own registrations to know what else might be stored: signing in through a
+/// Copilot-only manager still has to evict a Claude credential, or the profile
+/// ends up with two accounts and no rule about which one wins.
+pub const STORED_PROVIDER_IDS: [&str; 3] = ["claude-ai", "github-copilot", "anthropic-api-key"];
 
 /// Per-provider single-flight gate: exactly one refresh runs at a time.
 ///
@@ -37,13 +62,44 @@ pub struct CredentialManager {
     providers: HashMap<String, Arc<dyn AuthProvider>>,
     /// One gate per registered provider; initialized at construction time.
     refresh_gates: HashMap<String, RefreshGate>,
+    /// Serializes commit sections with every other holder of this profile.
+    coordinator: Arc<dyn CommitCoordinator>,
 }
 
 impl CredentialManager {
     /// Create a manager with the given store and providers.
+    ///
+    /// Coordination is **private to this manager**: it serializes nothing but
+    /// its own commits. That is correct for a store only this manager can
+    /// reach (an in-memory store, a test fixture). For a profile on disk —
+    /// which the TUI, other managers, and other processes also write — use
+    /// [`CredentialManager::from_storage`], or pass the profile's coordinator
+    /// to [`CredentialManager::with_coordinator`].
     pub fn new(
         store: Arc<dyn CredentialStore>,
         providers: impl IntoIterator<Item = Arc<dyn AuthProvider>>,
+    ) -> Self {
+        Self::with_coordinator(store, providers, Arc::new(LocalCoordinator::new()))
+    }
+
+    /// Create a manager for a resolved profile, coordinating with every other
+    /// process that shares it.
+    pub fn from_storage(
+        storage: &AuthStorage,
+        providers: impl IntoIterator<Item = Arc<dyn AuthProvider>>,
+    ) -> Self {
+        Self::with_coordinator(
+            Arc::clone(&storage.store),
+            providers,
+            Arc::clone(&storage.coordinator),
+        )
+    }
+
+    /// Create a manager with an explicit coordination mechanism.
+    pub fn with_coordinator(
+        store: Arc<dyn CredentialStore>,
+        providers: impl IntoIterator<Item = Arc<dyn AuthProvider>>,
+        coordinator: Arc<dyn CommitCoordinator>,
     ) -> Self {
         let providers: HashMap<_, _> = providers
             .into_iter()
@@ -59,6 +115,7 @@ impl CredentialManager {
             store,
             providers,
             refresh_gates,
+            coordinator,
         }
     }
 
@@ -70,15 +127,17 @@ impl CredentialManager {
     /// Load the stored credential, refreshing it first if the provider reports
     /// it is near expiry.  Refreshes are coalesced per provider: N concurrent
     /// calls for the same expired credential trigger exactly one refresh.
+    ///
+    /// Returns `Ok(None)` when there is no credential — including when a
+    /// logout removed it while a refresh was in flight.
     pub async fn get_credential(
         &self,
         provider_id: &str,
     ) -> Result<Option<Credential>, AuthError> {
-        let provider = self.provider(provider_id)?;
+        let provider = Arc::clone(self.provider(provider_id)?);
 
-        let credential = match self.load(provider_id).await? {
-            Some(c) => c,
-            None => return Ok(None),
+        let Some((_, credential)) = self.load(provider_id).await? else {
+            return Ok(None);
         };
 
         // Fast path: token is fresh, or there is nothing to refresh with.
@@ -94,16 +153,23 @@ impl CredentialManager {
 
         let _guard = gate.lock().await;
 
-        // Re-read inside the lock: another waiter may have already refreshed.
-        let credential = self.load(provider_id).await?.unwrap_or(credential);
+        // Re-read inside the gate, without migrating anything (a migration
+        // would want the commit section this refresh is about to take): a
+        // waiter may already have refreshed, or the credential may be gone. A
+        // stale in-memory copy must never be used as a fallback here — that is
+        // how a logged-out credential comes back to life.
+        let Some((raw, credential)) = self.load_pinned(provider_id).await? else {
+            return Ok(None);
+        };
 
         if !provider.needs_refresh(&credential) {
             return Ok(Some(credential));
         }
 
+        // The network call runs outside every commit section, so a hung
+        // provider cannot block a logout.
         let refreshed = provider.refresh(&credential).await?;
-        self.persist(provider_id, &refreshed).await?;
-        Ok(Some(refreshed))
+        self.commit_refresh(provider_id, &raw, refreshed).await
     }
 
     /// The auth headers for the provider (refreshing the credential if needed).
@@ -115,37 +181,69 @@ impl CredentialManager {
         let credential = self
             .get_credential(provider_id)
             .await?
-            .ok_or_else(|| AuthError::NotFound(provider_id.into()))?;
+            .ok_or_else(|| AuthError::NotFound(sanitize_key(provider_id)))?;
         provider.auth_headers(&credential)
     }
 
     /// Persist a credential obtained externally (e.g. after completing a login
-    /// flow outside the manager).  Also removes any credential stored for other
-    /// providers to preserve the single-credential invariant.
+    /// flow outside the manager).  Also removes the credential stored for
+    /// every other provider, to preserve the single-credential invariant.
+    ///
+    /// The credential must belong to `provider_id`: filing one provider's
+    /// tokens under another's key would hand them to the wrong API.
+    ///
+    /// Both writes happen inside the profile's commit section, so a refresh of
+    /// the provider being replaced cannot slip its own write in between them.
     pub async fn store_credential(
         &self,
         provider_id: &str,
         credential: &Credential,
     ) -> Result<(), AuthError> {
         let _ = self.provider(provider_id)?;
+        check_provider_match(provider_id, credential)?;
+
+        let _commit = self.coordinator.begin(AUTH_COMMIT_KEY).await?;
         self.persist(provider_id, credential).await?;
         self.remove_other_credentials(Some(provider_id)).await?;
         Ok(())
     }
 
     /// Delete the stored credential for a provider.
+    ///
+    /// Taken inside the profile's commit section so a refresh — of this
+    /// provider or of the one being replaced — cannot slip a write in between
+    /// this delete and its own check.
     pub async fn logout(&self, provider_id: &str) -> Result<(), AuthError> {
+        let _commit = self.coordinator.begin(AUTH_COMMIT_KEY).await?;
         self.store.delete(&store_key(provider_id)).await
     }
 
-    /// The single provider id that currently has a stored credential, or `None`.
+    /// The single provider id that currently has a stored credential.
+    ///
+    /// Exactly one is the invariant. If several are stored — an interrupted
+    /// switch, an older build, a hand-edited profile — that is reported, not
+    /// resolved by picking one: the choice would decide which account the user
+    /// is signed in as.
     pub async fn connected_provider_id(&self) -> Result<Option<String>, AuthError> {
-        for id in self.providers.keys() {
-            if self.store.get(&store_key(id)).await?.is_some() {
-                return Ok(Some(id.clone()));
+        let mut connected = BTreeSet::new();
+        for id in self.candidate_provider_ids() {
+            if self.store.read_only(&store_key(&id)).await?.is_some() {
+                connected.insert(id);
             }
         }
-        Ok(None)
+
+        let mut found = connected.into_iter();
+        match (found.next(), found.next()) {
+            (None, _) => Ok(None),
+            (Some(only), None) => Ok(Some(only)),
+            (Some(first), Some(second)) => {
+                let rest: Vec<String> = std::iter::once(first)
+                    .chain(std::iter::once(second))
+                    .chain(found)
+                    .collect();
+                Err(AuthError::AmbiguousCredentials { providers: rest.join(", ") })
+            }
+        }
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────
@@ -153,29 +251,108 @@ impl CredentialManager {
     fn provider(&self, provider_id: &str) -> Result<&Arc<dyn AuthProvider>, AuthError> {
         self.providers
             .get(provider_id)
-            .ok_or_else(|| AuthError::UnknownProvider(provider_id.into()))
+            .ok_or_else(|| AuthError::UnknownProvider(sanitize_key(provider_id)))
     }
 
-    async fn load(&self, provider_id: &str) -> Result<Option<Credential>, AuthError> {
-        match self.store.get(&store_key(provider_id)).await? {
-            Some(json) => Ok(Some(serde_json::from_str(&json)?)),
+    /// Writes a refreshed credential only if the stored value is still the one
+    /// the refresh was based on.
+    ///
+    /// * gone → the user logged out while the refresh was running; the refresh
+    ///   is discarded and the caller is told there is no credential;
+    /// * changed → someone stored a newer credential (a re-login, another
+    ///   process' refresh); theirs stands and the caller gets it;
+    /// * unchanged → the refresh is persisted.
+    async fn commit_refresh(
+        &self,
+        provider_id: &str,
+        expected: &str,
+        refreshed: Credential,
+    ) -> Result<Option<Credential>, AuthError> {
+        // A refresh result is still a credential being filed under a key: if
+        // the provider handed back someone else's, refuse before taking any
+        // lock or writing anything.
+        check_provider_match(provider_id, &refreshed)?;
+
+        let _commit = self.coordinator.begin(AUTH_COMMIT_KEY).await?;
+
+        match self.load_pinned(provider_id).await? {
+            None => Ok(None),
+            Some((raw, current)) if raw != expected => Ok(Some(current)),
+            Some(_) => {
+                self.persist(provider_id, &refreshed).await?;
+                Ok(Some(refreshed))
+            }
+        }
+    }
+
+    /// The stored credential and the exact bytes it was parsed from — the
+    /// bytes are what a commit compares against.
+    ///
+    /// Uses the migrating read, so an ordinary read still moves a credential
+    /// an earlier build left behind into the primary backend. Never call it
+    /// while holding the commit section; use [`Self::load_pinned`] there.
+    async fn load(&self, provider_id: &str) -> Result<Option<(String, Credential)>, AuthError> {
+        Self::parse(provider_id, self.store.get(&store_key(provider_id)).await?)
+    }
+
+    /// [`Self::load`] without any migration, for use inside a commit section.
+    async fn load_pinned(
+        &self,
+        provider_id: &str,
+    ) -> Result<Option<(String, Credential)>, AuthError> {
+        Self::parse(provider_id, self.store.read_only(&store_key(provider_id)).await?)
+    }
+
+    fn parse(provider_id: &str, raw: Option<String>) -> Result<Option<(String, Credential)>, AuthError> {
+        match raw {
+            Some(json) => {
+                let credential = serde_json::from_str(&json)?;
+                check_provider_match(provider_id, &credential)?;
+                Ok(Some((json, credential)))
+            }
             None => Ok(None),
         }
     }
 
     async fn persist(&self, provider_id: &str, credential: &Credential) -> Result<(), AuthError> {
+        check_provider_match(provider_id, credential)?;
         let json = serde_json::to_string(credential)?;
         self.store.set(&store_key(provider_id), &json).await
     }
 
+    /// Every provider id whose credential this manager is responsible for:
+    /// the ones it registered plus the ones the product stores, so a
+    /// single-provider manager still enforces the single-credential rule.
+    fn candidate_provider_ids(&self) -> BTreeSet<String> {
+        self.providers
+            .keys()
+            .cloned()
+            .chain(STORED_PROVIDER_IDS.iter().map(|id| (*id).to_owned()))
+            .collect()
+    }
+
     async fn remove_other_credentials(&self, keep: Option<&str>) -> Result<(), AuthError> {
-        for id in self.providers.keys() {
+        for id in self.candidate_provider_ids() {
             if keep.map(|k| k != id).unwrap_or(true) {
-                self.store.delete(&store_key(id)).await?;
+                self.store.delete(&store_key(&id)).await?;
             }
         }
         Ok(())
     }
+}
+
+/// Refuses a credential that does not belong to `provider_id`.
+///
+/// Used on load before a provider sees token material, and at the write
+/// boundary for external credentials and refresh results.
+fn check_provider_match(provider_id: &str, credential: &Credential) -> Result<(), AuthError> {
+    if credential.provider_id == provider_id {
+        return Ok(());
+    }
+    Err(AuthError::CredentialProviderMismatch {
+        expected: sanitize_key(provider_id),
+        actual: sanitize_key(&credential.provider_id),
+    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -192,6 +369,42 @@ mod tests {
     use crate::credential::{Credential, CredentialKind};
     use crate::secret::Secret;
     use crate::store::InMemoryStore;
+
+    async fn assert_wrong_provider_blob_is_refused(refresh: bool) {
+        let store = Arc::new(InMemoryStore::new());
+        let credential = Credential {
+            provider_id: "github-copilot".into(),
+            kind: CredentialKind::OAuth,
+            access_token: Some(Secret::new("test-access".into())),
+            refresh_token: Some(Secret::new("test-refresh".into())),
+            api_key: None,
+            expires_at: None,
+            scopes: Vec::new(),
+            account: None,
+        };
+        store.set("llmauth:claude-ai", &serde_json::to_string(&credential).unwrap()).await.unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = MockProvider {
+            id: "claude-ai", refresh_count: calls.clone(),
+            always_needs_refresh: refresh, refresh_delay: Duration::ZERO,
+        };
+        let manager = CredentialManager::new(
+            store, [Arc::new(provider) as Arc<dyn AuthProvider>],
+        );
+        let result = manager.get_credential("claude-ai").await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "a foreign token must not reach the refresh provider");
+        assert!(matches!(result, Err(AuthError::CredentialProviderMismatch { .. })));
+    }
+
+    #[tokio::test]
+    async fn a_loaded_foreign_provider_credential_is_never_returned() {
+        assert_wrong_provider_blob_is_refused(false).await;
+    }
+
+    #[tokio::test]
+    async fn a_loaded_foreign_provider_credential_is_never_refreshed() {
+        assert_wrong_provider_blob_is_refused(true).await;
+    }
 
     // ── Mock provider ─────────────────────────────────────────────────────────
 

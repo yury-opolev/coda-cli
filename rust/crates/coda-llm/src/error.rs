@@ -81,13 +81,7 @@ impl LlmError {
 
     /// Builds an error from an HTTP status and body.
     pub fn from_status(status: u16, body: &str, retry_after: Option<Duration>) -> LlmError {
-        let message = extract_message(body).unwrap_or_else(|| {
-            if body.trim().is_empty() {
-                format!("HTTP {status}")
-            } else {
-                format!("HTTP {status}: {}", truncate(body, 500))
-            }
-        });
+        let message = status_message(status, body);
 
         if status == 401 || status == 403 {
             return LlmError::Unauthorized(message);
@@ -101,6 +95,52 @@ impl LlmError {
             body: if body.is_empty() { None } else { Some(body.to_string()) },
         }
     }
+
+    /// Builds an error from a **model-discovery** HTTP status.
+    ///
+    /// Identical to [`Self::from_status`] except for `403`, which keeps its
+    /// status instead of collapsing into `Unauthorized`.
+    ///
+    /// On an inference request a `403` is the provider refusing the identity,
+    /// and `Unauthorized` is the right reading. On a *model list* it is an
+    /// entitlement answer: a Claude.ai subscription answers the console
+    /// `/v1/models` endpoint differently from a console key, and a Copilot
+    /// account can be signed in perfectly well without model-listing
+    /// entitlement. A caller diagnosing a credential must be able to tell the
+    /// two apart, or it reports "the provider rejected your credential; sign
+    /// in again" — and a user follows that advice by overwriting a credential
+    /// that works.
+    ///
+    /// Retry behaviour is unchanged: `403` classifies as
+    /// [`FailureKind::Permanent`] either way, so nothing retries that did not
+    /// retry before, and `401` still becomes `Unauthorized`.
+    pub fn from_model_discovery_status(
+        status: u16,
+        body: &str,
+        retry_after: Option<Duration>,
+    ) -> LlmError {
+        if status != 403 {
+            return Self::from_status(status, body, retry_after);
+        }
+        LlmError::Api {
+            status,
+            message: status_message(status, body),
+            kind: classify(status),
+            retry_after,
+            body: if body.is_empty() { None } else { Some(body.to_string()) },
+        }
+    }
+}
+
+/// The human-readable message for a status/body pair.
+fn status_message(status: u16, body: &str) -> String {
+    extract_message(body).unwrap_or_else(|| {
+        if body.trim().is_empty() {
+            format!("HTTP {status}")
+        } else {
+            format!("HTTP {status}: {}", truncate(body, 500))
+        }
+    })
 }
 
 /// Maps an HTTP status onto a reaction.

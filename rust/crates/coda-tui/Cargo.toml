@@ -14,13 +14,19 @@ path = "src/main.rs"
 [dependencies]
 coda-proto.workspace = true
 coda-client.workspace = true
-coda-agent.workspace = true
 coda-render.workspace = true
+# JSON *parsing* only, scoped to `src/local/` (the local maintenance adapter)
+# by `tests/conventions.rs`. The MCP editor has to show what is written in
+# `.mcp.json`, including the unresolved `coda-secret:` references the engine
+# deliberately never returns, so one crate owns that file format rather than
+# the TUI growing a second parser for it. Nothing here executes a server.
 coda-mcp.workspace = true
 coda-auth.workspace = true
 coda-diagnostics.workspace = true
+coda-boot.workspace = true
 futures.workspace = true
 futures-lite = "2"
+async-trait.workspace = true
 
 anyhow.workspace = true
 thiserror.workspace = true
@@ -45,4 +51,10 @@ insta.workspace = true
 pretty_assertions.workspace = true
 tempfile = "3"
 coda-llm.workspace = true
+# Test fixtures only: `tests/` writes saved transcripts through
+# `SessionTranscriptStore::save` so the engine has something real to list and
+# resume. It is deliberately **not** a `[dependencies]` entry — that is the
+# assertion in `tests/conventions.rs`, and it is what guarantees the shipped
+# terminal front-end contains no in-process agent execution path.
+coda-agent.workspace = true
 

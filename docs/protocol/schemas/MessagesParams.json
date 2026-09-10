@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "properties": {
+    "sinceIndex": {
+      "type": "integer",
+      "format": "int32"
+    }
+  },
+  "required": [
+    "sinceIndex"
+  ],
+  "title": "MessagesParams",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

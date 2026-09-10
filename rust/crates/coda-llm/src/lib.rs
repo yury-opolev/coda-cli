@@ -10,6 +10,7 @@ pub mod copilot;
 pub mod credential_source;
 pub mod diagnostics;
 pub mod error;
+mod headers;
 pub mod message;
 pub mod reasoning;
 pub mod retry;

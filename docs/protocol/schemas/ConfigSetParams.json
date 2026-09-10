@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "properties": {
+    "key": {
+      "type": "string",
+      "default": ""
+    },
+    "value": {
+      "default": null
+    }
+  },
+  "title": "ConfigSetParams",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

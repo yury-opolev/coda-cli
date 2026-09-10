@@ -116,6 +116,7 @@ fn correlation(id: &str) -> Correlation {
         activity_id: Some("a1".into()),
         call_id: Some(id.into()),
         source_id: Some("root:t1".into()),
+        ..Default::default()
     }
 }
 

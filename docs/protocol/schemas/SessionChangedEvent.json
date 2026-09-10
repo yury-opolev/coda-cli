@@ -1,0 +1,36 @@
+{
+  "type": "object",
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "engineInstanceId": {
+      "type": "string"
+    },
+    "reason": {
+      "type": "string"
+    },
+    "sessionId": {
+      "type": "string"
+    },
+    "historyEpoch": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "historyLength": {
+      "type": "integer",
+      "format": "int64"
+    }
+  },
+  "required": [
+    "seq",
+    "engineInstanceId",
+    "reason",
+    "sessionId",
+    "historyEpoch",
+    "historyLength"
+  ],
+  "title": "SessionChangedEvent",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

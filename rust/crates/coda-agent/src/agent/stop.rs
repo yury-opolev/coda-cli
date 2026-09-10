@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 use crate::events::{AgentEvent, AgentSink};
 use crate::goal::{GoalSupervisor, GoalVerdict};
 use crate::steering::SteeringInbox;
+use coda_tool::{AnswerOutcome, NoAnswerReason};
 
 use super::AgentError;
 
@@ -58,22 +59,30 @@ pub(crate) async fn decide_stop(
 
             GoalVerdict::Escalate { question, .. } => {
                 // Ask the operator — headless (user_question = None) → stop unmet.
-                let answer = match user_question {
+                let outcome = match user_question {
                     Some(prompt) => {
                         prompt
                             .ask(&question, &[GOAL_CONTINUE_OPTION, GOAL_STOP_OPTION], cancel.clone())
                             .await
                     }
-                    None => None,
+                    None => AnswerOutcome::NoAnswer(NoAnswerReason::NoController),
                 };
 
-                let wants_continue = answer
-                    .as_deref()
-                    .map(|a| !a.trim().is_empty() && !a.eq_ignore_ascii_case(GOAL_STOP_OPTION))
-                    .unwrap_or(false);
+                // SECURITY: only a real answer can grant an extension.
+                // `NoAnswer` (disconnected / cancelled / timed out / malformed)
+                // is *not* a choice, and must never be read as
+                // `GOAL_CONTINUE_OPTION` merely because that is the first
+                // option in the list.
+                let granted_answer = match &outcome {
+                    AnswerOutcome::Answered(a)
+                        if !a.trim().is_empty() && !a.eq_ignore_ascii_case(GOAL_STOP_OPTION) =>
+                    {
+                        Some(a.clone())
+                    }
+                    _ => None,
+                };
 
-                if wants_continue {
-                    let ans = answer.unwrap();
+                if let Some(ans) = granted_answer {
                     if goal.try_grant_extension() {
                         let nudge = format!("Operator guidance: {ans}\nContinue toward the goal.");
                         return Ok(StopAction::Continue { nudge });
@@ -83,9 +92,9 @@ pub(crate) async fn decide_stop(
                         message: "The budget extension was already used; stopping with the goal unmet.".into(),
                     });
                 }
-                // Headless, explicit stop, or extension spent → stop unmet.
-                // Fall through to the steering-seal check below so a racing
-                // operator message is not silently lost.
+                // Headless, no answer, explicit stop, or extension spent →
+                // stop unmet. Fall through to the steering-seal check below so
+                // a racing operator message is not silently lost.
                 goal.mark_stopped_unmet();
             }
 
@@ -118,14 +127,17 @@ pub(crate) async fn decide_stop(
 /// Seam for the user-question prompt (§4.4 escalation).
 ///
 /// The TUI and serve layers implement this; headless mode leaves it `None`.
-/// A later phase will provide a concrete implementation.
+///
+/// The outcome is [`AnswerOutcome`], not `Option<String>`, for the same reason
+/// the tool seam is: "the connection died" and "the operator picked the first
+/// option" must not be the same value. `NoAnswer` never grants an extension.
 pub trait UserQuestionPrompt: Send + Sync {
     fn ask<'a>(
         &'a self,
         question: &'a str,
         options: &'a [&'a str],
         cancel: CancellationToken,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>>;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AnswerOutcome> + Send + 'a>>;
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -165,8 +177,8 @@ mod tests {
         )
     }
 
-    /// A prompt that always returns the given fixed answer.
-    struct FixedPrompt(Option<String>);
+    /// A prompt that always returns the given fixed outcome.
+    struct FixedPrompt(AnswerOutcome);
 
     impl UserQuestionPrompt for FixedPrompt {
         fn ask<'a>(
@@ -174,11 +186,15 @@ mod tests {
             _question: &'a str,
             _options: &'a [&'a str],
             _cancel: CancellationToken,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>>
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AnswerOutcome> + Send + 'a>>
         {
             let ans = self.0.clone();
             Box::pin(async move { ans })
         }
+    }
+
+    fn answered(text: &str) -> FixedPrompt {
+        FixedPrompt(AnswerOutcome::Answered(text.to_string()))
     }
 
     // ── Escalate branch: try_grant_extension ──────────────────────────────────
@@ -189,7 +205,7 @@ mod tests {
         // and return Continue when the prompt says "continue".
         let mut goal = Some(escalating_supervisor());
         let sink = NullSink;
-        let prompt = FixedPrompt(Some(GOAL_CONTINUE_OPTION.to_string()));
+        let prompt = answered(GOAL_CONTINUE_OPTION);
 
         let result = decide_stop(
             None,
@@ -210,6 +226,73 @@ mod tests {
         );
     }
 
+    // ── Stage D: a fault never grants a goal extension ───────────────────────
+
+    /// SECURITY: `GOAL_CONTINUE_OPTION` is the **first** option in the
+    /// escalation list. Before the typed outcome existed, any fault in the
+    /// question path silently substituted `options.first()`, which auto-granted
+    /// a budget extension nobody asked for. Every no-answer reason must stop
+    /// with the goal unmet, and must leave the extension unspent.
+    #[tokio::test]
+    async fn no_answer_never_grants_a_goal_extension() {
+        for reason in [
+            NoAnswerReason::Disconnected,
+            NoAnswerReason::Cancelled,
+            NoAnswerReason::Timeout,
+            NoAnswerReason::Malformed,
+            NoAnswerReason::Declined,
+            NoAnswerReason::NoController,
+        ] {
+            let mut goal = Some(escalating_supervisor());
+            let sink = NullSink;
+            let prompt = FixedPrompt(AnswerOutcome::NoAnswer(reason));
+
+            let result = decide_stop(
+                None,
+                "some text",
+                &mut goal,
+                &mut 0,
+                None,
+                &sink,
+                CancellationToken::new(),
+                Some(&prompt),
+            )
+            .await
+            .expect("no error");
+
+            assert!(
+                matches!(result, StopAction::Stop),
+                "{reason:?}: an unanswered escalation must stop, not continue — got {result:?}"
+            );
+            assert!(
+                goal.as_mut().expect("goal still present").try_grant_extension(),
+                "{reason:?}: the extension must still be unspent — a fault must not consume it"
+            );
+        }
+    }
+
+    /// An empty string is not an answer either: it must not be treated as
+    /// "continue" merely because it is not the stop option.
+    #[tokio::test]
+    async fn an_empty_answer_string_does_not_grant_an_extension() {
+        let mut goal = Some(escalating_supervisor());
+        let sink = NullSink;
+        let prompt = answered("   ");
+        let result = decide_stop(
+            None,
+            "some text",
+            &mut goal,
+            &mut 0,
+            None,
+            &sink,
+            CancellationToken::new(),
+            Some(&prompt),
+        )
+        .await
+        .expect("no error");
+        assert!(matches!(result, StopAction::Stop));
+    }
+
     // ── Escalate branch: case-insensitive option match ────────────────────────
 
     #[tokio::test]
@@ -224,7 +307,7 @@ mod tests {
             .enumerate()
             .map(|(i, c)| if i % 2 == 0 { c.to_ascii_uppercase() } else { c.to_ascii_lowercase() })
             .collect::<String>();
-        let prompt = FixedPrompt(Some(mixed));
+        let prompt = FixedPrompt(AnswerOutcome::Answered(mixed));
 
         let result = decide_stop(
             None,

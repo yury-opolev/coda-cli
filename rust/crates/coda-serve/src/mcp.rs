@@ -58,13 +58,46 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// `true` when MCP is switched off for this engine process.
+///
+/// Read by `mcp/list` so an empty inventory is reported as "MCP is disabled"
+/// rather than as "no servers are configured".
+pub(crate) fn mcp_disabled() -> bool {
+    env_flag("CODA_SERVE_DISABLE_MCP")
+}
+
+/// `true` when the project `<cwd>/.mcp.json` layer is suppressed.
+pub(crate) fn project_mcp_disabled() -> bool {
+    env_flag("CODA_DISABLE_PROJECT_MCP")
+}
+
 /// Connect all enabled MCP servers for a session and build the tool bundle.
 ///
-/// Builds the platform credential store and delegates to
+/// Resolves the profile's credential storage and delegates to
 /// [`connect_mcp_with_store`]. Honours the disable flags/env.
+///
+/// When the store cannot be opened, MCP still starts and a notice says so:
+/// secret resolution treats an unresolvable `coda-secret:` reference as an
+/// empty value, so without the notice a server would simply fail to
+/// authenticate with no explanation.
 pub(crate) async fn connect_mcp(working_dir: &str) -> McpBundle {
-    let store = crate::host::credential_store();
-    connect_mcp_with_store(working_dir, store).await
+    match crate::host::credential_storage() {
+        Ok(storage) => connect_mcp_with_store(working_dir, Arc::clone(&storage.store)).await,
+        Err(e) => {
+            let mut bundle = connect_mcp_with_store(
+                working_dir,
+                Arc::new(coda_auth::store::InMemoryStore::new()),
+            )
+            .await;
+            // Sanitised: the raw error can carry paths and store details.
+            bundle.notices.push(format!(
+                "MCP secrets could not be read ({}). Servers that need a stored \
+                 secret will start without one and are likely to fail to authenticate.",
+                crate::host::sanitize_auth_error(&e)
+            ));
+            bundle
+        }
+    }
 }
 
 /// Inner implementation of MCP startup with an injected credential store.

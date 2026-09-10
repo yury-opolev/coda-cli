@@ -17,6 +17,7 @@ use crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 
+pub mod auth;
 pub mod browser;
 pub mod effort;
 pub mod form;
@@ -129,6 +130,18 @@ pub enum SurfaceAction {
     },
     /// Persist the MCP server held by the editor that emitted this.
     SaveMcpServer,
+
+    // ── Authentication ─────────────────────────────────────────────────────
+    //
+    // Deliberately value-free. The account, the deployment and above all the
+    // typed key are read back off the surface that emitted this; an action is
+    // `Debug`, `Clone` and travels through the application, and a secret has
+    // no business in any of that.
+    /// Run the sign-in the auth surface describes.
+    SubmitAuthChoice,
+    /// Abandon the sign-in: close the poller and the listener, keep the
+    /// profile exactly as it is.
+    CancelAuth,
 
     // ── Browser row actions ────────────────────────────────────────────────
     //

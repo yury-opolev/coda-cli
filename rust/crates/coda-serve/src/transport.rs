@@ -49,11 +49,30 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
     //    endpoint without a key was already rejected by `validate`.
     // 3. Otherwise the normal credential probe runs (env + keyring); only the
     //    keyring path can produce a diagnostic (Copilot credential error).
+    //
+    // A refused `ANTHROPIC_BASE_URL` is fatal only where an Anthropic API key
+    // would actually be spent (1 with `--provider anthropic`, and 2). It is
+    // carried, never discarded: the host keeps the refusal for the life of the
+    // process, so a later `initialize(apiKey)` cannot lose it either.
     let (client, copilot_diagnostic) = if let Some(provider) = startup.provider.as_deref() {
+        let endpoint = match startup.api_key_endpoint() {
+            Ok(endpoint) => endpoint,
+            Err(refusal)
+                if coda_auth::service::ProviderIdentity::parse(provider)
+                    == Some(coda_auth::service::ProviderIdentity::AnthropicApiKey) =>
+            {
+                coda_diagnostics::record(coda_diagnostics::Event::StartupFailure { category: "configuration" });
+                return Err(anyhow::anyhow!("invalid startup configuration: {refusal}"));
+            }
+            // Copilot and Claude.ai resolve their own endpoints; this one is
+            // not theirs to be blocked by. It stays refused for any API-key
+            // client this process might build later.
+            Err(_) => None,
+        };
         let result = crate::host::build_client_for_provider(
             provider,
             startup.api_key.as_deref(),
-            startup.endpoint.as_deref(),
+            endpoint.as_deref(),
         )
         .await
         .map_err(|e| {
@@ -62,19 +81,24 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
         })?;
         (Some(result), None)
     } else {
-        match (
-            startup.api_key.as_deref().filter(|k| !k.trim().is_empty()),
-            startup.endpoint.as_deref().filter(|e| !e.trim().is_empty()),
-        ) {
-            (Some(key), endpoint) => (crate::host::build_anthropic_at(key, endpoint), None),
-            (None, _) => {
-                // Full credential probe: env first (no diagnostic), then keyring (may have one).
-                crate::host::try_build_client_with_diagnostic(None).await
+        match startup.api_key.as_deref().filter(|k| !k.trim().is_empty()) {
+            // An explicit key *is* the API-key identity, so the endpoint
+            // decision applies in full. Building at the default host because
+            // the configured one was refused would send that key somewhere the
+            // user never configured.
+            Some(key) => {
+                let endpoint = startup.api_key_endpoint().map_err(|refusal| {
+                    coda_diagnostics::record(coda_diagnostics::Event::StartupFailure { category: "configuration" });
+                    anyhow::anyhow!("invalid startup configuration: {refusal}")
+                })?;
+                (crate::host::build_anthropic_at(key, endpoint.as_deref()), None)
             }
+            // Full credential probe: env first (no diagnostic), then keyring (may have one).
+            None => crate::host::try_build_client_with_diagnostic(None).await,
         }
     };
     if copilot_diagnostic.is_some() {
-        coda_diagnostics::record(coda_diagnostics::Event::StartupFailure { category: "copilot_configuration_or_credentials" });
+        coda_diagnostics::record(coda_diagnostics::Event::StartupFailure { category: "provider_configuration_or_credentials" });
     }
 
     // Connect enabled MCP servers before the host is built so their tools are
@@ -146,8 +170,15 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let prompt_channel = Arc::new(PromptChannel::new(outgoing_tx.clone()));
     let sink = Arc::new(ServeSink::new(outgoing_tx.clone()));
+    // The prompt channel mints request handles bound to the engine instance,
+    // so it must share the id the bus and `session/getState` report — a handle
+    // from a previous engine process is then a typed rejection rather than a
+    // silent re-application to whatever is pending now.
+    let prompt_channel = Arc::new(PromptChannel::with_instance(
+        outgoing_tx.clone(),
+        sink.bus().engine_instance_id(),
+    ));
 
     // Captured here, on the same task the process entrypoint's
     // `coda_diagnostics::scope` established it on — this is the last point
@@ -165,6 +196,22 @@ where
         copilot_diagnostic,
         diagnostics,
     );
+
+    // The profile the host authenticates against, for any wiring that happens
+    // after startup. Startup may deliberately have left the engine client-less
+    // (a chosen provider with no credential): the lazy path re-runs the *same*
+    // selection through this context rather than reaching for an ambient key.
+    // A profile that cannot be opened simply leaves the host without a
+    // context, which is exactly the client-less state startup already reported.
+    match crate::host::ProviderContext::from_env() {
+        Ok(context) => backend.set_provider_context(Arc::new(context)),
+        Err(error) => {
+            eprintln!(
+                "coda: credential storage unavailable: {}",
+                crate::host::sanitize_auth_error(&error)
+            );
+        }
+    }
 
     let writer_task = tokio::spawn(write_loop(writer, outgoing_rx));
 
@@ -563,6 +610,78 @@ mod tests {
 
         let msg = client.next().await;
         assert_eq!(msg["id"], 3);
+    }
+
+    // ── Stdin EOF fails every outstanding reverse request closed ──────────
+
+    /// The deterministic counterpart of the out-of-process EOF conformance
+    /// test (`coda-engine/tests/eof_conformance.rs`): drives the *real*
+    /// `read_loop` against a pipe whose far end is already closed, so the
+    /// `Ok(0)` branch is the only thing under test.
+    ///
+    /// SECURITY: a lost connection must resolve an outstanding
+    /// `request/question` as a typed no-answer. It must never look like the
+    /// operator picked an option, and it must never leave the waiter hanging
+    /// on a human who is gone.
+    #[tokio::test]
+    async fn a_stdin_eof_fails_every_outstanding_reverse_request_closed() {
+        use crate::state::requests::RequestOutcome;
+        use coda_proto::state::PendingRequestKind;
+        use coda_tool::{AnswerOutcome, NoAnswerReason};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (outgoing_tx, _outgoing_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let sink = Arc::new(crate::sink::ServeSink::new(outgoing_tx.clone()));
+        let prompt_channel =
+            Arc::new(PromptChannel::with_instance(outgoing_tx.clone(), "engine-eof"));
+        let backend = ServeHost::new(
+            sink,
+            Arc::clone(&prompt_channel),
+            dir.path().to_string_lossy().into_owned(),
+        );
+
+        // A question is outstanding when the pipe dies.
+        let (numeric, _handle) = prompt_channel.registry().mint_id();
+        let waiting = prompt_channel.registry().register(
+            numeric,
+            PendingRequestKind::Question,
+            json!({ "question": "Delete?", "options": ["Delete", "Keep"] }),
+            None,
+        );
+        let (permission_id, _) = prompt_channel.registry().mint_id();
+        let permission = prompt_channel.registry().register(
+            permission_id,
+            PendingRequestKind::Permission,
+            json!({ "toolName": "run_command" }),
+            None,
+        );
+
+        // The client end is dropped: the server's read half sees a genuine
+        // `Ok(0)`, exactly as a closed stdin does.
+        let (server_end, client_end) = duplex(1024);
+        drop(client_end);
+        read_loop(server_end, outgoing_tx, Arc::clone(&prompt_channel), backend).await;
+
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), waiting)
+                .await
+                .expect("EOF must resolve the waiter, not leave it hanging on a human who is gone")
+                .expect("the waiter must be answered, not dropped"),
+            RequestOutcome::Question(AnswerOutcome::NoAnswer(NoAnswerReason::Disconnected)),
+            "SECURITY: a lost connection is never the first option and never an empty answer"
+        );
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), permission)
+                .await
+                .expect("EOF must resolve the waiter")
+                .expect("the waiter must be answered"),
+            RequestOutcome::Permission { allow: false },
+            "SECURITY: a lost connection is never an allow"
+        );
+        assert!(
+            prompt_channel.registry().is_empty(),
+            "nothing may be left pending on a connection that no longer exists"
+        );
     }
 
     // ── End-to-end tests with a fake LLM client ───────────────────────────────

@@ -1,0 +1,45 @@
+{
+  "type": "object",
+  "properties": {
+    "ok": {
+      "type": "boolean",
+      "default": false
+    },
+    "messagesBefore": {
+      "type": "integer",
+      "format": "int64",
+      "default": 0
+    },
+    "messagesAfter": {
+      "type": "integer",
+      "format": "int64",
+      "default": 0
+    },
+    "tokensBefore": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64",
+      "default": null
+    },
+    "tokensAfter": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64",
+      "default": null
+    },
+    "error": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    }
+  },
+  "description": "Result of `session/compact`.",
+  "title": "CompactResult",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

@@ -30,8 +30,12 @@ const CHANNEL_DEPTH: usize = 256;
 /// Overall bound on the non-streaming model listing.
 const MODELS_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The identity this client reports unless one is chosen explicitly: the
+/// Anthropic console API key.
+const DEFAULT_PROVIDER_ID: &str = "anthropic";
+
 /// How the client authenticates.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Auth {
     /// A console API key, sent as `x-api-key`.
     ApiKey(String),
@@ -39,8 +43,18 @@ pub enum Auth {
     Bearer(String),
 }
 
+impl std::fmt::Debug for Auth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match self {
+            Self::ApiKey(_) => "ApiKey",
+            Self::Bearer(_) => "Bearer",
+        };
+        f.debug_tuple(kind).field(&"[REDACTED]").finish()
+    }
+}
+
 /// Configuration for [`AnthropicClient`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AnthropicConfig {
     pub base_url: String,
     pub auth: Auth,
@@ -50,6 +64,27 @@ pub struct AnthropicConfig {
     /// Optional dynamic credential source; when present its auth headers
     /// override the static `auth` field on every request.
     pub credential_source: Option<std::sync::Arc<dyn crate::credential_source::CredentialSource>>,
+    /// The provider id this client reports as its public identity.
+    ///
+    /// Defaults to `anthropic`, the console API key. A Claude.ai subscription
+    /// uses the same transport but is a *different account*, and the rest of
+    /// the product keys its saved model, its effort preference and its
+    /// "signed in as" line off this value — so that client sets `claude-ai`
+    /// here. Sharing the transport must never collapse the two.
+    pub provider_id: String,
+}
+
+impl std::fmt::Debug for AnthropicConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnthropicConfig")
+            .field("base_url", &"[REDACTED]")
+            .field("auth", &self.auth)
+            .field("retry", &self.retry)
+            .field("extra_headers", &"[REDACTED]")
+            .field("credential_source", &self.credential_source.as_ref().map(|_| "[REDACTED]"))
+            .field("provider_id", &self.provider_id)
+            .finish()
+    }
 }
 
 impl AnthropicConfig {
@@ -60,7 +95,16 @@ impl AnthropicConfig {
             retry: RetryPolicy::default(),
             extra_headers: Vec::new(),
             credential_source: None,
+            provider_id: DEFAULT_PROVIDER_ID.into(),
         }
+    }
+
+    /// Report a different public identity (see
+    /// [`AnthropicConfig::provider_id`]). Changes nothing about the endpoint,
+    /// the headers or the credential.
+    pub fn with_identity(mut self, provider_id: impl Into<String>) -> Self {
+        self.provider_id = provider_id.into();
+        self
     }
 
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
@@ -120,30 +164,16 @@ impl AnthropicClient {
         url: &str,
         dynamic_auth: Option<&[(String, String)]>,
     ) -> reqwest::RequestBuilder {
-        let mut builder = self
-            .http
-            .post(url)
-            .header("anthropic-version", API_VERSION)
-            .header("anthropic-beta", BETA_FEATURES)
-            .header("content-type", "application/json")
-            .header("accept", "text/event-stream");
-
-        if let Some(headers) = dynamic_auth {
-            // Dynamic credential source wins over static auth.
-            for (name, value) in headers {
-                builder = builder.header(name.as_str(), value.as_str());
-            }
-        } else {
-            builder = match &self.config.auth {
-                Auth::ApiKey(key) => builder.header("x-api-key", key.as_str()),
-                Auth::Bearer(token) => builder.header("authorization", format!("Bearer {}", token)),
-            };
+        let mut defaults = vec![
+            ("anthropic-version".into(), API_VERSION.into()),
+            ("anthropic-beta".into(), BETA_FEATURES.into()),
+            ("content-type".into(), "application/json".into()),
+            ("accept".into(), "text/event-stream".into()),
+        ];
+        if dynamic_auth.is_none() {
+            defaults.push(self.static_auth_header());
         }
-
-        for (name, value) in &self.config.extra_headers {
-            builder = builder.header(name.as_str(), value.as_str());
-        }
-        builder
+        crate::headers::apply(self.http.post(url), defaults, &self.config.extra_headers, dynamic_auth)
     }
 
     /// Build a GET request applying auth headers (used for model listing).
@@ -152,22 +182,18 @@ impl AnthropicClient {
         url: &str,
         dynamic_auth: Option<&[(String, String)]>,
     ) -> reqwest::RequestBuilder {
-        let mut builder = self
-            .http
-            .get(url)
-            .header("anthropic-version", API_VERSION);
-
-        if let Some(headers) = dynamic_auth {
-            for (name, value) in headers {
-                builder = builder.header(name.as_str(), value.as_str());
-            }
-        } else {
-            builder = match &self.config.auth {
-                Auth::ApiKey(key) => builder.header("x-api-key", key.as_str()),
-                Auth::Bearer(token) => builder.header("authorization", format!("Bearer {}", token)),
-            };
+        let mut defaults = vec![("anthropic-version".into(), API_VERSION.into())];
+        if dynamic_auth.is_none() {
+            defaults.push(self.static_auth_header());
         }
-        builder
+        crate::headers::apply(self.http.get(url), defaults, &self.config.extra_headers, dynamic_auth)
+    }
+
+    fn static_auth_header(&self) -> (String, String) {
+        match &self.config.auth {
+            Auth::ApiKey(key) => ("x-api-key".into(), key.clone()),
+            Auth::Bearer(token) => ("authorization".into(), format!("Bearer {token}")),
+        }
     }
     /// Sends the request, retrying transient failures before any bytes are
     /// streamed.
@@ -183,7 +209,7 @@ impl AnthropicClient {
         // Fetch dynamic auth headers once per request (before the retry loop) so
         // a refreshed token is used immediately without recreating the client.
         let dynamic_auth: Option<Vec<(String, String)>> = if let Some(src) = &self.config.credential_source {
-            src.auth_headers().await
+            src.auth_headers().await?
         } else {
             None
         };
@@ -198,7 +224,7 @@ impl AnthropicClient {
 #[async_trait::async_trait]
 impl LlmClient for AnthropicClient {
     fn provider_id(&self) -> &str {
-        "anthropic"
+        &self.config.provider_id
     }
 
     async fn stream(&self, request: ChatRequest) -> Result<ResponseStream, LlmError> {
@@ -217,7 +243,7 @@ impl LlmClient for AnthropicClient {
 
         // Use the credential source if configured, same as streaming requests.
         let dynamic_auth: Option<Vec<(String, String)>> = if let Some(src) = &self.config.credential_source {
-            src.auth_headers().await
+            src.auth_headers().await?
         } else {
             None
         };
@@ -234,7 +260,10 @@ impl LlmClient for AnthropicClient {
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let body = response.text().await.unwrap_or_default();
-            return Err(LlmError::from_status(status, &body, None));
+            // Model discovery, not inference: a 403 here is an entitlement
+            // answer and keeps its status, so a caller checking a credential
+            // does not read it as the provider refusing the identity.
+            return Err(LlmError::from_model_discovery_status(status, &body, None));
         }
 
         let value: serde_json::Value = tokio::time::timeout(MODELS_TIMEOUT, response.json())
@@ -279,6 +308,41 @@ pub fn parse_models(value: &serde_json::Value) -> Vec<ModelInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_auth_headers_are_unique_and_preserve_required_beta_features() {
+        let mut config = AnthropicConfig::api_key("static-key");
+        config.extra_headers = vec![
+            ("User-Agent".into(), "static-agent".into()),
+            ("anthropic-beta".into(), "oauth-test,extra-feature".into()),
+            ("x-extra-only".into(), "kept".into()),
+        ];
+        let client = AnthropicClient::new(config).unwrap();
+        let dynamic = vec![
+            ("user-agent".into(), "dynamic-agent".into()),
+            ("Anthropic-Beta".into(), "oauth-test".into()),
+        ];
+        for post in [false, true] {
+            let request = if post {
+                client.request_builder_with_auth("https://example.invalid", Some(&dynamic))
+            } else {
+                client.get_builder_with_auth("https://example.invalid", Some(&dynamic))
+            }.build().unwrap();
+            let headers = request.headers();
+            assert_eq!(headers.get_all("user-agent").iter().count(), 1);
+            assert_eq!(headers["user-agent"], "dynamic-agent");
+            assert_eq!(headers["x-extra-only"], "kept");
+            assert_eq!(headers.get_all("anthropic-beta").iter().count(), 1);
+            let flags: Vec<_> = headers["anthropic-beta"].to_str().unwrap().split(',').collect();
+            assert_eq!(flags.iter().filter(|flag| **flag == "oauth-test").count(), 1);
+            assert!(flags.contains(&"extra-feature"));
+            if post {
+                for feature in BETA_FEATURES.split(',') {
+                    assert!(flags.contains(&feature), "missing required beta feature: {feature}");
+                }
+            }
+        }
+    }
     use serde_json::json;
 
     #[test]
@@ -298,6 +362,25 @@ mod tests {
     fn reports_its_provider_id() {
         let client = AnthropicClient::new(AnthropicConfig::api_key("k")).expect("client");
         assert_eq!(client.provider_id(), "anthropic");
+    }
+
+    #[test]
+    fn a_subscription_client_keeps_its_own_identity_on_the_shared_transport() {
+        // The Claude.ai subscription and a console API key speak the same API.
+        // They are still different accounts, and the engine's public provider
+        // id — which selects the saved model row and the "signed in as" line —
+        // comes from this method.
+        let config = AnthropicConfig::api_key("").with_identity("claude-ai");
+        let client = AnthropicClient::new(config).expect("client");
+        assert_eq!(client.provider_id(), "claude-ai");
+    }
+
+    #[test]
+    fn an_identity_override_does_not_change_the_endpoint_or_auth() {
+        let config = AnthropicConfig::api_key("k").with_identity("claude-ai");
+        let client = AnthropicClient::new(config).expect("client");
+        assert_eq!(client.endpoint(), "https://api.anthropic.com/v1/messages");
+        assert!(matches!(client.config.auth, Auth::ApiKey(ref key) if key == "k"));
     }
 
     #[test]

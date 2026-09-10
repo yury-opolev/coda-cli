@@ -1,0 +1,41 @@
+{
+  "type": "object",
+  "properties": {
+    "index": {
+      "type": "integer",
+      "format": "int32",
+      "default": 0
+    },
+    "event": {
+      "type": "string",
+      "default": ""
+    },
+    "handlerType": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "matcher": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "scope": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "enabled": {
+      "type": "boolean",
+      "default": false
+    }
+  },
+  "title": "HooksInfoResult",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

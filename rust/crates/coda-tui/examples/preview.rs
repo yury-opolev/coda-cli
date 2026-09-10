@@ -21,7 +21,7 @@ fn main() {
     }));
     state.apply(UiEvent::Engine(Event::AssistantTextComplete));
 
-    let c = Correlation { root_turn_id: Some("t".into()), activity_id: Some("a".into()), call_id: Some("c1".into()), source_id: Some("root:t".into()) };
+    let c = Correlation { root_turn_id: Some("t".into()), activity_id: Some("a".into()), call_id: Some("c1".into()), source_id: Some("root:t".into()), ..Default::default() };
     state.apply(UiEvent::Engine(Event::ToolCall { tool_name: "edit".into(), input_json: r#"{"path":"src/http.rs"}"#.into(), correlation: c.clone() }));
     state.apply(UiEvent::Engine(Event::ToolResult { tool_name: "edit".into(), content: "ok".into(), is_error: false, status: Some(ToolCallStatus::Succeeded), correlation: c }));
     state.apply(UiEvent::Engine(Event::Usage { input_tokens: 24_000, output_tokens: 900 }));

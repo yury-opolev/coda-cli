@@ -14,16 +14,17 @@
 
 use std::sync::Arc;
 
-use coda_llm::CredentialSource;
+use coda_llm::{CredentialSource, LlmError};
 
 use crate::credential::{Credential, CredentialKind};
 use crate::manager::CredentialManager;
+use crate::failure::AuthFailure;
 
 /// Adapts a [`CredentialManager`] for one provider into a [`CredentialSource`].
 ///
-/// Calling `auth_headers()` fetches (and if necessary refreshes) the credential
-/// from the manager and translates it into the exact HTTP headers each provider
-/// client expects:
+/// Calling `auth_headers()` asks the manager for the registered provider's
+/// current HTTP authentication headers, refreshing when needed. Missing
+/// credentials and failures are errors, never permission to reuse static auth:
 ///
 /// - `ApiKey` credential → `x-api-key: <key>` (Anthropic console key)
 /// - `OAuth` credential  → `Authorization: Bearer <access_token>`
@@ -33,6 +34,13 @@ use crate::manager::CredentialManager;
 pub struct CredentialManagerSource {
     manager: Arc<CredentialManager>,
     provider_id: String,
+    /// Whether the last failure was this machine's rather than the provider's.
+    ///
+    /// A store that will not open, a credential that will not decrypt, and a
+    /// credential that is simply not there are all *local*: no request was
+    /// sent and the provider refused nothing. A refresh the authorization
+    /// server actually rejected is not local — that is the provider answering.
+    local_failure: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for CredentialManagerSource {
@@ -48,19 +56,123 @@ impl CredentialManagerSource {
         Self {
             manager,
             provider_id: provider_id.into(),
+            local_failure: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
 
 #[async_trait::async_trait]
 impl CredentialSource for CredentialManagerSource {
-    async fn auth_headers(&self) -> Option<Vec<(String, String)>> {
-        let credential = self.manager
-            .get_credential(&self.provider_id)
-            .await
-            .ok()??;
+    async fn auth_headers(&self) -> Result<Option<Vec<(String, String)>>, LlmError> {
+        use std::sync::atomic::Ordering;
 
-        Some(credential_to_auth_headers(&credential))
+        let headers = match self.manager.get_auth_headers(&self.provider_id).await {
+            Ok(headers) => headers,
+            Err(error) => {
+                let failure = AuthFailure::classify(&error);
+                self.local_failure.store(is_local(failure), Ordering::SeqCst);
+                return Err(source_failure(failure));
+            }
+        };
+        if headers.is_empty() {
+            // A credential that produces no headers is a local fault too: the
+            // provider was never asked anything.
+            self.local_failure.store(true, Ordering::SeqCst);
+            return Err(LlmError::Unauthorized(
+                "the stored credential produced no authentication headers".into(),
+            ));
+        }
+        self.local_failure.store(false, Ordering::SeqCst);
+        Ok(Some(headers))
+    }
+
+    fn last_failure_was_local(&self) -> bool {
+        self.local_failure.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Whether a classified failure happened on this machine.
+///
+/// Only an authorization server that actually answered counts as the
+/// provider's word; everything else — the store, the filesystem, a missing
+/// credential, a credential that cannot be parsed — happened here.
+fn is_local(failure: AuthFailure) -> bool {
+    !matches!(failure, AuthFailure::OAuthRejected { .. })
+}
+
+/// Authenticates with the `ANTHROPIC_API_KEY` exported in this process.
+///
+/// This is the source for the selection that stores no key. It reads the
+/// variable **on every call**, through the same environment port the service
+/// selects with, so:
+///
+/// * no copy of the key is retained anywhere — not in a store, not in a
+///   config, not in this struct;
+/// * a variable that disappears fails the next request closed, instead of a
+///   captured value outliving the environment it came from.
+///
+/// A missing variable is a *local* failure: no request was sent and the
+/// provider refused nothing.
+pub struct EnvironmentApiKeySource {
+    environment: Arc<dyn crate::service::AuthEnvironment>,
+    local_failure: std::sync::atomic::AtomicBool,
+}
+
+impl std::fmt::Debug for EnvironmentApiKeySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EnvironmentApiKeySource").finish_non_exhaustive()
+    }
+}
+
+impl EnvironmentApiKeySource {
+    /// A source over `environment`.
+    ///
+    /// Build a fresh one per probe: [`CredentialSource::last_failure_was_local`]
+    /// describes the last attempt *this* source made.
+    pub fn new(environment: Arc<dyn crate::service::AuthEnvironment>) -> Self {
+        Self { environment, local_failure: std::sync::atomic::AtomicBool::new(false) }
+    }
+}
+
+#[async_trait::async_trait]
+impl CredentialSource for EnvironmentApiKeySource {
+    async fn auth_headers(&self) -> Result<Option<Vec<(String, String)>>, LlmError> {
+        use std::sync::atomic::Ordering;
+
+        match self.environment.var(crate::provider::api_key::ENV_VAR) {
+            Some(key) => {
+                let credential = crate::provider::api_key::ApiKeyProvider::prepare_credential(&key)
+                    .map_err(|error| {
+                        self.local_failure.store(true, Ordering::SeqCst);
+                        source_failure(AuthFailure::classify(&error))
+                    })?;
+                self.local_failure.store(false, Ordering::SeqCst);
+                Ok(Some(credential_to_auth_headers(&credential)))
+            }
+            None => {
+                self.local_failure.store(true, Ordering::SeqCst);
+                Err(LlmError::Unauthorized(
+                    "ANTHROPIC_API_KEY is not set in this process, and no key is stored".into(),
+                ))
+            }
+        }
+    }
+
+    fn last_failure_was_local(&self) -> bool {
+        self.local_failure.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+fn source_failure(failure: AuthFailure) -> LlmError {
+    let message = failure.to_string();
+    match failure {
+        AuthFailure::OAuthRejected { status: 401 | 403 } => LlmError::Unauthorized(message),
+        AuthFailure::OAuthRejected { status } => LlmError::Api {
+            status, message, kind: coda_llm::error::classify(status),
+            retry_after: None, body: None,
+        },
+        _ if failure.is_transient() => LlmError::Transport(message),
+        _ => LlmError::Unauthorized(message),
     }
 }
 
@@ -217,7 +329,8 @@ mod tests {
             crate::provider::api_key::PROVIDER_ID,
         );
 
-        let headers = source.auth_headers().await.expect("should produce headers");
+        let headers = source.auth_headers().await.expect("credential lookup succeeds")
+            .expect("should produce headers");
         assert_eq!(headers.len(), 1, "exactly one auth header");
         assert_eq!(headers[0].0, "x-api-key");
         assert_eq!(headers[0].1, "sk-ant-refreshed-99");

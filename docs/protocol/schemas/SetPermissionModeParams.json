@@ -1,0 +1,15 @@
+{
+  "type": "object",
+  "properties": {
+    "mode": {
+      "type": "string",
+      "description": "`\"default\"`, `\"acceptEdits\"`, `\"plan\"` or `\"bypassPermissions\"`."
+    }
+  },
+  "required": [
+    "mode"
+  ],
+  "description": "Switches the live permission mode for the running session.\n\nThe mode is session state, not a setting: applying it through the engine is\nwhat lets `/yolo` take effect on the next tool call instead of asking the\nuser to restart.",
+  "title": "SetPermissionModeParams",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

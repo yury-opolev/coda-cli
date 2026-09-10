@@ -78,6 +78,24 @@ impl SurfaceStack {
         self.surfaces.pop()
     }
 
+    /// Swaps the topmost surface for `surface`, keeping the stack depth.
+    ///
+    /// Returns `false` when there is nothing to replace. Distinct from
+    /// pop-then-push on purpose: an exclusive surface being *updated* — a live
+    /// authentication challenge gaining its device code — must not have to
+    /// re-earn a place it already holds, and a pop-then-push would let
+    /// whatever sits underneath refuse the replacement and silently lose the
+    /// challenge the user is looking at.
+    pub fn replace_top(&mut self, surface: Box<dyn Surface>) -> bool {
+        match self.surfaces.last_mut() {
+            Some(top) => {
+                *top = surface;
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn clear(&mut self) {
         self.surfaces.clear();
     }
@@ -320,6 +338,24 @@ mod tests {
         stack.push(Box::new(Probe::exclusive("prompt")));
         stack.handle_key(key(KeyCode::Char('d')));
         assert_eq!(stack.len(), 1);
+    }
+
+    #[test]
+    fn replacing_the_top_keeps_an_exclusive_surface_updatable_without_re_earning_its_place() {
+        // A live challenge gaining its device code must not be refused by
+        // whatever sits underneath it.
+        let mut stack = SurfaceStack::default();
+        stack.push(Box::new(Probe::exclusive("under")));
+        assert!(stack.replace_top(Box::new(Probe::exclusive("challenge"))));
+        assert_eq!(stack.len(), 1);
+        assert_eq!(stack.top_title().as_deref(), Some("challenge"));
+    }
+
+    #[test]
+    fn replacing_the_top_of_an_empty_stack_opens_nothing() {
+        let mut stack = SurfaceStack::default();
+        assert!(!stack.replace_top(Box::new(Probe::normal("orphan"))));
+        assert!(stack.is_empty());
     }
 
     #[test]

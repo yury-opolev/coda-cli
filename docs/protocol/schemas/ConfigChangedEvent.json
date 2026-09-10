@@ -1,0 +1,169 @@
+{
+  "type": "object",
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "engineInstanceId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "seq",
+    "engineInstanceId"
+  ],
+  "anyOf": [
+    {
+      "$ref": "#/$defs/ActiveConfigChanged"
+    },
+    {
+      "$ref": "#/$defs/NextConfigChanged"
+    }
+  ],
+  "title": "ConfigChangedEvent",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "ActiveConfigChanged": {
+      "type": "object",
+      "properties": {
+        "turnId": {
+          "type": "string"
+        },
+        "active": {
+          "$ref": "#/$defs/ActiveConfig"
+        }
+      },
+      "required": [
+        "turnId",
+        "active"
+      ]
+    },
+    "ActiveConfig": {
+      "type": "object",
+      "properties": {
+        "providerId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "type": "string"
+        },
+        "effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effortIsAuto": {
+          "type": "boolean"
+        },
+        "permissionMode": {
+          "type": "string"
+        },
+        "systemPromptSource": {
+          "type": "string",
+          "description": "`\"default\" | \"sessionOverride\" | \"startup\"`."
+        }
+      },
+      "required": [
+        "model",
+        "effortIsAuto",
+        "permissionMode",
+        "systemPromptSource"
+      ]
+    },
+    "NextConfigChanged": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "next": {
+          "$ref": "#/$defs/ActiveConfig"
+        },
+        "active": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ActiveConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "differing": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ConfigDifference"
+          }
+        }
+      },
+      "required": [
+        "key",
+        "next",
+        "differing"
+      ]
+    },
+    "ConfigDifference": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "active": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "next": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "appliesWhen": {
+          "$ref": "#/$defs/AppliesWhen"
+        }
+      },
+      "required": [
+        "key",
+        "appliesWhen"
+      ],
+      "description": "One field where the running turn's captured config differs from what the\nnext turn / next check will use."
+    },
+    "AppliesWhen": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "immediately",
+          "description": "Observable on the very next read, with no turn boundary involved."
+        },
+        {
+          "type": "string",
+          "const": "nextPermissionCheck",
+          "description": "The running turn keeps its captured mode; the next permission\ndecision reads the new one."
+        },
+        {
+          "type": "string",
+          "const": "nextTurn",
+          "description": "The running turn keeps its captured value; the next turn is built\nwith the new one."
+        },
+        {
+          "type": "string",
+          "const": "newEngineInstance",
+          "description": "Only a new engine process picks this up."
+        },
+        {
+          "type": "string",
+          "const": "clientLocal",
+          "description": "The engine does not own this at all — it is the client's own setting."
+        }
+      ],
+      "description": "When a change to a config key actually takes hold."
+    }
+  }
+}

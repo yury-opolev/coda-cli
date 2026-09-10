@@ -11,34 +11,72 @@ use crate::transcript::NoticeLevel;
 
 impl App {
     /// `/output-style [<style>]` — show or set the response style persona.
+    ///
+    /// The list of styles comes from `config/describe`, which is the engine's
+    /// own catalogue for the key. Before this, the TUI enumerated
+    /// `coda_agent::BuiltInOutputStyles` in-process, which meant the terminal
+    /// front-end had to link the agent runtime to name a handful of strings —
+    /// and an engine on another machine could offer a different set with no
+    /// way to find out.
     pub(super) async fn cmd_output_style(&mut self, invocation: &commands::Invocation) {
         let arg = invocation.first().map(str::to_string);
         let paths = self.paths.clone();
 
-        let result = tokio::task::spawn_blocking(move || -> Result<String, config::ConfigError> {
-            let mut settings = config::Settings::load(&paths)?;
-
-            if let Some(ref style_name) = arg {
-                if !coda_agent::BuiltInOutputStyles::is_known(Some(style_name)) {
-                    let names: Vec<&str> =
-                        coda_agent::BuiltInOutputStyles::all().iter().map(|s| s.name).collect();
-                    return Ok(format!(
-                        "Unknown style '{style_name}'. Available: {}",
-                        names.join(", ")
-                    ));
-                }
-                settings.set_output_style(style_name);
-                settings.save()?;
-                return Ok(format!(
-                    "Output style set to {style_name}. Restart the engine to apply."
-                ));
+        let described = match self.described_output_styles().await {
+            Some(styles) => styles,
+            None => {
+                self.notice(
+                    "The engine does not describe output styles, so this build cannot \
+                     validate one.",
+                    NoticeLevel::Warning,
+                );
+                return;
             }
+        };
 
+        if let Some(style_name) = arg {
+            if !described.iter().any(|s| s.value.eq_ignore_ascii_case(&style_name)) {
+                let names: Vec<&str> = described.iter().map(|s| s.value.as_str()).collect();
+                self.output(format!(
+                    "Unknown style '{style_name}'. Available: {}",
+                    names.join(", ")
+                ));
+                return;
+            }
+            // `config/describe` reports this key as `clientLocal` and not
+            // mutable: the engine does not apply an output style at all. The
+            // value is this client's own, so it is saved in every mode — but
+            // the old "restart the engine to apply" promised a behaviour
+            // change that no restart produces.
+            let saved = self
+                .persist_client_local({
+                    let style = style_name.clone();
+                    move |settings| settings.set_output_style(&style)
+                })
+                .await;
+            match saved {
+                super::super::settings::Saved::Ok => self.output(format!(
+                    "Output style set to {style_name}, in this client's own settings. \
+                     The engine reports that it does not apply an output style, so \
+                     restarting it changes nothing."
+                )),
+                super::super::settings::Saved::Failed(error) => {
+                    self.notice(format!("Settings error: {error}"), NoticeLevel::Error)
+                }
+                // Client-local settings are never refused.
+                super::super::settings::Saved::Refused => {}
+            }
+            return;
+        }
+
+        let result = tokio::task::spawn_blocking(move || -> Result<String, config::ConfigError> {
+            let settings = config::Settings::load(&paths)?;
             let current = settings.output_style().unwrap_or("default");
             let mut out = format!("Current style: {current}\n");
-            for s in coda_agent::BuiltInOutputStyles::all() {
-                let marker = if s.name.eq_ignore_ascii_case(current) { " (active)" } else { "" };
-                out.push_str(&format!("  {}{marker} — {}\n", s.name, s.description));
+            for s in &described {
+                let marker = if s.value.eq_ignore_ascii_case(current) { " (active)" } else { "" };
+                let description = s.description.clone().unwrap_or_default();
+                out.push_str(&format!("  {}{marker} — {}\n", s.value, description));
             }
             Ok(out.trim_end().to_string())
         })
@@ -51,20 +89,82 @@ impl App {
         }
     }
 
+    /// The output styles the engine publishes, read once and cached.
+    async fn described_output_styles(
+        &mut self,
+    ) -> Option<Vec<coda_proto::config::AllowedValue>> {
+        let catalog = self.described_config().await?;
+        crate::api::allowed_values(catalog, "outputStyle").map(<[_]>::to_vec)
+    }
+
+    /// The permission mode the engine reports for the next check.
+    ///
+    /// `config/describe` publishes it as an engine-owned session value, which
+    /// is the only authority for what this session is actually doing — and a
+    /// *value*, not a description, so it is read fresh every time. Serving it
+    /// from the cache reported the mode from before a `/yolo`, with the
+    /// engine's authority behind a number the engine had already changed.
+    async fn described_permission_mode(&mut self) -> Option<String> {
+        let catalog = self.described_config_now().await?;
+        catalog
+            .entries
+            .iter()
+            .find(|entry| entry.key == "permissionMode")
+            .and_then(|entry| entry.value.as_ref())
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    }
+
+    /// The engine's own configuration catalogue, read once and cached.
+    ///
+    /// Safe to cache only for what a catalogue *is*: which keys exist, who
+    /// owns them, what they accept. The cache is dropped whenever the engine
+    /// says its configuration moved (`event/configChanged`), whenever the
+    /// conversation is replaced, and whenever the engine itself is — see
+    /// [`Self::forget_described_config`]. Live values are read through
+    /// [`Self::described_config_now`] instead.
+    async fn described_config(&mut self) -> Option<&coda_proto::config::ConfigDescribeResult> {
+        if self.config_catalog.is_none() {
+            self.config_catalog =
+                self.bounded(crate::api::config_describe(&self.connection)).await.ok();
+        }
+        self.config_catalog.as_ref()
+    }
+
+    /// The catalogue as it is *now*, refreshing the cache.
+    ///
+    /// For reads of a live value, where a cached answer is not a stale
+    /// description but a wrong fact.
+    async fn described_config_now(
+        &mut self,
+    ) -> Option<&coda_proto::config::ConfigDescribeResult> {
+        match self.bounded(crate::api::config_describe(&self.connection)).await {
+            Ok(fresh) => self.config_catalog = Some(fresh),
+            // Keep whatever is cached rather than losing the menus too: the
+            // caller reports the missing value itself.
+            Err(_) => return None,
+        }
+        self.config_catalog.as_ref()
+    }
+
     /// `/permissions [<mode>]` — show or set the tool-permission mode.
     pub(super) async fn cmd_permissions(&mut self, invocation: &commands::Invocation) {
         let Some(raw) = invocation.first().map(str::to_string) else {
-            // No argument: report the mode without changing anything.
-            let paths = self.paths.clone();
-            let current = tokio::task::spawn_blocking(move || {
-                config::Settings::load(&paths)
-                    .ok()
-                    .and_then(|s| s.permission_mode().map(str::to_string))
-                    .unwrap_or_else(|| "default".to_string())
-            })
-            .await
-            .unwrap_or_else(|_| "default".to_string());
-
+            // No argument: report the mode the *engine* is actually using.
+            // `settings.json` is only a startup default — and on an API-only
+            // session it is not even this engine's startup default — so
+            // reading it here described a file rather than the session.
+            let described = self.described_permission_mode().await;
+            let current = match described {
+                Some(mode) => mode,
+                None => {
+                    self.notice(
+                        "The engine did not report its permission mode.",
+                        NoticeLevel::Warning,
+                    );
+                    return;
+                }
+            };
             self.output(format!(
                 "Permission mode: {current}\nModes: default (ask), acceptEdits (auto-edit), plan (read-only), bypass (yolo: allow all)"
             ));
@@ -105,81 +205,59 @@ impl App {
         );
     }
 
-    /// `/provider [<id>]` — show the configured provider or switch to a different one.
+    /// `/provider [<id>]` — show what is connected, or connect something else.
+    ///
+    /// With an argument this is `/login` by another name: choosing a provider
+    /// is not a settings edit that happens to need a restart, it is a
+    /// credential decision that stops the engine, commits, and starts a fresh
+    /// one told explicitly which account to use. Writing `defaultProvider` and
+    /// restarting — which is what this did — changed nothing about *which
+    /// credential* the engine could find, so a switch to an account with no
+    /// stored credential silently came back on the old one.
     pub(super) async fn cmd_provider(&mut self, invocation: &commands::Invocation) {
-        let arg = invocation.first().map(str::to_string);
-        let paths = self.paths.clone();
-
-        if let Some(new_provider) = arg {
-            // Write the new provider and restart so the engine picks it up.
-            let success_msg = format!("Provider set to {new_provider}. Restarting engine…");
-            let write_result = tokio::task::spawn_blocking(move || -> Result<(), config::ConfigError> {
-                let mut settings = config::Settings::load(&paths)?;
-                settings.set_default_provider(&new_provider);
-                settings.save()
-            })
-            .await;
-
-            match write_result {
-                Ok(Ok(())) => {
-                    self.notice(success_msg, NoticeLevel::Info);
-                    self.restart_engine().await;
-                }
-                Ok(Err(e)) => self.notice(format!("Could not save provider: {e}"), NoticeLevel::Error),
-                Err(_) => self.notice("Settings write was interrupted.", NoticeLevel::Error),
-            }
+        if let Some(requested) = invocation.first() {
+            self.cmd_login(Some(requested)).await;
             return;
         }
 
-        // No argument — show provider status from two sources:
-        //   1. Engine-reported session provider (self.connected_provider): the provider
-        //      the engine actually found a credential for and connected with. This is
-        //      NOT independently verified as currently authenticated — it is what the
-        //      engine reported at model-list time.
-        //   2. Saved defaultProvider from settings: what the user has configured as
-        //      the startup default. May differ from the session provider if the engine
-        //      fell back to a different credential.
-        //
-        // These are kept separate deliberately: conflating them would falsely imply
-        // the configured default is authenticated, or that the session provider is
-        // the user's explicit choice.
+        // No argument — report, from two sources that must not be conflated:
+        //   1. what the engine says it connected with, which is a fact about
+        //      the running session and not a claim about what is stored;
+        //   2. what this machine actually holds, read without refreshing
+        //      anything — and only when this machine is the engine's host.
         let session_provider = self.connected_provider.clone();
-        let read_result = tokio::task::spawn_blocking(move || config::Settings::load(&paths)).await;
-        match read_result {
-            Ok(Ok(settings)) => {
-                let configured = settings.default_provider().unwrap_or("(none)");
-                let mut out = String::new();
-
-                match session_provider.as_deref() {
-                    Some(p) => out.push_str(&format!(
-                        "Session provider: {p} (reported by engine; authentication state unverified)\n"
-                    )),
-                    None => out.push_str("Session provider: (none — engine has not reported a connected provider)\n"),
-                }
-                out.push_str(&format!("Configured default: {configured}\n"));
-
-                let providers_seen: Vec<String> = settings
-                    .raw()
-                    .get("modelByProvider")
-                    .and_then(|m| m.as_object())
-                    .map(|obj| obj.keys().cloned().collect())
-                    .unwrap_or_default();
-                if !providers_seen.is_empty() {
-                    out.push_str("Configured providers (from modelByProvider):");
-                    for p in &providers_seen {
-                        out.push_str(&format!("\n  {p}"));
-                    }
-                } else {
-                    out.push_str("Use /provider <id> to switch (e.g. github-copilot, claude-ai).");
-                }
-                self.output(out.trim_end().to_string());
+        let mut out = match session_provider.as_deref() {
+            Some(provider) => format!(
+                "Session provider: {provider} (reported by the engine; authentication state \
+                 unverified)\n"
+            ),
+            None if !self.engine_connected => {
+                "Session provider: none — this session is disconnected.\n".to_owned()
             }
-            Ok(Err(e)) => self.notice(format!("Could not read settings: {e}"), NoticeLevel::Error),
-            Err(_) => self.notice("Settings read was interrupted.", NoticeLevel::Error),
+            None => "Session provider: (none — the engine has not reported one)\n".to_owned(),
+        };
+
+        if let Some(message) = crate::local::auth::refusal(self.access_mode, "Account maintenance")
+        {
+            out.push_str(&message);
+            self.output(out);
+            return;
         }
+
+        // The stored half is read on a task: opening a credential store is a
+        // keychain round-trip and a settings file, and awaiting either on the
+        // loop is a terminal that stops drawing. The session half above is
+        // already known, so it is carried into the answer rather than read
+        // again when it arrives.
+        self.report_accounts(out);
     }
 
     /// `/headers [--set <name> <value> | --remove <name>]` — manage custom HTTP headers.
+    ///
+    /// Engine-owned throughout: the headers are read by the engine's own HTTP
+    /// client from the engine host's settings, so an API-only session neither
+    /// shows nor edits this machine's copy — showing it would describe another
+    /// host's configuration as this session's.
     pub(super) async fn cmd_headers(&mut self, invocation: &commands::Invocation) {
         let words = invocation.words();
         let paths = self.paths.clone();
@@ -204,6 +282,11 @@ impl App {
                 "Usage: /headers | /headers --set <name> <value> | /headers --remove <name>",
                 NoticeLevel::Warning,
             );
+            return;
+        }
+
+        // Before any filesystem access, and for the read as much as the write.
+        if !self.allow_engine_settings("Custom HTTP header configuration") {
             return;
         }
 
@@ -245,6 +328,16 @@ impl App {
     }
 
     /// `/log [<level> | stderr on|off | off]` — show or change telemetry logging.
+    ///
+    /// Two different things wear this name, and they are reported separately
+    /// because only one of them is this client's:
+    ///
+    /// - the **front-end's own** essential diagnostics (path, verbosity,
+    ///   health) plus the engine's reported log path — client-local, always
+    ///   available, in every mode;
+    /// - the **legacy telemetry settings** in `settings.json`, which the
+    ///   *engine* reads at its own startup on its own host. An API-only
+    ///   session neither reads nor writes those.
     pub(super) async fn cmd_log(&mut self, invocation: &commands::Invocation) {
         let words = invocation.words();
         let paths = self.paths.clone();
@@ -289,6 +382,24 @@ impl App {
         // `coda_diagnostics` context (a `tokio::task_local`) is still
         // visible; it would not be inside `spawn_blocking`'s separate task.
         let diagnostics_report = self.diagnostics_status_report();
+
+        // The client's own diagnostics are always reportable; the engine's
+        // telemetry settings are not this client's to read or write when the
+        // engine runs elsewhere. Gated before any filesystem access.
+        if !self.owns_engine_settings() {
+            match op {
+                LogOp::Show => self.output(format!(
+                    "{diagnostics_report}\n\
+                     Engine telemetry settings are managed on the engine host: this \
+                     client did not start this engine, so the values on this machine \
+                     are not the ones it read."
+                )),
+                _ => {
+                    self.allow_engine_settings("Engine telemetry configuration");
+                }
+            }
+            return;
+        }
 
         let result = tokio::task::spawn_blocking(move || -> Result<String, config::ConfigError> {
             let mut settings = config::Settings::load(&paths)?;

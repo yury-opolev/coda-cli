@@ -1,0 +1,21 @@
+{
+  "type": "object",
+  "properties": {
+    "ok": {
+      "type": "boolean"
+    },
+    "projectPath": {
+      "type": "string"
+    },
+    "hookHash": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "ok",
+    "projectPath",
+    "hookHash"
+  ],
+  "title": "HooksTrustResult",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

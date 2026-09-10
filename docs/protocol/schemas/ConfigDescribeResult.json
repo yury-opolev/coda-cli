@@ -1,0 +1,150 @@
+{
+  "type": "object",
+  "properties": {
+    "entries": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ConfigEntryDto"
+      }
+    }
+  },
+  "required": [
+    "entries"
+  ],
+  "title": "ConfigDescribeResult",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "ConfigEntryDto": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "owner": {
+          "$ref": "#/$defs/ConfigOwner"
+        },
+        "appliesAt": {
+          "$ref": "#/$defs/AppliesWhen"
+        },
+        "mutable": {
+          "type": "boolean",
+          "description": "`true` only when `config/set` for this key is genuinely wired to a\nvalidated engine method. Never `true` \"in principle\"."
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Why it is not mutable. Present exactly when `mutable` is false."
+        },
+        "value": {
+          "description": "The value the *next* turn / next check will use. Omitted when the\nengine genuinely does not know it — never a fabricated default."
+        },
+        "activeValue": {
+          "description": "The value captured into the currently running turn, when one is\nrunning and it differs in kind from `value`."
+        },
+        "allowedValues": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/AllowedValue"
+          },
+          "description": "The closed set of accepted values, when there is one."
+        },
+        "allowedValuesFrom": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The RPC method that owns the *live* set of accepted values, for keys\nwhose set is provider- or model-dependent and therefore cannot be\nstated here without going stale.\n\nPresent exactly when `allowedValues` is not authoritative on its own,\nso an absent or partial `allowedValues` always has a discoverable\nauthority instead of leaving a client to guess."
+        },
+        "description": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "owner",
+        "appliesAt",
+        "mutable",
+        "description"
+      ],
+      "description": "One described configuration key."
+    },
+    "ConfigOwner": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "session",
+          "description": "The running session in this engine process. Mutable through\n`config/set`, which delegates to the existing validated RPC."
+        },
+        {
+          "type": "string",
+          "const": "engineStartup",
+          "description": "Fixed for the life of this engine process (chosen at startup)."
+        },
+        {
+          "type": "string",
+          "const": "clientLocal",
+          "description": "The client's own setting; the engine never applies it and never\nwrites it. Reported so a client can enumerate it without linking\nengine crates, but `config/set` refuses it."
+        },
+        {
+          "type": "string",
+          "const": "localFile",
+          "description": "Owned by a file on the machine the client is running on. Coda never\nwrites a remote client's filesystem, so this is read-only here."
+        }
+      ],
+      "description": "Who owns a config key."
+    },
+    "AppliesWhen": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "immediately",
+          "description": "Observable on the very next read, with no turn boundary involved."
+        },
+        {
+          "type": "string",
+          "const": "nextPermissionCheck",
+          "description": "The running turn keeps its captured mode; the next permission\ndecision reads the new one."
+        },
+        {
+          "type": "string",
+          "const": "nextTurn",
+          "description": "The running turn keeps its captured value; the next turn is built\nwith the new one."
+        },
+        {
+          "type": "string",
+          "const": "newEngineInstance",
+          "description": "Only a new engine process picks this up."
+        },
+        {
+          "type": "string",
+          "const": "clientLocal",
+          "description": "The engine does not own this at all — it is the client's own setting."
+        }
+      ],
+      "description": "When a change to a config key actually takes hold."
+    },
+    "AllowedValue": {
+      "type": "object",
+      "properties": {
+        "value": {
+          "type": "string"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "value"
+      ],
+      "description": "One accepted value for a key with a closed set."
+    }
+  }
+}

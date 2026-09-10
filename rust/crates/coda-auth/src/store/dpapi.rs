@@ -89,7 +89,7 @@ fn protect(plain: &[u8]) -> Result<Vec<u8>, AuthError> {
 
 /// Decrypts DPAPI ciphertext produced for the current user.
 #[cfg(windows)]
-fn unprotect(cipher: &[u8]) -> Result<Vec<u8>, AuthError> {
+fn unprotect(key: &str, cipher: &[u8]) -> Result<Vec<u8>, AuthError> {
     let input = DataBlob {
         cb_data: cipher.len() as u32,
         pb_data: cipher.as_ptr() as *mut u8,
@@ -111,9 +111,11 @@ fn unprotect(cipher: &[u8]) -> Result<Vec<u8>, AuthError> {
     };
     if ok == 0 {
         // A failure here is expected and benign when the file belongs to a
-        // different Windows user, so it must not be treated as corruption.
-        return Err(AuthError::store(
-            "DPAPI decryption failed; the credential may belong to another user",
+        // different Windows user — but it is still "unreadable", never
+        // "absent": the file must be left alone for the real owner.
+        return Err(AuthError::undecryptable(
+            key,
+            "DPAPI decryption failed; the credential may belong to another Windows user",
         ));
     }
 
@@ -174,16 +176,26 @@ impl Default for DpapiStore {
 impl CredentialStore for DpapiStore {
     async fn get(&self, key: &str) -> Result<Option<String>, AuthError> {
         let path = self.path_for(key);
-        let Ok(cipher) = std::fs::read(&path) else {
-            return Ok(None);
+        let cipher = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            // Only "the file is not there" means "no credential". Anything
+            // else — a permission change, a sharing violation, a broken mount
+            // — must not masquerade as a logged-out user.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(AuthError::undecryptable(
+                    key,
+                    format!("{} could not be read: {e}", path.display()),
+                ))
+            }
         };
 
         #[cfg(windows)]
         {
-            let plain = unprotect(&cipher)?;
+            let plain = unprotect(key, &cipher)?;
             String::from_utf8(plain)
                 .map(Some)
-                .map_err(|_| AuthError::store("credential is not valid UTF-8"))
+                .map_err(|e| AuthError::undecryptable(key, format!("not valid UTF-8: {e}")))
         }
         #[cfg(not(windows))]
         {
@@ -199,8 +211,9 @@ impl CredentialStore for DpapiStore {
                 .map_err(|e| AuthError::store(format!("cannot create credential directory: {e}")))?;
             let cipher = protect(value.as_bytes())?;
             let path = self.path_for(key);
-            std::fs::write(&path, cipher)
-                .map_err(|e| AuthError::store(format!("cannot write credential: {e}")))
+            // Atomic replace: a concurrent reader in another process must see
+            // the whole previous credential or the whole new one.
+            crate::store::atomic::write_atomic(&path, &cipher)
         }
         #[cfg(not(windows))]
         {
@@ -253,7 +266,7 @@ mod tests {
         let plain = b"{\"accessToken\":\"secret\"}";
         let cipher = protect(plain).expect("encrypt");
         assert_ne!(cipher.as_slice(), plain, "the stored bytes must be encrypted");
-        let recovered = unprotect(&cipher).expect("decrypt");
+        let recovered = unprotect("llmauth:test", &cipher).expect("decrypt");
         assert_eq!(recovered, plain);
     }
 
@@ -264,7 +277,10 @@ mod tests {
         let mut corrupt = cipher.clone();
         let last = corrupt.len() - 1;
         corrupt[last] ^= 0xFF;
-        assert!(unprotect(&corrupt).is_err(), "tampered ciphertext must not decrypt");
+        assert!(
+            unprotect("llmauth:test", &corrupt).is_err(),
+            "tampered ciphertext must not decrypt"
+        );
     }
 
     #[cfg(windows)]
@@ -290,10 +306,13 @@ mod tests {
 
     /// Compatibility check against a real installation.
     ///
-    /// Skips when the C# build has never logged in, so it is meaningful on a
-    /// developer machine without failing on a clean one. This is the test that
-    /// proves swapping the engine does not log the user out.
+    /// **Manual only.** It reads the developer's own credential store, so it
+    /// is never part of an ordinary run; execute it deliberately with
+    /// `cargo test -p coda-auth the_real_c_sharp_credential -- --ignored`.
+    /// The hermetic version of this guarantee is the known-answer fixture in
+    /// `tests/store_behaviour.rs`.
     #[cfg(windows)]
+    #[ignore = "reads the developer's real credential store; run manually"]
     #[tokio::test]
     async fn the_real_c_sharp_credential_is_readable_when_present() {
         let store = DpapiStore::default_location();

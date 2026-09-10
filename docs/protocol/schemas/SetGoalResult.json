@@ -1,0 +1,33 @@
+{
+  "type": "object",
+  "properties": {
+    "ok": {
+      "type": "boolean",
+      "default": false
+    },
+    "goal": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "maxDuration": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "maxContinuations": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int32",
+      "default": null
+    }
+  },
+  "title": "SetGoalResult",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

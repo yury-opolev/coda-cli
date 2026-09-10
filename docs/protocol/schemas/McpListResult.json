@@ -1,0 +1,151 @@
+{
+  "type": "object",
+  "properties": {
+    "servers": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/McpServerDto"
+      }
+    },
+    "enabled": {
+      "type": "boolean",
+      "description": "`false` when MCP is switched off for this engine process, so an empty\nlist is not mistaken for \"no servers are configured\"."
+    },
+    "managerAvailable": {
+      "type": "boolean",
+      "description": "`true` when a manager exists to ask about runtime state."
+    }
+  },
+  "required": [
+    "servers",
+    "enabled",
+    "managerAvailable"
+  ],
+  "title": "McpListResult",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "McpServerDto": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "scope": {
+          "type": "string",
+          "description": "`\"user\" | \"project\"`."
+        },
+        "transport": {
+          "type": "string",
+          "description": "`\"stdio\" | \"http\"`."
+        },
+        "targetKind": {
+          "type": "string",
+          "description": "`\"command\" | \"url\"`."
+        },
+        "targetDisplay": {
+          "type": "string",
+          "description": "Sanitised: a bare command name, or scheme + host + path. Never\nuserinfo, query string or fragment."
+        },
+        "configured": {
+          "$ref": "#/$defs/McpConfiguredState"
+        },
+        "runtimeStatus": {
+          "$ref": "#/$defs/McpRuntimeStatus"
+        },
+        "toolCount": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "Tools the running client advertises. `None` means \"not known\" (no\nmanager, or the server is not connected) — never a fake `0`."
+        },
+        "envVarNames": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Names only. Never values."
+        },
+        "secretRefs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/McpSecretRefDto"
+          }
+        }
+      },
+      "required": [
+        "name",
+        "scope",
+        "transport",
+        "targetKind",
+        "targetDisplay",
+        "configured",
+        "runtimeStatus"
+      ]
+    },
+    "McpConfiguredState": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "enabled",
+          "description": "Present and not disabled."
+        },
+        {
+          "type": "string",
+          "const": "disabled",
+          "description": "Present with `\"disabled\": true`."
+        },
+        {
+          "type": "string",
+          "const": "shadowed",
+          "description": "Present in the user file but overridden by a project entry of the\nsame name. The project entry is the one that is used."
+        }
+      ],
+      "description": "What the file says about a server."
+    },
+    "McpRuntimeStatus": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "connected",
+          "description": "The manager holds a live client for this server."
+        },
+        {
+          "type": "string",
+          "const": "notConnected",
+          "description": "The server is configured and enabled, but this engine process has no\nclient for it — it failed to start, or the file changed after startup\nand the manager needs a restart to pick it up."
+        },
+        {
+          "type": "string",
+          "const": "notAttempted",
+          "description": "The engine never attempted a connection (MCP disabled for this\nprocess, or the entry is disabled/shadowed)."
+        },
+        {
+          "type": "string",
+          "const": "unknown",
+          "description": "There is no manager to ask. Never reported as a confident zero."
+        }
+      ],
+      "description": "What the *running manager* knows about a server.\n\nDeliberately separate from [`McpConfiguredState`]: an enabled entry that\nwas added to the file after startup is `Enabled` + `NotStarted`, and a\nserver that was connected at startup and then deleted from the file is\nstill `Connected`. Collapsing the two would report a fiction."
+    },
+    "McpSecretRefDto": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "resolved": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "description": "A named reference to a stored secret, and whether it resolved.\n\n`name` is the *variable or header name* the reference is bound to. The\nstorage target (`coda-secret:<target>`) is deliberately absent: it names a\nkeyring entry, which is a credential locator, not a label.\n\n`resolved` is a **tri-state**. `None` (the field omitted) means \"this call\ndid not determine it\", which is the honest answer for any read that must\nnot touch the credential store — and is emphatically not the same claim as\n`false` (\"this reference does not resolve\"). Set it only from a fact the\nengine already holds, never by probing during a read."
+    }
+  }
+}

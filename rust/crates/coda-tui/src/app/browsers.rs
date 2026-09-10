@@ -142,37 +142,65 @@ impl App {
                     }
                 }
             }
-            // MCP configuration lives in local JSON, so it needs no engine call.
-            BrowserKind::Mcp => match config::load_mcp_servers(&self.paths) {
-                Ok(servers) => rows::mcp(&servers),
-                Err(error) => {
-                    self.notice(
-                        format!("Could not read MCP configuration: {error}"),
-                        NoticeLevel::Error,
-                    );
-                    return None;
+            // MCP: which source is authoritative depends on whose machine
+            // holds the files. When this client started the core, the local
+            // file *is* what the engine reads and the editor must show
+            // exactly that, unresolved secret references included. When it
+            // did not, the engine's own read-only inventory is the only
+            // truthful answer — and it is rendered read-only rather than
+            // silently disabled.
+            BrowserKind::Mcp => {
+                if self.access_mode.allows_local_maintenance() {
+                    match config::load_mcp_servers(&self.paths) {
+                        Ok(servers) => rows::mcp(&servers),
+                        Err(error) => {
+                            self.notice(
+                                format!("Could not read MCP configuration: {error}"),
+                                NoticeLevel::Error,
+                            );
+                            return None;
+                        }
+                    }
+                } else {
+                    if !self.require_engine("The MCP browser") {
+                        return None;
+                    }
+                    match self.bounded(crate::api::mcp_list(&self.connection)).await {
+                        Ok(result) => rows::mcp_from_engine(&result),
+                        Err(error) => {
+                            self.notice(
+                                format!("Could not read the engine's MCP servers: {error}"),
+                                NoticeLevel::Error,
+                            );
+                            return None;
+                        }
+                    }
                 }
-            },
+            }
             // Tasks are engine state, but the runtime persists a log per task
             // and reports outcomes over the event stream.
             BrowserKind::Tasks => {
                 let logs = config::list_task_logs(&self.paths, self.state.session_id.as_deref());
                 rows::tasks(&logs, &self.task_outcomes)
             }
-            // Sessions are read from disk; there is no engine RPC for listing them.
+            // Sessions come from the engine's own read-only listing, not from
+            // a directory this front-end reads: the engine is the only thing
+            // that knows where its transcripts live and what shape they are.
             BrowserKind::Sessions => {
-                let project_root = self.paths.project_root.clone();
-                let summaries = match tokio::task::spawn_blocking(move || {
-                    coda_agent::SessionTranscriptStore::new(&project_root).list()
-                })
-                .await
-                {
-                    Ok(list) => list,
-                    Err(_) => {
-                        self.notice("Could not load sessions.", NoticeLevel::Error);
-                        return None;
-                    }
-                };
+                if !self.require_engine("The sessions browser") {
+                    return None;
+                }
+                let summaries =
+                    match self.bounded(crate::api::list_sessions(&self.connection, None)).await {
+                        Ok(result) => result.sessions,
+                        Err(error) => {
+                            self.notice(
+                                format!("Could not load sessions: {error}"),
+                                NoticeLevel::Error,
+                            );
+                            return None;
+                        }
+                    };
                 if summaries.is_empty() {
                     self.notice(
                         "No sessions found. Start a conversation to create one.",
@@ -373,89 +401,120 @@ impl App {
         self.dirty = true;
     }
 
-
     /// Switches the active model.
     ///
-    /// `coda serve` exposes no model-switch method, but the model is read from
-    /// `~/.coda/settings.json` at engine start. Writing the setting and
-    /// restarting the engine against the same session id therefore performs a
-    /// real switch, with the conversation preserved.
+    /// `session/setModel` is a real engine method, and the engine rebuilds its
+    /// agent from the current model on every turn, so the switch takes effect
+    /// on the next one with the running conversation kept. Nothing is
+    /// restarted: writing `settings.json` and bouncing the process was a
+    /// workaround for a call that did not exist, it cost the session, and it
+    /// failed outright before the session had been written to disk.
+    ///
+    /// The setting is then persisted **only** where this client owns the file
+    /// the engine reads. On an [`AccessMode::ApiOnly`] session the write is
+    /// refused before it happens and the notice says so, because the engine
+    /// reads its own host's settings and a durable change here would be a
+    /// change nothing ever reads.
+    ///
+    /// [`AccessMode::ApiOnly`]: crate::local::AccessMode::ApiOnly
     pub(super) async fn switch_model(&mut self, model: &str) {
-        // Ask the engine directly. It rebuilds its agent from the current
-        // model on every turn, so this takes effect on the next one — no
-        // restart, nothing to invalidate, and the running conversation is
-        // kept. Writing the setting and bouncing the process was a workaround
-        // for the missing call; it cost the session, and failed outright when
-        // the session had not been written to disk yet.
+        // The picker's rows outlive the connection that filled them: a list
+        // read before a sign-out is still on screen afterwards, and choosing
+        // from it must not push a change at an engine that is gone.
+        if !self.require_engine("Switching the model") {
+            return;
+        }
+        // Ask the engine directly; see the doc comment for why nothing is
+        // restarted.
         let result = self
-            .connection
-            .request(
+            .ask::<serde_json::Value>(
                 method::SET_MODEL,
                 Some(serde_json::json!({ "model": model })),
             )
             .await;
-        if let Err(error) = result {
-            return self.notice(
-                format!("Could not switch the model: {error}"),
-                NoticeLevel::Error,
-            );
-        }
-
-        // Persisted too, so the choice survives the next start. The engine
-        // reads it at startup; the call above only covers this session.
-        let connected = self.connected_provider.clone();
-        let paths = self.paths.clone();
-        let provider = match connected {
-            Some(provider) => Some(provider),
-            None => match tokio::task::spawn_blocking(move || Settings::load(&paths)).await {
-                Ok(Ok(settings)) => settings.default_provider().map(str::to_string),
-                Ok(Err(error)) => {
-                    return self.notice(
-                        format!("Could not read settings: {error}"),
-                        NoticeLevel::Error,
-                    )
-                }
-                Err(_) => return self.notice("Settings read was interrupted.", NoticeLevel::Error),
-            },
-        };
-
-        let Some(provider) = provider else {
-            return self.notice(
-                "No default provider is configured; run `coda setup` first.",
-                NoticeLevel::Warning,
-            );
-        };
-
-        // Write the new model choice (also blocking I/O).
-        let paths = self.paths.clone();
-        let model_str = model.to_string();
-        let write_result = tokio::task::spawn_blocking(move || -> Result<(), config::ConfigError> {
-            let mut settings = Settings::load(&paths)?;
-            settings.set_model_for(&provider, &model_str);
-            settings.save()
-        })
-        .await;
-
-        match write_result {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
+        let value = match result {
+            Ok(value) => value,
+            Err(error) => {
+                // The change may or may not have been made: an engine that
+                // did not answer is not an engine that refused. Re-read
+                // rather than claim either.
+                self.needs_resync = true;
                 return self.notice(
-                    format!("Could not save the model: {error}"),
+                    format!("Could not switch the model: {error}"),
                     NoticeLevel::Error,
-                )
+                );
             }
-            Err(_) => return self.notice("Settings write was interrupted.", NoticeLevel::Error),
+        };
+        match value.get("ok").and_then(serde_json::Value::as_bool) {
+            Some(true) => {}
+            Some(false) => {
+                let reason = value.get("note").or_else(|| value.get("error"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|text| !text.is_empty())
+                    .unwrap_or("the engine did not accept the requested model");
+                return self.notice(format!("Model change refused: {reason}"), NoticeLevel::Warning);
+            }
+            None => {
+                self.needs_resync = true;
+                return self.notice(
+                    "Model change outcome is unknown: the engine did not confirm it. Nothing was saved.",
+                    NoticeLevel::Warning,
+                );
+            }
         }
 
+        // Persisted too, so the choice survives the next start — but only
+        // where this client owns the file the engine reads. An engine this
+        // client did not start reads its own host's settings, so writing them
+        // here would report a durable change that never happens.
+        if !self.owns_engine_settings() {
+            self.close_browser();
+            let note = self.not_saved_remotely();
+            self.notice(format!("Model set to {model} for this session.{note}"), NoticeLevel::Info);
+            self.load_models().await;
+            return;
+        }
+
+        let saved = self.save_model_preference(model).await;
+
+        // The session change already happened, so the screen must reflect it
+        // whatever the file did. Returning early here left the browser open
+        // on a list that no longer described the session, and the header
+        // naming the previous model.
         self.close_browser();
         self.notice(format!("Model set to {model}."), NoticeLevel::Info);
+        if let super::settings::Saved::Failed(error) = saved {
+            self.notice(
+                format!("The model was not saved for the next start: {error}"),
+                NoticeLevel::Warning,
+            );
+        }
         // Ask the engine what is now active: it reports the display name and
         // context limit, so the status line does not degrade to the raw id.
         self.load_models().await;
     }
 
+    async fn save_model_preference(&mut self, model: &str) -> super::settings::Saved {
+        use super::settings::Saved;
 
-
+        let paths = self.paths.clone();
+        let provider = match self.connected_provider.clone() {
+            Some(provider) => Some(provider),
+            None => match tokio::task::spawn_blocking(move || Settings::load(&paths)).await {
+                Ok(Ok(settings)) => settings.default_provider().map(str::to_string),
+                Ok(Err(error)) => return Saved::Failed(format!("Could not read settings: {error}")),
+                Err(_) => return Saved::Failed("Settings read was interrupted.".into()),
+            },
+        };
+        let Some(provider) = provider else {
+            return Saved::Failed(
+                "The engine has not reported a provider, and no default provider is configured.".into(),
+            );
+        };
+        let model = model.to_string();
+        self.persist_engine_default(move |settings| settings.set_model_for(&provider, &model))
+            .await
+    }
 
     /// Opens the editor on the selected MCP server.
     pub(super) async fn edit_mcp_server(&mut self, id: Option<String>) {

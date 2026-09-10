@@ -5,114 +5,331 @@
 //! | Request | fail-closed default |
 //! |---|---|
 //! | `request/permission` | deny (`false`) |
-//! | `request/question` | first option, else `""` |
+//! | `request/question` | **no answer** (`AnswerOutcome::NoAnswer`) |
 //! | `request/planApproval` | reject (`false`) |
 //!
 //! A dropped connection, a timeout, a cancellation, or a malformed body MUST
-//! all take the safe path.  **A lost connection must never result in an allow.**
+//! all take the safe path.  **A lost connection must never result in an allow,
+//! and must never look like the operator picked the first option.**
+//!
+//! Until Stage D, a question fault silently substituted `options.first()`.
+//! That made "the connection died" indistinguishable from "the user chose
+//! option 1" — and because `GOAL_CONTINUE_OPTION` is the first option in the
+//! goal-escalation list, it also auto-granted budget extensions nobody asked
+//! for. The outcome is now [`AnswerOutcome`], and every caller treats
+//! `NoAnswer` as a typed abort.
 //!
 //! # Architecture
-//! `PromptChannel` holds the shared write sender and a map of pending one-shot
-//! receivers, keyed by server-generated request id.  The transport read loop
-//! calls `PromptChannel::route_response` for every incoming `Response` message.
-//! When the connection closes, `fail_all_pending` resolves all waiters with
-//! `None`, triggering the fail-closed path in every in-flight prompt.
+//!
+//! `PromptChannel` owns the shared write sender plus the single
+//! [`PendingRegistry`], which is the one place a request can be resolved —
+//! whether the answer arrives as the ordinary JSON-RPC response to the
+//! original request or out of band through `session/resolveRequest` /
+//! `session/cancelRequest`.
+//!
+//! Ordering, per round-trip: **register → publish `event/requestPending` →
+//! write the `request/*` frame.** A client can therefore never receive a
+//! reverse request for something `session/getPendingRequests` does not
+//! already know about.
+//!
+//! A dropped `issue` future (tool ceiling fired, task aborted) withdraws its
+//! entry through an RAII guard, so the registry cannot leak a request nobody
+//! is waiting on.
 
-use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicI64, Ordering},
-};
+use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
+use coda_proto::state::PendingRequestKind;
 use coda_proto::{RequestId, Request, ResponseError, encode_frame};
+use coda_tool::{AnswerOutcome, NoAnswerReason};
 use serde_json::Value;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+use crate::state::requests::{
+    DEFAULT_DISPLAY_TEXT_CAP, PendingRegistry, RequestOutcome, ResolveError, configured_timeout,
+    display_text,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PromptChannel
 // ─────────────────────────────────────────────────────────────────────────────
 
-type PendingMap = Mutex<HashMap<RequestId, oneshot::Sender<Option<Value>>>>;
-
 /// Shared state for all server-initiated request round-trips.
 pub struct PromptChannel {
     outgoing: mpsc::UnboundedSender<Vec<u8>>,
-    pending: Arc<PendingMap>,
-    next_id: AtomicI64,
+    registry: Arc<PendingRegistry>,
+    /// Opt-in only (`CODA_SERVE_REQUEST_TIMEOUT`, default off). Captured once
+    /// at construction so a mid-session env mutation cannot change the rules
+    /// for requests already in flight.
+    timeout: Option<Duration>,
 }
 
 impl PromptChannel {
+    /// Test/legacy constructor: mints its own instance id.
+    ///
+    /// Production uses [`PromptChannel::with_instance`] so the handles it
+    /// mints are bound to the *same* `engineInstanceId` the event bus and
+    /// `session/getState` report.
     pub fn new(outgoing: mpsc::UnboundedSender<Vec<u8>>) -> Self {
+        Self::with_instance(outgoing, uuid::Uuid::new_v4().to_string())
+    }
+
+    pub fn with_instance(
+        outgoing: mpsc::UnboundedSender<Vec<u8>>,
+        engine_instance_id: impl Into<String>,
+    ) -> Self {
         Self {
             outgoing,
-            pending: Arc::new(Mutex::new(HashMap::new())),
-            next_id: AtomicI64::new(1),
+            registry: Arc::new(PendingRegistry::new(engine_instance_id)),
+            timeout: configured_timeout(),
         }
     }
 
-    /// Issue a server-initiated request and wait for the client's response.
+    /// Test-only: an explicit timeout, so the opt-in path can be exercised
+    /// without mutating process-global environment in a parallel test run.
+    #[cfg(test)]
+    pub(crate) fn with_timeout_for_test(
+        outgoing: mpsc::UnboundedSender<Vec<u8>>,
+        engine_instance_id: impl Into<String>,
+        timeout: Option<Duration>,
+    ) -> Self {
+        Self {
+            outgoing,
+            registry: Arc::new(PendingRegistry::new(engine_instance_id)),
+            timeout,
+        }
+    }
+
+    /// The single pending-request registry — shared with `dispatch` so the
+    /// out-of-band RPCs resolve the *same* entries as the raw responses.
+    pub fn registry(&self) -> &Arc<PendingRegistry> {
+        &self.registry
+    }
+
+    /// Issue a server-initiated request and wait for a terminal outcome.
     ///
-    /// Returns `Some(Value)` on success, `None` on any failure (connection
-    /// closed, cancellation, malformed response).  Callers apply their
-    /// fail-closed default on `None`.
-    pub async fn issue(
+    /// Always resolves: on connection loss, cancellation, an opt-in timeout or
+    /// a malformed reply it returns the kind's fail-closed outcome, tagged
+    /// with *why*.
+    async fn issue(
         &self,
         method: &str,
-        params: Value,
+        kind: PendingRequestKind,
+        display: Value,
+        mut params: Value,
+        call_id: Option<String>,
         cancel: CancellationToken,
-    ) -> Option<Value> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let id = RequestId::Number(id);
+    ) -> RequestOutcome {
+        let (numeric_id, handle) = self.registry.mint_id();
+        let rx = self.registry.register(numeric_id, kind, display, call_id);
+        let mut guard = PendingGuard { registry: &self.registry, numeric_id, armed: true };
 
-        let (tx, rx) = oneshot::channel();
-        self.pending.lock().expect("pending map poisoned").insert(id.clone(), tx);
-
-        let req = Request::new(id.clone(), method, Some(params));
-        let bytes = serde_json::to_vec(&req).ok()?;
-        // If the write channel is closed, send fails and we fall through to None.
-        if self.outgoing.send(encode_frame(&bytes)).is_err() {
-            self.pending.lock().expect("pending map poisoned").remove(&id);
-            return None;
+        // Additive: the same opaque handle `session/getPendingRequests` lists
+        // this request under, so a client that answers the raw round-trip can
+        // recognise its own request in the discovery list instead of showing
+        // it twice — or dropping the responder, which *declines* it. The
+        // client never parses the handle; it only compares it.
+        if let Some(object) = params.as_object_mut() {
+            object.insert("requestId".to_string(), Value::String(handle));
         }
+
+        let req = Request::new(RequestId::Number(numeric_id), method, Some(params));
+        let bytes = match serde_json::to_vec(&req) {
+            Ok(b) => b,
+            // Unreachable for our own payloads, but never fabricate an answer.
+            Err(_) => return guard.resolve_locally(kind, NoAnswerReason::Malformed),
+        };
+        if self.outgoing.send(encode_frame(&bytes)).is_err() {
+            return guard.resolve_locally(kind, NoAnswerReason::Disconnected);
+        }
+
+        let timeout = self.timeout;
+        let timed_out = async move {
+            match timeout {
+                Some(d) => tokio::time::sleep(d).await,
+                // Never completes: the default really is "wait for the human".
+                None => std::future::pending::<()>().await,
+            }
+        };
 
         tokio::select! {
             result = rx => {
+                guard.armed = false;
                 match result {
-                    Ok(Some(value)) => Some(value),
-                    // fail_all_pending sent None, or sender was dropped.
-                    Ok(None) | Err(_) => None,
+                    // The registry already published the terminal outcome.
+                    Ok(outcome) => outcome,
+                    // The sender was dropped without a value: treat as a lost
+                    // controller rather than as any kind of grant.
+                    Err(_) => RequestOutcome::fail_closed(kind, NoAnswerReason::Disconnected),
                 }
             }
-            _ = cancel.cancelled() => {
-                // Cancel: remove from map and fail closed.
-                self.pending.lock().expect("pending map poisoned").remove(&id);
-                None
-            }
+            _ = cancel.cancelled() => guard.resolve_locally(kind, NoAnswerReason::Cancelled),
+            _ = timed_out => guard.resolve_locally(kind, NoAnswerReason::Timeout),
         }
     }
 
     /// Route an incoming client response to the waiting `issue` call.
     ///
-    /// Called by the transport read loop for every `Response` message.
+    /// Called by the transport read loop for every `Response` message. A
+    /// reply that does not carry a usable value is a **terminal fault**, not a
+    /// retryable one: the client answered, the answer was unusable, so the
+    /// kind's fail-closed outcome applies. (`session/resolveRequest` treats a
+    /// malformed payload differently — see [`outcome_from_rpc`] — because
+    /// there the caller can correct it and try again.)
     pub fn route_response(&self, id: &RequestId, result: Result<Value, ResponseError>) {
-        if let Some(tx) = self.pending.lock().expect("pending map poisoned").remove(id) {
-            // A successful result resolves with `Some(value)`; an error result
-            // resolves with `None`, triggering fail-closed.
-            let _ = tx.send(result.ok());
-        }
+        let RequestId::Number(numeric_id) = id else {
+            // Reverse-request ids are always numeric; a string id is not one
+            // of ours and must not be allowed to resolve anything.
+            return;
+        };
+        let _ = self
+            .registry
+            .resolve_numeric(*numeric_id, |kind| Ok(parse_wire_response(kind, &result)));
     }
 
-    /// Resolve all in-flight requests with `None` (fail-closed).
-    ///
-    /// Called when the transport detects that the connection has closed.
+    /// Resolve all in-flight requests fail-closed (connection lost).
     pub fn fail_all_pending(&self) {
-        let mut map = self.pending.lock().expect("pending map poisoned");
-        for (_, tx) in map.drain() {
-            let _ = tx.send(None);
+        self.registry.fail_all(NoAnswerReason::Disconnected);
+    }
+}
+
+/// Withdraws a still-pending entry when the `issue` future goes away without
+/// a terminal outcome — including when the whole future is dropped (a tool
+/// ceiling firing, a cancelled task), where no `select!` branch ever runs.
+struct PendingGuard<'a> {
+    registry: &'a PendingRegistry,
+    numeric_id: i64,
+    armed: bool,
+}
+
+impl PendingGuard<'_> {
+    /// Withdraw and publish the fail-closed outcome for a fault this side of
+    /// the wire observed (cancel, timeout, failed write).
+    ///
+    /// Withdrawal and announcement are one registry call, so no concurrent
+    /// registration can be hidden by this one's projection (F4).
+    fn resolve_locally(
+        &mut self,
+        kind: PendingRequestKind,
+        reason: NoAnswerReason,
+    ) -> RequestOutcome {
+        self.armed = false;
+        self.registry
+            .withdraw_and_publish(self.numeric_id, |_| RequestOutcome::fail_closed(kind, reason))
+            .unwrap_or_else(|| RequestOutcome::fail_closed(kind, reason))
+    }
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
         }
+        self.registry.withdraw_and_publish(self.numeric_id, |kind| {
+            RequestOutcome::fail_closed(kind, NoAnswerReason::Cancelled)
+        });
+    }
+}
+
+/// Interprets a raw `request/*` response body. Every failure mode is
+/// fail-closed and typed.
+///
+/// # Why a JSON-RPC error is `Declined`, not `Malformed`
+///
+/// An error reply is the wire signal for "the operator dismissed this" — it is
+/// what a controller sends when a prompt is closed with Esc, and what
+/// `coda-client`'s `Responder` sends (`REQUEST_CANCELLED`, `-32800`) when it
+/// is dropped or explicitly failed. The engine therefore reads it as a
+/// **decision**: [`NoAnswerReason::Declined`].
+///
+/// It is deliberately kept distinct from the two neighbouring facts, because
+/// all three are fail-closed but they are not the same story:
+///
+/// | wire shape | reason | means |
+/// |---|---|---|
+/// | error reply (any code, incl. `REQUEST_CANCELLED`) | `declined` | a human refused to answer |
+/// | `{"answer": ""}` / no `answer` field | `malformed` | the controller tried to answer and produced nothing usable |
+/// | EOF / channel closed | `disconnected` | there is no controller any more |
+///
+/// The distinction is observable: it reaches the client as
+/// `event/requestResolved.outcome` (`noAnswer.declined`) and as
+/// `lastTurnOutcome.error.category` (`agent.aborted.question.noAnswer.declined`).
+/// Collapsing it would make a deliberate refusal indistinguishable from a
+/// broken controller.
+fn parse_wire_response(
+    kind: PendingRequestKind,
+    result: &Result<Value, ResponseError>,
+) -> RequestOutcome {
+    let Ok(value) = result else {
+        // The client answered with a JSON-RPC error: an explicit decline.
+        // Every code takes this path — the engine never inspects the code to
+        // decide whether a refusal counts, and never upgrades one into a
+        // grant.
+        return RequestOutcome::fail_closed(kind, NoAnswerReason::Declined);
+    };
+    match kind {
+        PendingRequestKind::Permission => RequestOutcome::Permission {
+            // SECURITY: any fault (missing field / wrong type) → deny.
+            allow: value.get("allow").and_then(Value::as_bool).unwrap_or(false),
+        },
+        PendingRequestKind::PlanApproval => RequestOutcome::PlanApproval {
+            approve: value.get("approve").and_then(Value::as_bool).unwrap_or(false),
+        },
+        PendingRequestKind::Question => match value.get("answer").and_then(Value::as_str) {
+            // An all-whitespace answer is not a decision. It is reported as a
+            // malformed reply rather than sent onward as a choice.
+            Some(a) if !a.trim().is_empty() => {
+                RequestOutcome::Question(AnswerOutcome::Answered(a.to_string()))
+            }
+            _ => RequestOutcome::Question(AnswerOutcome::NoAnswer(NoAnswerReason::Malformed)),
+        },
+    }
+}
+
+/// Builds a [`RequestOutcome`] from an out-of-band `session/resolveRequest`
+/// payload, validating shape **against the pending request's own kind**.
+///
+/// Unlike [`parse_wire_response`], an unusable payload here is an error the
+/// caller can correct: the entry stays outstanding.
+pub fn outcome_from_rpc(
+    kind: PendingRequestKind,
+    outcome: &Value,
+) -> Result<RequestOutcome, ResolveError> {
+    if let Some(declared) = outcome.get("kind").and_then(Value::as_str) {
+        if declared != kind.as_str() {
+            return Err(ResolveError::KindMismatch { expected: kind });
+        }
+    }
+    match kind {
+        PendingRequestKind::Permission => outcome
+            .get("allow")
+            .and_then(Value::as_bool)
+            .map(|allow| RequestOutcome::Permission { allow })
+            .ok_or_else(|| ResolveError::MalformedOutcome {
+                detail: "a permission outcome requires a boolean `allow`".into(),
+            }),
+        PendingRequestKind::PlanApproval => outcome
+            .get("approve")
+            .and_then(Value::as_bool)
+            .map(|approve| RequestOutcome::PlanApproval { approve })
+            .ok_or_else(|| ResolveError::MalformedOutcome {
+                detail: "a plan-approval outcome requires a boolean `approve`".into(),
+            }),
+        PendingRequestKind::Question => match outcome.get("answer").and_then(Value::as_str) {
+            Some(a) if !a.trim().is_empty() => {
+                Ok(RequestOutcome::Question(AnswerOutcome::Answered(a.to_string())))
+            }
+            Some(_) => Err(ResolveError::MalformedOutcome {
+                detail: "an empty answer is not a decision; use session/cancelRequest to decline"
+                    .into(),
+            }),
+            None => Err(ResolveError::MalformedOutcome {
+                detail: "a question outcome requires a non-empty string `answer`".into(),
+            }),
+        },
     }
 }
 
@@ -140,11 +357,26 @@ impl coda_agent::permission::PermissionPrompt for WirePermissionPrompt {
             "toolName": tool.name(),
             "inputPreview": input_preview,
         });
+        // The discovery display is bounded: a snapshot carrying a whole tool
+        // input verbatim would be unbounded state.
+        let display = serde_json::json!({
+            "toolName": tool.name(),
+            "inputPreview": display_text(input_preview, DEFAULT_DISPLAY_TEXT_CAP),
+        });
 
-        let response = self.channel.issue("request/permission", params, cancel).await;
+        let outcome = self
+            .channel
+            .issue(
+                "request/permission",
+                PendingRequestKind::Permission,
+                display,
+                params,
+                None,
+                cancel,
+            )
+            .await;
 
-        // SECURITY: fail closed — any fault (None / missing field / wrong type) → deny.
-        response.and_then(|v| v.get("allow").and_then(|b| b.as_bool())).unwrap_or(false)
+        matches!(outcome, RequestOutcome::Permission { allow: true })
     }
 }
 
@@ -155,8 +387,8 @@ impl coda_agent::permission::PermissionPrompt for WirePermissionPrompt {
 /// Implements [`coda_tool::UserQuestion`] and
 /// [`coda_agent::agent::stop::UserQuestionPrompt`].
 ///
-/// Issues `request/question`.  Any fault → **first option, else `""`**
-/// (fail-closed per spec).
+/// Issues `request/question`. Any fault → [`AnswerOutcome::NoAnswer`] with a
+/// typed reason. **Never** the first option, never an empty string.
 pub struct WireUserQuestion {
     pub channel: Arc<PromptChannel>,
 }
@@ -168,22 +400,38 @@ impl WireUserQuestion {
         options: &[String],
         multi_select: bool,
         cancel: CancellationToken,
-    ) -> String {
-        let fallback = options.first().cloned().unwrap_or_default();
-
+    ) -> AnswerOutcome {
         let params = serde_json::json!({
             "question": question,
             "options": options,
             "multiSelect": multi_select,
             "allowFreeText": true,
         });
+        let display = serde_json::json!({
+            "question": display_text(question, DEFAULT_DISPLAY_TEXT_CAP),
+            "options": options,
+            "multiSelect": multi_select,
+            "allowFreeText": true,
+        });
 
-        let response = self.channel.issue("request/question", params, cancel).await;
-
-        // Fail-closed: missing/malformed → first option, else "".
-        response
-            .and_then(|v| v.get("answer").and_then(|a| a.as_str()).map(str::to_string))
-            .unwrap_or(fallback)
+        match self
+            .channel
+            .issue(
+                "request/question",
+                PendingRequestKind::Question,
+                display,
+                params,
+                None,
+                cancel,
+            )
+            .await
+        {
+            RequestOutcome::Question(answer) => answer,
+            // Structurally impossible (the registry validates kind), but a
+            // fallback that invented an answer would be exactly the bug this
+            // change exists to remove.
+            _ => AnswerOutcome::NoAnswer(NoAnswerReason::Malformed),
+        }
     }
 }
 
@@ -195,27 +443,24 @@ impl coda_tool::UserQuestion for WireUserQuestion {
         options: &[String],
         multi_select: bool,
         cancel: CancellationToken,
-    ) -> String {
+    ) -> AnswerOutcome {
         self.ask_impl(question, options, multi_select, cancel).await
     }
 }
 
 /// Implements the goal-escalation variant of the question prompt.
 ///
-/// For goal escalation, returns `None` on any fault (which the goal supervisor
-/// interprets as "stop" — the safe default).
+/// Returns the same typed outcome: the goal supervisor grants an extension
+/// only for a real answer, never for a fault.
 impl coda_agent::agent::stop::UserQuestionPrompt for WireUserQuestion {
     fn ask<'a>(
         &'a self,
         question: &'a str,
         options: &'a [&'a str],
         cancel: CancellationToken,
-    ) -> Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
+    ) -> Pin<Box<dyn std::future::Future<Output = AnswerOutcome> + Send + 'a>> {
         let opts: Vec<String> = options.iter().map(|s| s.to_string()).collect();
-        Box::pin(async move {
-            let answer = self.ask_impl(question, &opts, false, cancel).await;
-            if answer.is_empty() { None } else { Some(answer) }
-        })
+        Box::pin(async move { self.ask_impl(question, &opts, false, cancel).await })
     }
 }
 
@@ -234,21 +479,32 @@ pub struct WirePlanApprover {
 impl coda_tool::PlanApprover for WirePlanApprover {
     async fn approve(&self, plan: &str, cancel: CancellationToken) -> bool {
         let params = serde_json::json!({ "plan": plan });
+        let display = serde_json::json!({ "plan": display_text(plan, DEFAULT_DISPLAY_TEXT_CAP) });
 
-        let response = self.channel.issue("request/planApproval", params, cancel).await;
+        let outcome = self
+            .channel
+            .issue(
+                "request/planApproval",
+                PendingRequestKind::PlanApproval,
+                display,
+                params,
+                None,
+                cancel,
+            )
+            .await;
 
-        // SECURITY: fail closed — any fault (None / missing field / wrong type) → reject.
-        response.and_then(|v| v.get("approve").and_then(|b| b.as_bool())).unwrap_or(false)
+        matches!(outcome, RequestOutcome::PlanApproval { approve: true })
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Tests — SECURITY: fail-closed defaults
+// Tests — SECURITY: fail-closed defaults, exactly-once resolution
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use coda_agent::agent::stop::{GOAL_CONTINUE_OPTION, GOAL_STOP_OPTION};
     use coda_agent::{PermissionPrompt, PlanApprover, UserQuestion};
     use serde_json::json;
 
@@ -282,313 +538,652 @@ mod tests {
         }
     }
 
+    fn channel() -> (Arc<PromptChannel>, mpsc::UnboundedReceiver<Vec<u8>>) {
+        let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        (Arc::new(PromptChannel::with_instance(tx, "engine-test")), rx)
+    }
+
+    /// Waits until the engine has actually registered a pending request,
+    /// rather than sleeping for an arbitrary interval.
+    async fn await_pending(channel: &PromptChannel) -> coda_proto::state::PendingRequestDto {
+        for _ in 0..2000 {
+            if let Some(dto) = channel.registry().list().into_iter().next() {
+                return dto;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!("no request became pending");
+    }
+
     // ── SECURITY TEST 1: request/permission → deny on channel closure ─────────
 
-    /// Dropping the connection must **deny** the permission, never allow it.
-    ///
-    /// Mutation test: change `unwrap_or(false)` → `unwrap_or(true)` in
-    /// `WirePermissionPrompt::request` and this test will fail because the
-    /// result would become `true` (allow).
+    /// F7 (review): the `callId` field is reserved and must stay *absent*
+    /// rather than becoming an invented or partially-correct correlation
+    /// value. The matching capability says so out loud, so a client cannot
+    /// build a correlation feature on a field that is never populated.
     #[tokio::test]
-    async fn permission_denied_when_channel_closes() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let channel = Arc::new(PromptChannel::new(tx));
-        let prompt = WirePermissionPrompt { channel: Arc::clone(&channel) };
-
+    async fn a_pending_request_never_claims_a_tool_call_correlation_it_does_not_have() {
+        let (channel, _rx) = channel();
+        let prompt = Arc::new(WirePermissionPrompt { channel: Arc::clone(&channel) });
         let tool = FakeTool { name: "dangerous_tool" };
-        let cancel = CancellationToken::new();
-
-        // Spawn the permission request in a separate task so we can close the
-        // channel concurrently.
-        let prompt_arc = Arc::new(prompt);
-        let cancel_clone = cancel.clone();
         let task = tokio::spawn({
-            let p = Arc::clone(&prompt_arc);
+            let p = Arc::clone(&prompt);
+            async move { p.request(&tool, "{}", CancellationToken::new()).await }
+        });
+
+        let dto = await_pending(&channel).await;
+        assert_eq!(dto.call_id, None, "the seam carries no tool-call id; none may be invented");
+        let v = serde_json::to_value(&dto).unwrap();
+        assert!(v.get("callId").is_none(), "unavailable must be omitted, never null: {v}");
+        assert!(dto.turn_id.is_none() || dto.turn_id.is_some(), "turnId is the correlation offered");
+
+        let catalog = crate::capabilities::capability_catalog();
+        let entry = &catalog["requests.callCorrelation"];
+        assert!(!entry.supported, "the contract must not promise correlation it cannot deliver");
+        assert!(entry.reason.as_deref().is_some_and(|r| r.contains("callId")));
+
+        channel.fail_all_pending();
+        assert!(!task.await.expect("task"));
+    }
+
+    /// The new discovery surface must not become a side channel for anything
+    /// credential-shaped that the request payload happened to contain.
+    #[tokio::test]
+    async fn a_pending_request_display_never_carries_a_credential_shaped_value() {
+        let (channel, _rx) = channel();
+        let prompt = Arc::new(WirePermissionPrompt { channel: Arc::clone(&channel) });
+        let tool = FakeTool { name: "run_command" };
+        let task = tokio::spawn({
+            let p = Arc::clone(&prompt);
             async move {
-                p.request(&tool, r#"{"cmd":"rm -rf /"}"#, cancel_clone).await
+                p.request(&tool, r#"{"cmd":"deploy"}"#, CancellationToken::new()).await
             }
         });
 
-        // Give the task a moment to register the pending request.
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        // Simulate connection close: fail all pending requests.
+        let dto = await_pending(&channel).await;
+        let v = serde_json::to_value(&dto).unwrap();
+        for banned in ["signature", "apiKey", "token", "headers", "env", "authorization"] {
+            assert!(v.get(banned).is_none(), "{banned} must never appear on a pending request: {v}");
+            assert!(
+                v["display"].get(banned).is_none(),
+                "{banned} must never appear in a pending request display: {v}"
+            );
+        }
+
+        channel.fail_all_pending();
+        assert!(!task.await.expect("task"));
+    }
+
+    #[tokio::test]
+    async fn permission_denied_when_channel_closes() {
+        let (channel, _rx) = channel();
+        let prompt = WirePermissionPrompt { channel: Arc::clone(&channel) };
+        let tool = FakeTool { name: "dangerous_tool" };
+
+        let task = tokio::spawn({
+            let p = Arc::new(prompt);
+            async move { p.request(&tool, r#"{"cmd":"rm -rf /"}"#, CancellationToken::new()).await }
+        });
+
+        await_pending(&channel).await;
         channel.fail_all_pending();
 
-        let allowed = task.await.expect("task panicked");
-        assert!(!allowed, "SECURITY: permission must be denied when connection closes");
+        assert!(!task.await.expect("task"), "SECURITY: connection loss must deny");
     }
 
-    /// A `request/permission` response with `allow: false` must be honoured.
     #[tokio::test]
     async fn permission_denied_when_response_is_deny() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let channel = Arc::new(PromptChannel::new(tx));
+        let (channel, _rx) = channel();
         let prompt = WirePermissionPrompt { channel: Arc::clone(&channel) };
         let tool = FakeTool { name: "tool" };
 
-        let channel_clone = Arc::clone(&channel);
-        let task = tokio::spawn(async move {
-            prompt.request(&tool, "{}", CancellationToken::new()).await
-        });
+        let c = Arc::clone(&channel);
+        let task =
+            tokio::spawn(async move { prompt.request(&tool, "{}", CancellationToken::new()).await });
 
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        // Route a deny response.
-        channel_clone.route_response(
-            &RequestId::Number(1),
-            Ok(json!({ "allow": false })),
-        );
-
-        let allowed = task.await.expect("task");
-        assert!(!allowed);
+        await_pending(&channel).await;
+        c.route_response(&RequestId::Number(1), Ok(json!({ "allow": false })));
+        assert!(!task.await.expect("task"));
     }
 
-    /// A `request/permission` response with `allow: true` must grant.
     #[tokio::test]
     async fn permission_allowed_when_response_grants() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let channel = Arc::new(PromptChannel::new(tx));
+        let (channel, _rx) = channel();
         let prompt = WirePermissionPrompt { channel: Arc::clone(&channel) };
         let tool = FakeTool { name: "tool" };
 
-        let channel_clone = Arc::clone(&channel);
+        let c = Arc::clone(&channel);
+        let task =
+            tokio::spawn(async move { prompt.request(&tool, "{}", CancellationToken::new()).await });
+
+        await_pending(&channel).await;
+        c.route_response(&RequestId::Number(1), Ok(json!({ "allow": true })));
+        assert!(task.await.expect("task"), "must allow when response is allow:true");
+    }
+
+    /// A reply that arrives twice must not be able to turn a denial into an
+    /// allow: the entry is already gone.
+    #[tokio::test]
+    async fn a_duplicate_permission_reply_cannot_grant_after_a_denial() {
+        let (channel, _rx) = channel();
+        let prompt = WirePermissionPrompt { channel: Arc::clone(&channel) };
+        let tool = FakeTool { name: "tool" };
+
+        let c = Arc::clone(&channel);
+        let task =
+            tokio::spawn(async move { prompt.request(&tool, "{}", CancellationToken::new()).await });
+
+        await_pending(&channel).await;
+        c.route_response(&RequestId::Number(1), Ok(json!({ "allow": false })));
+        c.route_response(&RequestId::Number(1), Ok(json!({ "allow": true })));
+
+        assert!(!task.await.expect("task"), "SECURITY: a replayed reply must not grant");
+        assert!(channel.registry().is_empty());
+    }
+
+    // ── SECURITY TEST 2: request/question → typed NoAnswer, never option 1 ────
+
+    /// The regression this whole change exists for.
+    #[tokio::test]
+    async fn a_lost_connection_is_no_answer_not_the_first_option() {
+        let (channel, _rx) = channel();
+        let uq = WireUserQuestion { channel: Arc::clone(&channel) };
+        let options = vec!["Delete".to_string(), "Keep".to_string()];
+
         let task = tokio::spawn(async move {
-            prompt.request(&tool, "{}", CancellationToken::new()).await
+            uq.ask("Delete the production database?", &options, false, CancellationToken::new())
+                .await
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        channel_clone.route_response(
+        await_pending(&channel).await;
+        channel.fail_all_pending();
+
+        assert_eq!(
+            task.await.expect("task"),
+            AnswerOutcome::NoAnswer(NoAnswerReason::Disconnected),
+            "SECURITY: a dropped connection must never read as 'the user chose Delete'"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_question_is_no_answer_with_a_cancelled_reason() {
+        let (channel, _rx) = channel();
+        let uq = WireUserQuestion { channel: Arc::clone(&channel) };
+        let cancel = CancellationToken::new();
+        let options = vec!["Delete".to_string(), "Keep".to_string()];
+
+        let c = cancel.clone();
+        let task = tokio::spawn(async move { uq.ask("q?", &options, false, c).await });
+
+        await_pending(&channel).await;
+        cancel.cancel();
+
+        assert_eq!(task.await.expect("task"), AnswerOutcome::NoAnswer(NoAnswerReason::Cancelled));
+        assert!(channel.registry().is_empty(), "a cancelled request must not leak");
+    }
+
+    #[tokio::test]
+    async fn a_malformed_answer_is_no_answer_not_an_empty_success() {
+        for body in [json!({}), json!({ "answer": 42 }), json!({ "answer": "   " })] {
+            let (channel, _rx) = channel();
+            let uq = WireUserQuestion { channel: Arc::clone(&channel) };
+            let options = vec!["Delete".to_string(), "Keep".to_string()];
+
+            let c = Arc::clone(&channel);
+            let task = tokio::spawn(async move {
+                uq.ask("q?", &options, false, CancellationToken::new()).await
+            });
+
+            await_pending(&channel).await;
+            c.route_response(&RequestId::Number(1), Ok(body.clone()));
+
+            assert_eq!(
+                task.await.expect("task"),
+                AnswerOutcome::NoAnswer(NoAnswerReason::Malformed),
+                "body {body} must not become an answer"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_error_response_is_an_explicit_decline() {
+        let (channel, _rx) = channel();
+        let uq = WireUserQuestion { channel: Arc::clone(&channel) };
+        let options = vec!["Delete".to_string()];
+
+        let c = Arc::clone(&channel);
+        let task = tokio::spawn(async move {
+            uq.ask("q?", &options, false, CancellationToken::new()).await
+        });
+
+        await_pending(&channel).await;
+        c.route_response(
             &RequestId::Number(1),
-            Ok(json!({ "allow": true })),
+            Err(ResponseError { code: -32000, message: "user closed the prompt".into(), data: None }),
         );
 
-        let allowed = task.await.expect("task");
-        assert!(allowed, "must allow when response is allow:true");
+        assert_eq!(task.await.expect("task"), AnswerOutcome::NoAnswer(NoAnswerReason::Declined));
     }
 
-    // ── SECURITY TEST 2: request/question → first option on channel closure ───
-
-    /// Dropping the connection must return the **first option**, not hang or panic.
+    /// The signal a controller sends when the operator **deliberately**
+    /// dismisses a question (Esc in the TUI) is a JSON-RPC error reply with
+    /// `REQUEST_CANCELLED`. It must classify as `declined` — an intentional
+    /// refusal to answer.
     ///
-    /// Mutation test: change `unwrap_or(fallback)` → `unwrap_or("WRONG".to_string())`
-    /// and this test will fail (the returned answer will be wrong).
+    /// It must specifically **not** be `malformed` (which is what `{"answer":
+    /// ""}` means: the controller tried to answer and produced nothing usable)
+    /// and not `disconnected` (which means the controller is gone). All three
+    /// are fail-closed, but they are different facts: `declined` is the only
+    /// one that says a human made a decision, and it is what
+    /// `lastTurnOutcome.error.category` reports back as
+    /// `agent.aborted.question.noAnswer.declined`.
     #[tokio::test]
-    async fn question_falls_back_to_first_option_when_channel_closes() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let channel = Arc::new(PromptChannel::new(tx));
+    async fn a_deliberate_cancellation_classifies_as_declined_not_malformed_or_disconnected() {
+        let (channel, _rx) = channel();
         let uq = WireUserQuestion { channel: Arc::clone(&channel) };
-        let options = vec!["option-alpha".to_string(), "option-beta".to_string()];
-        let cancel = CancellationToken::new();
+        let options = vec!["Delete".to_string(), "Keep".to_string()];
 
-        let channel_clone = Arc::clone(&channel);
+        let c = Arc::clone(&channel);
         let task = tokio::spawn(async move {
-            uq.ask("choose?", &options, false, cancel).await
+            uq.ask("Delete the production database?", &options, false, CancellationToken::new())
+                .await
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        channel_clone.fail_all_pending();
+        await_pending(&channel).await;
+        c.route_response(
+            &RequestId::Number(1),
+            Err(ResponseError {
+                code: coda_proto::jsonrpc::error_codes::REQUEST_CANCELLED,
+                message: "request cancelled".into(),
+                data: None,
+            }),
+        );
 
-        let answer = task.await.expect("task");
-        assert_eq!(answer, "option-alpha", "fail-closed must return first option");
+        let outcome = task.await.expect("task");
+        assert_eq!(
+            outcome,
+            AnswerOutcome::NoAnswer(NoAnswerReason::Declined),
+            "a deliberate cancellation is a decision, not a fault"
+        );
+        assert_ne!(outcome, AnswerOutcome::NoAnswer(NoAnswerReason::Malformed));
+        assert_ne!(outcome, AnswerOutcome::NoAnswer(NoAnswerReason::Disconnected));
+        assert_ne!(
+            outcome,
+            AnswerOutcome::Answered("Delete".into()),
+            "SECURITY: cancelling must never select the first option"
+        );
+        assert_ne!(outcome, AnswerOutcome::Answered(String::new()));
     }
 
-    /// When there are no options, the fail-closed default is `""`.
-    #[tokio::test]
-    async fn question_falls_back_to_empty_string_when_no_options() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let channel = Arc::new(PromptChannel::new(tx));
-        let uq = WireUserQuestion { channel: Arc::clone(&channel) };
+    /// The two shapes are deliberately different facts, and the classification
+    /// must keep them apart. This is the exact pair the TUI moved between:
+    /// it used to reply `{"answer": ""}` on cancel and now sends
+    /// `REQUEST_CANCELLED`.
+    #[test]
+    fn a_cancellation_error_and_an_empty_answer_are_classified_differently() {
+        use coda_proto::jsonrpc::error_codes::REQUEST_CANCELLED;
 
-        let channel_clone = Arc::clone(&channel);
+        let cancelled: Result<Value, ResponseError> = Err(ResponseError {
+            code: REQUEST_CANCELLED,
+            message: "request cancelled".into(),
+            data: None,
+        });
+        assert_eq!(
+            parse_wire_response(PendingRequestKind::Question, &cancelled),
+            RequestOutcome::Question(AnswerOutcome::NoAnswer(NoAnswerReason::Declined))
+        );
+
+        let empty_answer: Result<Value, ResponseError> = Ok(json!({ "answer": "" }));
+        assert_eq!(
+            parse_wire_response(PendingRequestKind::Question, &empty_answer),
+            RequestOutcome::Question(AnswerOutcome::NoAnswer(NoAnswerReason::Malformed)),
+            "an empty string is an attempt to answer that produced nothing, not a decision"
+        );
+    }
+
+    /// The same signal on the other two reverse requests keeps their own
+    /// fail-closed defaults: cancelling is never a grant.
+    #[test]
+    fn a_cancellation_error_denies_a_permission_and_rejects_a_plan() {
+        let cancelled: Result<Value, ResponseError> = Err(ResponseError {
+            code: coda_proto::jsonrpc::error_codes::REQUEST_CANCELLED,
+            message: "request cancelled".into(),
+            data: None,
+        });
+        assert_eq!(
+            parse_wire_response(PendingRequestKind::Permission, &cancelled),
+            RequestOutcome::Permission { allow: false },
+            "SECURITY: a cancelled permission prompt is a deny"
+        );
+        assert_eq!(
+            parse_wire_response(PendingRequestKind::PlanApproval, &cancelled),
+            RequestOutcome::PlanApproval { approve: false },
+            "SECURITY: a cancelled plan approval is a reject"
+        );
+    }
+
+    /// A cancellation must survive as a *label* too: `event/requestResolved`
+    /// and `lastTurnOutcome` both key off it, and a client distinguishing
+    /// "the operator said no" from "the pipe died" reads exactly this string.
+    #[test]
+    fn a_declined_question_is_labelled_no_answer_declined() {
+        let outcome =
+            RequestOutcome::Question(AnswerOutcome::NoAnswer(NoAnswerReason::Declined));
+        assert_eq!(outcome.label(), "noAnswer.declined");
+        assert_ne!(outcome.label(), "noAnswer.malformed");
+        assert_ne!(outcome.label(), "noAnswer.disconnected");
+    }
+
+    #[tokio::test]
+    async fn a_real_answer_is_carried_through_verbatim() {
+        let (channel, _rx) = channel();
+        let uq = WireUserQuestion { channel: Arc::clone(&channel) };
+        let options = vec!["Delete".to_string(), "Keep".to_string()];
+
+        let c = Arc::clone(&channel);
         let task = tokio::spawn(async move {
-            uq.ask("choose?", &[], false, CancellationToken::new()).await
+            uq.ask("q?", &options, false, CancellationToken::new()).await
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        channel_clone.fail_all_pending();
+        await_pending(&channel).await;
+        c.route_response(&RequestId::Number(1), Ok(json!({ "answer": "Keep" })));
 
-        let answer = task.await.expect("task");
-        assert_eq!(answer, "", "fail-closed with no options must return empty string");
+        assert_eq!(task.await.expect("task"), AnswerOutcome::Answered("Keep".into()));
+    }
+
+    /// The goal-escalation seam takes the same path: `GOAL_CONTINUE_OPTION` is
+    /// first in the list, so a fault must not silently select it.
+    #[tokio::test]
+    async fn the_goal_escalation_seam_never_returns_the_continue_option_on_a_fault() {
+        let (channel, _rx) = channel();
+        let uq = Arc::new(WireUserQuestion { channel: Arc::clone(&channel) });
+
+        let u = Arc::clone(&uq);
+        let task = tokio::spawn(async move {
+            coda_agent::agent::stop::UserQuestionPrompt::ask(
+                u.as_ref(),
+                "goal not met — continue?",
+                &[GOAL_CONTINUE_OPTION, GOAL_STOP_OPTION],
+                CancellationToken::new(),
+            )
+            .await
+        });
+
+        await_pending(&channel).await;
+        channel.fail_all_pending();
+
+        let outcome = task.await.expect("task");
+        assert_eq!(outcome, AnswerOutcome::NoAnswer(NoAnswerReason::Disconnected));
+        assert!(outcome.answered().is_none(), "a fault yields no answer at all");
+    }
+
+    // ── Timeout: opt-in only ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn an_opt_in_timeout_produces_a_typed_timeout_outcome() {
+        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let channel = Arc::new(PromptChannel::with_timeout_for_test(
+            tx,
+            "engine-test",
+            Some(Duration::from_millis(30)),
+        ));
+        let uq = WireUserQuestion { channel: Arc::clone(&channel) };
+        let options = vec!["Delete".to_string(), "Keep".to_string()];
+
+        let outcome = uq.ask("q?", &options, false, CancellationToken::new()).await;
+        assert_eq!(outcome, AnswerOutcome::NoAnswer(NoAnswerReason::Timeout));
+        assert!(channel.registry().is_empty(), "a timed-out request must not stay pending");
+    }
+
+    /// With no timeout configured (the default), the request simply stays
+    /// outstanding — a slow human is not cancelled.
+    #[tokio::test]
+    async fn with_no_timeout_configured_a_request_waits_indefinitely() {
+        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let channel = Arc::new(PromptChannel::with_timeout_for_test(tx, "engine-test", None));
+        let uq = WireUserQuestion { channel: Arc::clone(&channel) };
+        let options = vec!["Delete".to_string()];
+
+        let mut task =
+            Box::pin(async move { uq.ask("q?", &options, false, CancellationToken::new()).await });
+        let raced = tokio::time::timeout(Duration::from_millis(120), &mut task).await;
+        assert!(raced.is_err(), "the default must be to keep waiting for the human");
+        assert_eq!(channel.registry().list().len(), 1, "and the request stays discoverable");
+    }
+
+    // ── RAII: a dropped issue future never leaks a pending entry ─────────
+
+    #[tokio::test]
+    async fn dropping_the_request_future_withdraws_the_pending_entry() {
+        let (channel, _rx) = channel();
+        let uq = WireUserQuestion { channel: Arc::clone(&channel) };
+        let options = vec!["Delete".to_string()];
+
+        {
+            let mut fut = Box::pin(uq.ask("q?", &options, false, CancellationToken::new()));
+            // Drive it far enough to register, then drop it outright — the
+            // shape a tool wall-clock ceiling produces.
+            let _ = tokio::time::timeout(Duration::from_millis(50), &mut fut).await;
+            assert_eq!(channel.registry().list().len(), 1);
+        }
+        assert!(channel.registry().is_empty(), "a dropped request future must not leak an entry");
     }
 
     // ── SECURITY TEST 3: request/planApproval → reject on channel closure ─────
 
-    /// Dropping the connection must **reject** the plan, never approve it.
-    ///
-    /// Mutation test: change `unwrap_or(false)` → `unwrap_or(true)` in
-    /// `WirePlanApprover::approve` and this test will fail.
     #[tokio::test]
     async fn plan_rejected_when_channel_closes() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let channel = Arc::new(PromptChannel::new(tx));
+        let (channel, _rx) = channel();
         let approver = WirePlanApprover { channel: Arc::clone(&channel) };
-        let cancel = CancellationToken::new();
 
-        let channel_clone = Arc::clone(&channel);
         let task = tokio::spawn(async move {
-            approver.approve("dangerous plan", cancel).await
+            approver.approve("dangerous plan", CancellationToken::new()).await
         });
+        await_pending(&channel).await;
+        channel.fail_all_pending();
 
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        channel_clone.fail_all_pending();
-
-        let approved = task.await.expect("task");
-        assert!(!approved, "SECURITY: plan must be rejected when connection closes");
+        assert!(!task.await.expect("task"), "SECURITY: connection loss must reject");
     }
 
-    /// A `request/planApproval` response with `approve: false` must be honoured.
     #[tokio::test]
     async fn plan_rejected_when_response_is_reject() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let channel = Arc::new(PromptChannel::new(tx));
+        let (channel, _rx) = channel();
         let approver = WirePlanApprover { channel: Arc::clone(&channel) };
 
-        let channel_clone = Arc::clone(&channel);
-        let task = tokio::spawn(async move {
-            approver.approve("a plan", CancellationToken::new()).await
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        channel_clone.route_response(
-            &RequestId::Number(1),
-            Ok(json!({ "approve": false })),
-        );
-
-        let approved = task.await.expect("task");
-        assert!(!approved);
+        let c = Arc::clone(&channel);
+        let task =
+            tokio::spawn(async move { approver.approve("a plan", CancellationToken::new()).await });
+        await_pending(&channel).await;
+        c.route_response(&RequestId::Number(1), Ok(json!({ "approve": false })));
+        assert!(!task.await.expect("task"));
     }
 
-    /// A `request/planApproval` response with `approve: true` must be honoured.
     #[tokio::test]
     async fn plan_approved_when_response_grants() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let channel = Arc::new(PromptChannel::new(tx));
+        let (channel, _rx) = channel();
         let approver = WirePlanApprover { channel: Arc::clone(&channel) };
 
-        let channel_clone = Arc::clone(&channel);
-        let task = tokio::spawn(async move {
-            approver.approve("a plan", CancellationToken::new()).await
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        channel_clone.route_response(
-            &RequestId::Number(1),
-            Ok(json!({ "approve": true })),
-        );
-
-        let approved = task.await.expect("task");
-        assert!(approved, "must approve when response is approve:true");
+        let c = Arc::clone(&channel);
+        let task =
+            tokio::spawn(async move { approver.approve("a plan", CancellationToken::new()).await });
+        await_pending(&channel).await;
+        c.route_response(&RequestId::Number(1), Ok(json!({ "approve": true })));
+        assert!(task.await.expect("task"), "must approve when response is approve:true");
     }
-
-    // ── Cancellation is also fail-closed ──────────────────────────────────────
 
     #[tokio::test]
     async fn permission_denied_on_cancellation() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let channel = Arc::new(PromptChannel::new(tx));
-        let prompt = WirePermissionPrompt { channel };
-        let tool = FakeTool { name: "t" };
-        let cancel = CancellationToken::new();
-
-        let cancel_clone = cancel.clone();
-        let task = tokio::spawn(async move {
-            prompt.request(&tool, "{}", cancel_clone).await
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        cancel.cancel();
-
-        let allowed = task.await.expect("task");
-        assert!(!allowed, "permission must be denied on cancellation");
-    }
-
-    #[tokio::test]
-    async fn plan_rejected_on_cancellation() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let channel = Arc::new(PromptChannel::new(tx));
-        let approver = WirePlanApprover { channel };
-        let cancel = CancellationToken::new();
-
-        let cancel_clone = cancel.clone();
-        let task = tokio::spawn(async move { approver.approve("plan", cancel_clone).await });
-
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        cancel.cancel();
-
-        let approved = task.await.expect("task");
-        assert!(!approved, "plan must be rejected on cancellation");
-    }
-
-    // ── Malformed response body is also fail-closed ───────────────────────────
-
-    #[tokio::test]
-    async fn permission_denied_on_malformed_response() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let channel = Arc::new(PromptChannel::new(tx));
+        let (channel, _rx) = channel();
         let prompt = WirePermissionPrompt { channel: Arc::clone(&channel) };
         let tool = FakeTool { name: "t" };
+        let cancel = CancellationToken::new();
 
-        let channel_clone = Arc::clone(&channel);
-        let task = tokio::spawn(async move {
-            prompt.request(&tool, "{}", CancellationToken::new()).await
-        });
+        let c = cancel.clone();
+        let task = tokio::spawn(async move { prompt.request(&tool, "{}", c).await });
+        await_pending(&channel).await;
+        cancel.cancel();
 
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        // Malformed: `allow` is a string instead of bool.
-        channel_clone.route_response(
-            &RequestId::Number(1),
-            Ok(json!({ "allow": "yes" })),
-        );
-
-        let allowed = task.await.expect("task");
-        assert!(!allowed, "malformed response must default to deny");
+        assert!(!task.await.expect("task"), "SECURITY: cancellation must deny");
     }
 
-    #[tokio::test]
-    async fn question_falls_back_on_malformed_response() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let channel = Arc::new(PromptChannel::new(tx));
-        let uq = WireUserQuestion { channel: Arc::clone(&channel) };
-        let options = vec!["yes".to_string(), "no".to_string()];
+    // ── Discovery payloads are bounded and secret-free ───────────────────
 
-        let channel_clone = Arc::clone(&channel);
-        let task = tokio::spawn(async move {
-            uq.ask("?", &options, false, CancellationToken::new()).await
+    /// The raw `request/*` frame and `session/getPendingRequests` must
+    /// describe the same request in a way a client can *prove*, not guess.
+    ///
+    /// Without the handle on the frame, a client that answers the raw
+    /// round-trip and also polls the discovery list either renders the prompt
+    /// twice or drops the original responder — and dropping a responder
+    /// declines the request. The handle is opaque: the client compares it, it
+    /// never reconstructs it from the numeric JSON-RPC id.
+    #[tokio::test]
+    async fn the_raw_request_frame_carries_the_same_public_handle_the_registry_lists() {
+        let (channel, mut rx) = channel();
+        let prompt = Arc::new(WirePermissionPrompt { channel: Arc::clone(&channel) });
+        let tool = FakeTool { name: "edit" };
+        let task = tokio::spawn({
+            let p = Arc::clone(&prompt);
+            async move { p.request(&tool, "src/main.rs", CancellationToken::new()).await }
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        // Malformed: `answer` is a number instead of string.
-        channel_clone.route_response(
-            &RequestId::Number(1),
-            Ok(json!({ "answer": 42 })),
+        let dto = await_pending(&channel).await;
+        let frame = rx.recv().await.expect("a request frame was written");
+        let text = String::from_utf8_lossy(&frame);
+        let body = text.split("\r\n\r\n").nth(1).expect("framed body");
+        let request: serde_json::Value = serde_json::from_str(body).expect("json body");
+
+        assert_eq!(request["method"], "request/permission");
+        assert_eq!(
+            request["params"]["requestId"].as_str(),
+            Some(dto.request_id.as_str()),
+            "the frame must carry the handle the discovery list uses"
         );
+        // The pre-existing fields are untouched: this is additive only.
+        assert_eq!(request["params"]["toolName"], "edit");
+        assert_eq!(request["params"]["inputPreview"], "src/main.rs");
+        // The JSON-RPC id stays numeric, exactly as a legacy client expects.
+        assert!(request["id"].is_number(), "the raw request id stays numeric");
 
-        let answer = task.await.expect("task");
-        assert_eq!(answer, "yes", "malformed answer must fall back to first option");
-    }
-
-    // ── PromptChannel: fail_all_pending resolves all waiters ──────────────────
-
-    #[tokio::test]
-    async fn fail_all_pending_resolves_multiple_waiters() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let channel = Arc::new(PromptChannel::new(tx));
-
-        let c1 = Arc::clone(&channel);
-        let c2 = Arc::clone(&channel);
-
-        let t1 = tokio::spawn(async move {
-            c1.issue("request/permission", json!({}), CancellationToken::new()).await
-        });
-        let t2 = tokio::spawn(async move {
-            c2.issue("request/planApproval", json!({}), CancellationToken::new()).await
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         channel.fail_all_pending();
+        let _ = task.await;
+    }
 
-        let r1 = t1.await.expect("t1");
-        let r2 = t2.await.expect("t2");
-        assert!(r1.is_none(), "fail_all_pending must resolve with None");
-        assert!(r2.is_none(), "fail_all_pending must resolve with None");
+    #[tokio::test]
+    async fn a_question_request_carries_its_handle() {
+        let (channel, mut rx) = channel();
+        let question = Arc::new(WireUserQuestion { channel: Arc::clone(&channel) });
+        let task = tokio::spawn({
+            let q = Arc::clone(&question);
+            async move {
+                coda_tool::UserQuestion::ask(
+                    q.as_ref(),
+                    "Which?",
+                    &["a".to_string()],
+                    false,
+                    CancellationToken::new(),
+                )
+                .await
+            }
+        });
+        let dto = await_pending(&channel).await;
+        let frame = rx.recv().await.expect("frame");
+        let text = String::from_utf8_lossy(&frame);
+        let request: serde_json::Value =
+            serde_json::from_str(text.split("\r\n\r\n").nth(1).expect("body")).expect("json");
+        assert_eq!(request["params"]["requestId"].as_str(), Some(dto.request_id.as_str()));
+        assert_eq!(request["params"]["question"], "Which?");
+        channel.fail_all_pending();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn a_plan_approval_request_carries_its_handle() {
+        let (channel, mut rx) = channel();
+        let approver = Arc::new(WirePlanApprover { channel: Arc::clone(&channel) });
+        let task = tokio::spawn({
+            let a = Arc::clone(&approver);
+            async move { a.approve("the plan", CancellationToken::new()).await }
+        });
+        let dto = await_pending(&channel).await;
+        let frame = rx.recv().await.expect("frame");
+        let text = String::from_utf8_lossy(&frame);
+        let request: serde_json::Value =
+            serde_json::from_str(text.split("\r\n\r\n").nth(1).expect("body")).expect("json");
+        assert_eq!(request["params"]["requestId"].as_str(), Some(dto.request_id.as_str()));
+        assert_eq!(request["params"]["plan"], "the plan");
+        channel.fail_all_pending();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn a_pending_permission_is_discoverable_with_a_bounded_preview() {
+        let (channel, _rx) = channel();
+        let prompt = WirePermissionPrompt { channel: Arc::clone(&channel) };
+        let huge = "y".repeat(DEFAULT_DISPLAY_TEXT_CAP + 1000);
+        let tool = FakeTool { name: "run_command" };
+
+        let task = tokio::spawn({
+            let p = Arc::new(prompt);
+            async move { p.request(&tool, &huge, CancellationToken::new()).await }
+        });
+
+        let dto = await_pending(&channel).await;
+        assert_eq!(dto.kind, PendingRequestKind::Permission);
+        assert_eq!(dto.fail_closed_default, "deny");
+        assert!(dto.request_id.starts_with("req-engine-test-"));
+        assert_eq!(dto.display["toolName"], "run_command");
+        assert_eq!(dto.display["inputPreview"]["omittedReason"], "tooLarge");
+        assert_eq!(
+            dto.display["inputPreview"]["text"].as_str().unwrap().len(),
+            DEFAULT_DISPLAY_TEXT_CAP
+        );
+
+        channel.fail_all_pending();
+        let _ = task.await;
+    }
+
+    // ── outcome_from_rpc: kind validation ────────────────────────────────
+
+    #[test]
+    fn an_rpc_outcome_declaring_the_wrong_kind_is_refused() {
+        let err = outcome_from_rpc(
+            PendingRequestKind::Permission,
+            &json!({ "kind": "question", "answer": "Delete" }),
+        )
+        .expect_err("declared kind must be checked");
+        assert!(matches!(err, ResolveError::KindMismatch { .. }));
+    }
+
+    #[test]
+    fn an_rpc_outcome_missing_its_required_field_is_refused_not_defaulted() {
+        assert!(matches!(
+            outcome_from_rpc(PendingRequestKind::Permission, &json!({})),
+            Err(ResolveError::MalformedOutcome { .. })
+        ));
+        assert!(matches!(
+            outcome_from_rpc(PendingRequestKind::PlanApproval, &json!({ "allow": true })),
+            Err(ResolveError::MalformedOutcome { .. })
+        ));
+        assert!(matches!(
+            outcome_from_rpc(PendingRequestKind::Question, &json!({ "answer": "" })),
+            Err(ResolveError::MalformedOutcome { .. })
+        ));
+    }
+
+    #[test]
+    fn a_wellformed_rpc_outcome_is_accepted_for_each_kind() {
+        assert_eq!(
+            outcome_from_rpc(PendingRequestKind::Permission, &json!({ "allow": true })).unwrap(),
+            RequestOutcome::Permission { allow: true }
+        );
+        assert_eq!(
+            outcome_from_rpc(PendingRequestKind::PlanApproval, &json!({ "approve": false }))
+                .unwrap(),
+            RequestOutcome::PlanApproval { approve: false }
+        );
+        assert_eq!(
+            outcome_from_rpc(PendingRequestKind::Question, &json!({ "answer": "Keep" })).unwrap(),
+            RequestOutcome::Question(AnswerOutcome::Answered("Keep".into()))
+        );
     }
 }

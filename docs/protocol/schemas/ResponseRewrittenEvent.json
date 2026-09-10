@@ -1,0 +1,37 @@
+{
+  "type": "object",
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "engineInstanceId": {
+      "type": "string"
+    },
+    "hookCommand": {
+      "type": "string",
+      "default": ""
+    },
+    "originalResponse": {
+      "type": "string",
+      "default": ""
+    },
+    "displayContent": {
+      "type": "string",
+      "default": ""
+    },
+    "modifiedResponse": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    }
+  },
+  "required": [
+    "seq",
+    "engineInstanceId"
+  ],
+  "title": "ResponseRewrittenEvent",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

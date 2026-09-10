@@ -1,0 +1,96 @@
+{
+  "type": "object",
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "engineInstanceId": {
+      "type": "string"
+    },
+    "turnId": {
+      "type": "string"
+    },
+    "endedAt": {
+      "type": "string"
+    },
+    "stopReason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "interrupted": {
+      "type": "boolean"
+    },
+    "error": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TurnErrorSummary"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "historyEpoch": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "historyLength": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "finalizedCallIds": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "toolsTruncated": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "seq",
+    "engineInstanceId",
+    "turnId",
+    "endedAt",
+    "interrupted",
+    "historyEpoch",
+    "historyLength",
+    "finalizedCallIds",
+    "toolsTruncated"
+  ],
+  "title": "TurnEndedEvent",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "TurnErrorSummary": {
+      "type": "object",
+      "properties": {
+        "category": {
+          "type": "string",
+          "description": "Closed set: `\"cancelled\"`, `\"incomplete\"`, `\"agent.other\"`,\n`\"engine.<reason>\"`, or `\"llm.<coda_llm::diagnostics::category>\"`."
+        },
+        "status": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "parameter": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "A bounded, allowlisted request-parameter path when the provider named\nexactly one from a fixed set — never derived from a message body."
+        }
+      },
+      "required": [
+        "category"
+      ],
+      "description": "Why a turn failed, in a form that is safe to retain and to serve from\n`session/getState` for the rest of the session.\n\n`AgentError`/`LlmError` `Display` and `Debug` carry provider-authored text\nand can embed a credential-bearing URL or a request body. None of that may\nend up here: a `lastTurnOutcome` is polled indefinitely by any connected\nclient, so it carries only a fixed classification token, the HTTP status\nwhen there was one, and — at most — one allowlisted request-parameter path\nextracted by `coda_llm::diagnostics` (never free text, never a message)."
+    }
+  }
+}

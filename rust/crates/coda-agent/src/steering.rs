@@ -3,14 +3,64 @@
 //! The inbox is open while a turn is running and is atomically sealed at its
 //! natural completion, preventing a racing message from sneaking in after the
 //! last safe delivery boundary.
+//!
+//! # Observer (Slice 0 / Stage C)
+//!
+//! [`SteeringInbox`] optionally carries a [`SteeringObserver`], invoked
+//! synchronously **while still holding the inbox's own gate lock** for every
+//! mutation (enqueue, delivery, recall, turn-end drop, rejection). This keeps
+//! "the mutation happened" and "the observer saw it" one atomic step from the
+//! perspective of any other thread touching this inbox — the global lock
+//! order for callers that use this hook is `INBOX -> STATE -> BUS`
+//! (`coda-serve` implements the trait and takes its own state lock, then its
+//! event-bus lock, from inside this callback). The observer must never call
+//! back into this inbox (no re-entrant locking) and must never `.await` (the
+//! gate is a `std::sync::Mutex`).
+//!
+//! `SteeringInbox` remains the sole execution queue with its existing proven
+//! atomicity; the observer only mirrors transitions into a read-only
+//! projection elsewhere. Nothing about the queue's own semantics changes when
+//! no observer is installed (the default, used by every existing caller).
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// A single operator message queued for delivery.
 #[derive(Debug, Clone)]
 pub struct SteeringEntry {
     pub id: String,
     pub text: String,
+}
+
+/// Why an `enqueue` was refused. Distinguishes "no turn is running" (sealed)
+/// from "nothing to send" (empty text) so `session/steer` can report an exact
+/// `rejectedReason` instead of a mute `ok:false`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SteerRejectReason {
+    /// The queue is sealed — no turn is currently accepting steering.
+    Sealed,
+    /// The text was empty (or all whitespace).
+    EmptyText,
+}
+
+/// Synchronous observer for steering-queue transitions.
+///
+/// Implemented by `coda-serve` (never by `coda-agent` itself — this keeps the
+/// dependency direction `coda-serve -> coda-agent` and not the reverse).
+pub trait SteeringObserver: Send + Sync {
+    /// A message was accepted into the queue.
+    fn on_enqueued(&self, _entry: &SteeringEntry) {}
+    /// Entries were claimed for delivery (never called with an empty slice).
+    fn on_delivered(&self, _entries: &[SteeringEntry]) {}
+    /// Entries were withdrawn via recall (never called with an empty slice).
+    fn on_recalled(&self, _entries: &[SteeringEntry]) {}
+    /// A turn ended while entries were still undelivered; they are being
+    /// dropped (never called with an empty slice). Called from both the
+    /// explicit seal and `TurnGuard::drop` — natural idempotency: the second
+    /// `close_for_turn()` call always sees an already-empty queue, so this
+    /// fires at most once per batch of dropped entries.
+    fn on_turn_ended_dropped(&self, _entries: &[SteeringEntry]) {}
+    /// An `enqueue` was refused.
+    fn on_rejected(&self, _reason: SteerRejectReason) {}
 }
 
 /// Thread-safe FIFO queue for operator steering injections.
@@ -21,6 +71,7 @@ pub struct SteeringEntry {
 /// (some message raced in) forces one more iteration to deliver it.
 pub struct SteeringInbox {
     gate: Mutex<SteeringInboxInner>,
+    observer: Option<Arc<dyn SteeringObserver>>,
 }
 
 struct SteeringInboxInner {
@@ -30,8 +81,15 @@ struct SteeringInboxInner {
 
 impl SteeringInbox {
     pub fn new() -> Self {
+        Self::with_observer(None)
+    }
+
+    /// Constructs an inbox with an optional synchronous observer (see module
+    /// docs for the lock-order contract).
+    pub fn with_observer(observer: Option<Arc<dyn SteeringObserver>>) -> Self {
         Self {
             gate: Mutex::new(SteeringInboxInner { pending: Vec::new(), sealed_empty: false }),
+            observer,
         }
     }
 
@@ -41,41 +99,88 @@ impl SteeringInbox {
     }
 
     /// Enqueue a message.  Returns the accepted entry, or `None` when the
-    /// queue has been sealed (the owning turn already completed).
+    /// queue has been sealed (the owning turn already completed) or the text
+    /// was empty. Kept for existing callers that don't need the exact reason;
+    /// prefer [`SteeringInbox::enqueue_with_reason`] for a new caller such as
+    /// `session/steer`, which reports `rejectedReason`.
     pub fn enqueue(&self, text: impl Into<String>) -> Option<SteeringEntry> {
+        self.enqueue_with_reason(text).ok()
+    }
+
+    /// Enqueue a message, reporting the exact rejection reason on failure.
+    pub fn enqueue_with_reason(
+        &self,
+        text: impl Into<String>,
+    ) -> Result<SteeringEntry, SteerRejectReason> {
         let text = text.into();
         if text.trim().is_empty() {
-            return None;
+            if let Some(obs) = &self.observer {
+                obs.on_rejected(SteerRejectReason::EmptyText);
+            }
+            return Err(SteerRejectReason::EmptyText);
         }
         let mut inner = self.gate.lock().unwrap();
         if inner.sealed_empty {
-            return None;
+            if let Some(obs) = &self.observer {
+                obs.on_rejected(SteerRejectReason::Sealed);
+            }
+            return Err(SteerRejectReason::Sealed);
         }
         let entry = SteeringEntry {
             id: uuid::Uuid::new_v4().to_string().replace('-', ""),
             text,
         };
         inner.pending.push(entry.clone());
-        Some(entry)
+        // Observer runs while `inner` is still held (INBOX -> STATE -> BUS).
+        if let Some(obs) = &self.observer {
+            obs.on_enqueued(&entry);
+        }
+        Ok(entry)
     }
 
     /// Atomically drain all pending entries for delivery.
     pub fn take_all_for_delivery(&self) -> Vec<SteeringEntry> {
-        self.take_all()
+        let mut inner = self.gate.lock().unwrap();
+        if inner.pending.is_empty() {
+            return Vec::new();
+        }
+        let entries = std::mem::take(&mut inner.pending);
+        if let Some(obs) = &self.observer {
+            obs.on_delivered(&entries);
+        }
+        entries
     }
 
     /// Withdraws only entries not already claimed for delivery, atomically
     /// against the delivery path. Recalling never reopens a sealed inbox.
     pub fn recall_all(&self) -> Vec<SteeringEntry> {
-        self.take_all()
+        let mut inner = self.gate.lock().unwrap();
+        if inner.pending.is_empty() {
+            return Vec::new();
+        }
+        let entries = std::mem::take(&mut inner.pending);
+        if let Some(obs) = &self.observer {
+            obs.on_recalled(&entries);
+        }
+        entries
     }
 
     /// Ends a turn without allowing undelivered entries to leak into the next
     /// one. The UI retains their text for explicit recovery, not auto-delivery.
+    ///
+    /// Idempotent: called from both the explicit turn seal and
+    /// `TurnGuard::drop` on every turn; whichever runs first reports the
+    /// dropped entries to the observer, the second call always finds an
+    /// already-empty queue and reports nothing.
     pub fn close_for_turn(&self) {
         let mut inner = self.gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        inner.pending.clear();
+        let dropped = std::mem::take(&mut inner.pending);
         inner.sealed_empty = true;
+        if !dropped.is_empty() {
+            if let Some(obs) = &self.observer {
+                obs.on_turn_ended_dropped(&dropped);
+            }
+        }
     }
 
     /// Reopen the queue for a newly-started turn without discarding any
@@ -103,14 +208,6 @@ impl SteeringInbox {
         }
         inner.sealed_empty = true;
         true
-    }
-
-    fn take_all(&self) -> Vec<SteeringEntry> {
-        let mut inner = self.gate.lock().unwrap();
-        if inner.pending.is_empty() {
-            return Vec::new();
-        }
-        std::mem::take(&mut inner.pending)
     }
 }
 
@@ -240,5 +337,96 @@ mod tests {
         inbox2.enqueue("race!").unwrap();
         let sealed = inbox.try_seal_empty();
         assert!(!sealed, "seal must fail when a message raced in");
+    }
+
+    // ── Observer tests (Slice 0 / Stage C) ───────────────────────────────────
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        enqueued: Mutex<Vec<SteeringEntry>>,
+        delivered: Mutex<Vec<Vec<SteeringEntry>>>,
+        recalled: Mutex<Vec<Vec<SteeringEntry>>>,
+        dropped: Mutex<Vec<Vec<SteeringEntry>>>,
+        rejected: Mutex<Vec<SteerRejectReason>>,
+    }
+
+    impl SteeringObserver for RecordingObserver {
+        fn on_enqueued(&self, entry: &SteeringEntry) {
+            self.enqueued.lock().unwrap().push(entry.clone());
+        }
+        fn on_delivered(&self, entries: &[SteeringEntry]) {
+            self.delivered.lock().unwrap().push(entries.to_vec());
+        }
+        fn on_recalled(&self, entries: &[SteeringEntry]) {
+            self.recalled.lock().unwrap().push(entries.to_vec());
+        }
+        fn on_turn_ended_dropped(&self, entries: &[SteeringEntry]) {
+            self.dropped.lock().unwrap().push(entries.to_vec());
+        }
+        fn on_rejected(&self, reason: SteerRejectReason) {
+            self.rejected.lock().unwrap().push(reason);
+        }
+    }
+
+    #[test]
+    fn observer_sees_enqueue_delivery_recall_and_rejection() {
+        let obs = Arc::new(RecordingObserver::default());
+        let inbox = SteeringInbox::with_observer(Some(obs.clone() as Arc<dyn SteeringObserver>));
+
+        let e1 = inbox.enqueue("first").unwrap();
+        assert_eq!(obs.enqueued.lock().unwrap().len(), 1);
+        assert_eq!(obs.enqueued.lock().unwrap()[0].id, e1.id);
+
+        let e2 = inbox.enqueue("second").unwrap();
+        let delivered = inbox.take_all_for_delivery();
+        assert_eq!(delivered.len(), 2);
+        assert_eq!(obs.delivered.lock().unwrap().len(), 1);
+        assert_eq!(obs.delivered.lock().unwrap()[0].len(), 2);
+
+        // Delivering again with nothing pending must not call the observer.
+        assert!(inbox.take_all_for_delivery().is_empty());
+        assert_eq!(obs.delivered.lock().unwrap().len(), 1, "empty delivery must not notify");
+
+        let e3 = inbox.enqueue("third").unwrap();
+        let recalled = inbox.recall_all();
+        assert_eq!(recalled.len(), 1);
+        assert_eq!(obs.recalled.lock().unwrap().len(), 1);
+        assert_eq!(obs.recalled.lock().unwrap()[0][0].id, e3.id);
+
+        // Empty text and a sealed inbox each report their own reason.
+        assert!(inbox.enqueue("").is_none());
+        assert_eq!(*obs.rejected.lock().unwrap(), vec![SteerRejectReason::EmptyText]);
+        inbox.close_for_turn();
+        assert!(inbox.enqueue("late").is_none());
+        assert_eq!(
+            obs.rejected.lock().unwrap().last().copied(),
+            Some(SteerRejectReason::Sealed)
+        );
+
+        let _ = (e2,); // silence unused-var lint without weakening the assertions above
+    }
+
+    #[test]
+    fn observer_reports_dropped_entries_exactly_once_across_seal_and_drop() {
+        // Simulates the real dual-publish path: run_prompt_inner seals
+        // explicitly, then TurnGuard::drop calls close_for_turn() again.
+        let obs = Arc::new(RecordingObserver::default());
+        let inbox = SteeringInbox::with_observer(Some(obs.clone() as Arc<dyn SteeringObserver>));
+        inbox.open_for_turn();
+        inbox.enqueue("never delivered").unwrap();
+
+        inbox.close_for_turn(); // explicit seal — reports the drop
+        inbox.close_for_turn(); // TurnGuard::drop — queue is already empty
+
+        assert_eq!(obs.dropped.lock().unwrap().len(), 1, "must report exactly once");
+        assert_eq!(obs.dropped.lock().unwrap()[0].len(), 1);
+    }
+
+    #[test]
+    fn enqueue_with_reason_distinguishes_sealed_from_empty_text() {
+        let inbox = SteeringInbox::new();
+        assert_eq!(inbox.enqueue_with_reason("").err(), Some(SteerRejectReason::EmptyText));
+        assert!(inbox.try_seal_empty());
+        assert_eq!(inbox.enqueue_with_reason("hi").err(), Some(SteerRejectReason::Sealed));
     }
 }

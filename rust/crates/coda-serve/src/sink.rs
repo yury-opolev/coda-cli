@@ -3,22 +3,49 @@
 //! `ServeSink` implements `AgentSink` by translating each `AgentEvent` to a
 //! `coda_proto::Event` via `coda_agent::events::to_proto_event`, then calling
 //! `Event::to_notification()` to get the `(method, params)` pair, and finally
-//! enqueuing a framed notification onto the shared write channel.
+//! publishing it through the shared [`EventBus`] — which assigns the
+//! envelope `seq`/`engineInstanceId`, stores the whole frame in the bounded
+//! ring, and writes it to the outbound channel. Legacy events are never
+//! gated: `gated=false` on every `publish` call from this sink (§2.1 — only
+//! the *new* state/queue/lifecycle methods, published directly by
+//! `EngineState`, are gated behind `stateEvents`).
 //!
-//! The sink is `Send + Sync` because `tokio::sync::mpsc::UnboundedSender` is.
+//! # Scope after Stage C correction C1
+//!
+//! `ServeSink` owns the bus and is the publication path for events that carry
+//! **no** state transition — host-level `Error` frames and deferred MCP
+//! notices. Everything the agent loop emits during a turn goes through
+//! `crate::state_sink::StateSink` instead, which publishes the very same
+//! frame through the very same bus but does so *inside* the `EngineState`
+//! transaction that applies the transition, so a snapshot's cursor can never
+//! disagree with its own content. Both paths share one bus, so seq
+//! assignment and wire order stay globally consistent either way.
+//!
+//! The sink is `Send + Sync` because [`EventBus`] is.
+
+use std::sync::Arc;
 
 use coda_agent::events::{AgentEvent, AgentSink, to_proto_event};
-use coda_proto::{Notification, encode_frame};
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
-/// Bridges the agent event stream to the JSON-RPC writer channel.
+use crate::bus::EventBus;
+
+/// Bridges the agent event stream to the shared event bus.
 pub struct ServeSink {
-    outgoing: mpsc::UnboundedSender<Vec<u8>>,
+    bus: Arc<EventBus>,
 }
 
 impl ServeSink {
     pub fn new(outgoing: mpsc::UnboundedSender<Vec<u8>>) -> Self {
-        Self { outgoing }
+        Self { bus: Arc::new(EventBus::new(outgoing, Uuid::new_v4().to_string())) }
+    }
+
+    /// The shared bus this sink publishes through — `ServeHost` uses this to
+    /// build `EngineState` so both share one ordering/publication point and
+    /// one `engineInstanceId`.
+    pub fn bus(&self) -> Arc<EventBus> {
+        Arc::clone(&self.bus)
     }
 }
 
@@ -30,13 +57,7 @@ impl AgentSink for ServeSink {
         let Some((method, params)) = proto.to_notification() else {
             return;
         };
-        let notification = Notification::new(method, Some(params));
-        match serde_json::to_vec(&notification) {
-            Ok(bytes) => {
-                let _ = self.outgoing.send(encode_frame(&bytes));
-            }
-            Err(e) => tracing::error!(%e, "failed to serialise event notification"),
-        }
+        self.bus.publish(&method, params, false);
     }
 }
 
@@ -65,6 +86,9 @@ mod tests {
         assert_eq!(msg["params"]["delta"], "hello");
         // Notifications must not have an id field.
         assert!(msg.get("id").is_none(), "notifications must not have an id");
+        // Additive envelope metadata (§2.1): every event burns a seq.
+        assert_eq!(msg["params"]["seq"], 1);
+        assert!(msg["params"]["engineInstanceId"].is_string());
     }
 
     #[test]
@@ -107,5 +131,17 @@ mod tests {
             rx.try_recv().is_err(),
             "gap events must not produce any outbound frame"
         );
+    }
+
+    #[test]
+    fn sequential_events_get_increasing_seq_numbers() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let sink = ServeSink::new(tx);
+        sink.emit(AgentEvent::AssistantText { delta: "a".into() });
+        sink.emit(AgentEvent::AssistantText { delta: "b".into() });
+        let first = decode_notification(rx.try_recv().unwrap());
+        let second = decode_notification(rx.try_recv().unwrap());
+        assert_eq!(first["params"]["seq"], 1);
+        assert_eq!(second["params"]["seq"], 2);
     }
 }

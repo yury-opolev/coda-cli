@@ -177,23 +177,52 @@ fn write_json(path: &Path, value: &Value) -> Result<(), ConfigError> {
 // ---------------------------------------------------------------------------
 
 /// `~/.coda/settings.json`, kept as raw JSON so unmodelled keys survive.
+///
+/// A `Settings` value remembers the document it loaded (`original`) as well as
+/// the one being edited (`root`). Saving persists the *difference* between
+/// them, under the shared settings lock, against whatever the file holds at
+/// that moment — see [`coda_boot::settings_store`]. Writing `root` back
+/// wholesale would revert everything another process changed in the meantime,
+/// which is exactly how a freshly committed `defaultProvider` used to
+/// disappear when the user next changed their theme.
 #[derive(Debug, Clone)]
 pub struct Settings {
     path: PathBuf,
+    original: Value,
     root: Value,
 }
 
 impl Settings {
     pub fn load(paths: &Paths) -> Result<Self, ConfigError> {
         let path = paths.settings();
-        Ok(Self {
-            root: read_json(&path)?,
-            path,
-        })
+        let root = read_json(&path)?;
+        Ok(Self { original: root.clone(), root, path })
     }
 
-    pub fn save(&self) -> Result<(), ConfigError> {
-        write_json(&self.path, &self.root)
+    /// Persist only what changed since this value was loaded, or since the
+    /// last successful save.
+    ///
+    /// The baseline advances on success. Without that, every later save keeps
+    /// re-applying the earlier edits, which would overwrite whatever another
+    /// process wrote to those keys in the meantime — the same reversion this
+    /// delta save exists to prevent, one save later.
+    pub fn save(&mut self) -> Result<(), ConfigError> {
+        coda_boot::settings_store::save_changes(&self.path, &self.original, &self.root).map_err(
+            |error| match error {
+                coda_boot::settings_store::SettingsError::Parse { path, source } => {
+                    ConfigError::Parse { path, source }
+                }
+                coda_boot::settings_store::SettingsError::Read { path, source } => {
+                    ConfigError::Read { path, source }
+                }
+                other => ConfigError::Write {
+                    path: self.path.clone(),
+                    source: std::io::Error::other(other.to_string()),
+                },
+            },
+        )?;
+        self.original = self.root.clone();
+        Ok(())
     }
 
     fn object_mut(&mut self, key: &str) -> &mut Map<String, Value> {
@@ -392,9 +421,13 @@ impl Settings {
 
     /// An empty settings object rooted at `path`, for tests and for the case
     /// where `settings.json` does not exist yet.
+    ///
+    /// The baseline is empty too, so saving writes only what the caller sets —
+    /// it never asserts that every other key should be removed.
     pub fn empty_at(path: PathBuf) -> Self {
         Self {
             path,
+            original: Value::Object(Map::new()),
             root: Value::Object(Map::new()),
         }
     }
@@ -579,37 +612,12 @@ impl McpServer {
 
 /// Reads MCP servers from the project and user configuration files.
 ///
-/// Delegates the file-format parsing to `coda_mcp::config::load_all` so the
-/// JSON parsing logic lives in one place. Project definitions shadow user
-/// definitions of the same name.
-pub fn load_mcp_servers(paths: &Paths) -> Result<Vec<McpServer>, ConfigError> {
-    let raw = coda_mcp::config::load_all(&paths.user_mcp(), &paths.project_mcp());
-    let mut servers: Vec<McpServer> = raw.into_iter().map(raw_to_display).collect();
-    servers.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(servers)
-}
-
-fn raw_to_display(raw: coda_mcp::config::McpRawServer) -> McpServer {
-    let scope = match raw.scope {
-        coda_mcp::config::McpScope::Project => Scope::Project,
-        coda_mcp::config::McpScope::User => Scope::User,
-    };
-    let transport = raw.transport(); // call before moving fields
-    let mut env_pairs: Vec<(String, String)> = raw.env.into_iter().collect();
-    env_pairs.sort_by(|a, b| a.0.cmp(&b.0)); // stable order
-    let env_keys: Vec<String> = env_pairs.iter().map(|(k, _)| k.clone()).collect();
-    McpServer {
-        name: raw.name,
-        scope,
-        transport,
-        command: raw.command,
-        args: raw.args,
-        url: raw.url,
-        enabled: !raw.disabled,
-        env_raw: env_pairs,
-        env_keys,
-    }
-}
+/// **Moved.** The file parsing lives in [`crate::local::mcp`] — the local
+/// maintenance adapter — because it reads a file that only this client's own
+/// machine has. Re-exported here so the existing editor call sites are
+/// unchanged; the display path for an ordinary session is the engine's
+/// `mcp/list`.
+pub use crate::local::mcp::load_mcp_servers;
 
 /// The immutable identity a server was opened on.
 ///
@@ -1340,6 +1348,89 @@ mod tests {
         settings.save().expect("save");
 
         assert_eq!(Settings::load(&paths).expect("reload").model_for("p"), Some("m"));
+    }
+
+    #[test]
+    fn a_second_save_does_not_reassert_the_first_edit_over_someone_elses_update() {
+        // The baseline must move with each successful save. Otherwise every
+        // later save keeps re-applying the earlier edit, overwriting whatever
+        // another process wrote to that key in between.
+        let (_dir, paths) = temp_paths();
+        write(&paths.settings(), json!({ "theme": "dark", "outputStyle": "plain" }));
+
+        let mut settings = Settings::load(&paths).expect("load");
+        settings.set_theme("solarized");
+        settings.save().expect("first save");
+
+        // Another process changes the very key this instance last wrote.
+        let mut other = Settings::load(&paths).expect("load");
+        other.set_theme("high-contrast");
+        other.save().expect("concurrent save");
+
+        // This instance now saves an unrelated change.
+        settings.set_output_style("verbose");
+        settings.save().expect("second save");
+
+        let reloaded = read_json(&paths.settings()).expect("reread");
+        assert_eq!(reloaded["outputStyle"], "verbose", "the new edit must land");
+        assert_eq!(
+            reloaded["theme"], "high-contrast",
+            "a second save must not re-apply the first edit over a newer value"
+        );
+    }
+
+    #[test]
+    fn saving_does_not_revert_a_key_another_process_committed() {
+        // The auth transaction writes `defaultProvider` while this Settings
+        // instance is alive. Writing back the whole loaded document would undo
+        // a sign-in the user just completed.
+        let (_dir, paths) = temp_paths();
+        write(&paths.settings(), json!({ "theme": "dark", "defaultProvider": "github-copilot" }));
+
+        let mut settings = Settings::load(&paths).expect("load");
+        settings.set_theme("solarized");
+
+        coda_boot::settings_store::apply_patch(
+            &paths.settings(),
+            &coda_auth::service::AuthSettingsPatch::empty()
+                .with_default_provider(Some("claude-ai".into())),
+        )
+        .expect("the auth commit lands first");
+
+        settings.save().expect("save");
+
+        let reloaded = read_json(&paths.settings()).expect("reread");
+        assert_eq!(reloaded["theme"], "solarized", "this writer's own change must land");
+        assert_eq!(
+            reloaded["defaultProvider"], "claude-ai",
+            "a stale root snapshot must not revert the committed provider"
+        );
+    }
+
+    #[test]
+    fn saving_preserves_a_concurrent_change_to_another_providers_model() {
+        let (_dir, paths) = temp_paths();
+        write(
+            &paths.settings(),
+            json!({ "modelByProvider": { "github-copilot": "gpt-5", "claude-ai": "opus" } }),
+        );
+
+        let mut settings = Settings::load(&paths).expect("load");
+        settings.set_model_for("claude-ai", "opus-5.1");
+
+        // Another process changes a different row of the same object.
+        let mut concurrent = Settings::load(&paths).expect("load");
+        concurrent.set_model_for("github-copilot", "gpt-6");
+        concurrent.save().expect("save");
+
+        settings.save().expect("save");
+
+        let reloaded = read_json(&paths.settings()).expect("reread");
+        assert_eq!(reloaded["modelByProvider"]["claude-ai"], "opus-5.1");
+        assert_eq!(
+            reloaded["modelByProvider"]["github-copilot"], "gpt-6",
+            "an unrelated concurrent edit must survive"
+        );
     }
 
     #[test]

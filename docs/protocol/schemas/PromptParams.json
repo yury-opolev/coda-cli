@@ -1,0 +1,40 @@
+{
+  "type": "object",
+  "properties": {
+    "text": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "images": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/WireImage"
+      }
+    }
+  },
+  "required": [
+    "images"
+  ],
+  "title": "PromptParams",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "WireImage": {
+      "type": "object",
+      "properties": {
+        "mediaType": {
+          "type": "string",
+          "description": "`image/png`, `image/jpeg`, `image/gif` or `image/webp`."
+        },
+        "base64": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "mediaType",
+        "base64"
+      ]
+    }
+  }
+}

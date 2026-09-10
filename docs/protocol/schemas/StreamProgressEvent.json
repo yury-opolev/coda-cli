@@ -1,0 +1,37 @@
+{
+  "type": "object",
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "engineInstanceId": {
+      "type": "string"
+    },
+    "phase": {
+      "type": "string",
+      "default": ""
+    },
+    "chunks": {
+      "type": "integer",
+      "format": "int64",
+      "default": 0
+    },
+    "chars": {
+      "type": "integer",
+      "format": "int64",
+      "default": 0
+    },
+    "elapsedMs": {
+      "type": "integer",
+      "format": "int64",
+      "default": 0
+    }
+  },
+  "required": [
+    "seq",
+    "engineInstanceId"
+  ],
+  "title": "StreamProgressEvent",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

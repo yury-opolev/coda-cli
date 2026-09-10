@@ -1,0 +1,66 @@
+{
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "name": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "kind": {
+      "type": "string",
+      "description": "`\"interval\"`, `\"at\"` or `\"cron\"`.",
+      "default": ""
+    },
+    "prompt": {
+      "type": "string",
+      "default": ""
+    },
+    "rule": {
+      "type": "string",
+      "default": ""
+    },
+    "timeZone": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "nextRunUtc": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "state": {
+      "type": "string",
+      "description": "`\"idle\"`, `\"running\"` or `\"pending\"`.",
+      "default": ""
+    },
+    "activeTaskId": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "lastOutcome": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    }
+  },
+  "required": [
+    "id"
+  ],
+  "title": "ScheduledTask",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

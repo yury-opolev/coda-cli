@@ -1,0 +1,17 @@
+{
+  "type": "object",
+  "properties": {
+    "ok": {
+      "type": "boolean"
+    },
+    "newSessionId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "ok",
+    "newSessionId"
+  ],
+  "title": "ForkResponse",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

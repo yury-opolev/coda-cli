@@ -1,0 +1,35 @@
+{
+  "type": "object",
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "engineInstanceId": {
+      "type": "string"
+    },
+    "hookCommand": {
+      "type": "string",
+      "default": ""
+    },
+    "toolName": {
+      "type": "string",
+      "default": ""
+    },
+    "originalInput": {
+      "type": "string",
+      "default": ""
+    },
+    "modifiedInput": {
+      "type": "string",
+      "default": ""
+    }
+  },
+  "required": [
+    "seq",
+    "engineInstanceId"
+  ],
+  "description": "`event/toolInputModified` carries the input before and after the hook ran.",
+  "title": "ToolInputModifiedEvent",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

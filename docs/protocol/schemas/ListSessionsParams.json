@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "properties": {
+    "limit": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    }
+  },
+  "title": "ListSessionsParams",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

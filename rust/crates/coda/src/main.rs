@@ -20,10 +20,10 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
+use coda_boot::{parse_diagnostic_verbosity, parse_effort_level, resolve_system_prompt, SessionIntent, ServeArgs};
 use coda_client::EngineCommand;
 use coda_render::theme::{ColorDepth, Theme};
 use coda_tui::app::App;
-use coda_tui::startup::SessionIntent;
 use coda_tui::terminal::{install_panic_hook, TerminalGuard};
 
 #[derive(Debug, Parser)]
@@ -31,8 +31,11 @@ use coda_tui::terminal::{install_panic_hook, TerminalGuard};
     name = "coda",
     about = "Coda — an agentic coding assistant",
     // Reported from version.json rather than the crate version, so `--version`
-    // agrees with the banner and continues the C# build's version line.
-    version = coda_tui::branding::version(),
+    // agrees with the banner and continues the C# build's version line. Read
+    // directly from `coda-boot` (the shared core-boundary crate `coda serve`'s
+    // bootstrap uses) rather than through the TUI, per the same "core-owned
+    // version, not routed through the TUI" rule `run_serve` follows below.
+    version = coda_boot::version(),
     disable_help_subcommand = true,
     args_conflicts_with_subcommands = true
 )]
@@ -50,6 +53,12 @@ enum Command {
     Serve(ServeArgs),
     /// Send a single task, print the result, and exit.
     Run(RunArgs),
+    /// Connect, disconnect, or report this machine's provider sign-in.
+    ///
+    /// Host-local maintenance of this profile's credential store, shared with
+    /// `coda-engine auth` through `coda-boot`. It never starts, stops or
+    /// reconnects an engine.
+    Auth(coda_boot::auth_args::AuthArgs),
 }
 
 #[derive(Debug, Args)]
@@ -168,102 +177,6 @@ struct InteractiveArgs {
 }
 
 #[derive(Debug, Args)]
-struct ServeArgs {
-    /// Working directory for the session.
-    #[arg(long, value_name = "DIR")]
-    cwd: Option<PathBuf>,
-
-    /// Disable all MCP servers for this session (user and project).
-    #[arg(long)]
-    no_mcp: bool,
-
-    /// Disable only the project `<cwd>/.mcp.json` layer; user servers still load.
-    #[arg(long)]
-    no_project_mcp: bool,
-
-    /// Write a debug log to this file.
-    #[arg(long, value_name = "FILE")]
-    log_file: Option<PathBuf>,
-
-    /// Legacy compatibility hint: a `tracing` `EnvFilter` string. Only its
-    /// loudest named level is used, as a fallback default for
-    /// `--diagnostic-verbosity`.
-    #[arg(long, env = "CODA_LOG", default_value = "warn")]
-    log_filter: String,
-
-    /// Diagnostic detail level for the essential operational log: normal,
-    /// debug, or trace. Takes precedence over `--log-filter`/`CODA_LOG`.
-    #[arg(long, value_name = "LEVEL", value_parser = parse_diagnostic_verbosity)]
-    diagnostic_verbosity: Option<String>,
-
-    /// Initial reasoning-effort level: low, medium, high, xhigh, max, or auto.
-    ///
-    /// Wired through to the engine startup so a session opened over the raw
-    /// serve seam honours the same override the interactive and headless modes
-    /// accept.
-    #[arg(long, value_name = "LEVEL", value_parser = parse_effort_level)]
-    effort: Option<String>,
-
-    /// Model to use for the session (session-only override, not saved).
-    #[arg(long, value_name = "MODEL")]
-    model: Option<String>,
-
-    /// Provider hint — used to select the model saved for that provider.
-    /// Has no effect when `--model` is also given.
-    #[arg(long, value_name = "PROVIDER")]
-    provider: Option<String>,
-
-    /// Permission mode: default, acceptEdits, plan, or bypassPermissions.
-    #[arg(long, value_name = "MODE", conflicts_with = "yolo")]
-    permission_mode: Option<String>,
-
-    /// Shorthand for `--permission-mode bypassPermissions`.
-    #[arg(long, conflicts_with = "permission_mode")]
-    yolo: bool,
-
-    /// Goal statement the model must fulfil before stopping.
-    #[arg(long, value_name = "TEXT")]
-    goal: Option<String>,
-
-    /// Maximum wall-clock time for the goal. Format: `30m`, `2h`, `90s`.
-    #[arg(
-        long,
-        visible_alias = "goal-max-duration",
-        value_name = "DURATION",
-        requires = "goal"
-    )]
-    goal_timeout: Option<String>,
-
-    /// Maximum continuation turns the goal supervisor may grant.
-    #[arg(
-        long,
-        visible_alias = "goal-max-continuations",
-        value_name = "N",
-        requires = "goal"
-    )]
-    max_continuations: Option<i32>,
-
-    /// Custom system prompt for this session (session-only, not saved).
-    /// Mutually exclusive with `--system-prompt-file`.
-    #[arg(long, value_name = "TEXT", conflicts_with = "system_prompt_file")]
-    system_prompt: Option<String>,
-
-    /// Read the custom system prompt from this file (UTF-8).
-    /// Mutually exclusive with `--system-prompt`.
-    #[arg(long, value_name = "FILE", conflicts_with = "system_prompt")]
-    system_prompt_file: Option<PathBuf>,
-
-    /// Anthropic API key for this session. When provided, the engine uses it
-    /// instead of searching the credential store.
-    #[arg(long, value_name = "KEY", env = "CODA_SERVE_API_KEY")]
-    api_key: Option<String>,
-
-    /// Custom API endpoint base URL (e.g. a proxy). Requires `--api-key`.
-    #[arg(long, value_name = "URL", requires = "api_key")]
-    endpoint: Option<String>,
-}
-
-#[derive(Debug, Args)]
 struct RunArgs {
     /// The task to run.
     ///
@@ -371,79 +284,40 @@ struct RunArgs {
     fork: Option<Option<String>>,
 }
 
-/// Validates a `--effort` value at the parser layer so a syntactically invalid
-/// level is rejected before any engine is spawned or terminal entered.
-///
-/// Accepts the five levels plus `auto` (clear to automatic). The value is
-/// lower-cased so `HIGH` and `high` are the same flag.
-fn parse_effort_level(raw: &str) -> Result<String, String> {
-    let level = raw.trim().to_ascii_lowercase();
-    match level.as_str() {
-        "low" | "medium" | "high" | "xhigh" | "max" | "auto" => Ok(level),
-        _ => Err(format!(
-            "invalid effort '{raw}' (expected one of: low, medium, high, xhigh, max, auto)"
-        )),
-    }
-}
-
-/// Validates a `--diagnostic-verbosity` value at the parser layer.
-fn parse_diagnostic_verbosity(raw: &str) -> Result<String, String> {
-    let level = raw.trim().to_ascii_lowercase();
-    match level.as_str() {
-        "normal" | "debug" | "trace" => Ok(level),
-        _ => Err(format!(
-            "invalid diagnostic verbosity '{raw}' (expected one of: normal, debug, trace)"
-        )),
-    }
-}
-
 /// Resolves and opens this process's diagnostic logger for `coda`'s three
-/// entrypoints (interactive/run/serve). Delegates to `coda_tui::diagnostics`,
-/// which is shared with the standalone `coda-tui` binary — both `coda`
-/// (no subcommand) and `coda-tui` are the same `ProcessRole::Tui` frontend.
+/// entrypoints (interactive/run/serve). Delegates directly to `coda-boot` —
+/// the core-boundary crate `coda serve`'s bootstrap also uses — rather than
+/// through the TUI: interactive and headless mode happen to be the same
+/// `ProcessRole::Tui`/`ProcessRole::Run` frontend `coda-tui` also uses, but
+/// the initializer itself has no TUI dependency, so there is no reason for
+/// any of the three roles to reach through `coda_tui::diagnostics` (kept only
+/// as a compatibility re-export) for something core-owned.
 fn init_diagnostics(
     role: coda_diagnostics::ProcessRole,
     explicit_file: Option<PathBuf>,
     explicit_verbosity: Option<&str>,
     legacy_filter: &str,
 ) -> Result<(coda_diagnostics::DiagnosticContext, PathBuf)> {
-    coda_tui::diagnostics::init(role, explicit_file, explicit_verbosity, legacy_filter)
+    coda_boot::diagnostics::init(role, explicit_file, explicit_verbosity, legacy_filter)
 }
 
 /// Sets the environment variables a spawned engine child reads to correlate
 /// its own diagnostic log with this process's run id and directory.
 fn forward_diagnostics_env(command: EngineCommand, ctx: &coda_diagnostics::DiagnosticContext, directory: &std::path::Path) -> EngineCommand {
-    coda_tui::diagnostics::forward_env(command, ctx, directory)
-}
-
-/// Resolves the system prompt from either an inline string or a file.
-///
-/// The two are mutually exclusive (enforced by clap). A file is read as
-/// UTF-8; a non-UTF-8 file is a hard error rather than a silent lossy read.
-/// Returns `None` when neither flag was given.
-fn resolve_system_prompt(
-    inline: Option<&str>,
-    file: Option<&std::path::Path>,
-) -> Result<Option<String>> {
-    if let Some(text) = inline {
-        return Ok(Some(text.to_owned()));
-    }
-    if let Some(path) = file {
-        let content = std::fs::read(path)
-            .with_context(|| format!("failed to read system prompt file: {}", path.display()))?;
-        let text = String::from_utf8(content).with_context(|| {
-            format!(
-                "system prompt file is not valid UTF-8: {}",
-                path.display()
-            )
-        })?;
-        return Ok(Some(text));
-    }
-    Ok(None)
+    coda_boot::diagnostics::forward_env(command, ctx, directory)
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+
+    // Host-local credential maintenance runs before diagnostics are opened and
+    // exits without returning: an authorization URL or a device code belongs in
+    // the ephemeral CLI surface only, never in a diagnostic log. It also needs
+    // no engine, so it brings its own runtime rather than sharing this one.
+    if matches!(cli.command, Some(Command::Auth(_))) {
+        let Some(Command::Auth(auth)) = cli.command.take() else { unreachable!() };
+        std::process::exit(coda_boot::auth_cli::run(auth));
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -451,6 +325,7 @@ fn main() -> Result<()> {
         .context("failed to start the async runtime")?;
 
     match cli.command {
+        Some(Command::Auth(_)) => unreachable!("handled above"),
         Some(Command::Serve(args)) => {
             let (ctx, _forward_dir) = init_diagnostics(
                 coda_diagnostics::ProcessRole::Serve,
@@ -518,69 +393,10 @@ fn resolve_engine(explicit: Option<PathBuf>) -> Result<PathBuf> {
 }
 
 async fn run_serve(args: ServeArgs) -> Result<()> {
-    if let Some(dir) = &args.cwd {
-        std::env::set_current_dir(dir)
-            .with_context(|| format!("failed to enter {}", dir.display()))?;
-    }
-    // Translate the MCP flags into the env vars the engine reads at startup.
-    // A flag only ever sets the toggle; it never clears one the environment
-    // already provided, so `CODA_SERVE_DISABLE_MCP=1 coda serve` still works.
-    if args.no_mcp {
-        std::env::set_var("CODA_SERVE_DISABLE_MCP", "1");
-    }
-    if args.no_project_mcp {
-        std::env::set_var("CODA_DISABLE_PROJECT_MCP", "1");
-    }
-    // Wire the startup effort override through the env-var seam the engine
-    // reads at build time (parallel to the MCP flags above).
-    if let Some(level) = &args.effort {
-        std::env::set_var("CODA_SERVE_EFFORT", level);
-    }
-    // Startup model override.
-    if let Some(model) = &args.model {
-        std::env::set_var("CODA_SERVE_MODEL", model);
-    }
-    // Provider selection: the engine chooses the requested account at startup
-    // and fails closed if it is unavailable (never a different provider).
-    if let Some(provider) = &args.provider {
-        std::env::set_var("CODA_SERVE_PROVIDER", provider);
-    }
-    // Permission mode: `--yolo` is shorthand for bypassPermissions.
-    let perm_mode = if args.yolo {
-        Some("bypassPermissions".to_owned())
-    } else {
-        args.permission_mode.clone()
-    };
-    if let Some(mode) = &perm_mode {
-        std::env::set_var("CODA_SERVE_PERMISSION_MODE", mode);
-    }
-    // Goal parameters.
-    if let Some(goal) = &args.goal {
-        std::env::set_var("CODA_SERVE_GOAL", goal);
-    }
-    if let Some(timeout) = &args.goal_timeout {
-        std::env::set_var("CODA_SERVE_GOAL_TIMEOUT", timeout);
-    }
-    if let Some(n) = args.max_continuations {
-        std::env::set_var("CODA_SERVE_GOAL_MAX_CONTINUATIONS", n.to_string());
-    }
-    // System prompt (inline or from file, mutually exclusive).
-    let system_prompt = resolve_system_prompt(
-        args.system_prompt.as_deref(),
-        args.system_prompt_file.as_deref(),
-    )?;
-    if let Some(prompt) = &system_prompt {
-        std::env::set_var("CODA_SERVE_SYSTEM_PROMPT", prompt);
-    }
-    // API key and endpoint for explicit credential override.
-    // The endpoint requires the key (enforced by clap `requires`).
-    if let Some(key) = &args.api_key {
-        // Don't log or forward; only set the env var the transport reads.
-        std::env::set_var("CODA_SERVE_API_KEY", key);
-    }
-    if let Some(url) = &args.endpoint {
-        std::env::set_var("CODA_SERVE_ENDPOINT", url);
-    }
+    // All flag-to-env-var translation and cwd handling is core-owned and
+    // shared with `coda-engine`: `coda serve`'s bootstrap must not duplicate
+    // it, only chain it with the transport this binary links.
+    coda_boot::serve::prepare(&args)?;
     coda_serve::serve_stdio().await
 }
 
@@ -627,19 +443,68 @@ async fn run_interactive(
 
     let theme = Theme::default().with_depth(ColorDepth::detect());
 
-    // Resolved before the terminal is touched, so "no such session" prints as
-    // an ordinary error rather than flashing up behind an alternate screen.
-    let intent = SessionIntent::from_flags(
+    // Resolved by the engine, not by reading its files: the front-end spawns
+    // the core, asks it read-only which sessions exist, and hands the answer
+    // back through `initialize`. Done before the terminal is touched, so "no
+    // such session" prints as an ordinary error rather than flashing up
+    // behind an alternate screen.
+    let intent_for_session = SessionIntent::from_flags(
         args.continue_latest,
         args.resume.clone(),
         args.fork.clone(),
     );
-    let resuming = coda_tui::startup::resolve(&intent, &working_dir).await?;
+    // The local maintenance gate is the client's own knowledge of how it
+    // launched, never a flag the engine advertises: an engine cannot know
+    // whether its client is this terminal or a browser elsewhere. A custom
+    // `--engine`/`CODA_ENGINE` is treated as somebody else's machine.
+    let access_mode = coda_tui::local::AccessMode::for_launch(
+        args.engine.is_some() || std::env::var_os("CODA_ENGINE").is_some(),
+    );
+
+    // Before the engine, and before the terminal. A first run — or a launch
+    // whose explicitly-named provider has no credential — is offered the
+    // sign-in here, because once the engine has failed closed there is no
+    // session in which `/setup` could be typed. An API-only launch returns
+    // from this having opened no credential store and read no settings.
+    let intent = coda_tui::preflight::LaunchIntent::from_launch(
+        access_mode,
+        args.provider.as_deref(),
+        &args.engine_args,
+        |key| std::env::var(key).ok(),
+    );
+    let launch = coda_tui::preflight::prepare_launch(
+        command,
+        &intent,
+        &coda_tui::local::auth::AuthPort::profile(),
+        &theme,
+        !args.no_mouse,
+    )
+    .await;
+    // An explicit `--model` names a model *for an account*. The wizard cannot
+    // change which account an explicit `--provider` asked for, but it can
+    // connect something other than a saved default that had no credential —
+    // and then the model this launch carries belongs to the account that is no
+    // longer connected.
+    let startup_model = args.model.clone().filter(|_| launch.keeps_model_intent());
+    let command = match launch {
+        coda_tui::preflight::Launch::Proceed { command, notes, .. } => {
+            for note in notes {
+                eprintln!("{note}");
+            }
+            command
+        }
+        // Cancelled, or impossible without a terminal: no engine is started,
+        // and nothing on this machine was changed.
+        coda_tui::preflight::Launch::Abandoned(message) => {
+            println!("{message}");
+            return Ok(());
+        }
+    };
 
     // Connect before touching the terminal, so a failure prints a normal error
     // instead of a blank alternate screen.
     let (mut app, engine_process, inbound) =
-        App::connect_to_session(command, theme, resuming.clone()).await?;
+        App::boot(command, theme, &intent_for_session, access_mode).await?;
 
     // Helper: abort cleanly if any pre-launch RPC fails.
     macro_rules! apply_or_abort {
@@ -658,13 +523,15 @@ async fn run_interactive(
     // established FIRST, and reasoning-effort is applied LAST. Effort is
     // recorded per-model, so applying it before a model switch would leave the
     // explicit level attached to the previous model and silently dropped.
-    if let Some(ref model) = args.model {
+    if let Some(ref model) = startup_model {
         apply_or_abort!(app.apply_cli_model(model).await);
-    } else if let Some(ref provider) = args.provider {
-        // --provider without --model: look up the saved model for this provider.
-        let provider_model = coda_serve::settings::resolve_for_provider(Some(provider.as_str())).model;
-        apply_or_abort!(app.apply_cli_model(&provider_model).await);
     }
+    // `--provider` on its own deliberately sets no model. The engine was told
+    // which provider to connect (`CODA_SERVE_PROVIDER`, forwarded above) and
+    // resolves the model for the credential it actually connected, from its
+    // own host's settings. A front-end that resolved one here would overrule
+    // that with a value read from *this* machine — which, for an engine this
+    // process did not start, is somebody else's file.
     // Verify the engine actually connected the requested provider. A custom
     // engine that ignored the request, or a native engine that fell back, is
     // caught here and fails the launch rather than talking to the wrong account.
@@ -707,10 +574,12 @@ async fn run_interactive(
     let started_at = std::time::Instant::now();
     let mut guard = TerminalGuard::enter(!args.no_mouse).context("failed to set up the terminal")?;
 
-    let result = app.run(&mut guard, inbound, started_at).await;
+    let result = app.run(&mut guard, inbound, engine_process, started_at).await;
 
     // Restore the terminal before shutting the engine down so any engine
-    // diagnostics land on a normal screen.
+    // diagnostics land on a normal screen. The engine belongs to the loop
+    // from here: signing in has to stop and *await* it before a credential is
+    // written, which only its owner can do.
     drop(guard);
 
     // The summary is written after the alternate screen is released, so it
@@ -721,8 +590,6 @@ async fn run_interactive(
         // A failed run has no meaningful summary; the error is the message.
         Err(_) => {}
     }
-
-    let _ = engine_process.shutdown(std::time::Duration::from_secs(5)).await;
 
     result.map(|_| ())
 }
@@ -738,7 +605,7 @@ async fn run_headless(
     engine_log_dir: PathBuf,
 ) -> Result<i32> {
     use coda_client::Inbound;
-    use coda_proto::messages::{method, InitializeParams, PromptParams};
+    use coda_proto::messages::{method, PromptParams};
 
     let working_dir = match &args.cwd {
         Some(dir) => dir.clone(),
@@ -751,13 +618,15 @@ async fn run_headless(
         args.system_prompt_file.as_deref(),
     )?;
 
-    // Resolve the session intent (resume/continue/fork).
+    // Resolve the session intent (resume/continue/fork) — through the engine,
+    // exactly as the interactive front-end does. Headless mode shares the
+    // bootstrap helper so the two cannot drift apart on what `--continue` in
+    // an empty directory means, and so neither of them reads a transcript.
     let intent = SessionIntent::from_flags(
         args.continue_latest,
         args.resume.clone(),
         args.fork.clone(),
     );
-    let session_id = coda_tui::startup::resolve(&intent, &working_dir).await?;
 
     let engine = resolve_engine(args.engine.clone())?;
     let mut command = EngineCommand::new(engine.as_os_str())
@@ -770,21 +639,22 @@ async fn run_headless(
         command = command.env("CODA_SERVE_PROVIDER", provider.as_str());
     }
 
-    let (engine_process, mut inbound) =
-        coda_client::Engine::spawn(command).context("failed to start the engine")?;
-    let connection = engine_process.connection();
-
-    let mut init = InitializeParams::new("coda-run");
-    if let Some(ref sid) = session_id {
-        init = init.resume(sid.clone());
-    }
-    let init_val = serde_json::to_value(init)
-        .context("failed to serialise the handshake")?;
-    let initialized: coda_proto::messages::InitializeResult = serde_json::from_value(connection
-        .request(method::INITIALIZE, Some(init_val))
+    let booted = coda_tui::api::boot::boot(command, &intent, "coda-run")
         .await
-        .context("the engine handshake failed")?)?;
-    let diagnostics = diagnostics.with_session(initialized.session_id.clone());
+        .map_err(anyhow::Error::new)?;
+    let coda_tui::api::boot::Booted {
+        engine: engine_process,
+        mut inbound,
+        connection,
+        initialize: initialized,
+        session_id: booted_session_id,
+        notices: boot_notices,
+        ..
+    } = booted;
+    for notice in &boot_notices {
+        eprintln!("{notice}");
+    }
+    let diagnostics = diagnostics.with_session(booted_session_id.clone());
     coda_tui::diagnostics::record_engine_log_path(
         &diagnostics, initialized.telemetry_log_path.as_deref(),
     );
@@ -820,15 +690,11 @@ async fn run_headless(
             serde_json::json!({ "model": model }),
             format!("--model {model}")
         );
-    } else if let Some(ref provider) = args.provider {
-        let provider_model =
-            coda_serve::settings::resolve_for_provider(Some(provider.as_str())).model;
-        must_apply!(
-            method::SET_MODEL,
-            serde_json::json!({ "model": provider_model }),
-            format!("--provider {provider}")
-        );
     }
+    // As in interactive mode: `--provider` selects an account, and the model
+    // for it is the engine's own resolution, made against the credential it
+    // connected. Pushing one from here would override engine-owned state with
+    // this machine's settings.
     // Verify the engine connected the requested provider; fail closed on a
     // mismatch rather than running against a different account (Finding C2).
     if let Some(ref provider) = args.provider {
@@ -1059,13 +925,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn effort_level_parser_accepts_the_documented_set() {
-        for level in ["low", "medium", "high", "xhigh", "max", "auto"] {
-            assert_eq!(parse_effort_level(level).as_deref(), Ok(level));
-        }
-        assert!(parse_effort_level("nonsense").is_err());
-    }
+    // `parse_effort_level`'s accepted set is tested directly in `coda-boot`,
+    // its new home; this crate only re-tests it wired through `Cli` above.
 
     /// Without `--engine`, the engine is this executable, so a standalone
     /// binary needs nothing else on the system.
@@ -1329,31 +1190,7 @@ mod tests {
         assert_eq!(a.system_prompt.as_deref(), Some("Be helpful."));
     }
 
-    #[test]
-    fn resolve_system_prompt_inline_wins() {
-        let result = resolve_system_prompt(Some("inline text"), None).expect("resolve");
-        assert_eq!(result.as_deref(), Some("inline text"));
-    }
-
-    #[test]
-    fn resolve_system_prompt_none_when_neither_given() {
-        let result = resolve_system_prompt(None, None).expect("resolve");
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn resolve_system_prompt_from_file() {
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("coda-test-sp-{}.txt", std::process::id()));
-        std::fs::write(&path, "from file").expect("write");
-        let result = resolve_system_prompt(None, Some(&path)).expect("resolve");
-        assert_eq!(result.as_deref(), Some("from file"));
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn resolve_system_prompt_file_not_found_is_error() {
-        let result = resolve_system_prompt(None, Some(std::path::Path::new("no-such-file.txt")));
-        assert!(result.is_err(), "missing file must be an error");
-    }
+    // `resolve_system_prompt` itself is tested directly in `coda-boot`, its
+    // new home; this crate's `interactive_accepts_model_and_system_prompt`
+    // above already covers it wired through `Cli`.
 }}

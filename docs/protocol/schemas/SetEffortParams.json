@@ -1,0 +1,28 @@
+{
+  "type": "object",
+  "properties": {
+    "effort": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "`\"low\"`, `\"medium\"`, `\"high\"`, `\"xhigh\"`, `\"max\"`, `\"auto\"`, or `None` to clear."
+    },
+    "expectedModel": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The model the caller believed was active when it built this request.\n\nWhen present, the engine rejects the call (without mutating anything) if\nthe active model has since changed, so a picker opened for one model can\nnever silently reconfigure another. `None` skips the guard."
+    },
+    "expectedProvider": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The provider the caller believed was connected. Guarded exactly like\n`expected_model`."
+    }
+  },
+  "title": "SetEffortParams",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

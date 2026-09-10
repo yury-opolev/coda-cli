@@ -36,8 +36,25 @@ impl ActivityKey {
 ///
 /// Requires a `call_id`: without one there is nothing to distinguish two calls
 /// to the same tool, so callers must fall back to a positional match.
+///
+/// A `call_id` alone is **not** an identity. Provider tool-call ids are only
+/// unique within one request, and since the transcript can now be rehydrated
+/// from stored history the same id genuinely appears twice in one buffer: once
+/// on a replayed call from an earlier turn, once on a live one. So when both
+/// sides name a turn or a batch, those have to agree too — otherwise a live
+/// result would rewrite a historical call that merely shares an id, silently
+/// replacing the wrong output. Either side omitting them (a legacy engine, an
+/// old transcript) falls back to the previous behaviour rather than refusing
+/// to match at all.
 pub fn same_call(a: &Correlation, b: &Correlation) -> bool {
-    a.call_id.is_some() && a.call_id == b.call_id && a.source_id == b.source_id
+    if a.call_id.is_none() || a.call_id != b.call_id || a.source_id != b.source_id {
+        return false;
+    }
+    let agrees = |left: &Option<String>, right: &Option<String>| match (left, right) {
+        (Some(left), Some(right)) => left == right,
+        _ => true,
+    };
+    agrees(&a.root_turn_id, &b.root_turn_id) && agrees(&a.activity_id, &b.activity_id)
 }
 
 /// Severity of a notice block.
@@ -170,6 +187,33 @@ pub enum Block {
 }
 
 impl Block {
+    /// Whether this block belongs to this client rather than to the engine's
+    /// conversation.
+    ///
+    /// The distinction is load-bearing: a `session/getHistory` read is
+    /// authoritative over everything it *can* describe, and it cannot
+    /// describe the startup banner, a local notice, the output of a slash
+    /// command or a `/diff`. Those are the terminal's own, so a rebuild
+    /// replaces the conversation around them rather than through them.
+    ///
+    /// Permission outcomes and answered questions are here for a different
+    /// reason: they are records of what the operator did *at this terminal*.
+    /// The engine's rich history describes the conversation the model saw and
+    /// carries neither, so dropping them on a rebuild would not "reload" them
+    /// from anywhere — it would erase the only record that they happened.
+    pub fn is_client_owned(&self) -> bool {
+        matches!(
+            self,
+            Block::Banner { .. }
+                | Block::Notice { .. }
+                | Block::CommandOutput { .. }
+                | Block::Diff { .. }
+                | Block::SessionBoundary { .. }
+                | Block::Permission { .. }
+                | Block::Question { .. }
+        )
+    }
+
     /// Whether this block can still receive streamed content.
     pub fn is_open(&self) -> bool {
         match self {
@@ -522,6 +566,16 @@ fn finalize_activity(activity: &mut ToolActivity) {
     activity.complete = true;
 }
 
+/// Marks one block as no longer able to receive streamed content.
+fn close_block(block: &mut Block) {
+    match block {
+        Block::Assistant { complete, .. } => *complete = true,
+        Block::Thinking { complete, .. } => *complete = true,
+        Block::Tools { activity, .. } => finalize_activity(activity),
+        _ => {}
+    }
+}
+
 impl Transcript {
     pub fn new() -> Self {
         Self::default()
@@ -559,6 +613,53 @@ impl Transcript {
         self.tool_group_boundaries.clear();
     }
 
+    /// Replaces the conversation with the engine's authoritative version,
+    /// keeping the blocks that are this client's own.
+    ///
+    /// The engine owns what the conversation *is*; it does not own the
+    /// startup banner, the launch notices, `/help` output or a `/diff`, none
+    /// of which any history read could ever return. Clearing everything threw
+    /// those away on every resume, gap and compaction — and an empty
+    /// authoritative history did it while adding nothing back.
+    ///
+    /// Position is preserved as far as it can honestly be: client blocks that
+    /// preceded the whole conversation still precede it, and the rest keep
+    /// their order after it, because where they sat *within* a conversation
+    /// that has just been rebuilt is no longer knowable.
+    ///
+    /// Fold and group state is dropped with the old blocks, exactly as
+    /// [`Self::clear`] does: both are recorded by block index, and carrying
+    /// them over would expand or fold whichever blocks happen to land on
+    /// those indices next.
+    pub fn replace_conversation(&mut self, conversation: Vec<Block>) {
+        let mut conversation = conversation;
+        // Closed here rather than by the caller: once the client's own
+        // trailing blocks are appended, the conversation's last block is no
+        // longer the transcript's last block, and a caller reaching for
+        // `close_open` would finalise a banner instead of a tool batch.
+        if let Some(last) = conversation.last_mut() {
+            close_block(last);
+        }
+        let previous = std::mem::take(&mut self.blocks);
+        let first_conversation = previous.iter().position(|block| !block.is_client_owned());
+        let split = first_conversation.unwrap_or(previous.len());
+        let mut rebuilt: Vec<Block> = Vec::with_capacity(previous.len() + conversation.len());
+        let mut trailing: Vec<Block> = Vec::new();
+        for (index, block) in previous.into_iter().enumerate() {
+            if index < split {
+                rebuilt.push(block);
+            } else if block.is_client_owned() {
+                trailing.push(block);
+            }
+        }
+        rebuilt.extend(conversation);
+        rebuilt.extend(trailing);
+
+        self.blocks = rebuilt;
+        self.expanded_tool_groups.clear();
+        self.tool_group_boundaries.clear();
+    }
+
     /// The trailing block if it is still open, so streamed content can be
     /// appended to it rather than starting a new block per delta.
     pub fn open_tail(&mut self) -> Option<&mut Block> {
@@ -572,12 +673,7 @@ impl Transcript {
     /// an interrupted turn never leaves tools apparently still running.
     pub fn close_open(&mut self) {
         if let Some(block) = self.blocks.last_mut() {
-            match block {
-                Block::Assistant { complete, .. } => *complete = true,
-                Block::Thinking { complete, .. } => *complete = true,
-                Block::Tools { activity, .. } => finalize_activity(activity),
-                _ => {}
-            }
+            close_block(block);
         }
     }
 
@@ -955,6 +1051,137 @@ mod tests {
         transcript.push(completed_tool("second", CallStatus::Succeeded, "other-turn", None));
         assert_eq!(transcript.render(120, ToolDisplayMode::Summary).iter()
             .filter(|row| row.text.contains("Ran 1 tool")).count(), 2);
+    }
+
+    #[test]
+    fn replacing_the_conversation_keeps_this_clients_own_blocks() {
+        // The engine owns the conversation; the banner, the launch notices,
+        // `/help` output and a `/diff` are this client's own and are not a
+        // projection of any history the engine could return. Throwing them
+        // away on every resume, gap or compaction lost them for good.
+        let mut transcript = Transcript::new();
+        transcript.push(Block::Banner { wordmark: vec!["coda".into()], details: vec![] });
+        transcript.push(Block::Notice { text: "Forked from abc".into(), level: NoticeLevel::Info });
+        transcript.push(user_block("old question"));
+        transcript.push(assistant_block("old answer"));
+        transcript.push(Block::CommandOutput { text: "/help".into() });
+        transcript.push(Block::Diff { raw: "diff --git a b".into() });
+
+        transcript.replace_conversation(vec![user_block("new question"), assistant_block("new answer")]);
+
+        let shape: Vec<&str> = transcript
+            .blocks()
+            .iter()
+            .map(|block| match block {
+                Block::Banner { .. } => "banner",
+                Block::Notice { .. } => "notice",
+                Block::User { text, .. } => text.as_str(),
+                Block::Assistant { text, .. } => text.as_str(),
+                Block::CommandOutput { .. } => "output",
+                Block::Diff { .. } => "diff",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                "banner",
+                "notice",
+                "new question",
+                "new answer",
+                "output",
+                "diff",
+            ],
+            "client-owned blocks must survive, with the leading ones still leading"
+        );
+    }
+
+    #[test]
+    fn an_empty_authoritative_conversation_still_clears_the_old_one() {
+        // A rewind to the very start says the conversation is empty. Keeping
+        // the previous messages because there was nothing to replace them
+        // with would show a conversation the engine no longer has.
+        let mut transcript = Transcript::new();
+        transcript.push(Block::Banner { wordmark: vec!["coda".into()], details: vec![] });
+        transcript.push(user_block("old question"));
+        transcript.push(assistant_block("old answer"));
+
+        transcript.replace_conversation(Vec::new());
+
+        assert_eq!(transcript.len(), 1, "{:?}", transcript.blocks());
+        assert!(matches!(transcript.blocks()[0], Block::Banner { .. }));
+    }
+
+    #[test]
+    fn replacing_the_conversation_drops_fold_state_that_indexed_the_old_one() {
+        // Group expansion and group boundaries are recorded by block index.
+        // Carrying them across a replacement would fold and expand whichever
+        // blocks happen to land on those indices next.
+        let mut transcript = Transcript::new();
+        transcript.push(completed_tool("read_file", CallStatus::Succeeded, "turn", None));
+        transcript.push(completed_tool("grep", CallStatus::Succeeded, "turn", None));
+        assert!(transcript.toggle_tool_group(0), "the group is foldable to begin with");
+        transcript.end_tool_group();
+
+        transcript.replace_conversation(vec![
+            completed_tool("edit", CallStatus::Succeeded, "next", None),
+            completed_tool("bash", CallStatus::Succeeded, "next", None),
+        ]);
+
+        let rows = transcript.render(80, ToolDisplayMode::Summary);
+        assert_eq!(
+            rows.iter().filter(|row| row.text.contains("Ran 2 tools")).count(),
+            1,
+            "a stale expansion or boundary survived the replacement: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn replacing_the_conversation_keeps_decisions_the_engine_cannot_reconstruct() {
+        // A permission outcome and a question's answer are records of what the
+        // operator did *at this terminal*. `session/getHistory` describes the
+        // conversation the model saw and carries neither, so a rebuild that
+        // dropped them erased the only record that they ever happened — and
+        // erased it precisely when a resume or a compaction made the record
+        // most valuable.
+        let mut transcript = Transcript::new();
+        transcript.push(user_block("old question"));
+        transcript.push(Block::Permission {
+            tool: "run_command".into(),
+            preview: "rm -rf build".into(),
+            decision: PermissionDecision::Denied,
+        });
+        transcript.push(Block::Question {
+            question: "Which branch?".into(),
+            answer: Some("main".into()),
+        });
+
+        transcript.replace_conversation(vec![user_block("new question")]);
+
+        assert!(
+            transcript.blocks().iter().any(|b| matches!(
+                b,
+                Block::Permission { decision: PermissionDecision::Denied, .. }
+            )),
+            "the permission decision was erased: {:?}",
+            transcript.blocks()
+        );
+        assert!(
+            transcript
+                .blocks()
+                .iter()
+                .any(|b| matches!(b, Block::Question { answer: Some(a), .. } if a == "main")),
+            "the answer given here was erased: {:?}",
+            transcript.blocks()
+        );
+        assert!(
+            !transcript
+                .blocks()
+                .iter()
+                .any(|b| matches!(b, Block::User { text, .. } if text == "old question")),
+            "the conversation itself must still be replaced: {:?}",
+            transcript.blocks()
+        );
     }
 
     fn texts(lines: &[RenderLine]) -> Vec<String> {

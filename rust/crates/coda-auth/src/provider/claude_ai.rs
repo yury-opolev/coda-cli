@@ -20,13 +20,31 @@ use serde::Deserialize;
 
 use crate::credential::{AccountInfo, Credential, CredentialKind};
 use crate::error::AuthError;
-use crate::loopback::LoopbackListener;
+use crate::loopback::{CallbackVerdict, LoopbackListener, RedirectResult};
 use crate::pkce;
 use crate::provider::AuthProvider;
 use crate::secret::Secret;
 
 /// Provider id.
 pub const PROVIDER_ID: &str = "claude-ai";
+
+/// The scopes the .NET client requests for a Claude.ai subscription login.
+///
+/// The set is not cosmetic: dropping `user:inference` yields a token that
+/// cannot run a completion, and dropping `user:sessions:claude_code` breaks
+/// session continuity — both of which surface much later as opaque 403s.
+pub const ALL_OAUTH_SCOPES: &[&str] = &[
+    "org:create_api_key",
+    "user:profile",
+    "user:inference",
+    "user:sessions:claude_code",
+    "user:mcp_servers",
+    "user:file_upload",
+];
+
+/// Default wall-clock budget for a browser login, matching the time a user
+/// realistically needs to complete a hosted sign-in.
+pub const DEFAULT_LOGIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// OAuth beta header required for subscription auth.
 pub const OAUTH_BETA_HEADER: &str = "oauth-2025-04-20";
@@ -35,11 +53,27 @@ pub const OAUTH_BETA_HEADER: &str = "oauth-2025-04-20";
 const REFRESH_BUFFER: Duration = Duration::from_secs(5 * 60);
 
 /// Claude.ai OAuth configuration.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is implemented by hand: the endpoint URLs are configurable and a
+/// proxy endpoint can carry a token in its query or userinfo, which must not be
+/// reproducible from a log line. See
+/// [`redact_url`][crate::provider::copilot::redact_url].
+#[derive(Clone)]
 pub struct ClaudeAiConfig {
     pub client_id: String,
     pub authorize_url: String,
     pub token_url: String,
+}
+
+impl std::fmt::Debug for ClaudeAiConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::provider::copilot::redact_url;
+        f.debug_struct("ClaudeAiConfig")
+            .field("client_id", &self.client_id)
+            .field("authorize_url", &redact_url(&self.authorize_url))
+            .field("token_url", &redact_url(&self.token_url))
+            .finish()
+    }
 }
 
 impl ClaudeAiConfig {
@@ -65,7 +99,14 @@ impl ClaudeAiConfig {
     }
 }
 
-/// An in-progress Claude.ai login (holds the PKCE verifier and CSRF state).
+/// An in-progress Claude.ai login.
+///
+/// The flow **owns the live loopback listener** for its whole lifetime: the
+/// port advertised in `authorize_url` stays bound until the redirect arrives,
+/// the timeout fires, or the flow is dropped. Dropping it (which is what an
+/// outer `tokio::select!` on a cancellation token does) closes the listener and
+/// any half-answered browser connection, so a cancelled login leaves nothing
+/// listening and produces no credential.
 pub struct ClaudeAiLoginFlow {
     provider: ClaudeAiProvider,
     /// The URL the host must open in the browser.
@@ -74,24 +115,120 @@ pub struct ClaudeAiLoginFlow {
     pub state: String,
     verifier: Secret<String>,
     redirect_uri: String,
+    /// `None` only after [`ClaudeAiLoginFlow::finish`] has taken it, or when a
+    /// flow was constructed without a listener (tests).
+    listener: Option<LoopbackListener>,
 }
 
 impl ClaudeAiLoginFlow {
-    /// Complete the login by exchanging the authorization code.
+    /// The loopback redirect URI registered in `authorize_url`.
+    pub fn redirect_uri(&self) -> &str {
+        &self.redirect_uri
+    }
+
+    /// Wait for the browser redirect on the owned loopback listener and, once
+    /// the redirect validates, exchange the code for a credential.
+    ///
+    /// This is the API the CLI and the TUI drive; it has no UI dependency. The
+    /// browser is told the outcome only *after* the exchange, so the page can
+    /// never claim a sign-in that did not happen.
+    ///
+    /// Cancellation: drop the returned future (for example by racing it against
+    /// a cancellation token in `tokio::select!`). The listener closes with it.
+    ///
+    /// Time budget: `timeout` bounds the wait for the browser redirect only.
+    /// The token exchange that follows is bounded separately by this provider's
+    /// HTTP client timeout (15 s), so the worst case is `timeout + 15 s`. A
+    /// single connection that arrives and then stalls is dropped after a few
+    /// seconds and does not consume the redirect budget.
+    ///
+    /// Errors: [`AuthError::StateMismatch`] on a tampered or stale redirect,
+    /// [`AuthError::LoginCancelled`] on timeout, denial, or a redirect without
+    /// a code, and [`AuthError::OAuth`] when the token endpoint rejects the
+    /// exchange. None of these paths return a credential.
+    pub async fn wait_for_credential(mut self, timeout: Duration) -> Result<Credential, AuthError> {
+        let listener = self.listener.take().ok_or_else(|| {
+            AuthError::LoginCancelled("the login flow no longer owns a loopback listener".into())
+        })?;
+
+        let pending = listener.wait_for_callback_pending(timeout).await?;
+
+        let outcome = match validate_redirect(pending.redirect(), &self.state) {
+            Ok(code) => {
+                self.provider
+                    .exchange_code(&code, &self.state, self.verifier.expose(), &self.redirect_uri)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+
+        let verdict = if outcome.is_ok() {
+            CallbackVerdict::Success
+        } else {
+            CallbackVerdict::Failure
+        };
+        pending.respond(verdict).await;
+        outcome
+    }
+
+    /// Complete the login by exchanging an authorization code captured
+    /// elsewhere.
+    ///
+    /// Kept for callers that already hold the redirect parameters. It drops the
+    /// owned listener first, so the port is released before the exchange.
     ///
     /// Verifies `returned_state` against the stored state — a mismatch aborts
     /// the login because it indicates a CSRF attack or a stale redirect.
     pub async fn finish(
-        self,
+        mut self,
         code: &str,
         returned_state: &str,
     ) -> Result<Credential, AuthError> {
+        drop(self.listener.take());
         if returned_state != self.state {
             return Err(AuthError::StateMismatch);
+        }
+        if code.trim().is_empty() {
+            return Err(AuthError::LoginCancelled(
+                "the authorization server returned no code".into(),
+            ));
         }
         self.provider
             .exchange_code(code, &self.state, self.verifier.expose(), &self.redirect_uri)
             .await
+    }
+
+    /// Abandon the login, closing the loopback listener immediately.
+    pub fn cancel(self) {
+        drop(self);
+    }
+}
+
+/// Validates a captured redirect before anything is exchanged.
+///
+/// Returns the authorization code only when the state matches, the server
+/// reported no error, and a non-empty code is present.
+fn validate_redirect(redirect: &RedirectResult, expected_state: &str) -> Result<String, AuthError> {
+    if let Some(error) = redirect.error.as_deref() {
+        return Err(match error {
+            "access_denied" => {
+                AuthError::LoginCancelled("authorization was denied in the browser".into())
+            }
+            other => AuthError::OAuth { status: 400, body: other.to_owned() },
+        });
+    }
+
+    // Compare the state before looking at the code: a redirect that fails CSRF
+    // validation must not influence anything downstream.
+    if redirect.state.as_deref() != Some(expected_state) {
+        return Err(AuthError::StateMismatch);
+    }
+
+    match redirect.code.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+        Some(code) => Ok(code.to_owned()),
+        None => Err(AuthError::LoginCancelled(
+            "the browser redirect contained no authorization code".into(),
+        )),
     }
 }
 
@@ -113,8 +250,11 @@ impl ClaudeAiProvider {
 
     /// Begin the loopback authorization-code flow.
     ///
-    /// Returns a [`ClaudeAiLoginFlow`] whose `authorize_url` the host should
-    /// open in a browser, and whose `finish` method completes the exchange.
+    /// Returns a [`ClaudeAiLoginFlow`] that **owns the bound loopback
+    /// listener**: the port in its `redirect_uri` stays live until the flow
+    /// completes, times out, or is dropped. The host opens `authorize_url` in a
+    /// browser and then awaits
+    /// [`ClaudeAiLoginFlow::wait_for_credential`].
     pub async fn begin_login(
         &self,
         scopes: &[&str],
@@ -144,6 +284,7 @@ impl ClaudeAiProvider {
             state,
             verifier: Secret::new(verifier),
             redirect_uri,
+            listener: Some(listener),
         })
     }
 
@@ -167,7 +308,7 @@ impl ClaudeAiProvider {
             "state": state,
         });
         let response = self.post_token(&body).await?;
-        Ok(token_response_to_credential(response, None))
+        credential_from_token_response(response, None)
     }
 
     async fn do_refresh(&self, credential: &Credential) -> Result<Credential, AuthError> {
@@ -191,7 +332,7 @@ impl ClaudeAiProvider {
         let response = self.post_token(&body).await?;
         // Keep the old refresh token if the server did not issue a new one.
         let fallback = credential.refresh_token.clone();
-        Ok(token_response_to_credential(response, fallback))
+        credential_from_token_response(response, fallback)
     }
 
     async fn post_token(&self, body: &serde_json::Value) -> Result<OAuthTokenResponse, AuthError> {
@@ -302,11 +443,28 @@ fn form_encode(value: &str) -> String {
     out
 }
 
+/// Validates a token-endpoint response before it becomes a credential.
+///
+/// A 2xx response is not proof of success: a body without an access token
+/// would otherwise become a credential that authenticates nothing and fails
+/// much later, at the first inference call.
+fn credential_from_token_response(
+    resp: OAuthTokenResponse,
+    fallback_refresh: Option<Secret<String>>,
+) -> Result<Credential, AuthError> {
+    if resp.access_token.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        return Err(AuthError::OAuth {
+            status: 200,
+            body: "the token response contained no access token".into(),
+        });
+    }
+    Ok(token_response_to_credential(resp, fallback_refresh))
+}
+
 fn token_response_to_credential(
     resp: OAuthTokenResponse,
     fallback_refresh: Option<Secret<String>>,
-) -> Credential {
-    // Maximum safe value for chrono::Duration::seconds (≈ 292 years).
+) -> Credential {    // Maximum safe value for chrono::Duration::seconds (≈ 292 years).
     // Values beyond this panic chrono; clamp to 100 years (semantically
     // "permanent") so an attacker-controlled expires_in cannot cause a panic.
     const MAX_EXPIRES_SECS: i64 = 100 * 365 * 24 * 3600;
@@ -423,6 +581,7 @@ mod tests {
             state: state.clone(),
             verifier: Secret::new(verifier),
             redirect_uri: "http://localhost:0/callback".into(),
+            listener: None,
         };
 
         // A different state → should be rejected even without hitting the network.
@@ -690,6 +849,108 @@ mod tests {
         assert!(
             cred.expires_at.unwrap() > chrono::Utc::now(),
             "clamped expiry must be in the future"
+        );
+    }
+
+    // ── Redirect validation and listener ownership ────────────────────────────
+
+    fn redirect(code: Option<&str>, state: Option<&str>, error: Option<&str>) -> RedirectResult {
+        RedirectResult {
+            code: code.map(str::to_owned),
+            state: state.map(str::to_owned),
+            error: error.map(str::to_owned),
+            iss: None,
+        }
+    }
+
+    #[test]
+    fn a_redirect_without_a_code_is_not_a_state_mismatch_and_yields_no_code() {
+        let err = validate_redirect(&redirect(None, Some("s"), None), "s").unwrap_err();
+        assert!(matches!(err, AuthError::LoginCancelled(_)), "got {err:?}");
+
+        let blank = validate_redirect(&redirect(Some("   "), Some("s"), None), "s").unwrap_err();
+        assert!(matches!(blank, AuthError::LoginCancelled(_)), "got {blank:?}");
+    }
+
+    #[test]
+    fn a_redirect_error_is_reported_before_the_code_is_considered() {
+        let denied = validate_redirect(&redirect(Some("c"), Some("s"), Some("access_denied")), "s")
+            .unwrap_err();
+        assert!(matches!(denied, AuthError::LoginCancelled(_)), "got {denied:?}");
+
+        let other = validate_redirect(
+            &redirect(Some("c"), Some("s"), Some("server_error")),
+            "s",
+        )
+        .unwrap_err();
+        assert!(matches!(other, AuthError::OAuth { status: 400, .. }), "got {other:?}");
+    }
+
+    #[test]
+    fn a_mismatched_or_absent_state_is_a_state_mismatch() {
+        for returned in [None, Some("other")] {
+            let err = validate_redirect(&redirect(Some("c"), returned, None), "s").unwrap_err();
+            assert!(matches!(err, AuthError::StateMismatch), "got {err:?}");
+        }
+    }
+
+    #[test]
+    fn a_valid_redirect_yields_the_trimmed_code() {
+        let code = validate_redirect(&redirect(Some(" abc "), Some("s"), None), "s").expect("code");
+        assert_eq!(code, "abc");
+    }
+
+    /// The flow must keep the listener alive: the port advertised in the
+    /// authorize URL has to still be accepting connections after `begin_login`
+    /// returns, otherwise the browser redirect lands nowhere.
+    #[tokio::test]
+    async fn begin_login_keeps_the_advertised_port_bound() {
+        let p = provider("http://unused");
+        let flow = p.begin_login(ALL_OAUTH_SCOPES).await.expect("begin login");
+        let port: u16 = flow
+            .redirect_uri()
+            .rsplit_once(':')
+            .and_then(|(_, rest)| rest.split('/').next().map(str::to_owned))
+            .expect("port")
+            .parse()
+            .expect("port number");
+
+        assert!(
+            tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok(),
+            "the loopback listener must still be bound while the flow is alive"
+        );
+
+        drop(flow);
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        assert!(
+            tokio::net::TcpListener::bind(("127.0.0.1", port)).await.is_ok(),
+            "dropping the flow must release the loopback port"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_response_without_an_access_token_is_not_a_credential() {
+        let url = mock_token_server(200, r#"{"refresh_token":"only_refresh"}"#).await;
+        let p = provider(&url);
+        let err = p
+            .exchange_code("code", "state", "verifier", "http://localhost/cb")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AuthError::OAuth { status: 200, .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn the_scope_set_matches_the_dotnet_client() {
+        assert_eq!(
+            ALL_OAUTH_SCOPES,
+            [
+                "org:create_api_key",
+                "user:profile",
+                "user:inference",
+                "user:sessions:claude_code",
+                "user:mcp_servers",
+                "user:file_upload",
+            ]
         );
     }
 }

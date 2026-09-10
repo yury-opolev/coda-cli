@@ -16,9 +16,29 @@ pub const WORDMARK: &[&str] = crate::render::glyphs::WORDMARK;
 
 /// The crate version, matching the C# `Branding.Version`.
 pub fn version() -> &'static str {
-    // Set by build.rs from the repository's version.json, which is shared with
-    // the C# build so the version line is continuous across the two.
-    env!("CODA_VERSION")
+    // Delegates to `coda-boot`, the single place version.json is read and
+    // stamped in, so `coda`, `coda-tui` and `coda-engine` cannot report three
+    // different version strings from three copies of the same build-script
+    // logic.
+    coda_boot::version()
+}
+
+/// Where this session's provider, model and credentials are decided.
+///
+/// The banner exists to stop you spending money with the wrong account, so it
+/// must never describe a machine other than the one that actually decides. A
+/// client that talks to an engine it did not start cannot see that engine's
+/// credentials or defaults: "not signed in — run /login" would then be a
+/// statement about *this* terminal, and running `/login` here would change
+/// nothing the engine reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SettingsHost {
+    /// This machine. An unknown provider means nobody has signed in here.
+    #[default]
+    Local,
+    /// The engine's host. An unknown provider means it has not been reported
+    /// yet — never that nobody is signed in.
+    Engine,
 }
 
 /// What the exit summary reports.
@@ -33,6 +53,8 @@ pub struct ExitSummary {
     pub output_tokens: u64,
     pub session_id: Option<String>,
     pub working_directory: String,
+    /// Where the provider and model above came from.
+    pub settings_host: SettingsHost,
 }
 
 impl ExitSummary {
@@ -108,6 +130,7 @@ pub fn startup_detail_lines(
     working_directory: &str,
     provider: Option<&str>,
     model: Option<&str>,
+    host: SettingsHost,
 ) -> Vec<String> {
     let mut lines = Vec::new();
     lines.push(String::new());
@@ -115,12 +138,27 @@ pub fn startup_detail_lines(
     lines.push(TAGLINE.to_string());
     lines.push(String::new());
     lines.push(format!("cwd: {working_directory}"));
-    match provider {
-        Some(p) => lines.push(format!("provider: {p}   model: {}", model.unwrap_or("—"))),
-        None => lines.push("not signed in — run /login".to_string()),
-    }
+    lines.push(provider_line(provider, model, host));
     lines.push("Type /help for commands, or /exit to quit.".to_string());
     lines
+}
+
+/// The one line that says who this session is spending money as.
+fn provider_line(provider: Option<&str>, model: Option<&str>, host: SettingsHost) -> String {
+    match (provider, host) {
+        (Some(p), SettingsHost::Local) => format!("provider: {p}   model: {}", model.unwrap_or("—")),
+        (Some(p), SettingsHost::Engine) => format!(
+            "provider: {p}   model: {}   (managed on the engine host)",
+            model.unwrap_or("—")
+        ),
+        (None, SettingsHost::Local) => "not signed in — run /login".to_string(),
+        // Not "not signed in": this client cannot see the engine host's
+        // credentials, and offering /login would offer to change a file the
+        // engine never reads.
+        (None, SettingsHost::Engine) => {
+            "provider and model are managed on the engine host".to_string()
+        }
+    }
 }
 
 /// The startup banner, as plain lines ready to print.
@@ -128,15 +166,36 @@ pub fn startup_lines(
     working_directory: &str,
     provider: Option<&str>,
     model: Option<&str>,
+    host: SettingsHost,
 ) -> Vec<String> {
     let mut lines = wordmark_lines();
-    lines.extend(startup_detail_lines(working_directory, provider, model));
+    lines.extend(startup_detail_lines(working_directory, provider, model, host));
     lines
 }
 
+/// The provider/model/effort line of the exit summary.
+///
+/// An engine-owned session that was never told a provider says so, rather
+/// than printing "—", which reads as "none" and is a claim about the session
+/// this client is not entitled to make.
+fn exit_provider_line(summary: &ExitSummary) -> String {
+    let effort = summary.effort.as_deref().unwrap_or("auto");
+    let unknown = summary.provider_id.trim().is_empty() || summary.provider_id == "—";
+    if summary.settings_host == SettingsHost::Engine && unknown {
+        return format!("provider and model are managed on the engine host · effort: {effort}");
+    }
+    let provider = if unknown { "—" } else { summary.provider_id.as_str() };
+    let model = if summary.model.trim().is_empty() { "—" } else { summary.model.as_str() };
+    match summary.settings_host {
+        SettingsHost::Local => format!("provider: {provider} · model: {model} · effort: {effort}"),
+        SettingsHost::Engine => format!(
+            "provider: {provider} · model: {model} · effort: {effort} (managed on the engine host)"
+        ),
+    }
+}
+
 /// The exit summary, as plain lines ready to print.
-pub fn exit_lines(summary: &ExitSummary) -> Vec<String> {
-    let mut lines: Vec<String> = WORDMARK.iter().map(|l| (*l).to_string()).collect();
+pub fn exit_lines(summary: &ExitSummary) -> Vec<String> {    let mut lines: Vec<String> = WORDMARK.iter().map(|l| (*l).to_string()).collect();
     lines.push(String::new());
     lines.push("Session summary".to_string());
     lines.push(format!(
@@ -145,12 +204,7 @@ pub fn exit_lines(summary: &ExitSummary) -> Vec<String> {
         format_duration(summary.duration),
         summary.message_count
     ));
-    lines.push(format!(
-        "provider: {} · model: {} · effort: {}",
-        summary.provider_id,
-        summary.model,
-        summary.effort.as_deref().unwrap_or("auto")
-    ));
+    lines.push(exit_provider_line(summary));
     lines.push(format!(
         "Tokens: {} in · {} out · {} total",
         summary.input_tokens,
@@ -220,7 +274,7 @@ mod tests {
 
     #[test]
     fn the_startup_banner_names_the_provider_and_model() {
-        let lines = startup_lines("/tmp/project", Some("github-copilot"), Some("claude-opus-5"));
+        let lines = startup_lines("/tmp/project", Some("github-copilot"), Some("claude-opus-5"), SettingsHost::Local);
         let joined = lines.join("\n");
         assert!(joined.contains("github-copilot"), "{joined}");
         assert!(joined.contains("claude-opus-5"), "{joined}");
@@ -231,8 +285,46 @@ mod tests {
     /// sign of trouble is a failed turn.
     #[test]
     fn the_startup_banner_says_when_not_signed_in() {
-        let lines = startup_lines("/tmp", None, None);
+        let lines = startup_lines("/tmp", None, None, SettingsHost::Local);
         assert!(lines.iter().any(|l| l.contains("/login")), "{lines:?}");
+    }
+
+    #[test]
+    fn a_banner_for_an_engine_owned_session_never_claims_nobody_is_signed_in() {
+        // This client cannot see the engine host's credentials. "Not signed
+        // in — run /login" describes *this* machine, and running /login here
+        // would change nothing the engine reads.
+        let lines = startup_lines("/tmp", None, None, SettingsHost::Engine);
+        let joined = lines.join("\n");
+        assert!(!joined.contains("/login"), "a remote engine's credentials are not ours: {joined}");
+        assert!(joined.contains("engine host"), "{joined}");
+    }
+
+    #[test]
+    fn a_banner_for_an_engine_owned_session_names_what_the_engine_reported() {
+        let lines = startup_lines(
+            "/tmp",
+            Some("github-copilot"),
+            Some("claude-opus-5"),
+            SettingsHost::Engine,
+        );
+        let joined = lines.join("\n");
+        assert!(joined.contains("github-copilot") && joined.contains("claude-opus-5"), "{joined}");
+        assert!(joined.contains("engine host"), "where they are decided must be stated: {joined}");
+    }
+
+    #[test]
+    fn an_engine_owned_exit_summary_does_not_report_a_dash_as_the_provider() {
+        // "—" reads as "none", which is a claim about the session. The truth
+        // is that this client was never told.
+        let summary = ExitSummary {
+            provider_id: String::new(),
+            model: String::new(),
+            settings_host: SettingsHost::Engine,
+            ..Default::default()
+        };
+        let joined = exit_lines(&summary).join("\n");
+        assert!(joined.contains("engine host"), "{joined}");
     }
 
     #[test]
@@ -247,6 +339,7 @@ mod tests {
             output_tokens: 340,
             session_id: Some("abc123".into()),
             working_directory: r"C:\work".into(),
+            settings_host: SettingsHost::Local,
         };
         let joined = exit_lines(&summary).join("\n");
         assert!(joined.contains("1m 15s"), "{joined}");
@@ -269,3 +362,4 @@ mod tests {
         assert!(exit_lines(&summary).join("\n").contains("effort: auto"));
     }
 }
+

@@ -860,6 +860,21 @@ fn draw_status(
     viewport: &Viewport,
     theme: &Theme,
 ) {
+    frame.render_widget(
+        Paragraph::new(Line::from(status_spans(state, viewport, theme))).style(theme.surface()),
+        area,
+    );
+}
+
+/// Builds the status line's spans.
+///
+/// Pure and terminal-free so what the status bar *claims* — connected or not,
+/// and about which model — can be asserted without a frame.
+pub fn status_spans(
+    state: &UiState,
+    viewport: &Viewport,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
     // Static only: the pinned activity row above the composer owns the one
     // animated spinner now, so this never claims motion a second time in a
     // second place.
@@ -869,10 +884,15 @@ fn draw_status(
     )];
 
     if let Some(model) = &state.model {
-        spans.push(Span::styled(
-            format!("{} {model} ", glyphs::RULE_VERTICAL),
-            theme.style(Role::Notification),
-        ));
+        // Labelled, not dropped: which model the session was on is worth
+        // keeping after a disconnection, but printing it bare next to a status
+        // reads as the model of a live connection.
+        let text = if state.activity.is_connected() {
+            format!("{} {model} ", glyphs::RULE_VERTICAL)
+        } else {
+            format!("{} last model {model} ", glyphs::RULE_VERTICAL)
+        };
+        spans.push(Span::styled(text, theme.style(Role::Notification)));
     }
 
     if let Some(effort) = &state.effort {
@@ -936,10 +956,7 @@ fn draw_status(
         ));
     }
 
-    frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(theme.surface()),
-        area,
-    );
+    spans
 }
 
 /// Draws one surface: chrome, its pre-rendered lines, its hints and its caret.
@@ -1005,6 +1022,71 @@ mod tests {
     use coda_render::{Gutter, Span as RenderSpan};
     use crate::state::UiEvent;
     use ratatui::style::Modifier;
+
+    /// The status line as plain text, which is what the user actually reads.
+    fn status_text(state: &UiState) -> String {
+        status_spans(state, &Viewport::new(), &Theme::default())
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_disconnected_session_says_so_and_labels_the_model_it_used_to_have() {
+        // "ready" in green next to a model name is a claim about an engine.
+        // After a sign-out — or a replacement that did not start — there is no
+        // engine, and the conversation is kept precisely so the user can see
+        // what it *was*. Saying "ready" there invited a message that could not
+        // be sent, and the model shown belonged to a session that no longer
+        // existed.
+        let mut state = UiState::new();
+        state.apply(UiEvent::Connected { session_id: "s1".into() });
+        state.apply(UiEvent::ModelChanged {
+            id: "claude-sonnet-4-5".into(),
+            context_limit: None,
+        });
+        let connected = status_text(&state);
+        assert!(connected.contains("ready"), "{connected}");
+        assert!(connected.contains("claude-sonnet-4-5"), "{connected}");
+        assert!(!connected.contains("last model"), "{connected}");
+
+        state.apply(UiEvent::EngineDisconnected);
+        let disconnected = status_text(&state);
+        assert!(disconnected.contains("disconnected"), "{disconnected}");
+        assert!(!disconnected.contains("ready"), "a signed-out session claimed to be ready");
+        assert!(
+            disconnected.contains("last model claude-sonnet-4-5"),
+            "the previous model was shown as though it were live: {disconnected}"
+        );
+        // And nothing may claim to be running.
+        assert!(!state.is_busy(), "a disconnected session reported a turn in flight");
+        assert!(!state.activity.is_animated(), "a disconnected session spun a spinner");
+        assert_eq!(compose_activity(&state, Instant::now()), None);
+
+        // Adopting a replacement is what puts it back.
+        state.apply(UiEvent::EngineAdopted);
+        let again = status_text(&state);
+        assert!(again.contains("ready"), "{again}");
+        assert!(!again.contains("last model"), "{again}");
+    }
+
+    #[test]
+    fn a_disconnection_keeps_the_conversation_and_the_session_it_belonged_to() {
+        // The status is the only thing that changes: nothing about a
+        // disconnection is a reason to lose what was said or which session it
+        // was said in.
+        let mut state = UiState::new();
+        state.apply(UiEvent::Connected { session_id: "s1".into() });
+        state.apply(UiEvent::Submitted { text: "keep me".into() });
+        let before = state.transcript.blocks().len();
+
+        state.apply(UiEvent::EngineDisconnected);
+
+        assert_eq!(state.transcript.blocks().len(), before, "the conversation was lost");
+        assert_eq!(state.session_id.as_deref(), Some("s1"));
+        assert_eq!(state.model, None);
+    }
+
 
     fn theme() -> Theme {
         Theme::warm_ember().with_depth(ColorDepth::TrueColor)

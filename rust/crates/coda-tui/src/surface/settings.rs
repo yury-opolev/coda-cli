@@ -127,17 +127,27 @@ impl SettingsSurface {
         self.inner.form()
     }
 
-    /// Applies the form's values onto `settings` and saves.
-    pub fn apply(&self, settings: &mut Settings) -> Result<(), ConfigError> {
+    /// Applies the values this **client** owns — appearance and presentation.
+    ///
+    /// Split from [`Self::apply_engine_owned`] because one form edits two
+    /// different things: what this terminal looks like, and what the engine
+    /// reads at its own startup. Only the first is meaningful when the engine
+    /// runs somewhere this client cannot write.
+    pub fn apply_client_local(&self, settings: &mut Settings) {
         let form = self.form();
-        if let Some(i) = selected(form, index::PERMISSION) {
-            settings.set_permission_mode(PERMISSION_MODES[i]);
-        }
         if let Some(i) = selected(form, index::THEME) {
             settings.set_theme(THEMES[i]);
         }
         if let Some(i) = selected(form, index::TOOL_DISPLAY) {
             settings.set_tool_display_mode(TOOL_DISPLAY_MODES[i]);
+        }
+    }
+
+    /// Applies the values the **engine** reads at startup.
+    pub fn apply_engine_owned(&self, settings: &mut Settings) {
+        let form = self.form();
+        if let Some(i) = selected(form, index::PERMISSION) {
+            settings.set_permission_mode(PERMISSION_MODES[i]);
         }
         if let Some(switch) = form
             .control(index::TELEMETRY)
@@ -150,6 +160,12 @@ impl SettingsSurface {
             let stderr = settings.telemetry_stderr();
             settings.set_telemetry(switch.is_on(), &level, stderr);
         }
+    }
+
+    /// Applies every value the form edits, and saves.
+    pub fn apply(&self, settings: &mut Settings) -> Result<(), ConfigError> {
+        self.apply_client_local(settings);
+        self.apply_engine_owned(settings);
         settings.save()
     }
 }

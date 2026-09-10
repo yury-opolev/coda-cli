@@ -1,0 +1,16 @@
+{
+  "_comment": "Known-answer vectors produced by .NET AesGcm with the same primitives LlmAuth.FileTokenStore uses: raw 32-byte key, file layout nonce(12) || tag(16) || ciphertext. All values are fabricated test data; no real credential or key is involved.",
+  "key": "030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dc",
+  "samples": [
+    {
+      "name": "credential",
+      "plaintext": "{\"providerId\":\"claude-ai\",\"kind\":\"OAuth\",\"accessToken\":\"fixture-access-token\",\"refreshToken\":\"fixture-refresh-token\",\"expiresAt\":\"2999-01-01T00:00:00+00:00\",\"scopes\":[\"user:inference\"],\"account\":{\"emailAddress\":\"fixture@example.invalid\"}}",
+      "file": "a0a1a2a3a4a5a6a7a8a9aaab7ac62eb8558aafabb356e627b53ed3c100a6037b820bc6b171f463340825ce23774f4a0af5ca830d07d43b384b584caefc1e4398ab4dba804af2fc2e0c4c86b7e8853e657ff0a051cd875dda0edb3ca1ef61492166d7475503052c99146fc14e3f3a7dde6049c8cad0c85f043c73a9f30a3ffc4c2dbe82723b9ea6cde5f2d54fcd39eafc88ee7633bbdb16a241c75c16a3d13bf10a676c9d75fff2cf1c24c5145d5077684fa78e3651e0a5ff177291df053d952ad3a2eaf812517dd6fe1f82a3bc5ac452676eb29bf8e97163a40591781c45971be7d96702c209aecf1f6e710a9617c1bb29ab29c36a00f21c45dc645810f63762e3ab8b05a20ca6b0876c"
+    },
+    {
+      "name": "unicode",
+      "plaintext": "{\"providerId\":\"claude-ai\",\"kind\":\"ApiKey\",\"apiKey\":\"clé-de-test-你好-🔑\"}",
+      "file": "a0a1a2a3a4a5a6a7a8a9aaabf85fdb9d35ff95722d488ca9d0e8c48a00a6037b820bc6b171f463340825ce23774f4a0af5ca830d07d43b384b584caefc1e4da9b772b7db44fcbf2c1f40bea1c5c86f2272be59da868a40830fcc2af8a3e697e4f001d70c9cf1dd66143e"
+    }
+  ]
+}

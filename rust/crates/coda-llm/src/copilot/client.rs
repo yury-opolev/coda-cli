@@ -29,7 +29,7 @@ const CHANNEL_DEPTH: usize = 256;
 const MODELS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Configuration for [`CopilotClient`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CopilotConfig {
     pub base_url: String,
     pub token: String,
@@ -39,6 +39,18 @@ pub struct CopilotConfig {
     /// Optional dynamic credential source; when present its `Authorization: Bearer`
     /// header overrides the static `token` field so tokens are always fresh.
     pub credential_source: Option<std::sync::Arc<dyn crate::credential_source::CredentialSource>>,
+}
+
+impl std::fmt::Debug for CopilotConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CopilotConfig")
+            .field("base_url", &"[REDACTED]")
+            .field("token", &"[REDACTED]")
+            .field("retry", &self.retry)
+            .field("extra_headers", &"[REDACTED]")
+            .field("credential_source", &self.credential_source.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 impl CopilotConfig {
@@ -119,26 +131,20 @@ impl CopilotClient {
     fn auth_post_with_auth(
         &self,
         url: &str,
+        endpoint: CopilotEndpoint,
         dynamic_auth: Option<&[(String, String)]>,
     ) -> reqwest::RequestBuilder {
-        let mut builder = self
-            .http
-            .post(url)
-            .header("content-type", "application/json")
-            .header("accept", "text/event-stream");
-
-        if let Some(headers) = dynamic_auth {
-            for (name, value) in headers {
-                builder = builder.header(name.as_str(), value.as_str());
-            }
-        } else {
-            builder = builder.header("authorization", format!("Bearer {}", self.config.token));
+        let mut defaults = vec![
+            ("content-type".into(), "application/json".into()),
+            ("accept".into(), "text/event-stream".into()),
+        ];
+        if endpoint == CopilotEndpoint::Messages {
+            defaults.push(("anthropic-version".into(), ANTHROPIC_API_VERSION.into()));
         }
-
-        for (name, value) in &self.config.extra_headers {
-            builder = builder.header(name.as_str(), value.as_str());
+        if dynamic_auth.is_none() {
+            defaults.push(("authorization".into(), format!("Bearer {}", self.config.token)));
         }
-        builder
+        crate::headers::apply(self.http.post(url), defaults, &self.config.extra_headers, dynamic_auth)
     }
 
     /// Build a GET request applying auth headers (used for model listing).
@@ -147,20 +153,11 @@ impl CopilotClient {
         url: &str,
         dynamic_auth: Option<&[(String, String)]>,
     ) -> reqwest::RequestBuilder {
-        let mut builder = self.http.get(url);
-
-        if let Some(headers) = dynamic_auth {
-            for (name, value) in headers {
-                builder = builder.header(name.as_str(), value.as_str());
-            }
-        } else {
-            builder = builder.header("authorization", format!("Bearer {}", self.config.token));
+        let mut defaults = Vec::new();
+        if dynamic_auth.is_none() {
+            defaults.push(("authorization".into(), format!("Bearer {}", self.config.token)));
         }
-
-        for (name, value) in &self.config.extra_headers {
-            builder = builder.header(name.as_str(), value.as_str());
-        }
-        builder
+        crate::headers::apply(self.http.get(url), defaults, &self.config.extra_headers, dynamic_auth)
     }
     /// Fetches models from the API and stores them in the cache on success.
     async fn do_list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
@@ -171,7 +168,7 @@ impl CopilotClient {
 
         // Use the credential source if configured, same as streaming requests.
         let dynamic_auth: Option<Vec<(String, String)>> = if let Some(src) = &self.config.credential_source {
-            src.auth_headers().await
+            src.auth_headers().await?
         } else {
             None
         };
@@ -184,7 +181,10 @@ impl CopilotClient {
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let body = response.text().await.unwrap_or_default();
-            return Err(LlmError::from_status(status, &body, None));
+            // Model discovery, not inference: a Copilot account can be signed
+            // in without model-listing entitlement, so a 403 keeps its status
+            // rather than becoming an authentication refusal.
+            return Err(LlmError::from_model_discovery_status(status, &body, None));
         }
 
         let value: serde_json::Value = tokio::time::timeout(MODELS_TIMEOUT, response.json())
@@ -207,11 +207,7 @@ impl CopilotClient {
         // Delegate to the shared retry loop so the Anthropic and Copilot clients
         // do not duplicate the retry-after parsing, backoff and tracing logic.
         crate::retry::send_with_retry(&self.config.retry, "copilot", || {
-            let mut builder = self.auth_post_with_auth(url, dynamic_auth).json(body);
-            if endpoint == CopilotEndpoint::Messages {
-                builder = builder.header("anthropic-version", ANTHROPIC_API_VERSION);
-            }
-            builder
+            self.auth_post_with_auth(url, endpoint, dynamic_auth).json(body)
         })
         .await
     }
@@ -229,7 +225,7 @@ impl CopilotClient {
 
         // Fetch dynamic auth once per request (before endpoint selection / retry).
         let dynamic_auth_owned: Option<Vec<(String, String)>> = if let Some(src) = &self.config.credential_source {
-            src.auth_headers().await
+            src.auth_headers().await?
         } else {
             None
         };
@@ -381,6 +377,29 @@ impl ProtocolDecoder for Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_identity_headers_replace_static_values_once() {
+        let names = ["user-agent", "editor-version", "editor-plugin-version",
+            "copilot-integration-id", "x-github-api-version"];
+        let mut config = CopilotConfig::with_token("static-token");
+        for name in names {
+            config = config.with_header(name, "static-value");
+        }
+        let client = CopilotClient::new(config).unwrap();
+        let dynamic: Vec<_> = names.iter().map(|name| (name.to_ascii_uppercase(), "dynamic-value".into())).collect();
+        for post in [false, true] {
+            let request = if post {
+                client.auth_post_with_auth("https://example.invalid", CopilotEndpoint::ChatCompletions, Some(&dynamic))
+            } else {
+                client.auth_get_with_auth("https://example.invalid", Some(&dynamic))
+            }.build().unwrap();
+            for name in names {
+                assert_eq!(request.headers().get_all(name).iter().count(), 1, "{name}");
+                assert_eq!(request.headers()[name], "dynamic-value");
+            }
+        }
+    }
     use serde_json::json;
 
     fn config(base_url: &str) -> CopilotConfig {

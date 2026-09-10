@@ -1,0 +1,36 @@
+{
+  "type": "object",
+  "properties": {
+    "messages": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/WireMessage"
+      }
+    },
+    "nextIndex": {
+      "type": "integer",
+      "format": "int32",
+      "default": 0
+    }
+  },
+  "title": "MessagesResult",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "WireMessage": {
+      "type": "object",
+      "properties": {
+        "role": {
+          "type": "string",
+          "description": "`\"user\"` or `\"assistant\"`."
+        },
+        "content": {
+          "type": "string",
+          "default": ""
+        }
+      },
+      "required": [
+        "role"
+      ]
+    }
+  }
+}

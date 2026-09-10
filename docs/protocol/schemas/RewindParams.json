@@ -1,0 +1,16 @@
+{
+  "type": "object",
+  "properties": {
+    "n": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0,
+      "description": "Exchanges to remove. The legacy handler treats absence or zero as one."
+    }
+  },
+  "title": "RewindParams",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

@@ -1,0 +1,72 @@
+{
+  "type": "object",
+  "properties": {
+    "protocolVersion": {
+      "type": "string"
+    },
+    "clientInfo": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "apiKey": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "sessionId": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Resumes an existing session when supplied."
+    },
+    "clientCapabilities": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ClientCapabilities"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Additive, optional (§2.1): absent means legacy behaviour."
+    }
+  },
+  "required": [
+    "protocolVersion"
+  ],
+  "title": "InitializeParams",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "ClientCapabilities": {
+      "type": "object",
+      "properties": {
+        "stateEvents": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "richHistory": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Reserved reader hint; it does not gate `session/getHistory`.\nThe `history.rich` capability reports that method's availability."
+        },
+        "maxEventPayloadBytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "Reserved preference: the current engine does not negotiate an outgoing\nframe-size limit from this value. See `events.payloadLimitNegotiation`."
+        }
+      },
+      "description": "Optional capability negotiation from the client (§2.1 of the serve API\nimplementation plan). Absence of the whole struct, or of any field inside\nit, means legacy behaviour: no gated event method is emitted."
+    }
+  }
+}

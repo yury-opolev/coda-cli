@@ -124,16 +124,16 @@ for limits, failure behavior, and compatibility with older logging flags.
   loop** that keeps working until a judge says the goal is met. Plus automatic
   history **compaction**, output-style personas, and a plugin/skills marketplace.
   See [`docs/skills-and-plugins.md`](docs/skills-and-plugins.md) for authoring skills and plugins.
-- **Programmatic & embeddable** — `coda serve` exposes the agent over JSON-RPC
-  (bidirectional: it streams progress and can ask the caller permission/clarification
-  questions), over stdio or an **API-key-authenticated local named pipe/Unix socket**; or embed the
-  engine directly via `Coda.Sdk`.
+- **Programmatic access** — Rust `coda serve` exposes the agent over bidirectional
+  JSON-RPC on stdio, streaming progress and requesting permission or clarification.
+  The **legacy C# implementation** additionally supports API-key-authenticated local
+  named pipes/Unix sockets and in-process embedding through `Coda.Sdk`.
 
 Coda is its own product, independent of any vendor's official CLI.
 
-> **Platform note:** the engine is cross-platform, but the TUI and `coda serve`
-> currently require **Windows** at runtime because the default credential store uses
-> DPAPI.
+> **Platform note:** the Rust engine and TUI use DPAPI credential storage on
+> Windows and encrypted-file storage on other platforms. The legacy C# TUI and
+> `coda serve` retain their Windows DPAPI runtime requirement.
 
 ## Coda — the interactive TUI
 
@@ -274,10 +274,11 @@ without a timestamp omit the annotation.
 Inside the REPL:
 
 ```
-/login [claude|copilot]   sign in (Claude.ai browser / Copilot device code)
+/login [claude|copilot|api-key]   sign in (Claude.ai browser / Copilot device code / API key)
 /status                   sign-in state for every provider
 /tasks                    open the live task browser (prints a textual snapshot in plain/Spectre)
-/provider [id]            show or switch the active provider
+/provider [id]            show the connected account, or connect a different one
+/setup                    the first-run wizard: choose an account and sign in
 /model [id]               show or set the chat model
 /effort [low|medium|high|xhigh|max|auto]  choose or set model-specific reasoning effort
 /context                  show context-window usage broken down by category

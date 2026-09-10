@@ -1,0 +1,32 @@
+{
+  "type": "object",
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "engineInstanceId": {
+      "type": "string"
+    },
+    "fromCursor": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "toCursor": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "reason": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "seq",
+    "engineInstanceId",
+    "fromCursor",
+    "toCursor",
+    "reason"
+  ],
+  "title": "EventsDroppedEvent",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

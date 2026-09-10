@@ -1,0 +1,60 @@
+{
+  "type": "object",
+  "properties": {
+    "engineInstanceId": {
+      "type": "string"
+    },
+    "events": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/EventEnvelope"
+      }
+    },
+    "nextCursor": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "truncated": {
+      "type": "boolean"
+    },
+    "oldestAvailableCursor": {
+      "type": "integer",
+      "format": "int64"
+    }
+  },
+  "required": [
+    "engineInstanceId",
+    "events",
+    "nextCursor",
+    "truncated",
+    "oldestAvailableCursor"
+  ],
+  "description": "Result of `session/getEvents`.",
+  "title": "GetEventsResult",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "EventEnvelope": {
+      "type": "object",
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "engineInstanceId": {
+          "type": "string"
+        },
+        "method": {
+          "type": "string"
+        },
+        "params": true
+      },
+      "required": [
+        "seq",
+        "engineInstanceId",
+        "method",
+        "params"
+      ],
+      "description": "One stored/replayed notification, exactly as `session/getEvents` returns\nit. `params` is the whole original payload (already carrying `seq` and\n`engineInstanceId`, since the bus injects them before storing) — a\nreplayed frame is never truncated or re-summarised."
+    }
+  }
+}

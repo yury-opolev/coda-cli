@@ -27,8 +27,14 @@ fn to_proto_correlation(c: &LlmCorrelation) -> ProtoCorrelation {
     ProtoCorrelation {
         root_turn_id: c.root_turn_id.clone(),
         activity_id: c.activity_id.clone(),
-        call_id: None, // coda_llm::Correlation has no call_id field
+        // `source_id` already carries the provider `tool_use.id` (F3):
+        // proto and `to_notification` already support `callId` end to end,
+        // this was the one hard-coded gap.
+        call_id: c.source_id.clone(),
         source_id: c.source_id.clone(),
+        // Additive alias (§2.6): `batchId` equals today's per-batch
+        // `activity_id` value verbatim — `activity_id` is never re-rooted.
+        batch_id: c.activity_id.clone(),
     }
 }
 
@@ -130,6 +136,20 @@ pub enum AgentEvent {
     PostCompactContextInjected { context: String },
     /// No proto event; silently dropped by the adapter.
     Warning { message: String },
+    /// Fired once per outer stream attempt, immediately before `client.stream()`
+    /// is awaited (§ activity phase machine: this is the observable boundary
+    /// between `preparing` and `waitingForModel`). No proto event — observed
+    /// only by `coda-serve`'s state sink.
+    ModelRequestStarted { request_id: String },
+    /// Fired once the stream for `request_id` has finished, however it ended.
+    /// `outcome` is `"success" | "error" | "cancelled"`. No proto event.
+    ModelRequestEnded { request_id: String, outcome: String },
+    /// Fired before the first tool in a batch executes. No proto event —
+    /// observed only by `coda-serve`'s state sink to enter `runningTools`.
+    ToolBatchStarted { batch_id: String, call_ids: Vec<String> },
+    /// Fired after every tool in the batch has produced a result (or the
+    /// batch was cut short by steering pre-emption). No proto event.
+    ToolBatchEnded { batch_id: String },
 }
 
 /// Receives agent events.  A single `emit` call per event keeps the trait
@@ -312,6 +332,10 @@ pub fn to_proto_event(event: &AgentEvent) -> Option<ProtoEvent> {
             })
         }
         AgentEvent::Warning { .. } => None,
+        AgentEvent::ModelRequestStarted { .. } => None,
+        AgentEvent::ModelRequestEnded { .. } => None,
+        AgentEvent::ToolBatchStarted { .. } => None,
+        AgentEvent::ToolBatchEnded { .. } => None,
     }
 }
 

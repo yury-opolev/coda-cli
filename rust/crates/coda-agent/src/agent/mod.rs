@@ -53,8 +53,25 @@ pub enum AgentError {
     Cancelled,
     #[error("LLM error: {0}")]
     Llm(#[from] coda_llm::LlmError),
+    /// A tool raised [`coda_tool::ToolControl::AbortRun`]: the run stopped
+    /// with a typed failure and no follow-up model request was issued.
+    ///
+    /// This is deliberately a distinct variant rather than `Other`: every
+    /// caller that must not report success after an operator question went
+    /// unanswered has to match on something specific, and a stringly-typed
+    /// `Other` would let a future edit lose that meaning silently.
+    #[error("run aborted: {reason}")]
+    Aborted { reason: String },
     #[error("{0}")]
     Other(#[from] anyhow::Error),
+}
+
+impl AgentError {
+    /// `true` when the run ended because a tool demanded it stop — as opposed
+    /// to a provider fault or an explicit cancellation.
+    pub fn is_aborted(&self) -> bool {
+        matches!(self, AgentError::Aborted { .. })
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -82,6 +99,12 @@ impl ToolActivity {
             activity_id: Some(self.activity_id.clone()),
             source_id: Some(call_id.to_owned()),
         }
+    }
+
+    /// The per-batch id (equals `activity_id`, aliased on the wire as
+    /// `batchId` — see `events::to_proto_correlation`).
+    pub fn batch_id(&self) -> &str {
+        &self.activity_id
     }
 }
 
@@ -554,13 +577,27 @@ impl AgentLoop {
                     subagent_factory: self.subagent_factory.clone(),
                 };
 
-                let ToolBatchResult { result_blocks, abort_reason } =
+                let ToolBatchResult { result_blocks, abort_reason, control_abort } =
                     run_tools(&tool_uses_in_history, &activity, sink, &batch_ctx, cancel.clone())
                         .await?;
 
                 history.push(Message::new(Role::User, result_blocks));
 
                 // §8 item 28: persist after tool results (seam; no-op here).
+
+                // A typed terminal control signal from a tool. The batch's
+                // result blocks are already in history (so the conversation
+                // stays valid), but the loop stops here: no follow-up model
+                // request is issued, and the caller receives a typed error
+                // rather than a completion it could mistake for success.
+                if let Some(reason) = control_abort {
+                    sink.emit(AgentEvent::Stop { stop_reason: Some("aborted".into()) });
+                    sink.emit(AgentEvent::LimitReached {
+                        kind: "aborted".into(),
+                        message: format!("The run stopped: {reason}"),
+                    });
+                    return Err(AgentError::Aborted { reason });
+                }
 
                 if let Some(reason) = abort_reason {
                     // PreToolUse hook returned continue:false (§1.5).
@@ -1503,6 +1540,65 @@ mod tests {
             matches!(e, AgentEvent::ToolResult { tool_name, is_error: true, .. } if tool_name == "tool_b")
         });
         assert!(denied, "tool_b must have a denial error result");
+    }
+
+    // ── ToolBatchStarted/Ended wrap the whole batch exactly once ─────────────
+    //
+    // `coda-serve`'s state sink uses this pair to enter/leave `runningTools`
+    // (§ activity phase machine). Two tool rounds in one turn must produce two
+    // matched (Started, Ended) pairs with the same batch_id within each pair,
+    // and Started/Ended must bracket every ToolCall/ToolResult in that batch.
+    #[tokio::test]
+    async fn tool_batch_started_and_ended_bracket_each_batch_exactly_once() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let sink = CollectingSink::new();
+
+        let client = MockLlmClient::new(vec![
+            vec![Ok(tool_use_event("t1", "tool_a")), Ok(done())],
+            vec![Ok(tool_use_event("t2", "tool_a")), Ok(done())],
+            vec![Ok(StreamEvent::TextDelta("done".into())), Ok(done())],
+        ]);
+        let tools = Arc::new(ToolRegistry::new([dyn_tool(MockTool::new("tool_a", true, log))]));
+        let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
+            .with_tool_max_duration(None)
+            .build();
+
+        let mut history = vec![Message::user("go")];
+        agent.run(&mut history, &sink, None, CancellationToken::new()).await.unwrap();
+
+        let events = sink.take();
+        let started: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolBatchStarted { batch_id, .. } => Some(batch_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let ended: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolBatchEnded { batch_id } => Some(batch_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started.len(), 2, "two tool rounds must produce two ToolBatchStarted events");
+        assert_eq!(ended.len(), 2, "two tool rounds must produce two ToolBatchEnded events");
+        assert_eq!(started, ended, "each batch's started/ended ids must match, in order");
+        // Distinct batches must not share an id.
+        assert_ne!(started[0], started[1]);
+
+        // Every ToolCall/ToolResult must fall strictly between its batch's
+        // Started and Ended index.
+        let idx_of = |pred: &dyn Fn(&AgentEvent) -> bool| {
+            events.iter().position(|e| pred(e)).expect("event present")
+        };
+        let batch1_start = idx_of(&|e| matches!(e, AgentEvent::ToolBatchStarted { .. }));
+        let batch1_end = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::ToolBatchEnded { .. }))
+            .unwrap();
+        let call1 = idx_of(&|e| matches!(e, AgentEvent::ToolCall { .. }));
+        assert!(batch1_start < call1 && call1 < batch1_end);
     }
 
     // ── §8 item 25: max_iterations soft stop ─────────────────────────────────

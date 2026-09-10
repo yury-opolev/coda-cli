@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
-use coda_agent::SessionSummary;
+use coda_proto::history::SessionSummaryDto;
 use coda_proto::messages::{
     ScheduledTask, WireHook, WireModel, WirePlugin, WireSkill,
 };
@@ -355,6 +355,104 @@ pub fn mcp(servers: &[McpServer]) -> Browser {
     browser
 }
 
+/// The MCP browser as the **engine** sees it, for a session whose files this
+/// client does not own.
+///
+/// Read-only by construction: `mcp/list` is a read, and there is no engine
+/// write API for MCP configuration — Coda never writes a remote client's
+/// filesystem. So the surface renders with an explicit "managed on the engine
+/// host" footer instead of offering keys that would silently edit the wrong
+/// machine's files, and it is emphatically not blank.
+///
+/// It also shows something the local file cannot: the *runtime* status, so an
+/// entry that was added after startup, or that failed to connect, is
+/// distinguishable from one that is actually running.
+pub fn mcp_from_engine(result: &coda_proto::mcp::McpListResult) -> Browser {
+    use coda_proto::mcp::{McpConfiguredState, McpRuntimeStatus};
+
+    let title = if result.enabled {
+        format!("MCP servers (engine) — {}", result.servers.len())
+    } else {
+        "MCP servers (engine) — disabled for this engine".to_string()
+    };
+    let mut browser = Browser::new(
+        title,
+        vec![
+            Column::new("", 1),
+            Column::new("name", 25),
+            Column::new("transport", 9),
+            Column::new("scope", 7),
+            Column::new("target", 40),
+        ],
+    )
+    .with_footer(
+        "↑/↓ k/j move · Enter detail · r reload · Esc q close · managed on the engine host",
+    );
+
+    browser.set_items(
+        result
+            .servers
+            .iter()
+            .map(|server| {
+                let runtime = match server.runtime_status {
+                    McpRuntimeStatus::Connected => "connected",
+                    McpRuntimeStatus::NotConnected => "not connected",
+                    McpRuntimeStatus::NotAttempted => "not started",
+                    McpRuntimeStatus::Unknown => "unknown",
+                };
+                let configured = match server.configured {
+                    McpConfiguredState::Enabled => "enabled",
+                    McpConfiguredState::Disabled => "disabled",
+                    McpConfiguredState::Shadowed => "shadowed by a project entry",
+                };
+                let mut detail = vec![
+                    format!("name       {}", server.name),
+                    format!("scope      {}", server.scope),
+                    format!("transport  {}", server.transport),
+                    format!("configured {configured}"),
+                    format!("runtime    {runtime}"),
+                    format!("target     {}", server.target_display),
+                ];
+                match server.tool_count {
+                    Some(count) => detail.push(format!("tools      {count}")),
+                    // "Not known" is not "none"; the engine says so and this
+                    // must not flatten it into a confident zero.
+                    None => detail.push("tools      unknown".to_string()),
+                }
+                if !server.env_var_names.is_empty() {
+                    // Names only: values routinely hold tokens.
+                    detail.push(format!("env        {}", server.env_var_names.join(", ")));
+                }
+                for reference in &server.secret_refs {
+                    let resolved = match reference.resolved {
+                        Some(true) => "resolved",
+                        Some(false) => "unresolved",
+                        // The engine deliberately performs no credential-store
+                        // read here, so it reports nothing rather than a claim.
+                        None => "not checked",
+                    };
+                    detail.push(format!("secret     {} ({resolved})", reference.name));
+                }
+
+                let live = server.configured == McpConfiguredState::Enabled
+                    && server.runtime_status == McpRuntimeStatus::Connected;
+                Item::new(
+                    &server.name,
+                    vec![
+                        if live { glyph::ACTIVE } else { glyph::INACTIVE }.to_string(),
+                        server.name.clone(),
+                        server.transport.clone(),
+                        server.scope.clone(),
+                        server.target_display.clone(),
+                    ],
+                )
+                .with_detail(detail)
+            })
+            .collect(),
+    );
+    browser
+}
+
 /// The background task browser.
 ///
 /// Tasks are in-process engine state, but the runtime persists a log per task
@@ -424,11 +522,15 @@ pub fn tasks(logs: &[TaskLog], outcomes: &BTreeMap<String, TaskOutcome>) -> Brow
 
 /// The session picker for `/resume`.
 ///
-/// Sessions are listed newest-first (the order `SessionTranscriptStore::list`
-/// returns them).  Each row shows a 1-based index, the session id, message
-/// count, age, and a short preview of the first user message.  Enter on a
-/// row fires `Intent::Activate(session_id)` which the host uses to resume.
-pub fn sessions(summaries: &[SessionSummary]) -> Browser {
+/// Rows come from `session/listSessions` — the engine's own read-only view of
+/// its saved transcripts — rather than from a directory this front-end reads
+/// itself. Newest first, which is the order the engine lists them in; each row
+/// shows a 1-based index, the session id, message count, age, and a short
+/// preview of the first user message. Enter fires `Intent::Activate(id)`.
+///
+/// A preview the engine already capped is marked, so a shortened line is
+/// distinguishable from a short message.
+pub fn sessions(summaries: &[SessionSummaryDto]) -> Browser {
     let mut browser = Browser::new(
         format!("Sessions — {}", summaries.len()),
         vec![
@@ -447,17 +549,25 @@ pub fn sessions(summaries: &[SessionSummary]) -> Browser {
             .iter()
             .enumerate()
             .map(|(i, s)| {
-                let age = format_session_age(s.created_utc);
-                let preview = if s.preview.len() > 60 {
-                    format!("{}…", &s.preview[..60])
-                } else {
-                    s.preview.clone()
-                };
+                let age = parse_created(&s.created_utc)
+                    .map(format_session_age)
+                    // Never invent a time: an unparseable stamp says so.
+                    .unwrap_or_else(|| "unknown".to_string());
+                // Cut by display cells on a grapheme boundary, never by
+                // bytes: `&preview[..60]` panics the instant a preview
+                // contains Cyrillic, CJK or an emoji that straddles that
+                // byte, and it is the *engine's* text, so this client does
+                // not get to assume it is ASCII.
+                let mut preview = coda_render::text::truncate_with_ellipsis(&s.preview, 60);
+                if preview == s.preview && s.preview_truncated {
+                    // Nothing was cut here, but the engine already capped it.
+                    preview.push('…');
+                }
                 Item::new(
-                    &s.id,
+                    &s.session_id,
                     vec![
                         (i + 1).to_string(),
-                        s.id.clone(),
+                        s.session_id.clone(),
                         s.message_count.to_string(),
                         age,
                         preview,
@@ -467,6 +577,13 @@ pub fn sessions(summaries: &[SessionSummary]) -> Browser {
             .collect(),
     );
     browser
+}
+
+/// Parses the RFC 3339 timestamp `session/listSessions` publishes.
+fn parse_created(created_utc: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(created_utc)
+        .ok()
+        .map(|stamp| stamp.with_timezone(&Utc))
 }
 
 /// Formats the age of a session relative to now.
@@ -517,6 +634,63 @@ mod tests {
             "contextLimit": limit
         }))
         .expect("model")
+    }
+
+    #[test]
+    fn a_session_preview_of_non_ascii_text_is_cut_on_a_character_boundary() {
+        // The preview was sliced by *bytes*. These three previews each put a
+        // multi-byte character across byte 60, so `&preview[..60]` panics —
+        // taking the whole session browser, and with it `/resume`, down.
+        let straddling = [
+            format!("{}{}", "a".repeat(59), "🙂".repeat(10)),
+            format!("{}{}", "a".repeat(58), "€".repeat(20)),
+            format!("{}{}", "a".repeat(59), "é".repeat(20)),
+            "привет мир, это очень длинное описание сессии для проверки границ".to_string(),
+        ];
+        for preview in &straddling {
+            assert!(preview.len() > 60, "the case must actually be long enough");
+        }
+        let summaries: Vec<SessionSummaryDto> = straddling
+            .iter()
+            .enumerate()
+            .map(|(i, preview)| SessionSummaryDto {
+                session_id: format!("s{i}"),
+                created_utc: "2026-09-01T10:00:00+00:00".into(),
+                message_count: 4,
+                preview: preview.clone(),
+                preview_truncated: false,
+                is_current: false,
+            })
+            .collect();
+
+        let browser = sessions(&summaries);
+
+        assert_eq!(browser.len(), straddling.len());
+        for item in browser.items() {
+            let preview = item.cells.last().expect("the preview column");
+            assert!(
+                coda_render::text::width(preview) <= 60,
+                "the preview must still fit its column: {preview:?}"
+            );
+            assert!(preview.ends_with('…'), "a shortened preview must say so: {preview:?}");
+        }
+    }
+
+    #[test]
+    fn a_preview_the_engine_already_truncated_says_so_without_re_cutting_it() {
+        let summaries = vec![SessionSummaryDto {
+            session_id: "s1".into(),
+            created_utc: "2026-09-01T10:00:00+00:00".into(),
+            message_count: 1,
+            preview: "коротко".into(),
+            preview_truncated: true,
+            is_current: false,
+        }];
+
+        let browser = sessions(&summaries);
+        let preview = browser.items()[0].cells.last().expect("the preview column");
+        assert!(preview.ends_with('…'), "an engine-truncated preview must say so: {preview:?}");
+        assert!(preview.starts_with("коротко"), "{preview:?}");
     }
 
     #[test]
@@ -839,27 +1013,49 @@ mod tests {
 
     #[test]
     fn sessions_browser_activates_on_enter_without_detail() {
-        use chrono::Utc;
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let summaries = vec![SessionSummary {
-            id: "abc123456789".into(),
-            created_utc: Utc::now(),
-            message_count: 4,
-            preview: "hello".into(),
-        }];
+        let summaries = vec![session_summary("abc123456789", 4, "hello")];
         let mut browser = sessions(&summaries);
         // Enter must fire Activate (not open a detail pane) for a no-detail browser.
         let intent = browser.handle(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(intent, crate::overlay::Intent::Activate("abc123456789".into()));
     }
 
+    /// A `session/listSessions` summary, as the engine publishes it.
+    fn session_summary(id: &str, message_count: i64, preview: &str) -> SessionSummaryDto {
+        SessionSummaryDto {
+            session_id: id.into(),
+            created_utc: Utc::now().to_rfc3339(),
+            message_count,
+            preview: preview.into(),
+            preview_truncated: false,
+            is_current: false,
+        }
+    }
+
+    #[test]
+    fn a_session_whose_timestamp_cannot_be_read_says_so_rather_than_inventing_one() {
+        let mut summary = session_summary("abc", 1, "hi");
+        summary.created_utc = "not a timestamp".into();
+        let browser = sessions(&[summary]);
+        assert_eq!(browser.visible_items()[0].cells[3], "unknown");
+    }
+
+    #[test]
+    fn a_preview_the_engine_capped_is_marked_as_shortened() {
+        let mut summary = session_summary("abc", 1, "the beginning of a long message");
+        summary.preview_truncated = true;
+        let browser = sessions(&[summary]);
+        assert!(
+            browser.visible_items()[0].cells[4].ends_with('\u{2026}'),
+            "a shortened preview must be distinguishable from a short message"
+        );
+    }
+
     #[test]
     fn sessions_browser_shows_count_and_index() {
-        use chrono::Utc;
-        let summaries = vec![
-            SessionSummary { id: "aaa".into(), created_utc: Utc::now(), message_count: 3, preview: "first".into() },
-            SessionSummary { id: "bbb".into(), created_utc: Utc::now(), message_count: 7, preview: "second".into() },
-        ];
+        let summaries =
+            vec![session_summary("aaa", 3, "first"), session_summary("bbb", 7, "second")];
         let browser = sessions(&summaries);
         assert!(browser.title().contains("2"));
         let rows = browser.visible_items();
@@ -869,6 +1065,52 @@ mod tests {
         // Message counts.
         assert_eq!(rows[0].cells[2], "3");
         assert_eq!(rows[1].cells[2], "7");
+    }
+
+    #[test]
+    fn the_engine_sourced_mcp_browser_is_read_only_and_states_what_it_does_not_know() {
+        use coda_proto::mcp::{
+            McpConfiguredState, McpListResult, McpRuntimeStatus, McpSecretRefDto, McpServerDto,
+        };
+
+        let result = McpListResult {
+            enabled: true,
+            manager_available: true,
+            servers: vec![McpServerDto {
+                name: "everything".into(),
+                scope: "user".into(),
+                transport: "stdio".into(),
+                target_kind: "command".into(),
+                target_display: "npx".into(),
+                configured: McpConfiguredState::Enabled,
+                runtime_status: McpRuntimeStatus::NotConnected,
+                tool_count: None,
+                env_var_names: vec!["TOKEN_NAME".into()],
+                secret_refs: vec![McpSecretRefDto { name: "TOKEN_NAME".into(), resolved: None }],
+            }],
+        };
+
+        let browser = mcp_from_engine(&result);
+        // Not silently disabled: the surface exists, and says who owns it.
+        assert!(browser.footer().contains("managed on the engine host"), "{:?}", browser.footer());
+        // And offers no editing keys that would write the wrong machine's files.
+        for key in ['n', 'e', 'd'] {
+            assert!(
+                !browser.footer().contains(&format!("{key} new"))
+                    && !browser.footer().contains(&format!("{key} edit"))
+                    && !browser.footer().contains(&format!("{key} delete")),
+                "an editing key was offered for a session that cannot edit"
+            );
+        }
+
+        let detail = browser.visible_items()[0].detail.clone();
+        let joined = detail.join("\n");
+        assert!(joined.contains("tools      unknown"), "an unknown tool count must not read as 0");
+        assert!(
+            joined.contains("secret     TOKEN_NAME (not checked)"),
+            "an unverified reference must not claim to be unresolved: {joined}"
+        );
+        assert!(!joined.contains("coda-secret:"), "a secret target reached the UI");
     }
 
     #[test]

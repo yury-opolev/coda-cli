@@ -1,0 +1,68 @@
+{
+  "type": "object",
+  "properties": {
+    "protocolVersion": {
+      "type": "string"
+    },
+    "sessionId": {
+      "type": "string"
+    },
+    "serverInfo": {
+      "type": "string"
+    },
+    "telemetryLogPath": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "contractVersion": {
+      "type": "string"
+    },
+    "engineInstanceId": {
+      "type": "string"
+    },
+    "eventCursor": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/CapabilityEntry"
+      }
+    }
+  },
+  "required": [
+    "protocolVersion",
+    "sessionId",
+    "serverInfo",
+    "contractVersion",
+    "engineInstanceId",
+    "eventCursor",
+    "capabilities"
+  ],
+  "description": "The current Rust engine's initialize response. Unlike `InitializeResult`,\nwhich tolerates legacy peers, these contract fields are always emitted.",
+  "title": "InitializeResponse",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "CapabilityEntry": {
+      "type": "object",
+      "properties": {
+        "supported": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "supported"
+      ],
+      "description": "One entry in `InitializeResult.capabilities` — whether a named capability\nis supported by this engine build, with an explanatory reason when not."
+    }
+  }
+}

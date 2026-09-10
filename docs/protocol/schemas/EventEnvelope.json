@@ -1,0 +1,25 @@
+{
+  "type": "object",
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "engineInstanceId": {
+      "type": "string"
+    },
+    "method": {
+      "type": "string"
+    },
+    "params": true
+  },
+  "required": [
+    "seq",
+    "engineInstanceId",
+    "method",
+    "params"
+  ],
+  "description": "One stored/replayed notification, exactly as `session/getEvents` returns\nit. `params` is the whole original payload (already carrying `seq` and\n`engineInstanceId`, since the bus injects them before storing) — a\nreplayed frame is never truncated or re-summarised.",
+  "title": "EventEnvelope",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

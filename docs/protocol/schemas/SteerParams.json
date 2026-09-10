@@ -1,0 +1,13 @@
+{
+  "type": "object",
+  "properties": {
+    "text": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "text"
+  ],
+  "title": "SteerParams",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

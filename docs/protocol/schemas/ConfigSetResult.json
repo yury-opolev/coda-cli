@@ -1,0 +1,62 @@
+{
+  "type": "object",
+  "properties": {
+    "ok": {
+      "type": "boolean"
+    },
+    "key": {
+      "type": "string"
+    },
+    "appliedAt": {
+      "$ref": "#/$defs/AppliesWhen"
+    },
+    "effective": {
+      "description": "What the engine actually holds now, read back after the delegated\nmethod ran. Never an echo of the request."
+    },
+    "error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "ok",
+    "key",
+    "appliedAt"
+  ],
+  "title": "ConfigSetResult",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "AppliesWhen": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "immediately",
+          "description": "Observable on the very next read, with no turn boundary involved."
+        },
+        {
+          "type": "string",
+          "const": "nextPermissionCheck",
+          "description": "The running turn keeps its captured mode; the next permission\ndecision reads the new one."
+        },
+        {
+          "type": "string",
+          "const": "nextTurn",
+          "description": "The running turn keeps its captured value; the next turn is built\nwith the new one."
+        },
+        {
+          "type": "string",
+          "const": "newEngineInstance",
+          "description": "Only a new engine process picks this up."
+        },
+        {
+          "type": "string",
+          "const": "clientLocal",
+          "description": "The engine does not own this at all — it is the client's own setting."
+        }
+      ],
+      "description": "When a change to a config key actually takes hold."
+    }
+  }
+}

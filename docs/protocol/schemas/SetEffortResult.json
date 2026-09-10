@@ -1,0 +1,33 @@
+{
+  "type": "object",
+  "properties": {
+    "ok": {
+      "type": "boolean",
+      "default": false
+    },
+    "applied": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "current": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The effective current effort level after the call.\n\nMatches `applied` on success; on failure reflects whatever was in force\nbefore the (rejected) call. Absent when no effort is set at all.",
+      "default": null
+    },
+    "note": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    }
+  },
+  "title": "SetEffortResult",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}
