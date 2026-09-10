@@ -1,0 +1,15 @@
+{
+  "type": "object",
+  "properties": {
+    "requestId": {
+      "type": "string",
+      "default": ""
+    },
+    "outcome": {
+      "description": "Validated against the pending request: `{allow}`, `{answer}` or `{approve}`.",
+      "default": null
+    }
+  },
+  "title": "ResolveRequestParams",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

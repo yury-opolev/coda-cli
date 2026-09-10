@@ -1,0 +1,53 @@
+{
+  "type": "object",
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "engineInstanceId": {
+      "type": "string"
+    },
+    "turnId": {
+      "type": "string"
+    },
+    "phase": {
+      "$ref": "#/$defs/ActivityPhase"
+    },
+    "phaseSince": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "seq",
+    "engineInstanceId",
+    "turnId",
+    "phase",
+    "phaseSince"
+  ],
+  "title": "ActivityEvent",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "ActivityPhase": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "preparing",
+            "waitingForModel",
+            "reasoning",
+            "responding",
+            "runningTools",
+            "awaitingUserInput",
+            "compacting"
+          ]
+        },
+        {
+          "type": "string",
+          "const": "maintenance",
+          "description": "An administrative session mutation that owns the single-flight slot\nexactly like a turn does — `session/fork`, `session/rewind`. These\nrewrite the conversation, so a prompt must not run against a history\nthey are half way through replacing."
+        }
+      ]
+    }
+  }
+}

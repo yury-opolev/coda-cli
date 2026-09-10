@@ -1,0 +1,51 @@
+{
+  "type": "object",
+  "properties": {
+    "supported": {
+      "type": "boolean",
+      "default": false
+    },
+    "levels": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "supportsAuto": {
+      "type": "boolean",
+      "default": false
+    },
+    "current": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The effort level currently in force on the session, if any.\n\n`None` means \"automatic / not set\" — an honest, unambiguous default the\npicker uses to pre-select rather than always defaulting to `high`.",
+      "default": null
+    },
+    "indeterminate": {
+      "type": "boolean",
+      "description": "`true` when the capability could not be determined yet (for example a\nCopilot model before the model list has been fetched).\n\nDistinct from `supported: false`, which is a positive statement that the\nmodel has no reasoning effort. Callers must treat the two differently:\nindeterminate is \"unknown, do not lie\", unsupported is \"known absent\".",
+      "default": false
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The canonical model id the capability describes.\n\nThis is the engine's own id for the active model, never a display name,\nso a caller can persist a per-model preference under exactly the key the\nengine reads it back with. `None` when the engine could not identify it.",
+      "default": null
+    },
+    "providerId": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The provider that model is served by, paired with `model` to form the\ncanonical `(provider, model)` identity the picker persists against.",
+      "default": null
+    }
+  },
+  "title": "ReasoningCapabilityResult",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

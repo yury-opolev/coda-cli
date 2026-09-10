@@ -1,0 +1,96 @@
+{
+  "type": "object",
+  "properties": {
+    "source": {
+      "type": "string",
+      "description": "`\"live\"`, `\"catalog\"` or `\"builtin\"`.",
+      "default": ""
+    },
+    "models": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/WireModel"
+      }
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The model the engine will actually use.\n\nThe list alone does not say which entry is active, and the obvious\nguess — the first — is only whatever order the provider returned.",
+      "default": null
+    },
+    "provider_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The provider whose credential the engine connected with.\n\nNot necessarily `defaultProvider` from settings: the engine uses the\ncredential it actually found. A client saving a model preference must\nkey it by this, or it writes where the engine will never read.",
+      "default": null
+    }
+  },
+  "title": "ModelsResult",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "WireModel": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "displayName": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "contextLimit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "default": null
+        },
+        "inputCost": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "description": "US dollars per million input tokens, when the catalogue knows.",
+          "default": null
+        },
+        "outputCost": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "description": "US dollars per million output tokens, when the catalogue knows.",
+          "default": null
+        },
+        "reasoningLevels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Reasoning-effort levels the model advertises, lowest to highest.\n\nEmpty when the provider reported nothing; this is *not* the same as\n\"unsupported\" — the caller must not conclude absence means unsupported.",
+          "default": []
+        },
+        "effort": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The effort level effectively in force for this model right now.\n\nFor the *active* model this is the live effective level (after clamps\nand any per-model session override), so a browser can show what is\nactually in force rather than a possibly-stale persisted value. For\nother rows it is the session override or saved preference, when known.\n`None` means automatic / none.",
+          "default": null
+        }
+      },
+      "required": [
+        "id"
+      ]
+    }
+  }
+}

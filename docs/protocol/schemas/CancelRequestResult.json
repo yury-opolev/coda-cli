@@ -1,0 +1,32 @@
+{
+  "type": "object",
+  "properties": {
+    "ok": {
+      "type": "boolean"
+    },
+    "requestId": {
+      "type": "string"
+    },
+    "appliedDefault": {
+      "type": "string"
+    },
+    "outcome": {
+      "type": "string"
+    },
+    "reason": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Echoes the optional reason; the existing response uses null when absent."
+    }
+  },
+  "required": [
+    "ok",
+    "requestId",
+    "appliedDefault",
+    "outcome"
+  ],
+  "title": "CancelRequestResult",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

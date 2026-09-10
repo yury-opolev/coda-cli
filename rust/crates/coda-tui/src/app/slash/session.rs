@@ -8,7 +8,6 @@ use serde_json::Value;
 
 use super::super::App;
 use crate::surface::browser::BrowserKind;
-use coda_client::Engine;
 use crate::commands;
 use crate::state::UiEvent;
 use crate::transcript::NoticeLevel;
@@ -21,6 +20,13 @@ impl App {
     /// N-th newest session (1-based). Any other string → treat as a literal
     /// session id.
     pub(super) async fn cmd_resume(&mut self, invocation: &commands::Invocation) {
+        // Asked here as well as in `resume_to_session`: opening the picker
+        // reads the engine, and choosing a row from it starts a child. During
+        // a sign-out neither may happen, and refusing before the browser opens
+        // says so where the user typed it.
+        if !self.engine_start_allowed("Resuming a session") {
+            return;
+        }
         let arg = invocation.first().map(str::to_string);
 
         if let Some(arg) = arg {
@@ -34,18 +40,21 @@ impl App {
     /// Resolves a `/resume` argument to a session id.
     ///
     /// A bare positive integer selects the N-th newest session (1-based); any
-    /// other string is returned as-is. Mirrors C# `ResolveTargetIdAsync`.
+    /// other string is returned as-is. The list comes from
+    /// `session/listSessions`, so numbering matches what the picker shows and
+    /// no transcript directory is read here.
     pub(super) async fn resolve_resume_target(&self, arg: &str) -> String {
         if let Ok(n) = arg.parse::<usize>() {
-            if n >= 1 {
-                let project_root = self.paths.project_root.clone();
-                if let Ok(summaries) = tokio::task::spawn_blocking(move || {
-                    coda_agent::SessionTranscriptStore::new(&project_root).list()
-                })
-                .await
+            // Gated and bounded like every other read: resolving "the third
+            // newest" against an engine that is gone, or one that has stopped
+            // answering, must fall back to treating the argument literally
+            // rather than waiting in the event loop's own arm.
+            if n >= 1 && self.engine_connected() {
+                if let Ok(result) =
+                    self.bounded(crate::api::list_sessions(&self.connection, None)).await
                 {
-                    if n <= summaries.len() {
-                        return summaries[n - 1].id.clone();
+                    if n <= result.sessions.len() {
+                        return result.sessions[n - 1].session_id.clone();
                     }
                 }
             }
@@ -53,116 +62,73 @@ impl App {
         arg.to_string()
     }
 
-    /// Restarts the engine loading `session_id` from disk, clearing the
-    /// current transcript.
+    /// Restarts the engine loading `session_id`, replacing the current
+    /// transcript with the engine's own history for it.
     ///
-    /// Pre-checks that the session exists on disk so the user gets a clear
-    /// "not found" message instead of an engine handshake error.  Mirrors C#
-    /// `ResumeCommand.ResumeSessionAsync`.
+    /// The engine validates the id during `initialize` and answers with a
+    /// typed "no such session", so there is no pre-check against a directory
+    /// this client should not be reading — and nothing is thrown away until
+    /// that answer is in. Clearing first meant a bad id, or an engine that
+    /// would not spawn, wiped a perfectly healthy conversation and left the
+    /// user with an error message and an empty screen.
     pub(in crate::app) async fn resume_to_session(&mut self, session_id: String) {
-        // Pre-check: verify the session exists and get its message count.
-        let project_root = self.paths.project_root.clone();
-        let sid = session_id.clone();
-        let summary = match tokio::task::spawn_blocking(move || {
-            coda_agent::SessionTranscriptStore::new(&project_root)
-                .list()
-                .into_iter()
-                .find(|s| s.id == sid)
-        })
-        .await
+        // Before the spawn, not after it: a sign-out's transaction is
+        // uncancellable and runs on its own task, so a child started while it
+        // is in flight is a child holding a credential that is about to be
+        // deleted — and one nobody asked for.
+        if !self.engine_start_allowed("Resuming a session") {
+            return;
+        }
+        let intent = coda_boot::SessionIntent::Resume(session_id.clone());
+        let booted = match crate::api::boot::boot(self.engine_command.clone(), &intent, "coda-tui")
+            .await
         {
-            Ok(s) => s,
-            Err(_) => {
-                self.notice("Could not read session store.", NoticeLevel::Error);
-                return;
+            Ok(booted) => booted,
+            Err(error) => {
+                return self.notice(format!("{error}"), NoticeLevel::Error);
             }
         };
 
-        let Some(summary) = summary else {
-            let escaped = coda_render::text::sanitize(&session_id);
-            self.notice(
-                format!("Session '{escaped}' not found."),
+        // Asked again on the far side of the await. Nothing on the loop can
+        // start a sign-out while this one is running today, but "the boot is
+        // inline" is not a property this function should have to rely on: a
+        // replacement adopted after a transaction began would be a live engine
+        // on a credential that is being removed.
+        if self.auth.is_active() {
+            let grace = self.shutdown_grace;
+            tokio::spawn(async move {
+                let _ = booted.engine.shutdown(grace).await;
+            });
+            return self.notice(
+                "A sign-in or sign-out started while the session was being resumed, so the \
+                 engine that had started was stopped and nothing was changed.",
                 NoticeLevel::Warning,
             );
-            return;
-        };
-        let count = summary.message_count;
-
-        self.close_browser();
-        // Clear the current transcript — we are switching sessions.
-        self.apply(UiEvent::Cleared);
-
-        // Restart with the target session id; initialize loads the history.
-        let (engine, inbound) = match Engine::spawn(self.engine_command.clone()) {
-            Ok(pair) => pair,
-            Err(error) => {
-                return self.notice(
-                    format!("Could not restart the engine: {error}"),
-                    NoticeLevel::Error,
-                )
-            }
-        };
-
-        let connection = engine.connection();
-        let params =
-            serde_json::to_value(messages::InitializeParams::new("coda-tui").resume(&session_id))
-                .unwrap_or_default();
-
-        match connection.request(method::INITIALIZE, Some(params)).await {
-            Ok(value) => {
-                let initialized: messages::InitializeResult =
-                    serde_json::from_value(value).unwrap_or(messages::InitializeResult {
-                        protocol_version: coda_proto::PROTOCOL_VERSION.to_string(),
-                        session_id: session_id.clone(),
-                        server_info: "coda".into(),
-                        telemetry_log_path: None,
-                    });
-
-                self.connection = connection;
-                self.restarted = Some((engine, inbound));
-
-                let actual_id = if initialized.session_id.is_empty() {
-                    session_id.clone()
-                } else {
-                    initialized.session_id.clone()
-                };
-                self.state.session_id = Some(actual_id.clone());
-                if let Some(ctx) = coda_diagnostics::current() {
-                    crate::diagnostics::record_engine_log_path(
-                        &ctx.with_session(actual_id.clone()),
-                        initialized.telemetry_log_path.as_deref(),
-                    );
-                }
-                self.engine_log_path = initialized.telemetry_log_path;
-                self.header_id_selected = false;
-                self.selection.clear();
-                self.dragging = false;
-
-                let escaped = coda_render::text::sanitize(&actual_id);
-                self.notice(
-                    format!("Resumed session {escaped} ({count} messages)."),
-                    NoticeLevel::Info,
-                );
-            }
-            Err(error) => {
-                self.notice(
-                    format!("The restarted engine rejected the handshake: {error}"),
-                    NoticeLevel::Error,
-                );
-            }
         }
+
+        // Committed: the new engine is up, so the conversation on screen is
+        // now the wrong one. `adopt_engine` re-reads the replacement's own
+        // history over the top of the cleared transcript.
+        self.close_browser();
+        self.apply(UiEvent::Cleared);
+        self.adopt_engine(booted);
+        let escaped = coda_render::text::sanitize(&session_id);
+        self.notice(format!("Resumed session {escaped}."), NoticeLevel::Info);
     }
 
     /// `/fork` — branch the live conversation into a new session.
     ///
     /// Calls `session/fork`; the engine persists the current history under a
     /// fresh id and switches to it.  Mirrors C# `ForkCommand`.
+    ///
+    /// Gated and bounded like every other engine command: forking a session
+    /// there is no engine for cannot mean anything, and awaiting an unbounded
+    /// answer would do it in the event loop's own select arm.
     pub(super) async fn cmd_fork(&mut self) {
-        match self
-            .connection
-            .request("session/fork", Some(serde_json::json!({})))
-            .await
-        {
+        if !self.require_engine("/fork") {
+            return;
+        }
+        match self.ask::<Value>("session/fork", Some(serde_json::json!({}))).await {
             Ok(value) => {
                 if let Some(new_id) = value.get("newSessionId").and_then(Value::as_str) {
                     let new_id = new_id.to_string();
@@ -196,12 +162,11 @@ impl App {
                 return;
             }
         };
+        if !self.require_engine("/rewind") {
+            return;
+        }
 
-        match self
-            .connection
-            .request("session/rewind", Some(serde_json::json!({ "n": n })))
-            .await
-        {
+        match self.ask::<Value>("session/rewind", Some(serde_json::json!({ "n": n }))).await {
             Ok(value) => {
                 let removed =
                     value.get("removed").and_then(Value::as_u64).unwrap_or(0) as usize;

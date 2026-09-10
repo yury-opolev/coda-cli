@@ -1,0 +1,57 @@
+{
+  "type": "object",
+  "properties": {
+    "sessionId": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Absent means the live session; saved IDs are scoped to the engine workspace."
+    },
+    "historyEpoch": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64",
+      "description": "Exact history-reset fence; stale values are refused, not ignored."
+    },
+    "expectedHistoryLength": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64",
+      "description": "Exact committed-length fence across pages of one logical read."
+    },
+    "engineInstanceId": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Refuse a read from a replacement engine instance."
+    },
+    "sinceIndex": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "limit": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "includeLive": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    }
+  },
+  "title": "GetHistoryParams",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

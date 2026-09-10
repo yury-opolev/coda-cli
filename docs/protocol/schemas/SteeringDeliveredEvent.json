@@ -1,0 +1,25 @@
+{
+  "type": "object",
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "engineInstanceId": {
+      "type": "string"
+    },
+    "messageIds": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    }
+  },
+  "required": [
+    "seq",
+    "engineInstanceId"
+  ],
+  "title": "SteeringDeliveredEvent",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

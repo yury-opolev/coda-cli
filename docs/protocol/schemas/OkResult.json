@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "properties": {
+    "ok": {
+      "type": "boolean",
+      "default": false
+    }
+  },
+  "description": "Shared `{ \"ok\": true }` shape used by interrupt and shutdown.",
+  "title": "OkResult",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

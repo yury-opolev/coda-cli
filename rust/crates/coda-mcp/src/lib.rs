@@ -35,7 +35,7 @@ pub(crate) mod ssrf;
 pub(crate) mod transport;
 
 pub use error::{McpConnectError, McpError};
-pub use manager::McpClientManager;
+pub use manager::{McpClientManager, McpServerStatus};
 pub use tool::McpTool;
 
 // Auth re-exports for consumers that need to configure HTTP servers.

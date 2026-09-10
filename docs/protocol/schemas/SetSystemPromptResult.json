@@ -1,0 +1,16 @@
+{
+  "type": "object",
+  "properties": {
+    "ok": {
+      "type": "boolean",
+      "default": false
+    },
+    "cleared": {
+      "type": "boolean",
+      "description": "Non-empty when the prompt was cleared via a None/empty `text`.",
+      "default": false
+    }
+  },
+  "title": "SetSystemPromptResult",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

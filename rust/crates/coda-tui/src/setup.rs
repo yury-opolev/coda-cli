@@ -1,165 +1,202 @@
-//! First-run detection and setup wizard.
+//! First-run detection, from the shared selector rather than from file guesses.
 //!
-//! Ported from `SetupWizard.cs` and `FirstRunDetector.cs` in C#.
+//! # What "first run" actually means
 //!
-//! The C# wizard uses Spectre.Console and a `CommandContext` that bundles
-//! credentials, providers, and prompts.  The Rust port runs entirely inside
-//! the existing TUI: it injects notice and prompt blocks into the transcript,
-//! using the reducer's existing `UiEvent::PromptRequested` path for provider
-//! selection.
+//! It means *this profile has no credential and no configured way to get one*.
+//! It emphatically does not mean "`settings.json` has no `defaultProvider`" —
+//! a machine signed in to a single account has a perfectly usable credential
+//! and no saved choice — and it does not mean "the store would not open",
+//! which is a fault to report rather than an invitation to sign in again over
+//! a credential that may still be recoverable.
 //!
-//! ## Seams
+//! The verdict therefore comes from [`AuthService::selected_provider`], the
+//! same selector the engine resolves its own credential with, so the wizard
+//! opens exactly when the engine would have nothing to connect with.
 //!
-//! Two steps in the wizard depend on subsystems being ported by other agents:
+//! # What replaced the previous module
 //!
-//! 1. **Credential storage / login handoff** — the `coda-auth` crate handles
-//!    OAuth PKCE and device-code flows.  The Rust `App` does not yet wire up
-//!    `/login` to the actual auth flow; the wizard surfaces the correct
-//!    instruction and marks the seam clearly.
-//!
-//! 2. **Session persistence** — `/resume` is not yet implemented.  The wizard
-//!    does not attempt session restoration.
-//!
-//! When the seams close, this module gains real login by calling the existing
-//! `coda-auth` login RPCs through the engine connection, matching the C#
-//! `LoginCommand.ExecuteAsync` call.
+//! The earlier version listed two providers, guessed at a first run by reading
+//! `settings.json` and `ANTHROPIC_API_KEY`, and told the user to run a
+//! `/login` that did not exist — while its own documentation said the real
+//! work was waiting on "login RPCs" that were never going to be added, because
+//! signing in is host-local maintenance and has no serve-API method by design.
+//! The flow it described now exists in [`crate::app::auth`]; this module is
+//! the detection half of it.
 
-use crate::config::{Paths, Settings};
+use coda_auth::service::{AuthService, ProviderIdentity, SelectionError};
 
-/// A detected provider that the user can log in to.
-#[derive(Debug, Clone)]
-pub struct ProviderDescriptor {
-    /// The provider id used in settings and login commands.
-    pub id: &'static str,
-    /// The display name shown in the wizard picker.
-    pub display_name: &'static str,
+/// What a profile looks like before an engine is asked to connect with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FirstRun {
+    /// A credential is available. Nothing is said.
+    Ready,
+    /// Nothing is stored and nothing is configured: the wizard applies.
+    NoCredentials,
+    /// A provider was chosen — on the command line, in the environment or in
+    /// settings — and has no usable credential. Nameable, and therefore
+    /// fixable by signing in to exactly that account.
+    SelectedMissing { identity: ProviderIdentity, reason: String },
+    /// Something is wrong that signing in would not fix, and might make
+    /// worse. Reported, never treated as a first run.
+    Unusable(String),
 }
 
-/// The providers the wizard offers.
-///
-/// These are the same two providers the C# wizard surfaces.
-pub const PROVIDERS: &[ProviderDescriptor] = &[
-    ProviderDescriptor {
-        id: "claude",
-        display_name: "Anthropic Claude",
-    },
-    ProviderDescriptor {
-        id: "copilot",
-        display_name: "GitHub Copilot",
-    },
-];
+/// The verdict for `service`, with no explicit provider named.
+pub async fn first_run_state(service: &AuthService) -> FirstRun {
+    launch_state(service, None).await
+}
 
-/// Returns `true` when this appears to be a first run.
+/// The verdict for `service` when the launch explicitly named a provider.
 ///
-/// A first run is defined as: no provider has a non-empty `apiKey` in
-/// `settings.json`, and `ANTHROPIC_API_KEY` is not set.
-///
-/// This mirrors `FirstRunDetector.IsFirstRunAsync` in C#.
-pub fn is_first_run(paths: &Paths) -> bool {
-    // If the ANTHROPIC_API_KEY environment variable is set, the user already
-    // has a way to connect — not a first run.
-    if std::env::var("ANTHROPIC_API_KEY").is_ok_and(|v| !v.is_empty()) {
-        return false;
-    }
-
-    // If settings exist and contain any api key for a known provider, not first run.
-    match Settings::load(paths) {
-        Ok(settings) => {
-            // If there is a default provider configured, assume not first run.
-            settings.default_provider().is_none()
-        }
-        // Settings file not found — definitely first run.
-        Err(_) => true,
+/// `explicit` is the launch's own intent — a `--provider` flag or a
+/// `CODA_SERVE_PROVIDER` in the environment the engine would inherit — and it
+/// is passed to the *same* selector the engine resolves its credential with.
+/// Asking without it would report a healthy profile for a launch that is about
+/// to fail closed on the one account it was told to use.
+pub async fn launch_state(service: &AuthService, explicit: Option<&str>) -> FirstRun {
+    match service.select(explicit).await {
+        Ok(_) => FirstRun::Ready,
+        Err(SelectionError::NoCredentials) => FirstRun::NoCredentials,
+        // Chosen but unusable is not a first run: the user made a decision and
+        // it is still theirs. Naming the provider is what turns "it does not
+        // work" into something actionable.
+        Err(SelectionError::NeedsLogin { identity, .. }) => FirstRun::SelectedMissing {
+            identity,
+            reason: format!(
+                "This profile is set to {}, but it has no usable credential. Run /login {} to \
+                 connect it, or /provider to choose a different account.",
+                identity.label(),
+                identity.engine_id(),
+            ),
+        },
+        Err(SelectionError::Ambiguous { stored }) => FirstRun::Unusable(format!(
+            "Credentials are stored for {}, and nothing says which to use. Run /provider to \
+             choose one.",
+            stored.iter().copied().map(ProviderIdentity::label).collect::<Vec<_>>().join(" and "),
+        )),
+        Err(SelectionError::UnknownProvider { .. }) => FirstRun::Unusable(
+            "The saved provider choice names a provider this build does not know. Run /provider \
+             to choose one of this product's accounts."
+                .to_owned(),
+        ),
+        // Deliberately not "signed out": the credential may be perfectly valid
+        // and simply unreadable from here, and signing in again over it is
+        // exactly how a recoverable one gets overwritten.
+        Err(SelectionError::Unavailable { failure }) => FirstRun::Unusable(format!(
+            "The stored authentication could not be read ({failure}). Do not sign in again \
+             until that is understood, or a recoverable credential may be overwritten. \
+             `coda auth status` reports what is on this machine."
+        )),
     }
 }
 
-/// The text shown in the wizard welcome notice.
+/// The welcome shown on a genuine first run.
+///
+/// It names commands that exist and do the work, rather than describing a
+/// handoff to something that is not there.
 pub const WELCOME_TEXT: &str = "\
-Welcome to Coda! Let's connect it to an LLM so you can start chatting.\n\
+Welcome to Coda. No account is connected on this machine yet.\n\
 \n\
-Run /setup to choose a provider and log in.";
-
-/// The provider-selection prompt presented during setup.
-pub fn provider_selection_prompt() -> String {
-    let options: Vec<String> = PROVIDERS
-        .iter()
-        .enumerate()
-        .map(|(i, p)| format!("{}. {} ({})", i + 1, p.display_name, p.id))
-        .collect();
-    format!("Choose a provider:\n{}", options.join("\n"))
-}
-
-/// The login-handoff notice for the given provider.
-///
-/// **Seam**: actual browser-loopback / device-code login is not yet wired up
-/// in the Rust front-end.  When `coda-auth` login RPCs are available via the
-/// engine, replace this notice with a real login sequence.
-pub fn login_seam_notice(provider: &ProviderDescriptor) -> String {
-    format!(
-        "To connect to {name}, run: /login {id}\n\
-        \n\
-        [SEAM: real OAuth login handoff depends on coda-auth login RPCs \
-        being added by the coda-auth / coda-serve porting agent.  \
-        Once those RPCs are available, the wizard will call them directly \
-        instead of surfacing this instruction.]",
-        name = provider.display_name,
-        id = provider.id,
-    )
-}
-
-/// Finds a provider descriptor by id (case-insensitive).
-pub fn find_provider(id: &str) -> Option<&'static ProviderDescriptor> {
-    PROVIDERS.iter().find(|p| p.id.eq_ignore_ascii_case(id))
-}
+Run /setup to choose one — a Claude.ai subscription, GitHub Copilot (public or \
+an enterprise tenant), or an Anthropic API key. /login <provider> goes straight \
+to one, and /logout disconnects again.";
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use coda_auth::coordination::LocalCoordinator;
+    use coda_auth::service::{
+        AuthEnvironment, AuthSettings, InMemoryAuthSettings, MapEnvironment,
+    };
+    use coda_auth::store::{open_profile_storage, Profile};
+    use std::sync::Arc;
 
-    #[test]
-    fn providers_list_is_not_empty() {
-        assert!(!PROVIDERS.is_empty());
+    /// A service over a throwaway profile: no `CODA_HOME`, no process
+    /// environment, nothing shared with another test.
+    async fn service(
+        root: &std::path::Path,
+        settings: AuthSettings,
+        env: &[(&str, &str)],
+    ) -> AuthService {
+        let storage = open_profile_storage(&Profile::isolated(root)).expect("profile opens");
+        AuthService::builder(Arc::clone(&storage.profile), Arc::new(LocalCoordinator::new()))
+            .with_settings(Arc::new(InMemoryAuthSettings::with(settings)))
+            .with_environment(Arc::new(MapEnvironment::new(env)) as Arc<dyn AuthEnvironment>)
+            .build()
+            .await
+            .expect("builds")
     }
 
-    #[test]
-    fn find_provider_by_exact_id() {
-        let p = find_provider("claude").unwrap();
-        assert_eq!(p.id, "claude");
+    #[tokio::test]
+    async fn an_empty_profile_is_a_first_run() {
+        let root = tempfile::tempdir().expect("temp");
+        let service = service(root.path(), AuthSettings::default(), &[]).await;
+        assert_eq!(first_run_state(&service).await, FirstRun::NoCredentials);
     }
 
-    #[test]
-    fn find_provider_case_insensitive() {
-        let p = find_provider("COPILOT").unwrap();
-        assert_eq!(p.id, "copilot");
+    #[tokio::test]
+    async fn an_exported_key_with_no_saved_choice_is_not_a_first_run() {
+        // The engine would connect with it, so the wizard must not claim there
+        // is nothing to connect with.
+        let root = tempfile::tempdir().expect("temp");
+        let service =
+            service(root.path(), AuthSettings::default(), &[("ANTHROPIC_API_KEY", "sk-x")]).await;
+        assert_eq!(first_run_state(&service).await, FirstRun::Ready);
     }
 
-    #[test]
-    fn find_unknown_provider_returns_none() {
-        assert!(find_provider("unknown-llm").is_none());
+    #[tokio::test]
+    async fn a_saved_choice_with_nothing_behind_it_is_reported_not_treated_as_a_first_run() {
+        let root = tempfile::tempdir().expect("temp");
+        let settings = AuthSettings {
+            default_provider: Some("github-copilot".into()),
+            github_enterprise_domain: None,
+        };
+        let service = service(root.path(), settings, &[]).await;
+        match first_run_state(&service).await {
+            FirstRun::SelectedMissing { identity, reason } => {
+                assert_eq!(identity, ProviderIdentity::GithubCopilot);
+                assert!(reason.contains("GitHub Copilot"), "{reason}");
+                assert!(reason.contains("/login github-copilot"), "{reason}");
+            }
+            other => panic!("expected a named account to connect, got {other:?}"),
+        }
     }
 
-    #[test]
-    fn login_seam_notice_contains_provider_id() {
-        let p = find_provider("claude").unwrap();
-        let notice = login_seam_notice(p);
-        assert!(notice.contains("claude"));
-        assert!(notice.contains("SEAM"));
+    /// The launch's own intent decides what "missing" means. Without it, a
+    /// profile holding one healthy credential reports `Ready` for a launch
+    /// that was explicitly told to use a different account and is about to
+    /// fail closed on it.
+    #[tokio::test]
+    async fn an_explicitly_named_provider_with_no_credential_is_a_setup_the_launch_can_offer() {
+        let root = tempfile::tempdir().expect("temp");
+        let service =
+            service(root.path(), AuthSettings::default(), &[("ANTHROPIC_API_KEY", "sk-x")]).await;
+        assert_eq!(first_run_state(&service).await, FirstRun::Ready);
+
+        match launch_state(&service, Some("github-copilot")).await {
+            FirstRun::SelectedMissing { identity, .. } => {
+                assert_eq!(identity, ProviderIdentity::GithubCopilot);
+            }
+            other => panic!("an explicitly selected, unconnected provider reported {other:?}"),
+        }
     }
 
-    #[test]
-    fn provider_selection_prompt_contains_all_providers() {
-        let prompt = provider_selection_prompt();
-        for p in PROVIDERS {
-            assert!(
-                prompt.contains(p.id),
-                "missing provider id {}: {prompt:?}",
-                p.id
-            );
+    #[tokio::test]
+    async fn a_provider_this_build_does_not_know_is_reported_rather_than_offered_a_wizard() {
+        let root = tempfile::tempdir().expect("temp");
+        let service = service(root.path(), AuthSettings::default(), &[]).await;
+        match launch_state(&service, Some("not-a-provider")).await {
+            FirstRun::Unusable(reason) => assert!(reason.contains("does not know"), "{reason}"),
+            other => panic!("an unknown provider was treated as {other:?}"),
         }
     }
 
     #[test]
-    fn welcome_text_contains_setup_command() {
+    fn the_welcome_names_commands_that_exist() {
         assert!(WELCOME_TEXT.contains("/setup"));
+        assert!(WELCOME_TEXT.contains("/login"));
+        assert!(WELCOME_TEXT.contains("/logout"));
+        // The previous wording promised work that no code did.
+        assert!(!WELCOME_TEXT.contains("SEAM"));
     }
 }

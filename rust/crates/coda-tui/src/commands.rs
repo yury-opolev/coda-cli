@@ -228,7 +228,21 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "provider",
         aliases: &[],
         args: "[<id>]",
-        summary: "Show the active provider, or connect to a different one.",
+        summary: "Show the connected account, or connect a different one.",
+        scope: Scope::Local,
+    },
+    CommandSpec {
+        name: "login",
+        aliases: &["connect"],
+        args: "[claude|copilot|api-key]",
+        summary: "Sign in to a provider on this machine.",
+        scope: Scope::Local,
+    },
+    CommandSpec {
+        name: "logout",
+        aliases: &["disconnect"],
+        args: "[claude|copilot|api-key]",
+        summary: "Remove a stored credential and disconnect.",
         scope: Scope::Local,
     },
     CommandSpec {
@@ -655,7 +669,7 @@ mod tests {
     #[test]
     fn all_new_commands_are_local_scope() {
         let new_names = [
-            "init", "memory", "output-style", "permissions", "yolo", "provider",
+            "init", "memory", "output-style", "permissions", "yolo", "provider", "login", "logout",
             "headers", "log", "marketplace", "plugin", "skill", "export", "diff", "image",
             "compact", "resume", "fork", "rewind",
         ];
@@ -673,7 +687,7 @@ mod tests {
     fn help_text_includes_every_new_command() {
         let text = help(None);
         let new_names = [
-            "init", "memory", "output-style", "permissions", "yolo", "provider",
+            "init", "memory", "output-style", "permissions", "yolo", "provider", "login", "logout",
             "headers", "log", "marketplace", "plugin", "skill", "export", "diff", "image",
             "compact", "resume", "fork", "rewind",
         ];

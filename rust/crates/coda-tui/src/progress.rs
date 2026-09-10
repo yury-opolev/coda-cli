@@ -59,7 +59,19 @@ impl Phase {
 /// The turn's own clock and phase, independent of the transcript.
 #[derive(Debug, Clone)]
 pub struct TurnProgress {
-    started_at: Instant,
+    /// The local instant the clock's baseline was observed at.
+    ///
+    /// Together with [`Self::offset_ms`] this expresses "the turn had already
+    /// been running for `offset_ms` when this client looked, at `origin`".
+    /// A local start is simply an offset of zero.
+    origin: Instant,
+    /// Elapsed time that had already accumulated before `origin`, as reported
+    /// by whoever owns it (the engine). Never derived from a remote wall
+    /// clock, and never subtracted from a local `Instant` — a duration older
+    /// than this process cannot be subtracted from `Instant::now()` at all,
+    /// and the fallback for that was a zero that claimed the turn had just
+    /// started.
+    offset_ms: i64,
     phase: Phase,
     /// Sum of reasoning segments that have already ended.
     reasoning_committed_ms: i64,
@@ -86,7 +98,8 @@ impl TurnProgress {
     /// truthful to show at the very first frame: zero seconds, `Working`.
     pub fn start(now: Instant) -> Self {
         Self {
-            started_at: now,
+            origin: now,
+            offset_ms: 0,
             phase: Phase::Working,
             reasoning_committed_ms: 0,
             reasoning_started_at: None,
@@ -94,6 +107,25 @@ impl TurnProgress {
             last_response_tokens: None,
             frozen_elapsed_ms: None,
         }
+    }
+
+    /// Rebuilds a progress clock for a turn that started before this client
+    /// was watching, from the **engine's own monotonic** elapsed time.
+    ///
+    /// `elapsed_ms` is `TurnState.elapsedMs`: a duration measured by the
+    /// server's monotonic clock at the instant the snapshot was taken. It is
+    /// used rather than `startedAt` deliberately — re-deriving elapsed time by
+    /// subtracting a remote wall-clock timestamp from a local one makes the
+    /// displayed duration jump by whatever the two machines' clocks disagree
+    /// by, and can make a timer run backwards. Keeping it as an offset from
+    /// the instant it was observed needs no clock agreement at all, and — 
+    /// unlike subtracting it from a local `Instant` — cannot fail for a
+    /// duration longer than this process has existed.
+    ///
+    /// Resetting to zero would be worse than either: a turn that has been
+    /// running for four minutes would claim it had just started.
+    pub fn rehydrate(elapsed_ms: i64, now: Instant) -> Self {
+        Self { offset_ms: elapsed_ms.max(0), ..Self::start(now) }
     }
 
     pub fn phase(&self) -> Phase {
@@ -108,7 +140,7 @@ impl TurnProgress {
     pub fn elapsed_ms(&self, now: Instant) -> i64 {
         match self.frozen_elapsed_ms {
             Some(ms) => ms,
-            None => elapsed_since(self.started_at, now),
+            None => self.offset_ms.saturating_add(elapsed_since(self.origin, now)),
         }
     }
 
@@ -200,6 +232,25 @@ impl TurnProgress {
         self.last_response_tokens = Some((input_tokens, output_tokens));
     }
 
+    /// Adopts the engine's own elapsed baseline for a turn this client is
+    /// already timing, **without** discarding what it observed.
+    ///
+    /// A resync mid-turn brings back one fact — how long the engine says the
+    /// turn has been running — and nothing about how that time was spent.
+    /// Rebuilding the clock from it therefore threw away facts the snapshot
+    /// never contradicted: the reasoning segments this client watched, that a
+    /// reasoning phase happened at all, and the last response's tokens.
+    ///
+    /// A finished clock is not moved: it has already been frozen, and a
+    /// snapshot describing the turn that just ended must not restart it.
+    pub fn adopt_elapsed(&mut self, elapsed_ms: i64, observed_at: Instant) {
+        if self.is_finished() {
+            return;
+        }
+        self.origin = observed_at;
+        self.offset_ms = elapsed_ms.max(0);
+    }
+
     /// Freezes the clock. Idempotent: once finished, later calls (a
     /// duplicate `TurnComplete`, a `TurnFinished` that follows it, a cancel
     /// racing an error) change nothing, so the displayed duration can never
@@ -209,7 +260,7 @@ impl TurnProgress {
             return;
         }
         self.commit_reasoning(now);
-        self.frozen_elapsed_ms = Some(elapsed_since(self.started_at, now));
+        self.frozen_elapsed_ms = Some(self.elapsed_ms(now));
     }
 
     fn commit_reasoning(&mut self, now: Instant) {
@@ -229,6 +280,92 @@ fn elapsed_since(from: Instant, now: Instant) -> i64 {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn a_rehydrated_turn_keeps_the_engines_own_elapsed_time() {
+        // The snapshot's `elapsedMs` is a server-monotonic duration. A client
+        // that reset to zero here would tell the user a four-minute turn had
+        // just started; one that subtracted a remote wall clock from a local
+        // one would jump by the machines' clock skew.
+        let now = Instant::now();
+        let progress = TurnProgress::rehydrate(240_000, now);
+        assert_eq!(progress.elapsed_ms(now), 240_000);
+        assert_eq!(progress.elapsed_ms(now + Duration::from_secs(10)), 250_000);
+        assert!(!progress.is_finished());
+    }
+
+    #[test]
+    fn a_server_elapsed_larger_than_the_local_clock_is_kept_rather_than_reset() {
+        // Seeding by subtracting the remote duration from the local `Instant`
+        // fails outright once the duration is older than this process, and
+        // the fallback claimed the turn had just started. An offset needs no
+        // such subtraction, so a very large server elapsed stays itself.
+        let now = Instant::now();
+        let progress = TurnProgress::rehydrate(i64::MAX, now);
+        assert_eq!(progress.elapsed_ms(now), i64::MAX, "the server's duration was discarded");
+        assert_eq!(
+            progress.elapsed_ms(now + Duration::from_secs(1)),
+            i64::MAX,
+            "and it saturates rather than wrapping"
+        );
+    }
+
+    #[test]
+    fn adopting_the_servers_elapsed_keeps_what_this_client_observed_this_turn() {
+        // A resync mid-turn adopts the engine's baseline duration. It says
+        // nothing about how much of that was reasoning, so the reasoning this
+        // client actually watched must survive: recreating the clock wiped a
+        // committed reasoning segment and the last response's tokens.
+        let start = Instant::now();
+        let mut progress = TurnProgress::start(start);
+        progress.on_thinking_start(start);
+        progress.on_thinking_end(start + Duration::from_secs(3));
+        progress.on_usage(11, 7);
+
+        let now = start + Duration::from_secs(5);
+        progress.adopt_elapsed(90_000, now);
+
+        assert_eq!(progress.elapsed_ms(now), 90_000, "the engine owns the total duration");
+        assert_eq!(progress.elapsed_ms(now + Duration::from_secs(2)), 92_000, "and keeps running");
+        assert_eq!(progress.reasoning_ms(now), Some(3_000), "observed reasoning was discarded");
+        assert_eq!(progress.last_response_tokens(), Some((11, 7)));
+    }
+
+    #[test]
+    fn adopting_an_elapsed_baseline_mid_reasoning_keeps_the_open_segment_running() {
+        let start = Instant::now();
+        let mut progress = TurnProgress::start(start);
+        progress.on_thinking_start(start);
+
+        let now = start + Duration::from_secs(4);
+        progress.adopt_elapsed(600_000, now);
+        assert_eq!(progress.phase(), Phase::Thinking, "the phase is not a duration");
+        assert_eq!(
+            progress.reasoning_ms(now),
+            Some(4_000),
+            "the open reasoning segment is measured on the local clock, not the server's"
+        );
+    }
+
+    #[test]
+    fn adopting_an_elapsed_baseline_never_moves_a_finished_clock() {
+        let start = Instant::now();
+        let mut progress = TurnProgress::start(start);
+        progress.finish(start + Duration::from_secs(2));
+        progress.adopt_elapsed(999_000, start + Duration::from_secs(3));
+        assert_eq!(progress.elapsed_ms(start + Duration::from_secs(9)), 2_000);
+    }
+
+    #[test]
+    fn a_rehydrated_turn_claims_no_reasoning_it_did_not_observe() {
+        // Time already spent is not evidence the model was reasoning: the
+        // client did not see those deltas and must not invent the split.
+        let now = Instant::now();
+        let progress = TurnProgress::rehydrate(60_000, now);
+        assert_eq!(progress.reasoning_ms(now), None);
+        assert_eq!(progress.last_response_tokens(), None);
+        assert_eq!(progress.phase(), Phase::Working);
+    }
 
     #[test]
     fn starts_generic_and_at_zero() {

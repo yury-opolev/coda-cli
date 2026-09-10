@@ -191,10 +191,22 @@ impl Engine {
 
     /// Closes stdin and waits for a graceful exit, killing the process if it
     /// outlives the grace period.
+    ///
+    /// The connection is *closed*, not merely dropped. Dropping only ends the
+    /// connection when the last clone goes, and the application keeps one:
+    /// after a sign-out the writer therefore stayed alive on somebody else's
+    /// sender, so a command issued afterwards was queued for a process that no
+    /// longer exists and its caller waited for ever. Closing fails every
+    /// outstanding request now, refuses new ones, and lets the writer drain
+    /// what was already queued — the reply to a reverse request the engine is
+    /// blocked on is still written — before it closes the engine's stdin,
+    /// which is what a healthy engine exits on.
     pub async fn shutdown(mut self, grace: std::time::Duration) -> std::io::Result<()> {
-        // Dropping the connection closes the outgoing channel, which ends the
-        // writer task and in turn closes the engine's stdin.
-        drop(self.connection);
+        self.connection.close();
+        // Bounded by the same grace: the writer is draining into a pipe whose
+        // reader may already be gone, and a stop that hangs here is the very
+        // thing this is preventing elsewhere.
+        let _ = tokio::time::timeout(grace, &mut self.tasks.writer).await;
         self.tasks.reader.abort();
 
         let result = match tokio::time::timeout(grace, self.child.wait()).await {
@@ -278,6 +290,133 @@ mod tests {
                 assert_eq!(program, "definitely-not-a-real-executable-xyz");
             }
             other => panic!("expected a spawn error, got {other:?}"),
+        }
+    }
+
+    // ── Stopping an engine other handles still hold ──────────────────────────
+
+    /// The bound these tests await under. The failure they cover is a caller
+    /// that waits for ever, so a hang has to be a failed assertion rather than
+    /// a run that never ends.
+    const NO_HANG: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// A child that stays alive and never speaks the protocol — exactly what
+    /// an engine looks like between "stop this" and "it is gone".
+    fn idle_child() -> EngineCommand {
+        if cfg!(windows) {
+            EngineCommand::new("powershell.exe")
+                .arg("-NoProfile")
+                .arg("-NonInteractive")
+                .arg("-Command")
+                .arg("Start-Sleep -Seconds 30")
+        } else {
+            EngineCommand::new("sleep").arg("30")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_made_after_a_shutdown_fails_rather_than_waiting_for_a_dead_engine() {
+        // The hang this closes. A sign-out stops the engine but the
+        // application keeps its own clone of the connection, so the writer
+        // task survives on that clone's sender. A command issued afterwards
+        // registered a waiter, the frame was written into a pipe whose reader
+        // is a killed process, and nothing ever failed the waiter: the UI
+        // awaited it inline and the terminal was lost.
+        let (engine, _inbound) = Engine::spawn(idle_child()).expect("the child starts");
+        let connection = engine.connection();
+        let _ = engine.shutdown(std::time::Duration::from_millis(250)).await;
+
+        let error = tokio::time::timeout(NO_HANG, connection.request("session/fork", None))
+            .await
+            .expect("a request made after a shutdown never returned")
+            .expect_err("a stopped engine cannot answer");
+        assert!(
+            matches!(
+                error,
+                ClientError::ConnectionClosed | ClientError::Rpc(_) | ClientError::Io(_)
+            ),
+            "got {error:?}"
+        );
+        assert!(connection.is_closed(), "the stopped engine's connection still reports open");
+    }
+
+    #[tokio::test]
+    async fn shutting_down_fails_the_requests_already_in_flight() {
+        let (engine, _inbound) = Engine::spawn(idle_child()).expect("the child starts");
+        let connection = engine.connection();
+        let waiter = connection.send_request("session/getState", None).expect("send");
+
+        let _ = engine.shutdown(std::time::Duration::from_millis(250)).await;
+
+        let outcome = tokio::time::timeout(NO_HANG, waiter)
+            .await
+            .expect("an in-flight request outlived the engine that was to answer it")
+            .expect("a stopped engine must fail its waiters, not drop them");
+        assert!(outcome.is_err(), "a stopped engine answered a request");
+    }
+
+    #[tokio::test]
+    async fn a_graceful_stop_answers_over_the_connection_before_the_child_goes_away() {
+        // The other side of the fail-fast tests, and the one they must not
+        // break. A stop is a *conversation*: the client asks the engine to
+        // shut down over the live connection, the engine answers, and only
+        // then is the process stopped — which it does by seeing its stdin
+        // close, not by being killed. Closing the connection when that
+        // request is sent would refuse it before it reached the wire; killing
+        // instead of closing stdin would deny the child the chance to flush.
+        // Both are visible here: the answer must come back, and the marker is
+        // only written on a clean end-of-input.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let marker = dir.path().join("stopped-after-answering.marker");
+        let (engine, _inbound) =
+            Engine::spawn(answering_child(&marker)).expect("the child starts");
+        let connection = engine.connection();
+
+        let answer = tokio::time::timeout(NO_HANG, connection.request("shutdown", None))
+            .await
+            .expect("the engine never answered the stop request")
+            .expect("a live engine must answer over an open connection");
+        assert_eq!(answer["ok"], true, "{answer}");
+
+        let _ = engine.shutdown(std::time::Duration::from_secs(5)).await;
+
+        assert!(
+            marker.exists(),
+            "the child was killed rather than allowed to finish on end-of-input"
+        );
+        assert!(connection.is_closed(), "the stopped engine's connection still reports open");
+    }
+
+    /// A child that answers the first framed request it is sent, then exits
+    /// when its stdin closes — the minimum that makes "asked, answered, then
+    /// stopped" observable against a real process.
+    fn answering_child(marker: &std::path::Path) -> EngineCommand {
+        // `Content-Length: N\r\n\r\n<body>`, the same framing the transport
+        // writes: the reply is built for request id 1, which is the first id a
+        // fresh connection mints.
+        let marker = marker.display().to_string();
+        if cfg!(windows) {
+            EngineCommand::new("powershell.exe")
+                .arg("-NoProfile")
+                .arg("-NonInteractive")
+                .arg("-Command")
+                .arg(format!(
+                    "$null = [Console]::In.ReadLine(); \
+                     $body = '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"ok\":true}}}}'; \
+                     $out = [Console]::OpenStandardOutput(); \
+                     $bytes = [Text.Encoding]::ASCII.GetBytes(\
+                     \"Content-Length: $($body.Length)`r`n`r`n$body\"); \
+                     $out.Write($bytes, 0, $bytes.Length); $out.Flush(); \
+                     $null = [Console]::In.ReadToEnd(); \
+                     New-Item -ItemType File -Force -Path '{marker}' | Out-Null"
+                ))
+        } else {
+            EngineCommand::new("sh").arg("-c").arg(format!(
+                "read _header; \
+                 body='{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"ok\":true}}}}'; \
+                 printf 'Content-Length: %s\\r\\n\\r\\n%s' \"${{#body}}\" \"$body\"; \
+                 cat >/dev/null; touch '{marker}'"
+            ))
         }
     }
 }

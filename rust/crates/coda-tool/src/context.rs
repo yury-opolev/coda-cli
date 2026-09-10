@@ -75,6 +75,75 @@ impl TodoStore {
 
 // ── Interaction seams ─────────────────────────────────────────────────────────
 
+/// Why a question produced no answer.
+///
+/// Every variant is a *fault*, never a choice. A client that vanished, a
+/// timeout, a cancellation and a malformed reply are all distinguishable, and
+/// none of them may ever be collapsed into a selected option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoAnswerReason {
+    /// No controller was attached at all (headless).
+    NoController,
+    /// The connection to the controller was lost.
+    Disconnected,
+    /// The turn/tool was cancelled while the question was outstanding.
+    Cancelled,
+    /// An explicitly configured reverse-request timeout elapsed.
+    Timeout,
+    /// A reply arrived but did not carry a usable answer.
+    Malformed,
+    /// The controller explicitly declined to answer (`session/cancelRequest`).
+    Declined,
+}
+
+impl NoAnswerReason {
+    /// Stable classification token — safe for logs, wire fields and tests.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NoAnswerReason::NoController => "noController",
+            NoAnswerReason::Disconnected => "disconnected",
+            NoAnswerReason::Cancelled => "cancelled",
+            NoAnswerReason::Timeout => "timeout",
+            NoAnswerReason::Malformed => "malformed",
+            NoAnswerReason::Declined => "declined",
+        }
+    }
+}
+
+/// The result of asking the operator a question.
+///
+/// This type exists because `-> String` made "the connection died" and "the
+/// user picked option 1" the same value. Every caller must handle
+/// [`AnswerOutcome::NoAnswer`] as a typed abort: never coerced to a string,
+/// never substituted with the first option, never auto-retried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnswerOutcome {
+    /// The operator answered. The string is exactly what they chose or typed.
+    Answered(String),
+    /// No answer exists. There is nothing to tell the model.
+    NoAnswer(NoAnswerReason),
+}
+
+impl AnswerOutcome {
+    /// The answer text, or `None` when there was no answer.
+    ///
+    /// Deliberately named so a caller cannot mistake it for a fallback: there
+    /// is no `unwrap_or_default()`-shaped API on this type.
+    pub fn answered(&self) -> Option<&str> {
+        match self {
+            AnswerOutcome::Answered(a) => Some(a.as_str()),
+            AnswerOutcome::NoAnswer(_) => None,
+        }
+    }
+
+    pub fn no_answer_reason(&self) -> Option<NoAnswerReason> {
+        match self {
+            AnswerOutcome::NoAnswer(r) => Some(*r),
+            AnswerOutcome::Answered(_) => None,
+        }
+    }
+}
+
 /// Seam for surfacing a multiple-choice question to the user.
 ///
 /// The loop wires a concrete implementation; `None` in `ToolContext` signals
@@ -87,7 +156,7 @@ pub trait UserQuestion: Send + Sync {
         options: &[String],
         multi_select: bool,
         cancel: CancellationToken,
-    ) -> String;
+    ) -> AnswerOutcome;
 }
 
 /// Seam for presenting a plan to the user and receiving an approval decision.

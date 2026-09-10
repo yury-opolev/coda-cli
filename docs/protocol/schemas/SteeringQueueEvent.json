@@ -1,0 +1,112 @@
+{
+  "type": "object",
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "engineInstanceId": {
+      "type": "string"
+    },
+    "pendingCount": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "pending": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/SteeringPendingDto"
+      }
+    },
+    "outcomes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/SteeringOutcomeDto"
+      },
+      "description": "Bounded ring, newest last."
+    },
+    "outcomesTruncated": {
+      "type": "boolean"
+    },
+    "retainedOutcomes": {
+      "type": "integer",
+      "format": "int64"
+    }
+  },
+  "required": [
+    "seq",
+    "engineInstanceId",
+    "pendingCount",
+    "pending",
+    "outcomes",
+    "outcomesTruncated",
+    "retainedOutcomes"
+  ],
+  "title": "SteeringQueueEvent",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "SteeringPendingDto": {
+      "type": "object",
+      "properties": {
+        "messageId": {
+          "type": "string"
+        },
+        "enqueuedAt": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string",
+          "description": "The full original text (§2.3a) — never a preview. Capped; see\n`text_truncated`."
+        },
+        "textLength": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "textTruncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "messageId",
+        "enqueuedAt",
+        "text",
+        "textLength",
+        "textTruncated"
+      ]
+    },
+    "SteeringOutcomeDto": {
+      "type": "object",
+      "properties": {
+        "messageId": {
+          "type": "string"
+        },
+        "outcome": {
+          "$ref": "#/$defs/SteeringOutcomeKind"
+        },
+        "at": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "messageId",
+        "outcome",
+        "at"
+      ]
+    },
+    "SteeringOutcomeKind": {
+      "type": "string",
+      "enum": [
+        "delivered",
+        "recalled",
+        "cancelledTurnEnded",
+        "rejected"
+      ]
+    }
+  }
+}

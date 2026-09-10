@@ -1,0 +1,15 @@
+{
+  "type": "object",
+  "properties": {
+    "text": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The full system prompt text. `None` or empty string clears any override."
+    }
+  },
+  "description": "Sets a session-only custom system prompt that **fully replaces** the\nengine's built-in system prompt (it is not appended to it). Session-only:\nnever written to settings.",
+  "title": "SetSystemPromptParams",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

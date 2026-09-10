@@ -1,0 +1,34 @@
+[package]
+name = "coda-boot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Headless bootstrap shared by `coda serve` and the standalone `coda-engine` binary: diagnostics init/forward, product version, serve argument parsing, and pure session-intent resolution. Deliberately free of TUI, rendering, clipboard, and agent-runtime dependencies so a core-only build is provable."
+
+[dependencies]
+coda-client = { workspace = true }
+coda-diagnostics = { workspace = true }
+coda-auth = { workspace = true }
+# The uncached model-listing probe that turns "a credential was stored" into
+# "the connection works". No agent runtime, no renderer: `coda-auth` already
+# depends on this crate, so it adds nothing new to the engine's graph.
+coda-llm = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
+# Advisory file lock: settings.json has several writers in several processes.
+fs2 = { workspace = true }
+
+# Turning terminal echo off for a masked API-key prompt. `termios` only; the
+# engine must not link a terminal renderer, so this is not `crossterm`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

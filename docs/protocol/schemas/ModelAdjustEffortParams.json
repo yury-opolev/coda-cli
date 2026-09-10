@@ -1,0 +1,28 @@
+{
+  "type": "object",
+  "properties": {
+    "model": {
+      "type": "string",
+      "description": "The model to step. Must be a model the engine knows (live list or\ncatalogue), not an arbitrary string."
+    },
+    "direction": {
+      "type": "integer",
+      "format": "int32",
+      "description": "`-1` toward automatic/lower, `+1` toward higher. Any other value is\nrejected with `-32602`."
+    },
+    "expectedProvider": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The provider the caller believed was connected; when it no longer\nmatches, the engine rejects the call without mutating anything."
+    }
+  },
+  "required": [
+    "model",
+    "direction"
+  ],
+  "description": "Parameters for `model/adjustEffort`.\n\nSteps the *target* model's reasoning effort one rung up (`+1`) or down\n(`-1`) along the engine-owned ladder `[auto?, levels…]`. Unlike\n[`SetEffortParams`] this never activates or changes the active model — it\nedits the target's own per-model preference and only touches the live level\nwhen the target happens to be active.",
+  "title": "ModelAdjustEffortParams",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

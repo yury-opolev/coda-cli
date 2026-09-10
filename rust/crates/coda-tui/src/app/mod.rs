@@ -8,9 +8,8 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use coda_client::{ClientError, Connection, Engine, EngineCommand, Inbound, Responder};
+use coda_client::{ClientError, Connection, Engine, EngineCommand, Inbound};
 use coda_proto::messages::{self, method};
-use coda_proto::Event;
 use coda_render::{RenderLine, Theme};
 use crossterm::event::{
     Event as TerminalEvent, EventStream, KeyCode, KeyEvent, KeyEventKind,
@@ -21,16 +20,20 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
+mod auth;
 mod browsers;
 mod slash;
 mod clipboard;
 mod effort;
 mod engine;
+mod identity;
 mod image;
 mod queue;
+mod serve;
+mod settings;
 mod startup_cli;
 
-use crate::config::{self, Paths, Settings};
+use crate::config::{self, Paths};
 use crate::commands;
 use crate::composer::{Completion, Composer};
 use crate::draw;
@@ -60,6 +63,14 @@ pub(crate) enum PointerAction {
 /// Matches C# `UiActor.MinStreamingFrameIntervalMs = 33`.
 const MIN_STREAMING_FRAME_MS: u64 = 33;
 
+/// How long the loop waits before running a re-read it owes but has no
+/// schedule for.
+///
+/// Short enough that a stale screen corrects itself immediately, long enough
+/// that a read which keeps re-owing one cannot become a spin: each wake costs
+/// one settle, and a settle that fails arms a real backoff instead.
+const SETTLE_WAKE: Duration = Duration::from_millis(50);
+
 /// How long each frame of the working indicator is held.
 ///
 /// Slower than the frame cap, so the spinner costs at most one extra redraw
@@ -72,13 +83,6 @@ struct TurnOutcome {
 }
 
 /// The running application.
-/// What the startup banner needs before the UI takes over the terminal.
-#[derive(Debug, Clone, Default)]
-pub struct SessionSnapshot {
-    pub provider: Option<String>,
-    pub model: Option<String>,
-}
-
 pub struct App {
     state: UiState,    composer: Composer,
     viewport: Viewport,
@@ -125,8 +129,35 @@ pub struct App {
     detached_anchor: Option<ViewportAnchor>,
     /// Set while a `session/prompt` is outstanding.
     turn: Option<oneshot::Receiver<Result<Value, coda_proto::ResponseError>>>,
-    /// The responder for a prompt the user has not answered yet.
-    pending_responder: Option<Responder>,
+    /// The event fence: what this client has already seen (§2.5).
+    pub(crate) view: crate::api::ServeView,
+    /// Outstanding permission/question/plan decisions, from the raw
+    /// round-trip and from discovery alike.
+    pub(crate) pending: crate::api::requests::PendingInteractions,
+    /// Set when the engine's authoritative state must be re-read.
+    pub(crate) needs_resync: bool,
+    /// Set when the conversation itself must be rebuilt from the engine.
+    pub(crate) needs_rehydrate: bool,
+    /// Retry schedule for `session/getState`.
+    pub(crate) resync_recovery: serve::Recovery,
+    /// Retry schedule for `session/getHistory`.
+    pub(crate) rehydrate_recovery: serve::Recovery,
+    /// Whether this client may maintain the engine-adjacent files itself.
+    pub(crate) access_mode: crate::local::AccessMode,
+    /// How long the UI waits for one engine read before treating the silence
+    /// as a failure. A field rather than a constant so the bound is visible
+    /// where the loop is, and drivable in a test without sleeping through it.
+    pub(crate) metadata_timeout: Duration,
+    /// The engine's own configuration catalogue, when it has been read.
+    pub(crate) config_catalog: Option<coda_proto::config::ConfigDescribeResult>,
+    /// How long a deliberate stop waits for the engine to go away before it
+    /// is killed.
+    ///
+    /// A field rather than a constant because an authentication transition
+    /// depends on this bound being *reached*: the credential is only safe to
+    /// delete once the process using it is gone, and a test proving that
+    /// ordering must not have to sleep through the production grace period.
+    pub(crate) shutdown_grace: Duration,
     /// A two-press chord armed by the previous keystroke, and when.
     armed: Option<(keymap::Chord, std::time::Instant)>,
     /// Open surfaces, topmost last. Owns key routing while non-empty.
@@ -167,117 +198,101 @@ pub struct App {
     header_id_rect: Option<ratatui::layout::Rect>,
     /// Whether the header's session id is selected (all-or-nothing).
     header_id_selected: bool,
+    /// The engine process this application owns — the one it was handed at
+    /// launch, and thereafter whichever replacement superseded it.
+    ///
+    /// Unified deliberately. While only restarts were owned here, an
+    /// authentication transition could not stop the *original* engine at all:
+    /// it belonged to `main`, so the credential it was using was deleted while
+    /// its process was still running and spending it.
+    owned_engine: Option<Engine>,
+    /// Whether an engine is believed to be answering.
+    ///
+    /// Cleared by a deliberate disconnection so the loop stops reading a
+    /// closed channel and stops polling for a recovery that cannot happen,
+    /// while every local command keeps working.
+    engine_connected: bool,
+    /// The running authentication flow, if any.
+    auth: auth::AuthState,
+    /// How a login opens this profile.
+    auth_port: crate::local::auth::AuthPort,
 }
 
 
 impl App {
-
-
-    /// Connects to an engine and completes the handshake.
-    pub async fn connect(
-        command: EngineCommand,
-        theme: Theme,
-    ) -> Result<(Self, Engine, mpsc::UnboundedReceiver<Inbound>)> {
-        Self::connect_to_session(command, theme, None).await
-    }
-
-    /// Connects to an engine, resuming `session_id` when one is given.
-    ///
-    /// Resuming is part of the handshake rather than something done afterwards
-    /// because the engine seeds its history from the stored transcript while
-    /// initialising; asking later would leave the first turn without it.
-    pub async fn connect_to_session(
-        command: EngineCommand,
-        theme: Theme,
-        session_id: Option<String>,
-    ) -> Result<(Self, Engine, mpsc::UnboundedReceiver<Inbound>)> {
-        let (engine, inbound) = Engine::spawn(command.clone()).context("failed to start the engine")?;
-        let connection = engine.connection();
-
-        let mut init = messages::InitializeParams::new("coda-tui");
-        init.session_id = session_id;
-        let params = serde_json::to_value(init)?;
-        let result = connection
-            .request(method::INITIALIZE, Some(params))
-            .await
-            .context("the engine rejected the handshake")?;
-        let initialized: messages::InitializeResult = serde_json::from_value(result)
-            .context("the engine returned an unexpected initialize result")?;
-        if let Some(ctx) = coda_diagnostics::current() {
-            crate::diagnostics::record_engine_log_path(
-                &ctx.with_session(initialized.session_id.clone()),
-                initialized.telemetry_log_path.as_deref(),
-            );
-        }
-
-        let mut state = UiState::new();
-        state.apply(UiEvent::Connected {
-            session_id: initialized.session_id,
-        });
-
-        let project_root = command
-            .working_dir
-            .clone()
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-
-        let app = Self {
-            state,
-            composer: Composer::new(),
-            viewport: Viewport::new(),
-            theme,
-            connection,
-            rows: Vec::new(),
-            block_starts: Vec::new(),
-            laid_out_width: 0,
-            dirty: true,
-            critical_dirty: false,
-            frame_deadline: None,
-            last_frame_at: None,
-            spinner_at: None,
-            connected_provider: None,
-            dragging: false,
-            detached_anchor: None,
-            turn: None,
-            pending_responder: None,
-            armed: None,
-            surfaces: Default::default(),
-            paths: Paths::new(project_root),
-            task_outcomes: std::collections::BTreeMap::new(),
-            engine_command: command,
-            restarted: None,
-            staged_images: Vec::new(),
-            selection: crate::selection::TranscriptSelection::new(),
-            transcript_origin: (0, 0),
-            composer_origin: (0, 0),
-            session_effort: None,
-            engine_log_path: initialized.telemetry_log_path,
-            header_id_rect: None,
-            header_id_selected: false,
-        };
-
-        Ok((app, engine, inbound))
-    }
-
     /// Runs until the user quits or the engine disconnects.
     /// Runs the UI loop, returning the summary the caller prints on exit.
     ///
     /// The summary is produced here rather than by the caller because the loop
     /// consumes `self`: usage and session id are only final once it returns.
+    ///
+    /// **Every** way out of the loop — a quit, a disconnect, a terminal error
+    /// — goes through [`Self::finish`], which is the only place this session
+    /// is torn down. It is written this way on purpose: the teardown used to
+    /// live in a method with no callers at all, so in production the engine's
+    /// outstanding requests were left to be cancelled by `Drop`, which cannot
+    /// tell a live request from one whose engine has been replaced.
+    ///
+    /// `engine` is the process the caller started for this session. It is
+    /// handed over rather than kept, because a credential change has to stop
+    /// and *await* it before writing: a caller holding it could only be told
+    /// about the change afterwards, by which time its child has already
+    /// outlived the credential it was using.
     pub async fn run(
         mut self,
         guard: &mut TerminalGuard,
-        mut inbound: mpsc::UnboundedReceiver<Inbound>,
+        inbound: mpsc::UnboundedReceiver<Inbound>,
+        engine: Engine,
         started_at: std::time::Instant,
     ) -> Result<crate::branding::ExitSummary> {
-        // Holds an engine this loop started itself, so it can be shut down
-        // when superseded by another restart.
-        let mut owned_engine: Option<Engine> = None;
+        // One owner for the original and for every replacement after it.
+        self.owned_engine = Some(engine);
+        let outcome = self.event_loop(guard, inbound).await;
+        // `finish` is the whole teardown, engines included: the session is
+        // closed out over the connection first, and only then do the
+        // processes this loop owns go away.
+        self.finish(outcome, started_at).await
+    }
+
+    /// Tears the session down and reports what the run produced.
+    ///
+    /// The single exit for every path through [`Self::run`], including the
+    /// failing ones: the engine's outstanding requests are answered or
+    /// discarded *before* anything is dropped, then every process this
+    /// application owns is asked to stop and awaited, and only then is the
+    /// run's own outcome propagated. Bound to that order rather than to
+    /// `?`-propagation, so a failing run still stops its engines instead of
+    /// leaking them.
+    pub(crate) async fn finish(
+        &mut self,
+        outcome: Result<()>,
+        started_at: std::time::Instant,
+    ) -> Result<crate::branding::ExitSummary> {
+        self.close_out().await;
+        self.stop_owned_engines(SHUTDOWN_GRACE).await;
+        outcome?;
+        Ok(self.exit_summary(started_at.elapsed()))
+    }
+
+    async fn event_loop(
+        &mut self,
+        guard: &mut TerminalGuard,
+        mut inbound: mpsc::UnboundedReceiver<Inbound>,
+    ) -> Result<()> {
         let mut terminal_events = EventStream::new();
         let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<TurnOutcome>();
+        let mut auth_events = self.auth.take_events();
 
+        // The screen first, before anything off this machine is awaited. The
+        // model list is a round-trip and the preflight opens a credential
+        // store — both bounded, neither instant — and doing them ahead of the
+        // first draw left the terminal blank for as long as they took, with
+        // no banner, no composer and nothing to say why.
+        self.redraw(guard)?;
         self.load_models().await;
-        // Show the setup wizard welcome on first run.
-        self.check_first_run();
+        // Says nothing at all when this profile already has a credential, and
+        // nothing ever for an engine this client did not start.
+        self.preflight().await;
         self.redraw(guard)?;
 
         loop {
@@ -290,14 +305,23 @@ impl App {
 
             tokio::select! {
                 // Engine notifications and server-initiated requests.
-                message = inbound.recv() => match message {
+                //
+                // Guarded: after a deliberate disconnection the channel is
+                // closed and `recv` answers `None` immediately and forever,
+                // which would spin the loop at full speed while reporting a
+                // disconnection the user asked for.
+                message = inbound.recv(), if self.engine_connected => match message {
                     Some(message) => self.on_inbound(message),
                     None => {
+                        self.set_engine_connected(false);
                         self.notice("The engine disconnected.", NoticeLevel::Error);
                         self.redraw(guard)?;
                         break;
                     }
                 },
+
+                // An authentication task has something to report.
+                Some(event) = auth_events.recv() => self.on_auth_event(event).await,
 
                 // Terminal input.
                 event = terminal_events.next() => match event {
@@ -337,7 +361,7 @@ impl App {
             // A restart stages a new engine; swap it in between iterations so
             // the inbound stream is never replaced mid-await.
             if let Some((engine, next_inbound)) = self.restarted.take() {
-                let previous = std::mem::replace(&mut owned_engine, Some(engine));
+                let previous = std::mem::replace(&mut self.owned_engine, Some(engine));
                 inbound = next_inbound;
                 if let Some(previous) = previous {
                     let _ = previous.shutdown(SHUTDOWN_GRACE).await;
@@ -347,6 +371,11 @@ impl App {
             if self.state.should_quit {
                 break;
             }
+            // Whatever the event fence asked for: a snapshot after a gap or a
+            // reset, a rehydration after the conversation was replaced. Done
+            // here, between iterations, so no RPC is awaited while an inbound
+            // frame is half-processed.
+            self.settle_with_engine().await;
             self.tick_spinner();
             if self.state.tick_thinking(std::time::Instant::now()) {
                 self.laid_out_width = 0;
@@ -357,10 +386,7 @@ impl App {
             self.arm_spinner_wakeup();
         }
 
-        if let Some(engine) = owned_engine {
-            let _ = engine.shutdown(SHUTDOWN_GRACE).await;
-        }
-        Ok(self.exit_summary(started_at.elapsed()))
+        Ok(())
     }
 
     // -- Engine -------------------------------------------------------------
@@ -391,9 +417,17 @@ impl App {
     /// happened to return first, so the status bar could disagree with the
     /// engine and switching a model looked as though it had not been saved.
     async fn load_models(&mut self) {
+        if !self.engine_connected {
+            return;
+        }
+        // Bounded like every other read the loop awaits: this one runs at
+        // startup and after a model switch, and an unbounded await here would
+        // freeze the UI before it had drawn a single frame.
         let Ok(value) = self
-            .connection
-            .request(method::MODELS, Some(serde_json::json!({ "refresh": false })))
+            .bounded(
+                self.connection
+                    .request(method::MODELS, Some(serde_json::json!({ "refresh": false }))),
+            )
             .await
         else {
             return;
@@ -699,6 +733,17 @@ impl App {
         // A message typed mid-turn is steered into the running turn rather
         // than dropped or forced to wait for it to finish.
         let images = image::images_for_draft(&self.staged_images, &text);
+        if !self.engine_connected {
+            // The draft is put back, never sent and never queued for an
+            // automatic resend: reconnecting is a decision, and so is sending.
+            self.composer.set_text(text);
+            self.notice(
+                "Not connected to an engine, so nothing was sent. Your message is still here. \
+                 Run /provider or /login to connect.",
+                NoticeLevel::Warning,
+            );
+            return;
+        }
         if self.state.is_busy() {
             if !images.is_empty() {
                 self.composer.set_text(text);
@@ -741,6 +786,9 @@ impl App {
     }
 
     fn interrupt(&mut self) {
+        if !self.engine_connected {
+            return;
+        }
         self.apply(UiEvent::InterruptRequested);
         if let Err(error) = self
             .connection
@@ -850,64 +898,6 @@ impl App {
 
     // -- Helpers ------------------------------------------------------------
 
-    /// What the startup banner needs to know before the UI takes the terminal.
-    ///
-    /// Provider and model come from settings rather than the engine, because
-    /// the banner is printed before the first turn and there is nothing to ask
-    /// yet — and because naming the wrong provider is exactly the mistake the
-    /// banner exists to prevent.
-    pub fn session_snapshot(&self) -> SessionSnapshot {
-        let settings = Settings::load(&self.paths).ok();
-        let provider = settings
-            .as_ref()
-            .and_then(|s| s.default_provider().map(str::to_owned));
-        let model = self.state.model.clone().or_else(|| {
-            let settings = settings.as_ref()?;
-            let provider = provider.as_deref()?;
-            settings.model_for(provider).map(str::to_owned)
-        });
-        SessionSnapshot { provider, model }
-    }
-
-    /// Seeds the transcript with the startup banner.
-    ///
-    /// The banner belongs in the transcript, not on the raw console: written
-    /// before the alternate screen it is hidden the moment the screen is
-    /// entered, so the user never sees it at all. In the transcript it scrolls
-    /// and can be selected like any other content.
-    pub fn push_banner(&mut self, working_directory: &str) {
-        let session = self.session_snapshot();
-        self.state.transcript.push(crate::transcript::Block::Banner {
-            wordmark: crate::branding::wordmark_lines(),
-            details: crate::branding::startup_detail_lines(
-                working_directory,
-                session.provider.as_deref(),
-                session.model.as_deref(),
-            ),
-        });
-        self.dirty = true;
-    }
-
-    /// Builds the exit summary from the session's final state.
-    pub fn exit_summary(&self, duration: std::time::Duration) -> crate::branding::ExitSummary {
-        let snapshot = self.session_snapshot();
-        let effort = self.session_effort.clone();
-
-        crate::branding::ExitSummary {
-            duration,
-            message_count: self.state.transcript.blocks().len(),
-            provider_id: snapshot.provider.unwrap_or_else(|| "—".into()),
-            model: snapshot.model.unwrap_or_else(|| "—".into()),
-            effort,
-            input_tokens: self.state.usage.input_tokens.max(0) as u64,
-            output_tokens: self.state.usage.output_tokens.max(0) as u64,
-            session_id: self.state.session_id.clone(),
-            working_directory: self.paths.project_root.to_string_lossy().into_owned(),
-        }
-    }
-
-
-
     fn key_context(&self) -> KeyContext {
         let (line, _) = self.composer.cursor_position();
         KeyContext {
@@ -967,7 +957,7 @@ impl App {
     }
 
     fn apply(&mut self, event: UiEvent) {
-        if is_critical_event(&event) {
+        if crate::state::is_critical_event(&event) {
             self.critical_dirty = true;
         } else {
             self.dirty = true;
@@ -1036,6 +1026,8 @@ impl App {
     ///
     /// Also arms a wakeup for the next hint expiry so transient messages
     /// disappear on time even when no other events are arriving.
+    /// Arms a timer wakeup for whatever the loop owes itself next: the
+    /// spinner, a hint expiry, or a backed-off re-read of the engine's state.
     fn arm_spinner_wakeup(&mut self) {
         if self.frame_deadline.is_some() {
             return;
@@ -1059,6 +1051,31 @@ impl App {
             deadline = Some(match deadline {
                 Some(d) => d.min(expiry),
                 None => expiry,
+            });
+        }
+
+        // A re-read this client owes itself. The loop only settles when
+        // something wakes it, and the two ways a re-read comes to be owed
+        // both leave nothing else that would: a *successful* snapshot clears
+        // the retry schedule and can still owe another read (a hole in the
+        // replayed buffer, a config or steering change it carried), and a
+        // failing engine sends no events at all. Either way an idle screen
+        // would sit on state it already knows is stale until the user typed.
+        //
+        // Gated by each read's own schedule, so a failing engine is retried
+        // at the backoff rather than at the speed of this wakeup.
+        let owed = [
+            (self.needs_resync || self.view.needs_snapshot(), self.resync_recovery.next_attempt()),
+            (self.needs_rehydrate, self.rehydrate_recovery.next_attempt()),
+        ];
+        for due in owed
+            .into_iter()
+            .filter(|(owed, _)| *owed)
+            .map(|(_, scheduled)| scheduled.unwrap_or(now + SETTLE_WAKE))
+        {
+            deadline = Some(match deadline {
+                Some(d) => d.min(due),
+                None => due,
             });
         }
 
@@ -1334,9 +1351,24 @@ impl App {
                 };
                 let mut settings = crate::config::Settings::load(&self.paths)
                     .unwrap_or_else(|_| crate::config::Settings::empty_at(self.paths.settings()));
-                match settings_surface.apply(&mut settings) {
-                    Ok(()) => self.notice(
+                // The form edits two owners' values. Appearance is always
+                // this client's; the permission mode and telemetry are read
+                // by the engine at *its* startup, so an API-only session
+                // saves only its own half and says which half that was.
+                settings_surface.apply_client_local(&mut settings);
+                let engine_owned = self.owns_engine_settings();
+                if engine_owned {
+                    settings_surface.apply_engine_owned(&mut settings);
+                }
+                match settings.save() {
+                    Ok(()) if engine_owned => self.notice(
                         "Settings saved. Some changes apply on restart.",
+                        NoticeLevel::Info,
+                    ),
+                    Ok(()) => self.notice(
+                        "Appearance settings saved. The permission mode and telemetry \
+                         settings belong to the engine host, which this client did not \
+                         start, so they were left alone.",
                         NoticeLevel::Info,
                     ),
                     Err(err) => self.notice(
@@ -1360,6 +1392,10 @@ impl App {
 
                 let draft = editor.draft();
                 let original = editor.original().cloned();
+
+                if !self.allow_local_maintenance("MCP server configuration") {
+                    return;
+                }
 
                 let paths = self.paths.clone();
                 let name = draft.name.clone();
@@ -1407,18 +1443,40 @@ impl App {
             // no kind to look up and nothing to forget.
             SurfaceAction::SwitchModel(id) => self.switch_model(&id).await,
             SurfaceAction::ResumeSession(id) => self.resume_to_session(id).await,
-            SurfaceAction::TogglePlugin(id) => self.toggle_plugin(&id).await,
-            SurfaceAction::UpdatePlugin(id) => self.update_plugin(&id).await,
-            SurfaceAction::ToggleMcp(id) => self.toggle_mcp(&id).await,
+            SurfaceAction::TogglePlugin(id) => {
+                if self.allow_local_maintenance("Plugin management") {
+                    self.toggle_plugin(&id).await
+                }
+            }
+            SurfaceAction::UpdatePlugin(id) => {
+                if self.allow_local_maintenance("Plugin management") {
+                    self.update_plugin(&id).await
+                }
+            }
+            SurfaceAction::ToggleMcp(id) => {
+                if self.allow_local_maintenance("MCP server configuration") {
+                    self.toggle_mcp(&id).await
+                }
+            }
             SurfaceAction::DeleteSchedule(id) => self.delete_schedule(&id).await,
             SurfaceAction::NewMcpServer => {
-                self.surfaces.push(Box::new(
-                    crate::surface::mcp_editor::McpEditorSurface::creating(),
-                ));
-                self.dirty = true;
+                if self.allow_local_maintenance("MCP server configuration") {
+                    self.surfaces.push(Box::new(
+                        crate::surface::mcp_editor::McpEditorSurface::creating(),
+                    ));
+                    self.dirty = true;
+                }
             }
-            SurfaceAction::EditMcpServer(id) => self.edit_mcp_server(Some(id)).await,
-            SurfaceAction::DeleteMcpServer(id) => self.delete_mcp_server(Some(id)).await,
+            SurfaceAction::EditMcpServer(id) => {
+                if self.allow_local_maintenance("MCP server configuration") {
+                    self.edit_mcp_server(Some(id)).await
+                }
+            }
+            SurfaceAction::DeleteMcpServer(id) => {
+                if self.allow_local_maintenance("MCP server configuration") {
+                    self.delete_mcp_server(Some(id)).await
+                }
+            }
             SurfaceAction::ExplainScheduleCreation => self.notice(
                 "Creating a schedule needs arguments; use /schedule from the composer.",
                 NoticeLevel::Info,
@@ -1427,9 +1485,11 @@ impl App {
                 "Skills are frontmatter-driven; edit the SKILL.md file to change them.",
                 NoticeLevel::Info,
             ),
+            SurfaceAction::SubmitAuthChoice => self.start_prepared_login(),
+            SurfaceAction::CancelAuth => self.cancel_auth(),
             SurfaceAction::AnswerPrompt { allowed, answer } => {
                 self.surfaces.pop();
-                self.answer_prompt(allowed, answer);
+                self.answer_prompt(allowed, answer).await;
             }
             SurfaceAction::SetEffort { effort, persist, for_model } => {
                 self.apply_set_effort(effort, persist, for_model).await;
@@ -1451,36 +1511,18 @@ impl App {
         }
     }
 
-    /// Checks for a first run and surfaces the setup wizard notice.
-    fn check_first_run(&mut self) {
-        if crate::setup::is_first_run(&self.paths) {
-            self.notice(crate::setup::WELCOME_TEXT, NoticeLevel::Info);
-        }
-    }
-
-    /// Closes the engine down cleanly.
-    pub async fn shutdown(self, engine: Engine) {
-        if let Some(responder) = self.pending_responder {
-            responder.fail(
-                coda_proto::error_codes::REQUEST_CANCELLED,
-                "the client is shutting down",
-            );
-        }
-        let _ = self
-            .connection
-            .request(method::SHUTDOWN, Some(serde_json::json!({})))
-            .await;
-        let _ = engine.shutdown(SHUTDOWN_GRACE).await;
-    }
-
-
-    // -- Slash command handlers (local / config scope) -----------------------
-
     /// Submits a programmatic prompt to the engine on behalf of a command.
     ///
     /// Used by `/init` and `/skill` to inject model-directed work into the
     /// running session without touching the composer.
     async fn submit_programmatic(&mut self, text: String) {
+        if !self.engine_connected {
+            self.notice(
+                "Not connected to an engine; nothing was sent. Run /provider to connect.",
+                NoticeLevel::Warning,
+            );
+            return;
+        }
         if self.state.is_busy() {
             self.notice("A turn is already running; try again when ready.", NoticeLevel::Warning);
             return;
@@ -1517,60 +1559,4 @@ impl App {
 
 
 
-}
-
-
-
-
-
-
-
-
-
-
-
-
-/// Returns `true` for events that bypass the 30 FPS streaming throttle.
-///
-/// Mirrors `UiActor.IsCritical` in C#: turn boundaries, errors, prompts,
-/// session lifecycle, and mode changes all get immediate frames.
-fn is_critical_event(event: &UiEvent) -> bool {
-        match event {
-        UiEvent::TurnFinished { .. }
-        | UiEvent::Connected { .. }
-        | UiEvent::PromptRequested(_)
-        | UiEvent::PromptAnswered { .. }
-        | UiEvent::Notice { .. }
-        | UiEvent::Cleared
-        | UiEvent::ModelChanged { .. }
-        | UiEvent::DisplayModeChanged(_)
-        // A fold is a direct response to a click, so it must repaint at once
-        // rather than waiting for the streaming throttle: an idle session
-        // produces no further frames to carry it.
-        | UiEvent::ThinkingFoldToggled { .. }
-        | UiEvent::ToolGroupFoldToggled { .. }
-        | UiEvent::Submitted { .. }
-        | UiEvent::Queued { .. }
-        | UiEvent::SteeringRecalled { .. }
-        | UiEvent::InterruptRequested => true,
-        UiEvent::Engine(inner) => match inner {
-            Event::TurnComplete { .. }
-            | Event::Error { .. }
-            | Event::LimitReached { .. }
-            | Event::AssistantTextComplete
-            | Event::ThinkingComplete { .. }
-            | Event::PermissionDecided { .. }
-            | Event::SteeringDelivered { .. } => true,
-            // Streaming events: subject to throttle.
-            Event::AssistantText { .. }
-            | Event::Thinking { .. }
-            | Event::ToolProgress { .. }
-            | Event::Usage { .. }
-            | Event::StreamProgress { .. } => false,
-            _ => true,
-        },
-        // The buffering activation seam is rare and user-visible.
-        UiEvent::EnableAssistantBuffering => true,
-        UiEvent::CommandOutput { .. } | UiEvent::DiffOutput { .. } => true,
-    }
 }

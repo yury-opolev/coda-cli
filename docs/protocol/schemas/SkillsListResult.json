@@ -1,0 +1,62 @@
+{
+  "type": "object",
+  "properties": {
+    "skills": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/WireSkill"
+      }
+    }
+  },
+  "title": "SkillsListResult",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "WireSkill": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "origin": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "userInvocable": {
+          "type": "boolean",
+          "default": false
+        },
+        "sourcePath": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "argumentHint": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "name"
+      ]
+    }
+  }
+}

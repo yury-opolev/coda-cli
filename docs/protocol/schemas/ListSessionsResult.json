@@ -1,0 +1,63 @@
+{
+  "type": "object",
+  "properties": {
+    "sessions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/SessionSummaryDto"
+      }
+    },
+    "totalKnown": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "truncated": {
+      "type": "boolean",
+      "description": "`true` when `total_known` exceeded the (bounded) limit applied."
+    }
+  },
+  "required": [
+    "sessions",
+    "totalKnown",
+    "truncated"
+  ],
+  "title": "ListSessionsResult",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "SessionSummaryDto": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        },
+        "createdUtc": {
+          "type": "string"
+        },
+        "messageCount": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "preview": {
+          "type": "string",
+          "description": "Capped first-user-message preview."
+        },
+        "previewTruncated": {
+          "type": "boolean"
+        },
+        "isCurrent": {
+          "type": "boolean",
+          "description": "`true` for the session this engine is currently running."
+        }
+      },
+      "required": [
+        "sessionId",
+        "createdUtc",
+        "messageCount",
+        "preview",
+        "previewTruncated",
+        "isCurrent"
+      ],
+      "description": "A saved transcript, as listed by `session/listSessions`.\n\nOnly ids the engine itself validated, only the current workspace, never a\nraw filesystem path: a client must never be handed something it could feed\nback as a path."
+    }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "type": "object",
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "engineInstanceId": {
+      "type": "string"
+    },
+    "stopReason": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    }
+  },
+  "required": [
+    "seq",
+    "engineInstanceId"
+  ],
+  "title": "StopEvent",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

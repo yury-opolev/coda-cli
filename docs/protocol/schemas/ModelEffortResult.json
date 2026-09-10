@@ -1,0 +1,40 @@
+{
+  "type": "object",
+  "properties": {
+    "ok": {
+      "type": "boolean",
+      "default": false
+    },
+    "model": {
+      "type": "string",
+      "description": "The canonical model id the preference was keyed under — never a display\nname — so a client persists the per-model save under exactly the key the\nengine reads it back with.",
+      "default": ""
+    },
+    "providerId": {
+      "type": "string",
+      "description": "The provider that model is served by, paired with `model` for the\ncanonical `(provider, model)` identity.",
+      "default": ""
+    },
+    "current": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The effective level in force for the target after the step. `None` means\nautomatic / none — a boundary or an unchanged step reports the truth,\nnever a phantom level change.",
+      "default": null
+    },
+    "active": {
+      "type": "boolean",
+      "description": "Whether the target is the currently active model. An inactive edit\nchanges only the stored preference, leaving the running model untouched.",
+      "default": false
+    },
+    "note": {
+      "type": "string",
+      "description": "Always present (may be empty): a clamp at a bound or a refusal explains\nitself here.",
+      "default": ""
+    }
+  },
+  "description": "Result of `model/adjustEffort`.",
+  "title": "ModelEffortResult",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

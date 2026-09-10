@@ -76,6 +76,8 @@ impl App {
             "permissions" => self.cmd_permissions(&invocation).await,
             "yolo" => self.cmd_yolo().await,
             "provider" => self.cmd_provider(&invocation).await,
+            "login" => self.cmd_login(invocation.first()).await,
+            "logout" => self.cmd_logout(invocation.first()).await,
             "headers" => self.cmd_headers(&invocation).await,
             "log" => self.cmd_log(&invocation).await,
             "marketplace" => self.cmd_marketplace(&invocation).await,
@@ -84,7 +86,7 @@ impl App {
             "export" => self.cmd_export(&invocation).await,
             "diff" => self.cmd_diff().await,
             "image" => self.cmd_image(&invocation).await,
-            "setup" => self.cmd_setup(),
+            "setup" => self.cmd_setup().await,
             "compact" => self.cmd_compact().await,
             "resume" => self.cmd_resume(&invocation).await,
             "fork" => self.cmd_fork().await,
@@ -102,6 +104,12 @@ impl App {
         spec: &commands::CommandSpec,
         invocation: commands::Invocation,
     ) {
+        // Deliberately disconnected: the request would fail on a closed
+        // connection and read as a fault rather than as the state the user
+        // asked for.
+        if !self.require_engine(&format!("/{}", spec.name)) {
+            return;
+        }
         let (rpc_method, params) = match spec.name {
             "models" => (
                 method::MODELS,
@@ -145,7 +153,7 @@ impl App {
             }
         };
 
-        match self.connection.request(rpc_method, params).await {
+        match self.ask::<Value>(rpc_method, params).await {
             Ok(value) => self.output(format_result(spec.name, &value)),
             Err(error) => self.notice(
                 format!("/{} failed: {error}", spec.name),

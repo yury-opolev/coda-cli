@@ -1,0 +1,25 @@
+{
+  "type": "object",
+  "properties": {
+    "ok": {
+      "type": "boolean"
+    },
+    "removed": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0
+    },
+    "remaining": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "ok",
+    "removed",
+    "remaining"
+  ],
+  "title": "RewindResponse",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

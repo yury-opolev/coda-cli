@@ -46,7 +46,7 @@ pub struct SubagentHost {
     tools: Arc<ToolRegistry>,
     quarantine: Arc<ToolQuarantine>,
     task_manager: Arc<TaskManager>,
-    base_model: String,
+    base_model: Arc<dyn Fn() -> String + Send + Sync>,
     base_max_tokens: u32,
     base_max_iterations: usize,
     working_directory: String,
@@ -70,6 +70,7 @@ impl SubagentHost {
         hook_runner: Option<Arc<HookRunner>>,
         max_concurrent: usize,
     ) -> Arc<Self> {
+        let base_model = base_model.into();
         Arc::new(Self {
             client,
             permission_prompt,
@@ -77,13 +78,24 @@ impl SubagentHost {
             tools,
             quarantine,
             task_manager,
-            base_model: base_model.into(),
+            base_model: Arc::new(move || base_model.clone()),
             base_max_tokens,
             base_max_iterations,
             working_directory: working_directory.into(),
             hook_runner,
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
         })
+    }
+
+    /// Resolve the inherited model once at the start of each run. Explicit
+    /// request overrides still win, and in-flight runs keep their capture.
+    pub fn with_model_source(
+        self: Arc<Self>,
+        source: Arc<dyn Fn() -> String + Send + Sync>,
+    ) -> Arc<Self> {
+        let mut host = self.clone_for_background();
+        host.base_model = source;
+        Arc::new(host)
     }
 
     pub fn with_defaults(
@@ -154,7 +166,7 @@ impl SubagentHost {
         let definition = BuiltInAgents::resolve(Some(&request.agent_type));
 
         // Determine the model to use.
-        let model = request.model.clone().unwrap_or_else(|| self.base_model.clone());
+        let model = request.model.clone().unwrap_or_else(|| (self.base_model)());
 
         // Resolve the tool set for this depth/definition.
         let child_tools = resolve_child_tools(&self.tools, definition.read_only_tools_only, request.depth);
@@ -255,6 +267,18 @@ impl SubagentHost {
         // Surface run errors as error strings (not propagated as Err).
         if let Err(AgentError::Cancelled) = run_result {
             return Err("Subagent was cancelled.".into());
+        }
+        // A typed abort (today: an operator question the controller never
+        // answered) must never be reported as a completed subagent. Returning
+        // `Ok(collected_text)` here would hand the parent model a partial
+        // transcript that reads exactly like a finished piece of work — the
+        // "pretend success" failure this audit exists to prevent. The task
+        // manager marks the task failed via the `Err` path.
+        if let Err(AgentError::Aborted { reason }) = &run_result {
+            return Err(format!(
+                "Subagent stopped without completing its task ({reason}). \
+                 Any partial output was discarded rather than reported as a result."
+            ));
         }
 
         // Fire SubagentStop hook (fail-open: broken hook must not lose the result).

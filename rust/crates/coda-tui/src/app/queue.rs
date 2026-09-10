@@ -5,7 +5,19 @@ use crate::state::UiEvent;
 
 impl App {
     pub(super) async fn steer(&mut self, text: String) {
-        let response = self.connection.request(method::STEER, Some(serde_json::json!({ "text": &text }))).await;
+        // A disconnected session cannot queue anything at an engine, and the
+        // draft is the user's: it goes back in the composer rather than into
+        // a request nobody will ever answer.
+        if !self.engine_connected() {
+            self.composer.set_text(text);
+            self.hint(
+                "Not connected to an engine, so nothing was queued. Your message is still here.",
+            );
+            return;
+        }
+        let response = self
+            .ask::<serde_json::Value>(method::STEER, Some(serde_json::json!({ "text": &text })))
+            .await;
         let hint = match response {
             Ok(value) => match serde_json::from_value::<SteerResult>(value) {
                 Ok(result) if result.ok => {
@@ -23,11 +35,22 @@ impl App {
 
     /// Recall is engine-owned: an acknowledged message must never be edited
     /// locally while it remains deliverable in the engine's steering inbox.
+    ///
+    /// Which is also why a disconnected session reclaims nothing: the queue on
+    /// screen describes messages an engine still holds, and emptying it here
+    /// on the strength of a call that never happened would lose them.
     pub(super) async fn recall_pending_into_composer(&mut self) -> bool {
         if !self.composer.is_empty() || self.state.queued.is_empty() {
             return false;
         }
-        let value = match self.connection.request(method::RECALL_STEERING, None).await {
+        if !self.engine_connected() {
+            self.hint(
+                "Not connected to an engine, so nothing was reclaimed; your pending text has \
+                 been retained.",
+            );
+            return true;
+        }
+        let value = match self.ask::<serde_json::Value>(method::RECALL_STEERING, None).await {
             Ok(value) => value,
             Err(_) => {
                 self.hint("Could not confirm the reclaim; your pending text has been retained.");

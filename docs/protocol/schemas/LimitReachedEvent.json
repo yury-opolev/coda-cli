@@ -1,0 +1,26 @@
+{
+  "type": "object",
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "engineInstanceId": {
+      "type": "string"
+    },
+    "kind": {
+      "type": "string",
+      "default": ""
+    },
+    "message": {
+      "type": "string",
+      "default": ""
+    }
+  },
+  "required": [
+    "seq",
+    "engineInstanceId"
+  ],
+  "title": "LimitReachedEvent",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

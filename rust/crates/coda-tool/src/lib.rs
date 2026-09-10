@@ -16,10 +16,29 @@ pub mod context;
 pub mod sandbox;
 
 pub use context::{
-    OpaqueServiceHandle, PlanApprover, ServiceMap, ToolContext, ToolDescriptor,
-    UserQuestion,
+    AnswerOutcome, NoAnswerReason, OpaqueServiceHandle, PlanApprover, ServiceMap, ToolContext,
+    ToolDescriptor, UserQuestion,
 };
 pub use sandbox::{is_within_root, resolve_path, try_resolve_within_root};
+
+/// A control signal a tool can raise alongside its result.
+///
+/// Ordinary failures are values (`is_error = true`) the model is expected to
+/// read and react to. A control signal is different in kind: it says the run
+/// itself must not continue. It exists so a terminal outcome is a **typed
+/// path** rather than a tool-name special case or a forged marker string in
+/// `content` that some future caller could produce by accident.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolControl {
+    /// Stop the run now. The result block is still recorded (a `tool_use`
+    /// with no matching `tool_result` is not a valid conversation), but the
+    /// loop must **not** issue a follow-up model request on the strength of
+    /// it, and no caller may report the run as a success.
+    ///
+    /// `reason` is a stable classification token (e.g.
+    /// `"question.noAnswer.disconnected"`), never free provider text.
+    AbortRun { reason: String },
+}
 
 /// The output of running a tool, fed back to the model as a content block.
 ///
@@ -31,15 +50,35 @@ pub use sandbox::{is_within_root, resolve_path, try_resolve_within_root};
 pub struct ToolResult {
     pub content: String,
     pub is_error: bool,
+    /// `None` for every ordinary result. See [`ToolControl`].
+    pub control: Option<ToolControl>,
 }
 
 impl ToolResult {
     pub fn ok(content: impl Into<String>) -> Self {
-        Self { content: content.into(), is_error: false }
+        Self { content: content.into(), is_error: false, control: None }
     }
 
     pub fn error(content: impl Into<String>) -> Self {
-        Self { content: content.into(), is_error: true }
+        Self { content: content.into(), is_error: true, control: None }
+    }
+
+    /// A terminal failure: the recorded result plus an explicit instruction
+    /// to stop the run. Always an error result — an abort is never a success.
+    pub fn abort(reason: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            is_error: true,
+            control: Some(ToolControl::AbortRun { reason: reason.into() }),
+        }
+    }
+
+    /// The abort reason, when this result demands the run stop.
+    pub fn abort_reason(&self) -> Option<&str> {
+        match &self.control {
+            Some(ToolControl::AbortRun { reason }) => Some(reason.as_str()),
+            None => None,
+        }
     }
 }
 

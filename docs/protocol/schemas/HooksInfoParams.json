@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "properties": {
+    "index": {
+      "type": "integer",
+      "format": "int32",
+      "default": 0
+    }
+  },
+  "title": "HooksInfoParams",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

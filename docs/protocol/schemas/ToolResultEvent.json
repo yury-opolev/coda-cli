@@ -1,0 +1,88 @@
+{
+  "type": "object",
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "engineInstanceId": {
+      "type": "string"
+    },
+    "toolName": {
+      "type": "string",
+      "default": ""
+    },
+    "content": {
+      "type": "string",
+      "default": ""
+    },
+    "isError": {
+      "type": "boolean",
+      "default": false
+    },
+    "status": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ToolCallStatus"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "rootTurnId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "activityId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "callId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "sourceId": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "`\"root:<rootTurnId>\"` or `\"subagent:<taskId>\"`."
+    },
+    "batchId": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Additive alias for `activity_id` (§2.6 of the serve API implementation\nplan): equals today's per-batch `activity_id` value verbatim.\n`activity_id` is never re-rooted or removed; this is a second name for\nthe same value so new clients can adopt the documented identity model\nwithout any existing field changing meaning."
+    }
+  },
+  "required": [
+    "seq",
+    "engineInstanceId"
+  ],
+  "description": "Ids that tie tool calls, progress and results together.\n\nAll four are optional on the wire. A call and its result correlate only when\nevery populated component matches, which is what lets two same-named tools\nrunning concurrently stay distinct.",
+  "title": "ToolResultEvent",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "ToolCallStatus": {
+      "type": "string",
+      "enum": [
+        "Pending",
+        "AwaitingApproval",
+        "Running",
+        "Succeeded",
+        "Failed",
+        "Cancelled",
+        "Skipped"
+      ],
+      "description": "Status reported alongside a tool result.\n\nSerialised by the C# host as `ToString()` on its enum, hence PascalCase."
+    }
+  }
+}

@@ -1,0 +1,78 @@
+{
+  "type": "object",
+  "properties": {
+    "ok": {
+      "type": "boolean",
+      "default": false
+    },
+    "stopReason": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "interrupted": {
+      "type": "boolean",
+      "default": false
+    },
+    "goalStatus": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/WireGoalStatus"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "error": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    }
+  },
+  "title": "PromptResult",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "WireGoalStatus": {
+      "type": "object",
+      "properties": {
+        "outcome": {
+          "type": "string",
+          "description": "`\"Met\"` or `\"Unmet\"`; the field is omitted entirely for `None`."
+        },
+        "remaining": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "continuations": {
+          "type": "integer",
+          "format": "int32",
+          "default": 0
+        },
+        "elapsedSeconds": {
+          "type": "number",
+          "format": "double",
+          "default": 0.0
+        },
+        "escalated": {
+          "type": "boolean",
+          "default": false
+        },
+        "extensionUsed": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [
+        "outcome"
+      ]
+    }
+  }
+}

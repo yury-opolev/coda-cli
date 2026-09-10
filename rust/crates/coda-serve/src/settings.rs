@@ -103,14 +103,26 @@ pub fn resolve_for_provider_at(path: &Path, provider: Option<&str>) -> StartupMo
     resolve_for_provider_from(&value, provider)
 }
 
-fn resolve_for_provider_from(value: &Value, provider: Option<&str>) -> StartupModel {
+pub(crate) fn resolve_for_provider_from(value: &Value, provider: Option<&str>) -> StartupModel {
     let provider_id = crate::host::canonical_provider(provider.unwrap_or(FALLBACK_PROVIDER));
 
+    // The saved model row is keyed by the engine provider id, but an older
+    // build wrote the API key's row under its *stored* id
+    // (`anthropic-api-key`). Reading only the canonical key would silently
+    // change that user's model, so every spelling this identity has ever had
+    // is consulted, most canonical first.
+    let model_keys: Vec<&str> = match coda_auth::service::ProviderIdentity::parse(&provider_id) {
+        Some(identity) => identity.settings_model_keys().to_vec(),
+        None => vec![provider_id.as_str()],
+    };
     let by_provider = value
         .get("modelByProvider")
         .and_then(Value::as_object)
-        .and_then(|map| map.get(&provider_id))
-        .and_then(Value::as_str)
+        .and_then(|map| {
+            model_keys
+                .iter()
+                .find_map(|key| map.get(*key).and_then(Value::as_str))
+        })
         .filter(|s| !s.trim().is_empty());
 
     let top_level = value
@@ -125,6 +137,30 @@ fn resolve_for_provider_from(value: &Value, provider: Option<&str>) -> StartupMo
         .to_owned();
 
     StartupModel { provider_id, model }
+}
+
+/// The saved `defaultProvider`, as written, for an explicit settings path.
+///
+/// `Ok(None)` means the key is absent or blank — no choice was made. An
+/// unreadable or malformed settings file is an **error**, not "no choice":
+/// treating it as unconfigured would let a corrupt file quietly move the user
+/// off the account they chose, which is the same failure as reading a locked
+/// credential store as "logged out".
+pub(crate) fn saved_default_provider_at(
+    path: &Path,
+) -> Result<Option<String>, CopilotConfigError> {
+    let Some(value) = read_settings_json_checked(path)? else {
+        return Ok(None);
+    };
+    let object = value.as_object().ok_or(CopilotConfigError::InvalidSettings)?;
+    match object.get("defaultProvider") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(provider)) => {
+            let trimmed = provider.trim();
+            Ok((!trimmed.is_empty()).then(|| trimmed.to_owned()))
+        }
+        Some(_) => Err(CopilotConfigError::InvalidSettings),
+    }
 }
 
 /// Returns the model to use for the given connected provider.
@@ -177,35 +213,39 @@ pub(crate) enum CopilotConfigError {
 /// Resolves the [`AuthCopilotConfig`] by layering:
 ///
 /// 1. `GH_COPILOT_ENTERPRISE_DOMAIN` (and other `GH_COPILOT_*` overrides) from
-///    the **process environment** — non-blank env value wins unconditionally.
-/// 2. `githubEnterpriseDomain` from the **saved settings file** — read from
-///    `~/.coda/settings.json` (path respects `CODA_HOME`).
+///    the caller's environment lookup — a non-blank value wins unconditionally.
+/// 2. `githubEnterpriseDomain` from the **saved settings file** at the given
+///    path (the profile's, never an ambient one).
 /// 3. Public github.com defaults when neither source has a domain.
 ///
 /// **No environment mutation.** This function never writes to the process
 /// environment; it passes a custom lookup closure to
-/// [`AuthCopilotConfig::from_env_lookup`] instead, which is already the
-/// testable seam.
+/// [`coda_auth::provider::copilot::resolve_copilot_config`], the one shared
+/// resolver, which the login flows use as well (with an explicit deployment
+/// choice, which this engine path never makes).
 ///
 /// An absent file permits public defaults. An unreadable or invalid file fails
 /// closed so losing the saved enterprise domain never redirects its credentials.
-pub(crate) fn resolve_copilot_config() -> Result<AuthCopilotConfig, CopilotConfigError> {
-    let path = settings_path();
-    resolve_copilot_config_from(
-        path.as_deref(),
-        |key| std::env::var(key).ok().filter(|v| !v.is_empty()),
-    )
-}
-
-/// Testable core of [`resolve_copilot_config`].
 ///
-/// Accepts an explicit file path (so tests can use temp files) and an explicit
-/// env lookup (so tests never write real process-environment variables).
+/// Accepts an explicit file path (so a profile-scoped context, and tests, use
+/// their own settings) and an explicit env lookup (so tests never write real
+/// process-environment variables).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn resolve_copilot_config_from(
     settings_path: Option<&Path>,
     env: impl Fn(&str) -> Option<String>,
 ) -> Result<AuthCopilotConfig, CopilotConfigError> {
-    // Read the saved domain once; it may be used inside the closure below.
+    Ok(resolve_copilot_deployment_from(settings_path, env)?.config)
+}
+
+/// As [`resolve_copilot_config_from`], but keeps the resolver's report of which
+/// deployment the endpoints actually contact and which env overrides applied.
+pub(crate) fn resolve_copilot_deployment_from(
+    settings_path: Option<&Path>,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<coda_auth::provider::copilot::ResolvedCopilotConfig, CopilotConfigError> {
+    // Read the saved domain once; the resolver uses it as the fallback for the
+    // enterprise-domain key only.
     let settings = settings_path.map(read_settings_json_checked).transpose()?.flatten();
     let saved_domain = match settings.as_ref() {
         None => None,
@@ -217,20 +257,13 @@ pub(crate) fn resolve_copilot_config_from(
         _ => return Err(CopilotConfigError::InvalidSettings),
     };
 
-    // Build the effective env lookup: env wins if non-blank; otherwise fall
-    // back to the saved domain for the enterprise-domain key only.
-    Ok(AuthCopilotConfig::from_env_lookup(|key| {
-        let env_val = env(key).filter(|v| !v.trim().is_empty());
-        if env_val.is_some() {
-            return env_val;
-        }
-        // Only the enterprise-domain key has a settings fallback; every other
-        // GH_COPILOT_* variable is pure environment-override.
-        if key == "GH_COPILOT_ENTERPRISE_DOMAIN" {
-            return saved_domain.clone().filter(|v| !v.trim().is_empty());
-        }
-        None
-    })?)
+    Ok(coda_auth::provider::copilot::resolve_copilot_config(
+        // The engine never overrides the deployment: it uses whatever the user
+        // signed in to. Only the login flow passes an explicit choice.
+        None,
+        saved_domain.as_deref(),
+        env,
+    )?)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -606,4 +639,36 @@ mod tests {
         // ...but the inference base URL is overridden.
         assert_eq!(config.api_base_url, "https://proxy.internal/copilot");
     }
+
+    /// The resolver reports what the endpoints actually contact, so a caller
+    /// can disclose a redirected auth host instead of labelling it with the
+    /// deployment the user thinks they are on.
+    #[test]
+    fn the_resolved_deployment_describes_the_real_auth_host() {
+        use coda_auth::provider::copilot::CopilotDeployment;
+
+        let (_dir, path) = temp_settings(r#"{"githubEnterpriseDomain": "octocorp.ghe.com"}"#);
+        let saved = resolve_copilot_deployment_from(Some(&path), no_env).expect("config");
+        assert_eq!(
+            saved.deployment,
+            CopilotDeployment::Enterprise { domain: "octocorp.ghe.com".into() }
+        );
+        assert!(saved.endpoint_overrides.is_empty());
+
+        let public = resolve_copilot_deployment_from(None, no_env).expect("config");
+        assert_eq!(public.deployment, CopilotDeployment::Public);
+
+        let redirected = resolve_copilot_deployment_from(
+            None,
+            env_of(&[("GH_COPILOT_DEVICE_CODE_URL", "https://proxy.internal/login/device/code")]),
+        )
+        .expect("config");
+        assert_eq!(
+            redirected.deployment,
+            CopilotDeployment::Custom { auth_host: "proxy.internal".into() }
+        );
+        assert_eq!(redirected.endpoint_overrides, ["GH_COPILOT_DEVICE_CODE_URL"]);
+    }
 }
+
+

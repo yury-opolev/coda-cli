@@ -1,0 +1,347 @@
+{
+  "type": "object",
+  "properties": {
+    "sessionId": {
+      "type": "string"
+    },
+    "engineInstanceId": {
+      "type": "string"
+    },
+    "isLiveSession": {
+      "type": "boolean",
+      "description": "`true` when this is the session the engine is running, so `cursor`,\n`historyEpoch` and `liveEntries` are meaningful."
+    },
+    "historyEpoch": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64",
+      "description": "Present only for the live session. Absent (not `0`) for a saved\ntranscript, which has no epoch of its own."
+    },
+    "cursor": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64",
+      "description": "The event cursor this read is exact at — the same fence\n`session/getState` reports, read under the same lock. Present only\nfor the live session."
+    },
+    "historyLength": {
+      "type": "integer",
+      "format": "int64",
+      "description": "The committed/live fence at the instant of this read. A client\nreconstructs the conversation as\n`entries[..historyLength] ++ liveEntries` and cannot double-count."
+    },
+    "entries": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/HistoryEntry"
+      }
+    },
+    "nextIndex": {
+      "type": "integer",
+      "format": "int64",
+      "description": "Index to pass as the next `sinceIndex`."
+    },
+    "totalKnown": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "truncated": {
+      "type": "boolean",
+      "description": "`true` when `nextIndex < totalKnown`: there is more to page."
+    },
+    "liveEntries": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "$ref": "#/$defs/HistoryEntry"
+      },
+      "description": "The in-flight turn, projected with the same DTOs. Present only when\n`includeLive` was requested, this is the live session, and a turn is\nactually running."
+    },
+    "liveTruncated": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "liveOmittedBytes": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    }
+  },
+  "required": [
+    "sessionId",
+    "engineInstanceId",
+    "isLiveSession",
+    "historyLength",
+    "entries",
+    "nextIndex",
+    "totalKnown",
+    "truncated"
+  ],
+  "title": "GetHistoryResult",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "HistoryEntry": {
+      "type": "object",
+      "properties": {
+        "index": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "role": {
+          "type": "string",
+          "description": "`\"user\" | \"assistant\"` — exactly the provider protocol role."
+        },
+        "entryKind": {
+          "$ref": "#/$defs/HistoryEntryKind",
+          "description": "What this entry actually is. See [`HistoryEntryKind`]: a `user` role\ndoes **not** imply the operator typed anything.",
+          "default": "userPrompt"
+        },
+        "blocks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/HistoryBlock"
+          }
+        }
+      },
+      "required": [
+        "index",
+        "role",
+        "blocks"
+      ],
+      "description": "One role-tagged entry (committed message or in-flight live turn content)."
+    },
+    "HistoryEntryKind": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "userPrompt",
+          "description": "Text the operator actually sent."
+        },
+        {
+          "type": "string",
+          "const": "toolResults",
+          "description": "A user-role message carrying tool results (and possibly steering text\nappended at a delivery boundary). **Never** a new operator prompt."
+        },
+        {
+          "type": "string",
+          "const": "assistant",
+          "description": "An assistant message."
+        }
+      ],
+      "description": "What an entry *is*, independent of its wire `role`.\n\nA provider conversation encodes tool results as **user-role** messages.\nA client that renders `role == \"user\"` as \"something the operator typed\"\ntherefore invents user prompts that never happened. This discriminator\nexists so that mistake is not possible: `role` stays exactly what the\nprovider protocol says, and `entryKind` says what it means."
+    },
+    "HistoryBlock": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "omittedReason": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "`\"tooLarge\"` (a per-block cap) or `\"liveBudgetExceeded\"` (the\nlive-turn retention budget). Present exactly when `text` is\nshorter than what was actually said."
+            },
+            "fullLength": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64",
+              "description": "Byte length of the *original* text before any cap was applied.\nPresent exactly when `text` was truncated."
+            },
+            "kind": {
+              "type": "string",
+              "const": "text"
+            }
+          },
+          "required": [
+            "kind",
+            "text"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "redacted": {
+              "type": "boolean"
+            },
+            "omittedReason": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "See [`HistoryBlock::Text::omitted_reason`]."
+            },
+            "fullLength": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            },
+            "kind": {
+              "type": "string",
+              "const": "reasoningSummary"
+            }
+          },
+          "required": [
+            "kind",
+            "text",
+            "redacted"
+          ],
+          "description": "A reasoning summary — never the opaque provider signature/ciphertext.\n\n`redacted: true` means the provider withheld the text; that is a\npolicy statement, not a truncation, so it carries no `fullLength`."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "callId": {
+              "type": "string"
+            },
+            "toolName": {
+              "type": "string"
+            },
+            "inputJson": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "inputOmittedReason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "inputFullLength": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64",
+              "description": "Byte length of the *original* `input_json` before any cap was\napplied. Present exactly when `input_json` was truncated, so a\nclient can say how much it is not seeing instead of assuming the\ncapped string is the whole input (I8)."
+            },
+            "turnId": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "The turn that produced this call, when the stored message\nrecorded one. Provider `call_id`s are only unique within a\nrequest, so `(turn_id, batch_id, call_id)` is the identity a\nclient should key on. Omitted — never invented — for transcripts\nwritten before correlation ids existed."
+            },
+            "batchId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "toolCall"
+            }
+          },
+          "required": [
+            "kind",
+            "callId",
+            "toolName"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "callId": {
+              "type": "string"
+            },
+            "isError": {
+              "type": "boolean"
+            },
+            "status": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "content": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "omittedReason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "fullLength": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64",
+              "description": "Byte length of the *original* `content` before any cap was applied\n(I8). Present exactly when `content` was truncated."
+            },
+            "turnId": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "See [`HistoryBlock::ToolCall::turn_id`]."
+            },
+            "batchId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "toolResult"
+            }
+          },
+          "required": [
+            "kind",
+            "callId",
+            "isError"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "mediaType": {
+              "type": "string"
+            },
+            "byteLength": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "kind": {
+              "type": "string",
+              "const": "image"
+            }
+          },
+          "required": [
+            "kind",
+            "mediaType",
+            "byteLength"
+          ],
+          "description": "Metadata only — never a base64 payload (secret deny-list)."
+        }
+      ],
+      "description": "One block of content within a [`HistoryEntry`].\n\nEvery variant that can carry capped free text also carries the pair\n(`omittedReason`, `fullLength`). They are present **exactly** when the\nprojection retained less than the original, so a client can always tell a\ncomplete value from a shortened one. Both are omitted — never `null`,\nnever a fabricated length — when nothing was dropped."
+    }
+  }
+}

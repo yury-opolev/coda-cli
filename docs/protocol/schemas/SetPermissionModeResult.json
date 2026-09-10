@@ -1,0 +1,18 @@
+{
+  "type": "object",
+  "properties": {
+    "ok": {
+      "type": "boolean",
+      "default": false
+    },
+    "applied": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The mode actually in force after the call."
+    }
+  },
+  "title": "SetPermissionModeResult",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

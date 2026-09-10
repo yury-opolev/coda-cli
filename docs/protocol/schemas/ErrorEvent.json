@@ -1,0 +1,22 @@
+{
+  "type": "object",
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "engineInstanceId": {
+      "type": "string"
+    },
+    "message": {
+      "type": "string",
+      "default": ""
+    }
+  },
+  "required": [
+    "seq",
+    "engineInstanceId"
+  ],
+  "title": "ErrorEvent",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

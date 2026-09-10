@@ -1,21 +1,21 @@
 //! Per-session state.
 //!
-//! Holds the real `coda_llm::Message` conversation history, the
-//! `SteeringInbox` for mid-turn operator injections, and a log of all
-//! steering messages for `session/recallSteering`.
+//! Holds the real `coda_llm::Message` conversation history and the
+//! `SteeringInbox` for mid-turn operator injections. The inbox is
+//! constructed with an optional [`SteeringObserver`] (Slice 0 / Stage C) so
+//! `EngineState` mirrors every enqueue/delivery/recall/drop transition as a
+//! derived projection; the inbox itself remains the sole execution queue and
+//! its own authoritative source of truth (§3 of the serve API implementation
+//! plan). `steering_log` (a second, undocumented queue authority that leaked
+//! full message text and was never cleared at turn end — F1) has been
+//! removed: outcomes and timestamps are now owned end-to-end by the steering
+//! projection in `crate::state`.
 
 use std::sync::{Arc, Mutex};
 
+use coda_agent::steering::SteeringObserver;
 use coda_agent::SteeringInbox;
 use coda_llm::Message;
-
-/// A steering entry that was accepted and logged.
-#[derive(Clone)]
-pub struct SteeringLogEntry {
-    pub id: String,
-    pub text: String,
-    pub enqueued_at: String,
-}
 
 /// Per-connection session state.
 pub struct Session {
@@ -24,17 +24,21 @@ pub struct Session {
     pub history: Mutex<Vec<Message>>,
     /// Delivery inbox shared with the agent loop.
     pub steering: Arc<SteeringInbox>,
-    /// Full log of every steering message (for `recallSteering`).
-    pub steering_log: Mutex<Vec<SteeringLogEntry>>,
 }
 
 impl Session {
     pub fn new(session_id: impl Into<String>) -> Arc<Self> {
+        Self::with_steering_observer(session_id, None)
+    }
+
+    pub fn with_steering_observer(
+        session_id: impl Into<String>,
+        observer: Option<Arc<dyn SteeringObserver>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             session_id: session_id.into(),
             history: Mutex::new(Vec::new()),
-            steering: Arc::new(SteeringInbox::new()),
-            steering_log: Mutex::new(Vec::new()),
+            steering: Arc::new(SteeringInbox::with_observer(observer)),
         })
     }
 }

@@ -24,6 +24,10 @@ pub mod method {
     pub const HISTORY: &str = "session/history";
     pub const MESSAGES: &str = "session/messages";
     pub const MODELS: &str = "session/models";
+    /// Authoritative snapshot of engine state (Slice 0 / Stage C, §2.2).
+    pub const GET_STATE: &str = "session/getState";
+    /// Bounded event replay with an explicit gap/`oldestAvailableCursor`.
+    pub const GET_EVENTS: &str = "session/getEvents";
     pub const SET_GOAL: &str = "session/setGoal";
     pub const SET_EFFORT: &str = "session/setEffort";
     /// Steps a specific model's reasoning effort up/down one rung without
@@ -44,8 +48,33 @@ pub mod method {
     pub const HOOKS_TRUST: &str = "hooks/trust";
 
     pub const SKILLS_LIST: &str = "skills/list";
+    pub const SKILLS_TRUST: &str = "skills/trust";
     pub const PLUGINS_LIST: &str = "plugins/list";
     pub const COMPACT: &str = "session/compact";
+    /// Branch the live conversation into a new session id, freezing the
+    /// original. Named here rather than spelled out at each call site so the
+    /// bootstrap and the slash command cannot drift apart.
+    pub const FORK: &str = "session/fork";
+    pub const REWIND: &str = "session/rewind";
+
+    // ── Stage D (§2.2) ───────────────────────────────────────────────────
+    /// UI-safe rich history for the live session or a validated saved one,
+    /// read at the same consistency boundary as `session/getState`.
+    pub const GET_HISTORY: &str = "session/getHistory";
+    /// Saved transcripts in the current workspace. Read-only; valid before
+    /// `initialize` so a client can choose a session before resuming one.
+    pub const LIST_SESSIONS: &str = "session/listSessions";
+    /// Outstanding server-initiated requests.
+    pub const GET_PENDING_REQUESTS: &str = "session/getPendingRequests";
+    /// Answer a pending request out of band (i.e. not by replying to the
+    /// original `request/*` round-trip).
+    pub const RESOLVE_REQUEST: &str = "session/resolveRequest";
+    /// Apply a pending request's fail-closed default and stop waiting.
+    pub const CANCEL_REQUEST: &str = "session/cancelRequest";
+    pub const CONFIG_DESCRIBE: &str = "config/describe";
+    pub const CONFIG_SET: &str = "config/set";
+    /// Read-only, secret-free MCP server inventory.
+    pub const MCP_LIST: &str = "mcp/list";
 }
 
 /// Method names the server may call on us. Each expects a reply.
@@ -59,14 +88,82 @@ pub mod server_method {
 pub mod error_code {
     pub const UNAUTHORIZED: i64 = -32001;
     pub const SESSION_NOT_FOUND: i64 = -32002;
+    /// A method that mutates state or is scoped to a turn was called before
+    /// `initialize`. Read-only discovery is deliberately still allowed.
+    pub const NOT_INITIALIZED: i64 = -32011;
+    /// `session/getHistory` was called with a `historyEpoch` the engine has
+    /// already moved past (fork/rewind/compact/resume), so the client's
+    /// indices refer to a conversation that no longer exists. Never answered
+    /// with a partially-valid page.
+    pub const STALE_EPOCH: i64 = -32012;
+    /// The committed-history fence moved between two pages of the same
+    /// logical read, so continuing would duplicate or skip content.
+    pub const HISTORY_FENCE_MOVED: i64 = -32013;
+    /// A pending-request handle does not exist (or was already resolved).
+    pub const UNKNOWN_REQUEST: i64 = -32014;
+    /// The outcome offered does not match the pending request's kind.
+    pub const REQUEST_KIND_MISMATCH: i64 = -32015;
 }
 
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
 
+/// Optional capability negotiation from the client (§2.1 of the serve API
+/// implementation plan). Absence of the whole struct, or of any field inside
+/// it, means legacy behaviour: no gated event method is emitted.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ClientCapabilities {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_events: Option<bool>,
+    /// Reserved reader hint; it does not gate `session/getHistory`.
+    /// The `history.rich` capability reports that method's availability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rich_history: Option<bool>,
+    /// Reserved preference: the current engine does not negotiate an outgoing
+    /// frame-size limit from this value. See `events.payloadLimitNegotiation`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_event_payload_bytes: Option<i64>,
+}
+
+impl ClientCapabilities {
+    /// Whether the client negotiated the new `event/*` state/queue/lifecycle
+    /// notification methods.
+    pub fn wants_state_events(&self) -> bool {
+        self.state_events.unwrap_or(false)
+    }
+}
+
+/// One entry in `InitializeResult.capabilities` — whether a named capability
+/// is supported by this engine build, with an explanatory reason when not.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct CapabilityEntry {
+    pub supported: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl CapabilityEntry {
+    pub fn supported() -> Self {
+        Self { supported: true, reason: None }
+    }
+    pub fn unsupported(reason: impl Into<String>) -> Self {
+        Self { supported: false, reason: Some(reason.into()) }
+    }
+}
+
+/// Contract version stamped on every `InitializeResult` since the serve API
+/// implementation plan's Slice 0. Independent of `PROTOCOL_VERSION`, which
+/// stays `"1"` for wire-envelope compatibility.
+pub const CONTRACT_VERSION: &str = "2026-09-1";
+
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct InitializeParams {
     pub protocol_version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -76,6 +173,9 @@ pub struct InitializeParams {
     /// Resumes an existing session when supplied.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Additive, optional (§2.1): absent means legacy behaviour.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_capabilities: Option<ClientCapabilities>,
 }
 
 impl InitializeParams {
@@ -85,6 +185,7 @@ impl InitializeParams {
             client_info: Some(client_info.into()),
             api_key: None,
             session_id: None,
+            client_capabilities: None,
         }
     }
 
@@ -92,20 +193,56 @@ impl InitializeParams {
         self.session_id = Some(session_id.into());
         self
     }
+
+    pub fn with_client_capabilities(mut self, caps: ClientCapabilities) -> Self {
+        self.client_capabilities = Some(caps);
+        self
+    }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct InitializeResult {
     pub protocol_version: String,
     pub session_id: String,
     pub server_info: String,
     #[serde(default)]
     pub telemetry_log_path: Option<String>,
+    /// Additive fields since Slice 0 (§2.1). All `#[serde(default)]` so a
+    /// legacy engine's response — missing these keys entirely — still parses.
+    #[serde(default)]
+    pub contract_version: Option<String>,
+    #[serde(default)]
+    pub engine_instance_id: Option<String>,
+    /// The authoritative start cursor for `session/getEvents`, valid at the
+    /// moment this `initialize` call returned.
+    #[serde(default)]
+    pub event_cursor: Option<i64>,
+    #[serde(default)]
+    pub capabilities: Option<std::collections::HashMap<String, CapabilityEntry>>,
+}
+
+/// The current Rust engine's initialize response. Unlike `InitializeResult`,
+/// which tolerates legacy peers, these contract fields are always emitted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct InitializeResponse {
+    pub protocol_version: String,
+    pub session_id: String,
+    pub server_info: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry_log_path: Option<String>,
+    pub contract_version: String,
+    pub engine_instance_id: String,
+    pub event_cursor: i64,
+    pub capabilities: std::collections::HashMap<String, CapabilityEntry>,
 }
 
 /// Shared `{ "ok": true }` shape used by interrupt and shutdown.
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct OkResult {
     #[serde(default)]
     pub ok: bool,
@@ -117,6 +254,7 @@ pub struct OkResult {
 
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PromptParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
@@ -135,6 +273,7 @@ impl PromptParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WireImage {
     /// `image/png`, `image/jpeg`, `image/gif` or `image/webp`.
     pub media_type: String,
@@ -143,6 +282,7 @@ pub struct WireImage {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PromptResult {
     #[serde(default)]
     pub ok: bool,
@@ -158,6 +298,7 @@ pub struct PromptResult {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WireGoalStatus {
     /// `"Met"` or `"Unmet"`; the field is omitted entirely for `None`.
     pub outcome: String,
@@ -175,20 +316,26 @@ pub struct WireGoalStatus {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SteerParams {
     pub text: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SteerResult {
     #[serde(default)]
     pub ok: bool,
     #[serde(default)]
     pub message_id: Option<String>,
+    /// Rejection classification such as `noActiveTurn`, `turnEnding` or `emptyText`.
+    #[serde(default)]
+    pub rejected_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RecallSteeringResult {
     #[serde(default)]
     pub messages: Vec<RecalledSteeringMessage>,
@@ -196,6 +343,7 @@ pub struct RecallSteeringResult {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RecalledSteeringMessage {
     pub id: String,
     pub text: String,
@@ -208,12 +356,14 @@ pub struct RecalledSteeringMessage {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct HistoryResult {
     #[serde(default)]
     pub messages: Vec<WireMessage>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WireMessage {
     /// `"user"` or `"assistant"`.
     pub role: String,
@@ -223,12 +373,14 @@ pub struct WireMessage {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MessagesParams {
     pub since_index: i32,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MessagesResult {
     #[serde(default)]
     pub messages: Vec<WireMessage>,
@@ -241,11 +393,13 @@ pub struct MessagesResult {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ModelsParams {
     pub refresh: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ModelsResult {
     /// `"live"`, `"catalog"` or `"builtin"`.
     #[serde(default)]
@@ -300,6 +454,7 @@ impl ModelsResult {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WireModel {
     pub id: String,
     #[serde(default)]
@@ -337,6 +492,7 @@ impl WireModel {
 
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SetGoalParams {
     /// `None` clears the active goal.
     pub goal: Option<String>,
@@ -348,6 +504,7 @@ pub struct SetGoalParams {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SetGoalResult {
     #[serde(default)]
     pub ok: bool,
@@ -361,6 +518,7 @@ pub struct SetGoalResult {
 
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SetEffortParams {
     /// `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`, `"auto"`, or `None` to clear.
     pub effort: Option<String>,
@@ -383,12 +541,14 @@ pub struct SetEffortParams {
 /// what lets `/yolo` take effect on the next tool call instead of asking the
 /// user to restart.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SetPermissionModeParams {
     /// `"default"`, `"acceptEdits"`, `"plan"` or `"bypassPermissions"`.
     pub mode: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SetPermissionModeResult {
     #[serde(default)]
     pub ok: bool,
@@ -402,6 +562,7 @@ pub struct SetPermissionModeResult {
 /// never written to settings.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SetSystemPromptParams {
     /// The full system prompt text. `None` or empty string clears any override.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -409,6 +570,7 @@ pub struct SetSystemPromptParams {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SetSystemPromptResult {
     #[serde(default)]
     pub ok: bool,
@@ -418,6 +580,7 @@ pub struct SetSystemPromptResult {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SetEffortResult {
     #[serde(default)]
     pub ok: bool,
@@ -442,6 +605,7 @@ pub struct SetEffortResult {
 /// when the target happens to be active.
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ModelAdjustEffortParams {
     /// The model to step. Must be a model the engine knows (live list or
     /// catalogue), not an arbitrary string.
@@ -458,6 +622,7 @@ pub struct ModelAdjustEffortParams {
 /// Result of `model/adjustEffort`.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ModelEffortResult {
     #[serde(default)]
     pub ok: bool,
@@ -487,6 +652,7 @@ pub struct ModelEffortResult {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ReasoningCapabilityResult {
     #[serde(default)]
     pub supported: bool,
@@ -528,6 +694,7 @@ pub struct ReasoningCapabilityResult {
 /// Params for `session/compact`.
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CompactParams {
     /// Optional override for the summarisation system prompt.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -537,6 +704,7 @@ pub struct CompactParams {
 /// Result of `session/compact`.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CompactResult {
     #[serde(default)]
     pub ok: bool,
@@ -557,6 +725,7 @@ pub struct CompactResult {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ScheduleListResult {
     #[serde(default)]
     pub schedules: Vec<ScheduledTask>,
@@ -564,6 +733,7 @@ pub struct ScheduleListResult {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ScheduledTask {
     pub id: String,
     #[serde(default)]
@@ -590,6 +760,7 @@ pub struct ScheduledTask {
 
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ScheduleCreateParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -606,6 +777,7 @@ pub struct ScheduleCreateParams {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ScheduleDeleteParams {
     pub id: String,
 }
@@ -615,6 +787,7 @@ pub struct ScheduleDeleteParams {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SkillsListResult {
     #[serde(default)]
     pub skills: Vec<WireSkill>,
@@ -622,6 +795,7 @@ pub struct SkillsListResult {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WireSkill {
     pub name: String,
     #[serde(default)]
@@ -639,6 +813,7 @@ pub struct WireSkill {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PluginsListResult {
     #[serde(default)]
     pub plugins: Vec<WirePlugin>,
@@ -646,6 +821,7 @@ pub struct PluginsListResult {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WirePlugin {
     pub name: String,
     #[serde(default)]
@@ -659,6 +835,7 @@ pub struct WirePlugin {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct HooksListResult {
     #[serde(default)]
     pub hooks: Vec<WireHook>,
@@ -666,6 +843,7 @@ pub struct HooksListResult {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WireHook {
     #[serde(default)]
     pub index: i32,
@@ -685,22 +863,40 @@ pub struct WireHook {
 // Server-initiated requests
 // ---------------------------------------------------------------------------
 
+/// The opaque public handle for a server-initiated request, carried on the
+/// `request/*` params themselves.
+///
+/// Without it a client that answers the raw round-trip and *also* discovers
+/// the same request through `session/getPendingRequests` has no way to tell
+/// the two descriptions apart, so it either renders the prompt twice or drops
+/// the original responder — and dropping a responder **declines** the request.
+/// The value is the same opaque handle `PendingRequestDto.requestId` carries,
+/// and is bound to the engine instance that minted it. It is **never** parsed:
+/// its internal shape is not part of the contract.
+///
+/// Additive and optional: a legacy engine omits it, and a client that has
+/// never heard of it ignores it.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PermissionRequest {
     #[serde(default)]
     pub tool_name: String,
     #[serde(default)]
     pub input_preview: String,
+    #[serde(default)]
+    pub request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PermissionResponse {
     pub allow: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct QuestionRequest {
     #[serde(default)]
     pub question: String,
@@ -710,20 +906,30 @@ pub struct QuestionRequest {
     pub multi_select: bool,
     #[serde(default)]
     pub allow_free_text: bool,
+    /// See [`PermissionRequest::request_id`].
+    #[serde(default)]
+    pub request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct QuestionResponse {
     pub answer: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PlanApprovalRequest {
     #[serde(default)]
     pub plan: String,
+    /// See [`PermissionRequest::request_id`].
+    #[serde(default)]
+    pub request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PlanApprovalResponse {
     pub approve: bool,
 }
@@ -739,6 +945,7 @@ pub struct PlanApprovalResponse {
 /// running concurrently stay distinct.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Correlation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_turn_id: Option<String>,
@@ -749,6 +956,13 @@ pub struct Correlation {
     /// `"root:<rootTurnId>"` or `"subagent:<taskId>"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_id: Option<String>,
+    /// Additive alias for `activity_id` (§2.6 of the serve API implementation
+    /// plan): equals today's per-batch `activity_id` value verbatim.
+    /// `activity_id` is never re-rooted or removed; this is a second name for
+    /// the same value so new clients can adopt the documented identity model
+    /// without any existing field changing meaning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<String>,
 }
 
 impl Correlation {
@@ -777,6 +991,51 @@ impl Correlation {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── Reverse-request public handle (Stage E) ──────────────────────────
+
+    #[test]
+    fn a_reverse_request_carries_the_public_handle_it_is_also_listed_under() {
+        // A client answering the raw round-trip must be able to recognise the
+        // *same* request when it also appears in `session/getPendingRequests`,
+        // without parsing the opaque handle or guessing at its shape.
+        let permission: PermissionRequest = serde_json::from_value(json!({
+            "toolName": "edit",
+            "inputPreview": "src/main.rs",
+            "requestId": "req-engine-7-3",
+        }))
+        .expect("permission request parses");
+        assert_eq!(permission.request_id.as_deref(), Some("req-engine-7-3"));
+
+        let question: QuestionRequest = serde_json::from_value(json!({
+            "question": "Which?",
+            "options": ["a", "b"],
+            "requestId": "req-engine-7-4",
+        }))
+        .expect("question request parses");
+        assert_eq!(question.request_id.as_deref(), Some("req-engine-7-4"));
+
+        let plan: PlanApprovalRequest = serde_json::from_value(json!({
+            "plan": "do it",
+            "requestId": "req-engine-7-5",
+        }))
+        .expect("plan approval request parses");
+        assert_eq!(plan.request_id.as_deref(), Some("req-engine-7-5"));
+    }
+
+    #[test]
+    fn a_legacy_engine_that_omits_the_handle_still_parses() {
+        // Additive means additive: the field's absence is legal, and it must
+        // never be back-filled with a fabricated handle.
+        let permission: PermissionRequest =
+            serde_json::from_value(json!({ "toolName": "edit", "inputPreview": "x" }))
+                .expect("legacy permission request parses");
+        assert_eq!(permission.request_id, None);
+
+        let plan: PlanApprovalRequest =
+            serde_json::from_value(json!({ "plan": "x" })).expect("legacy plan parses");
+        assert_eq!(plan.request_id, None);
+    }
 
     #[test]
     fn initialize_params_serialise_as_camel_case() {
@@ -905,6 +1164,7 @@ mod tests {
             activity_id: Some("a".into()),
             call_id: Some("c".into()),
             source_id: Some("root:t".into()),
+            batch_id: Some("a".into()),
         };
         assert!(correlation.is_complete());
         assert!(!correlation.is_subagent());

@@ -5,7 +5,7 @@
 //! may add events, and a front-end that refuses to run against a newer engine
 //! would be needlessly brittle.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::messages::Correlation;
@@ -38,12 +38,54 @@ pub mod event_method {
     pub const SUBAGENT_RESULT_MODIFIED: &str = "event/subagentResultModified";
     pub const COMPACTION_CANCELLED: &str = "event/compactionCancelled";
     pub const POST_COMPACT_CONTEXT_INJECTED: &str = "event/postCompactContextInjected";
+
+    // ── New, gated behind `stateEvents` (§2.4 of the serve API implementation
+    // plan). Not modelled as `Event` enum variants: they are synthesised
+    // directly from `coda-serve`'s `EngineState`/`EventBus`, never routed
+    // through the `AgentEvent` adapter, so no existing `Event::parse` /
+    // `to_notification` match arm changes. An ordinary seq, never a fixed 0.
+    //
+    // Every constant below is wired and published today. Method names the
+    // plan reserves but this stage does not emit (`event/engineHello`,
+    // `event/steeringOutcome`, `event/turnStarted`, `event/modelRequest`,
+    // `event/toolBatch`, `event/requestPending`, `event/requestResolved`,
+    // `event/usageUpdated`) are deliberately **not** declared here: a named
+    // constant no publisher uses is a promise the engine does not keep.
+    // `event/activity` already carries the phase machine (including turn
+    // start), `event/steeringQueue` already carries the full queue state
+    // after every outcome, the ungated `event/usage` already carries usage,
+    // and the rest arrive with Stage D.
+    pub const ACTIVITY: &str = "event/activity";
+    /// A turn reached its terminal outcome: the live view was cleared, the
+    /// committed-history fence moved and any in-flight tool call was
+    /// finalised — all in one transaction. Carries everything a state client
+    /// needs to converge on those changes without re-snapshotting.
+    pub const TURN_ENDED: &str = "event/turnEnded";
+    /// `EngineLifecycle` changed (initialised, the engine became available
+    /// again after a turn, shutdown began/completed).
+    pub const LIFECYCLE: &str = "event/lifecycle";
+    /// The running turn's `activeConfig` was resolved or replaced.
+    pub const CONFIG_CHANGED: &str = "event/configChanged";
+    pub const STEERING_QUEUE: &str = "event/steeringQueue";
+    pub const SESSION_CHANGED: &str = "event/sessionChanged";
+    pub const EVENTS_DROPPED: &str = "event/eventsDropped";
+    /// A server-initiated request became outstanding (Stage D). Carries the
+    /// new `PendingRequestDto` and the full pending list, so a client that
+    /// missed one frame still converges.
+    pub const REQUEST_PENDING: &str = "event/requestPending";
+    /// A server-initiated request reached a terminal outcome — answered,
+    /// denied, rejected, or explicitly not answered with a typed reason.
+    pub const REQUEST_RESOLVED: &str = "event/requestResolved";
 }
+
+#[cfg(feature = "schema")]
+pub(crate) mod schema;
 
 /// Status reported alongside a tool result.
 ///
 /// Serialised by the C# host as `ToString()` on its enum, hence PascalCase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum ToolCallStatus {
     Pending,
     AwaitingApproval,
@@ -198,6 +240,7 @@ fn parse<T: for<'de> Deserialize<'de> + Default>(params: Option<&Value>) -> T {
 
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 struct DeltaPayload {
     #[serde(default)]
     delta: String,
@@ -205,6 +248,7 @@ struct DeltaPayload {
 
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 struct ThinkingCompletePayload {
     #[serde(default)]
     elapsed_ms: i64,
@@ -214,6 +258,7 @@ struct ThinkingCompletePayload {
 
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 struct ToolCallPayload {
     #[serde(default)]
     tool_name: String,
@@ -225,6 +270,7 @@ struct ToolCallPayload {
 
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 struct ToolProgressPayload {
     #[serde(default)]
     tool_name: String,
@@ -236,6 +282,7 @@ struct ToolProgressPayload {
 
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 struct ToolResultPayload {
     #[serde(default)]
     tool_name: String,
@@ -251,6 +298,7 @@ struct ToolResultPayload {
 
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 struct TurnCompletePayload {
     #[serde(default)]
     stop_reason: Option<String>,
@@ -264,6 +312,7 @@ struct TurnCompletePayload {
 
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 struct StopPayload {
     #[serde(default)]
     stop_reason: Option<String>,
@@ -271,6 +320,7 @@ struct StopPayload {
 
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 struct UsagePayload {
     #[serde(default)]
     input_tokens: i64,
@@ -280,6 +330,7 @@ struct UsagePayload {
 
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 struct MessagePayload {
     #[serde(default)]
     message: String,
@@ -287,6 +338,7 @@ struct MessagePayload {
 
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 struct LimitReachedPayload {
     #[serde(default)]
     kind: String,
@@ -296,6 +348,7 @@ struct LimitReachedPayload {
 
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 struct StreamProgressPayload {
     #[serde(default)]
     phase: String,
@@ -309,6 +362,7 @@ struct StreamProgressPayload {
 
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 struct SteeringDeliveredPayload {
     #[serde(default)]
     message_ids: Vec<String>,
@@ -316,6 +370,7 @@ struct SteeringDeliveredPayload {
 
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 struct TaskCompletedPayload {
     #[serde(default)]
     task_id: String,
@@ -329,6 +384,7 @@ struct TaskCompletedPayload {
 
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 struct ScheduleLifecyclePayload {
     #[serde(default)]
     definition_id: String,
@@ -346,6 +402,7 @@ struct ScheduleLifecyclePayload {
 
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 struct PromptRewrittenPayload {
     #[serde(default)]
     hook_command: String,
@@ -357,6 +414,7 @@ struct PromptRewrittenPayload {
 
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 struct ResponseRewrittenPayload {
     #[serde(default)]
     hook_command: String,
@@ -371,6 +429,7 @@ struct ResponseRewrittenPayload {
 /// `event/toolInputModified` carries the input before and after the hook ran.
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 struct ToolInputModifiedPayload {
     #[serde(default)]
     hook_command: String,
@@ -385,6 +444,7 @@ struct ToolInputModifiedPayload {
 /// `event/toolResultModified` carries the result before and after the hook ran.
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 struct ToolResultModifiedPayload {
     #[serde(default)]
     hook_command: String,
@@ -398,6 +458,7 @@ struct ToolResultModifiedPayload {
 
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 struct CompactionCancelledPayload {
     #[serde(default)]
     hook_command: String,
@@ -407,6 +468,7 @@ struct CompactionCancelledPayload {
 
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 struct PostCompactContextInjectedPayload {
     #[serde(default)]
     additional_context: String,
@@ -414,6 +476,7 @@ struct PostCompactContextInjectedPayload {
 
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 struct PermissionDecidedPayload {
     #[serde(default)]
     hook_command: String,
@@ -425,6 +488,7 @@ struct PermissionDecidedPayload {
 
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 struct PermissionsUpdatedPayload {
     #[serde(default)]
     hook_command: String,
@@ -438,6 +502,7 @@ struct PermissionsUpdatedPayload {
 
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 struct SubagentBlockedPayload {
     #[serde(default)]
     hook_command: String,
@@ -449,6 +514,7 @@ struct SubagentBlockedPayload {
 
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 struct SubagentResultModifiedPayload {
     #[serde(default)]
     hook_command: String,
@@ -458,6 +524,40 @@ struct SubagentResultModifiedPayload {
     original_result: String,
     #[serde(default)]
     modified_result: String,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Envelope metadata + replay DTOs (§2.1, §2.2 of the serve API implementation
+// plan). `seq`/`engineInstanceId` are injected into a notification's `params`
+// object by `EventBus`, *after* `Event::to_notification()` (or, for the new
+// gated methods, after direct DTO serialisation) produces it — they are
+// transport-envelope metadata, not part of any typed `Event` payload.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One stored/replayed notification, exactly as `session/getEvents` returns
+/// it. `params` is the whole original payload (already carrying `seq` and
+/// `engineInstanceId`, since the bus injects them before storing) — a
+/// replayed frame is never truncated or re-summarised.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct EventEnvelope {
+    pub seq: i64,
+    pub engine_instance_id: String,
+    pub method: String,
+    pub params: Value,
+}
+
+/// Result of `session/getEvents`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct GetEventsResult {
+    pub engine_instance_id: String,
+    pub events: Vec<EventEnvelope>,
+    pub next_cursor: i64,
+    pub truncated: bool,
+    pub oldest_available_cursor: i64,
 }
 
 impl Event {
@@ -687,6 +787,7 @@ impl Event {
             put_opt(map, "activityId", &c.activity_id);
             put_opt(map, "callId", &c.call_id);
             put_opt(map, "sourceId", &c.source_id);
+            put_opt(map, "batchId", &c.batch_id);
         }
 
         let (method, params): (&str, Value) = match self {
@@ -916,6 +1017,7 @@ mod tests {
                 activity_id: Some("act".into()),
                 call_id: Some("call".into()),
                 source_id: Some("src".into()),
+                batch_id: Some("act".into()),
             }
         }
 

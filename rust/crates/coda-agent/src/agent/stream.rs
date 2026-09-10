@@ -216,6 +216,16 @@ pub(crate) async fn stream_with_retries(
         }
         let attempt_started = Instant::now();
 
+        // Minted per outer stream attempt (§2.6 of the serve API
+        // implementation plan): a retry gets a new id, but it links back to
+        // the same turn via the state sink's single active-turn tracking.
+        // Emitted BEFORE `client.stream()` is awaited — this is the
+        // observable boundary the activity phase machine keys off to move
+        // from `preparing`/`runningTools` into `waitingForModel`; silence
+        // after this point must never be read as `reasoning`.
+        let model_request_id = uuid::Uuid::new_v4().to_string();
+        sink.emit(AgentEvent::ModelRequestStarted { request_id: model_request_id.clone() });
+
         let stream_result = match &attempt_ctx {
             Some(ctx) => coda_diagnostics::scope(ctx.clone(), client.stream(request.clone())).await,
             None => client.stream(request.clone()).await,
@@ -228,6 +238,10 @@ pub(crate) async fn stream_with_retries(
                 // (`send_with_retry`) before ever returning an error here.
                 record_stream_failure(attempt_ctx.as_ref(), &err);
                 record_model_request_end(attempt_ctx.as_ref(), outer_attempt, attempt_started, "failed");
+                sink.emit(AgentEvent::ModelRequestEnded {
+                    request_id: model_request_id,
+                    outcome: "error".into(),
+                });
                 return Err(err);
             }
         };
@@ -245,16 +259,16 @@ pub(crate) async fn stream_with_retries(
             Some(ctx) => coda_diagnostics::scope(ctx.clone(), drive_fut).await,
             None => drive_fut.await,
         };
-        record_model_request_end(
-            attempt_ctx.as_ref(),
-            outer_attempt,
-            attempt_started,
-            match &drive_result {
-                Ok(()) => "success",
-                Err(LlmError::Cancelled) => "cancelled",
-                Err(_) => "error",
-            },
-        );
+        let outer_outcome = match &drive_result {
+            Ok(()) => "success",
+            Err(LlmError::Cancelled) => "cancelled",
+            Err(_) => "error",
+        };
+        record_model_request_end(attempt_ctx.as_ref(), outer_attempt, attempt_started, outer_outcome);
+        sink.emit(AgentEvent::ModelRequestEnded {
+            request_id: model_request_id,
+            outcome: outer_outcome.into(),
+        });
 
         match drive_result {
             Ok(()) => {
@@ -805,6 +819,126 @@ mod tests {
             1,
             "exactly one ThinkingComplete must be emitted when the provider closes the burst with ThinkingDone"
         );
+    }
+
+    // ── ModelRequestStarted/Ended (Slice 0 / Stage C activity phase) ─────────
+    //
+    // `event/activity` (coda-serve) keys off these to move the phase from
+    // `preparing`/`runningTools` to `waitingForModel` BEFORE `client.stream()`
+    // is awaited, and back out again once the stream finishes however it
+    // finished. Both must fire exactly once per outer attempt, in order, with
+    // the same request_id, and ModelRequestStarted must precede any stream
+    // content.
+    #[tokio::test]
+    async fn model_request_started_precedes_stream_content_and_ended_follows_with_matching_id() {
+        use crate::events::CollectingSink;
+        use crate::tool::ToolQuarantine;
+
+        struct OneShotClient;
+        #[async_trait::async_trait]
+        impl coda_llm::LlmClient for OneShotClient {
+            fn provider_id(&self) -> &str { "mock" }
+            async fn stream(&self, _: coda_llm::ChatRequest) -> Result<coda_llm::ResponseStream, coda_llm::LlmError> {
+                let events = vec![
+                    Ok(StreamEvent::TextDelta("hi".into())),
+                    Ok(StreamEvent::Done {
+                        stop_reason: Some("end_turn".into()),
+                        usage: coda_llm::Usage::ZERO,
+                    }),
+                ];
+                let (tx, rx) = tokio::sync::mpsc::channel(8);
+                tokio::spawn(async move { for e in events { let _ = tx.send(e).await; } });
+                Ok(coda_llm::ResponseStream::new(rx))
+            }
+        }
+
+        let quarantine = ToolQuarantine::new();
+        let sink = CollectingSink::new();
+        let mut request = coda_llm::ChatRequest::new("model".to_owned(), vec![]);
+        let retry_cfg = RetryConfig::default();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut blocked = None;
+
+        stream_with_retries(
+            &OneShotClient,
+            &mut request,
+            &quarantine,
+            &sink,
+            cancel,
+            &retry_cfg,
+            None,
+            &mut blocked,
+        )
+        .await
+        .unwrap();
+
+        let events = sink.take();
+        let started_idx = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::ModelRequestStarted { .. }))
+            .expect("ModelRequestStarted must be emitted");
+        let text_idx = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::AssistantText { .. }))
+            .expect("AssistantText must be emitted");
+        let ended_idx = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::ModelRequestEnded { .. }))
+            .expect("ModelRequestEnded must be emitted");
+        assert!(started_idx < text_idx, "ModelRequestStarted must precede stream content");
+        assert!(text_idx < ended_idx, "ModelRequestEnded must follow stream content");
+
+        let AgentEvent::ModelRequestStarted { request_id: started_id } = &events[started_idx] else {
+            unreachable!()
+        };
+        let AgentEvent::ModelRequestEnded { request_id: ended_id, outcome } = &events[ended_idx] else {
+            unreachable!()
+        };
+        assert_eq!(started_id, ended_id, "started/ended request_id must match for one attempt");
+        assert_eq!(outcome, "success");
+    }
+
+    #[tokio::test]
+    async fn model_request_ended_reports_error_when_stream_call_fails() {
+        use crate::events::CollectingSink;
+        use crate::tool::ToolQuarantine;
+
+        struct AlwaysErrorsClient;
+        #[async_trait::async_trait]
+        impl coda_llm::LlmClient for AlwaysErrorsClient {
+            fn provider_id(&self) -> &str { "mock" }
+            async fn stream(&self, _: coda_llm::ChatRequest) -> Result<coda_llm::ResponseStream, coda_llm::LlmError> {
+                Err(coda_llm::LlmError::Transport("boom".into()))
+            }
+        }
+
+        let quarantine = ToolQuarantine::new();
+        let sink = CollectingSink::new();
+        let mut request = coda_llm::ChatRequest::new("model".to_owned(), vec![]);
+        let retry_cfg = RetryConfig::default();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut blocked = None;
+
+        let result = stream_with_retries(
+            &AlwaysErrorsClient,
+            &mut request,
+            &quarantine,
+            &sink,
+            cancel,
+            &retry_cfg,
+            None,
+            &mut blocked,
+        )
+        .await;
+        assert!(result.is_err());
+
+        let events = sink.take();
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::ModelRequestStarted { .. })));
+        let ended = events.iter().find_map(|e| match e {
+            AgentEvent::ModelRequestEnded { outcome, .. } => Some(outcome.clone()),
+            _ => None,
+        });
+        assert_eq!(ended.as_deref(), Some("error"));
     }
 
     // ── Burst open at stream end still emits ThinkingComplete ────────────────

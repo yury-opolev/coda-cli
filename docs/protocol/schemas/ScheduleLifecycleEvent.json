@@ -1,0 +1,54 @@
+{
+  "type": "object",
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "engineInstanceId": {
+      "type": "string"
+    },
+    "definitionId": {
+      "type": "string",
+      "default": ""
+    },
+    "definitionName": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "taskId": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "state": {
+      "type": "string",
+      "default": ""
+    },
+    "timestamp": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "summary": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    }
+  },
+  "required": [
+    "seq",
+    "engineInstanceId"
+  ],
+  "title": "ScheduleLifecycleEvent",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

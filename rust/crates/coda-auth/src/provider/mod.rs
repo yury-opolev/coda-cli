@@ -6,8 +6,11 @@ use crate::credential::Credential;
 use crate::error::AuthError;
 
 pub use self::api_key::ApiKeyProvider;
-pub use self::claude_ai::ClaudeAiProvider;
-pub use self::copilot::CopilotProvider;
+pub use self::claude_ai::{ClaudeAiLoginFlow, ClaudeAiProvider};
+pub use self::copilot::{
+    resolve_copilot_config, CopilotConfig, CopilotDeployment, CopilotDeploymentChoice,
+    CopilotProvider, ResolvedCopilotConfig,
+};
 
 pub mod api_key;
 pub mod claude_ai;

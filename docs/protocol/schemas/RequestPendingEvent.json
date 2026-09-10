@@ -1,0 +1,80 @@
+{
+  "type": "object",
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "engineInstanceId": {
+      "type": "string"
+    },
+    "request": {
+      "$ref": "#/$defs/PendingRequestDto"
+    },
+    "requests": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/PendingRequestDto"
+      }
+    }
+  },
+  "required": [
+    "seq",
+    "engineInstanceId",
+    "request",
+    "requests"
+  ],
+  "title": "RequestPendingEvent",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "PendingRequestDto": {
+      "type": "object",
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "description": "Opaque handle, bound to the engine instance that minted it. A handle\nfrom a previous engine process is rejected, never silently re-applied\nto whatever happens to be pending now."
+        },
+        "kind": {
+          "$ref": "#/$defs/PendingRequestKind"
+        },
+        "issuedAt": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "callId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The provider tool-call id, when the request is attached to one.\n\n**Reserved, and always omitted by the Rust engine.** The\npermission/question/plan-approval seams it would have to come from do\nnot carry the id, and inventing a plausible one would be worse than\nsaying nothing. `requests.callCorrelation` is advertised as\n`supported: false` for exactly this reason: correlate on `turnId`\ntogether with the `event/toolCall` stream instead. The field stays on\nthe wire shape so a host that *does* have the id can populate it\nwithout a contract change."
+        },
+        "display": true,
+        "failClosedDefault": {
+          "type": "string",
+          "description": "`\"deny\" | \"noAnswer\" | \"reject\"`."
+        }
+      },
+      "required": [
+        "requestId",
+        "kind",
+        "issuedAt",
+        "display",
+        "failClosedDefault"
+      ],
+      "description": "One outstanding server-initiated request, as seen by a client that did not\nissue the original `request/*` round-trip (or reconnected after it).\n\n`display` carries only what a UI needs to render the prompt: a tool name, a\ncapped input preview, the question and its options, or a capped plan. It\nnever carries a credential, a header value or an environment value."
+    },
+    "PendingRequestKind": {
+      "type": "string",
+      "enum": [
+        "permission",
+        "question",
+        "planApproval"
+      ]
+    }
+  }
+}

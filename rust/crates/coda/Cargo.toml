@@ -19,6 +19,7 @@ coda-proto = { workspace = true }
 coda-render = { workspace = true }
 coda-auth = { workspace = true }
 coda-diagnostics = { workspace = true }
+coda-boot = { workspace = true }
 
 anyhow = { workspace = true }
 clap = { workspace = true }
@@ -27,4 +28,10 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# The launch preflight is a screen: `tui_client` drives it against a test
+# backend with scripted keys, so the terminal toolkit is a test dependency
+# here for the same reason it is a real one in `coda-tui`.
+ratatui = { workspace = true }
+crossterm = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros"] }
+

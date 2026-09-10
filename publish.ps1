@@ -12,6 +12,12 @@
                      The package wraps a thin .NET launcher that runs the
                      bundled native binary — the TUI engine is pure Rust.
                      -> publish/tool/*.nupkg
+    engine           Standalone, TUI-free `coda-engine` binary (opt-in; not
+                     part of `all`). Same core JSON-RPC-over-stdio engine
+                     `coda serve` runs, for an external orchestrator/worker/
+                     bridge that wants to launch a core-only artifact instead
+                     of the unified `coda` binary.
+                     -> publish/engine/coda-engine.exe
 
   LEGACY (-Legacy switch, C# / .NET):
     self-contained   Single coda.exe bundling the .NET runtime (no install
@@ -26,12 +32,13 @@
   ./publish.ps1                         # Rust: all three flavors, win-x64
   ./publish.ps1 -Flavor self-contained  # Rust: just the standalone exe
   ./publish.ps1 -Flavor tool            # Rust: just the global-tool nupkg
+  ./publish.ps1 -Flavor engine          # Rust: just the standalone coda-engine
   ./publish.ps1 -Legacy                 # C#: all three flavors
   ./publish.ps1 -Legacy -Flavor tool    # C#: just the global-tool nupkg
 
 .NOTES
   Build the Rust binary before publishing:
-    ./rust/build.ps1 -NoBump   # or: cd rust; cargo build --package coda --release
+    ./rust/build.ps1 -NoBump   # or: cd rust; cargo build --package coda --package coda-engine --release
 
   Install or upgrade the global tool from the produced package:
     dotnet tool install --global --add-source ./publish/tool Coda.Cli
@@ -39,7 +46,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('all', 'self-contained', 'framework-dependent', 'tool')]
+    [ValidateSet('all', 'self-contained', 'framework-dependent', 'tool', 'engine')]
     [string]$Flavor = 'all',
     [ValidateSet('Release', 'Debug')]
     [string]$Configuration = 'Release',
@@ -47,6 +54,7 @@ param(
     # Publish the legacy C# / .NET implementation instead of the default Rust.
     [switch]$Legacy
 )
+
 
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
@@ -139,6 +147,12 @@ if ($Legacy) {
             Publish-LegacyFrameworkDependent
             Publish-LegacyTool
         }
+        default {
+            # 'engine' is a Rust-only flavor: `coda-engine` is TUI-free by
+            # construction, which the C#/.NET legacy build has no equivalent
+            # of. Fail rather than silently publishing nothing.
+            throw "-Flavor $Flavor is not supported with -Legacy."
+        }
     }
 
     Write-Host "Published Coda $semVer (legacy C#)." -ForegroundColor Green
@@ -155,23 +169,29 @@ if ($Runtime -ne 'win-x64') {
 }
 $nativeDir = Join-Path $root "rust\target\$($Configuration.ToLowerInvariant())"
 $rustExe = Join-Path $nativeDir 'coda.exe'
-if (-not (Test-Path $rustExe)) {
+if ($Flavor -ne 'engine' -and -not (Test-Path $rustExe)) {
     throw "Rust binary not found at $rustExe. Build it first: .\build.ps1 -Configuration $Configuration -NoBump"
 }
 
 # Do not label a stale or differently targeted payload with the current version/RID.
-$reader = [System.IO.BinaryReader]::new([System.IO.File]::OpenRead($rustExe))
-try {
-    $reader.BaseStream.Position = 0x3c
-    $peOffset = $reader.ReadInt32()
-    $reader.BaseStream.Position = $peOffset
-    if ($reader.ReadUInt32() -ne 0x00004550 -or $reader.ReadUInt16() -ne 0x8664) {
-        throw "Native payload must be a Windows x64 executable: $rustExe"
+function Assert-WindowsX64Executable {
+    param([string]$Path)
+    $reader = [System.IO.BinaryReader]::new([System.IO.File]::OpenRead($Path))
+    try {
+        $reader.BaseStream.Position = 0x3c
+        $peOffset = $reader.ReadInt32()
+        $reader.BaseStream.Position = $peOffset
+        if ($reader.ReadUInt32() -ne 0x00004550 -or $reader.ReadUInt16() -ne 0x8664) {
+            throw "Native payload must be a Windows x64 executable: $Path"
+        }
+    }
+    finally {
+        $reader.Dispose()
     }
 }
-finally {
-    $reader.Dispose()
-}
+
+if ($Flavor -ne 'engine') {
+Assert-WindowsX64Executable $rustExe
 $reported = & $rustExe --version
 if ($LASTEXITCODE -ne 0 -or "$reported".Trim() -ne "coda $semVer") {
     throw "Native payload version '$reported' does not match coda $semVer. Rebuild before publishing."
@@ -190,6 +210,7 @@ $asmVer = "$semVer.0"
   </PropertyGroup>
 </Project>
 "@ | Set-Content (Join-Path $root 'version.props') -Encoding utf8
+}
 
 function Publish-RustSelfContained {
     $out = Join-Path $publishRoot 'self-contained'
@@ -218,11 +239,36 @@ function Publish-RustTool {
     if ($LASTEXITCODE -ne 0) { throw "dotnet pack failed (exit $LASTEXITCODE)." }
 }
 
+function Publish-RustEngine {
+    # Opt-in flavor: the standalone, TUI-free `coda-engine` binary. Validated
+    # the same way `coda.exe` is above (PE architecture + reported version),
+    # with its own product-name prefix ("coda-engine", not "coda") — the two
+    # binaries are separate artifacts, not the same one renamed.
+    $rustEngineExe = Join-Path $nativeDir 'coda-engine.exe'
+    if (-not (Test-Path $rustEngineExe)) {
+        throw "Rust binary not found at $rustEngineExe. Build it first: .\rust\build.ps1 -Configuration $Configuration -NoBump (builds both coda and coda-engine)."
+    }
+    Assert-WindowsX64Executable $rustEngineExe
+    $engineReported = & $rustEngineExe --version
+    if ($LASTEXITCODE -ne 0 -or "$engineReported".Trim() -ne "coda-engine $semVer") {
+        throw "Native payload version '$engineReported' does not match coda-engine $semVer. Rebuild before publishing."
+    }
+
+    $out = Join-Path $publishRoot 'engine'
+    Reset-OutputDir $out
+    Write-Host "==> engine (Rust, TUI-free core) -> $out" -ForegroundColor Yellow
+    Copy-Item $rustEngineExe (Join-Path $out 'coda-engine.exe') -Force
+}
+
 switch ($Flavor) {
     'self-contained'      { Publish-RustSelfContained }
     'framework-dependent' { Publish-RustFrameworkDependent }
     'tool'                { Publish-RustTool }
+    'engine'              { Publish-RustEngine }
     'all' {
+        # 'engine' is intentionally not part of 'all': it is a separate,
+        # opt-in artifact for external orchestrators, not part of the default
+        # `coda` distribution or the global-tool package.
         Publish-RustSelfContained
         Publish-RustFrameworkDependent
         Publish-RustTool

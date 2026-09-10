@@ -85,7 +85,7 @@ pub use steering::{SteeringEntry, SteeringInbox};
 pub use subagents::{BuiltInAgents, SubagentDefinition, SubagentFactory, SubagentRequest, SubagentRegistry, PluginAgentLoader};
 pub use todos::{TodoItem, TodoStatus, TodoStore};
 pub use tool::{
-    PlanApprover, Tool, ToolContext, ToolDescriptor, ToolNameFilter, ToolOutcome, ToolQuarantine,
-    ToolRegistry, ToolResult, UserQuestion,
+    AnswerOutcome, NoAnswerReason, PlanApprover, Tool, ToolContext, ToolControl, ToolDescriptor,
+    ToolNameFilter, ToolOutcome, ToolQuarantine, ToolRegistry, ToolResult, UserQuestion,
 };
 pub use tools::{built_in_file_tools, built_in_tools};

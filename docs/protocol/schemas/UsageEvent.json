@@ -1,0 +1,28 @@
+{
+  "type": "object",
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "engineInstanceId": {
+      "type": "string"
+    },
+    "inputTokens": {
+      "type": "integer",
+      "format": "int64",
+      "default": 0
+    },
+    "outputTokens": {
+      "type": "integer",
+      "format": "int64",
+      "default": 0
+    }
+  },
+  "required": [
+    "seq",
+    "engineInstanceId"
+  ],
+  "title": "UsageEvent",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

@@ -131,6 +131,14 @@ enum ServerSpec {
     Http(Box<config::McpHttpConnectable>, Option<Arc<dyn CredentialStore>>),
 }
 
+/// What the running manager knows about one server. Names and counts only —
+/// never a command line, a URL, an env value or a header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServerStatus {
+    pub name: String,
+    pub tool_count: usize,
+}
+
 /// Connects configured MCP servers and exposes their tools.
 pub struct McpClientManager {
     /// Per-server client, protected so `call_tool` is lock-free while the
@@ -263,6 +271,31 @@ impl McpClientManager {
             }
         }
         errors
+    }
+
+    /// Per-server runtime status: which servers this manager actually holds a
+    /// live client for, and how many tools each advertises.
+    ///
+    /// Deliberately *only* what the manager already knows. It performs no
+    /// connection attempt, no `tools/list` round-trip and — critically — no
+    /// credential-store read: reading a status must never probe an auth store
+    /// or wake a keyring prompt.
+    ///
+    /// A server absent from the returned map is one this manager has no
+    /// client for. That is not the same as "not configured": the caller
+    /// combines this with the file inventory, so a file edited after startup
+    /// reads as `configured + not connected` rather than as a fiction.
+    pub async fn connected_status(&self) -> Vec<McpServerStatus> {
+        let guard = self.servers.read().await;
+        let mut out: Vec<McpServerStatus> = guard
+            .iter()
+            .map(|(name, entry)| McpServerStatus {
+                name: name.clone(),
+                tool_count: entry.client.tools().len(),
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
     }
 
     /// Return all tools across all connected servers as `Arc<dyn Tool>`.

@@ -1,0 +1,19 @@
+{
+  "type": "object",
+  "properties": {
+    "projectPath": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "hookHash": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "title": "HooksTrustParams",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

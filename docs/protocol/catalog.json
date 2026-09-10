@@ -1,0 +1,600 @@
+{
+  "format": "coda-serve-catalog/1",
+  "protocolVersion": "1",
+  "contractVersion": "2026-09-1",
+  "transport": "contentLengthFramedStdio",
+  "methods": [
+    {
+      "method": "initialize",
+      "paramsSchema": "schemas/InitializeParams.json",
+      "resultSchema": "schemas/InitializeResponse.json",
+      "paramsContract": "clientWriter",
+      "resultContract": "sharedServerDto",
+      "requiresInitialize": false,
+      "availability": "reusable"
+    },
+    {
+      "method": "shutdown",
+      "paramsSchema": null,
+      "resultSchema": "schemas/OkResult.json",
+      "paramsContract": null,
+      "resultContract": "clientReader",
+      "requiresInitialize": false,
+      "availability": "reusable"
+    },
+    {
+      "method": "session/prompt",
+      "paramsSchema": "schemas/PromptParams.json",
+      "resultSchema": "schemas/PromptResult.json",
+      "paramsContract": "clientWriter",
+      "resultContract": "clientReader",
+      "requiresInitialize": false,
+      "availability": "reusable"
+    },
+    {
+      "method": "session/interrupt",
+      "paramsSchema": null,
+      "resultSchema": "schemas/OkResult.json",
+      "paramsContract": null,
+      "resultContract": "clientReader",
+      "requiresInitialize": false,
+      "availability": "reusable"
+    },
+    {
+      "method": "session/steer",
+      "paramsSchema": "schemas/SteerParams.json",
+      "resultSchema": "schemas/SteerResult.json",
+      "paramsContract": "clientWriter",
+      "resultContract": "clientReader",
+      "requiresInitialize": false,
+      "availability": "reusable"
+    },
+    {
+      "method": "session/recallSteering",
+      "paramsSchema": null,
+      "resultSchema": "schemas/RecallSteeringResult.json",
+      "paramsContract": null,
+      "resultContract": "clientReader",
+      "requiresInitialize": false,
+      "availability": "reusable"
+    },
+    {
+      "method": "session/history",
+      "paramsSchema": null,
+      "resultSchema": "schemas/HistoryResult.json",
+      "paramsContract": null,
+      "resultContract": "clientReader",
+      "requiresInitialize": false,
+      "availability": "limited"
+    },
+    {
+      "method": "session/messages",
+      "paramsSchema": "schemas/MessagesParams.json",
+      "resultSchema": "schemas/MessagesResult.json",
+      "paramsContract": "clientWriter",
+      "resultContract": "clientReader",
+      "requiresInitialize": false,
+      "availability": "limited"
+    },
+    {
+      "method": "session/models",
+      "paramsSchema": "schemas/ModelsParams.json",
+      "resultSchema": "schemas/ModelsResult.json",
+      "paramsContract": "clientWriter",
+      "resultContract": "clientReader",
+      "requiresInitialize": false,
+      "availability": "reusable"
+    },
+    {
+      "method": "session/setModel",
+      "paramsSchema": "schemas/SetModelParams.json",
+      "resultSchema": "schemas/SetModelResult.json",
+      "paramsContract": "sharedParser",
+      "resultContract": "sharedServerDto",
+      "requiresInitialize": false,
+      "availability": "reusable"
+    },
+    {
+      "method": "session/setGoal",
+      "paramsSchema": "schemas/SetGoalParams.json",
+      "resultSchema": "schemas/SetGoalResult.json",
+      "paramsContract": "clientWriter",
+      "resultContract": "clientReader",
+      "requiresInitialize": false,
+      "availability": "reusable"
+    },
+    {
+      "method": "session/setEffort",
+      "paramsSchema": "schemas/SetEffortParams.json",
+      "resultSchema": "schemas/SetEffortResult.json",
+      "paramsContract": "clientWriter",
+      "resultContract": "clientReader",
+      "requiresInitialize": false,
+      "availability": "reusable"
+    },
+    {
+      "method": "model/adjustEffort",
+      "paramsSchema": "schemas/ModelAdjustEffortParams.json",
+      "resultSchema": "schemas/ModelEffortResult.json",
+      "paramsContract": "clientWriter",
+      "resultContract": "clientReader",
+      "requiresInitialize": false,
+      "availability": "reusable"
+    },
+    {
+      "method": "model/reasoningCapability",
+      "paramsSchema": null,
+      "resultSchema": "schemas/ReasoningCapabilityResult.json",
+      "paramsContract": null,
+      "resultContract": "clientReader",
+      "requiresInitialize": false,
+      "availability": "reusable"
+    },
+    {
+      "method": "session/setPermissionMode",
+      "paramsSchema": "schemas/SetPermissionModeParams.json",
+      "resultSchema": "schemas/SetPermissionModeResult.json",
+      "paramsContract": "clientWriter",
+      "resultContract": "clientReader",
+      "requiresInitialize": false,
+      "availability": "reusable"
+    },
+    {
+      "method": "session/setSystemPrompt",
+      "paramsSchema": "schemas/SetSystemPromptParams.json",
+      "resultSchema": "schemas/SetSystemPromptResult.json",
+      "paramsContract": "clientWriter",
+      "resultContract": "clientReader",
+      "requiresInitialize": false,
+      "availability": "reusable"
+    },
+    {
+      "method": "session/scheduleList",
+      "paramsSchema": null,
+      "resultSchema": "schemas/ScheduleListResult.json",
+      "paramsContract": null,
+      "resultContract": "clientReader",
+      "requiresInitialize": false,
+      "availability": "reusable"
+    },
+    {
+      "method": "session/scheduleCreate",
+      "paramsSchema": "schemas/ScheduleCreateParams.json",
+      "resultSchema": "schemas/ScheduledTask.json",
+      "paramsContract": "clientWriter",
+      "resultContract": "clientReader",
+      "requiresInitialize": false,
+      "availability": "reusable"
+    },
+    {
+      "method": "session/scheduleDelete",
+      "paramsSchema": "schemas/ScheduleDeleteParams.json",
+      "resultSchema": "schemas/OkResult.json",
+      "paramsContract": "clientWriter",
+      "resultContract": "clientReader",
+      "requiresInitialize": false,
+      "availability": "reusable"
+    },
+    {
+      "method": "hooks/list",
+      "paramsSchema": null,
+      "resultSchema": "schemas/HooksListResult.json",
+      "paramsContract": null,
+      "resultContract": "clientReader",
+      "requiresInitialize": false,
+      "availability": "reusable"
+    },
+    {
+      "method": "hooks/info",
+      "paramsSchema": "schemas/HooksInfoParams.json",
+      "resultSchema": "schemas/HooksInfoResult.json",
+      "paramsContract": "sharedParser",
+      "resultContract": "clientReader",
+      "requiresInitialize": false,
+      "availability": "reusable"
+    },
+    {
+      "method": "hooks/trust",
+      "paramsSchema": "schemas/HooksTrustParams.json",
+      "resultSchema": "schemas/HooksTrustResult.json",
+      "paramsContract": "sharedParser",
+      "resultContract": "sharedServerDto",
+      "requiresInitialize": false,
+      "availability": "reusable"
+    },
+    {
+      "method": "skills/list",
+      "paramsSchema": null,
+      "resultSchema": "schemas/SkillsListResult.json",
+      "paramsContract": null,
+      "resultContract": "clientReader",
+      "requiresInitialize": false,
+      "availability": "reusable"
+    },
+    {
+      "method": "skills/trust",
+      "paramsSchema": null,
+      "resultSchema": null,
+      "paramsContract": null,
+      "resultContract": null,
+      "requiresInitialize": false,
+      "availability": "unsupported"
+    },
+    {
+      "method": "plugins/list",
+      "paramsSchema": null,
+      "resultSchema": "schemas/PluginsListResult.json",
+      "paramsContract": null,
+      "resultContract": "clientReader",
+      "requiresInitialize": false,
+      "availability": "limited"
+    },
+    {
+      "method": "session/compact",
+      "paramsSchema": "schemas/CompactParams.json",
+      "resultSchema": "schemas/CompactResult.json",
+      "paramsContract": "clientWriter",
+      "resultContract": "clientReader",
+      "requiresInitialize": false,
+      "availability": "reusable"
+    },
+    {
+      "method": "session/fork",
+      "paramsSchema": "schemas/ForkParams.json",
+      "resultSchema": "schemas/ForkResponse.json",
+      "paramsContract": "sharedParser",
+      "resultContract": "sharedServerDto",
+      "requiresInitialize": false,
+      "availability": "reusable"
+    },
+    {
+      "method": "session/rewind",
+      "paramsSchema": "schemas/RewindParams.json",
+      "resultSchema": "schemas/RewindResponse.json",
+      "paramsContract": "sharedParser",
+      "resultContract": "sharedServerDto",
+      "requiresInitialize": false,
+      "availability": "reusable"
+    },
+    {
+      "method": "session/getState",
+      "paramsSchema": "schemas/GetStateParams.json",
+      "resultSchema": "schemas/StateSnapshot.json",
+      "paramsContract": "sharedParser",
+      "resultContract": "sharedServerDto",
+      "requiresInitialize": false,
+      "availability": "reusable"
+    },
+    {
+      "method": "session/getEvents",
+      "paramsSchema": "schemas/GetEventsParams.json",
+      "resultSchema": "schemas/GetEventsResult.json",
+      "paramsContract": "sharedParser",
+      "resultContract": "sharedServerDto",
+      "requiresInitialize": false,
+      "availability": "reusable"
+    },
+    {
+      "method": "session/getHistory",
+      "paramsSchema": "schemas/GetHistoryParams.json",
+      "resultSchema": "schemas/GetHistoryResult.json",
+      "paramsContract": "sharedParser",
+      "resultContract": "sharedServerDto",
+      "requiresInitialize": true,
+      "availability": "reusable"
+    },
+    {
+      "method": "session/listSessions",
+      "paramsSchema": "schemas/ListSessionsParams.json",
+      "resultSchema": "schemas/ListSessionsResult.json",
+      "paramsContract": "sharedParser",
+      "resultContract": "sharedServerDto",
+      "requiresInitialize": false,
+      "availability": "reusable"
+    },
+    {
+      "method": "session/getPendingRequests",
+      "paramsSchema": null,
+      "resultSchema": "schemas/GetPendingRequestsResult.json",
+      "paramsContract": null,
+      "resultContract": "sharedServerDto",
+      "requiresInitialize": true,
+      "availability": "reusable"
+    },
+    {
+      "method": "session/resolveRequest",
+      "paramsSchema": "schemas/ResolveRequestParams.json",
+      "resultSchema": "schemas/ResolveRequestResult.json",
+      "paramsContract": "sharedParser",
+      "resultContract": "sharedServerDto",
+      "requiresInitialize": true,
+      "availability": "reusable"
+    },
+    {
+      "method": "session/cancelRequest",
+      "paramsSchema": "schemas/CancelRequestParams.json",
+      "resultSchema": "schemas/CancelRequestResult.json",
+      "paramsContract": "sharedParser",
+      "resultContract": "sharedServerDto",
+      "requiresInitialize": true,
+      "availability": "reusable"
+    },
+    {
+      "method": "config/describe",
+      "paramsSchema": null,
+      "resultSchema": "schemas/ConfigDescribeResult.json",
+      "paramsContract": null,
+      "resultContract": "sharedServerDto",
+      "requiresInitialize": false,
+      "availability": "reusable"
+    },
+    {
+      "method": "config/set",
+      "paramsSchema": "schemas/ConfigSetParams.json",
+      "resultSchema": "schemas/ConfigSetResult.json",
+      "paramsContract": "sharedParser",
+      "resultContract": "sharedServerDto",
+      "requiresInitialize": true,
+      "availability": "reusable"
+    },
+    {
+      "method": "mcp/list",
+      "paramsSchema": null,
+      "resultSchema": "schemas/McpListResult.json",
+      "paramsContract": null,
+      "resultContract": "sharedServerDto",
+      "requiresInitialize": false,
+      "availability": "reusable"
+    }
+  ],
+  "serverRequests": [
+    {
+      "method": "request/permission",
+      "paramsSchema": "schemas/PermissionRequest.json",
+      "resultSchema": "schemas/PermissionResponse.json",
+      "cancelDefault": "deny"
+    },
+    {
+      "method": "request/question",
+      "paramsSchema": "schemas/QuestionRequest.json",
+      "resultSchema": "schemas/QuestionResponse.json",
+      "cancelDefault": "noAnswer"
+    },
+    {
+      "method": "request/planApproval",
+      "paramsSchema": "schemas/PlanApprovalRequest.json",
+      "resultSchema": "schemas/PlanApprovalResponse.json",
+      "cancelDefault": "reject"
+    }
+  ],
+  "events": [
+    {
+      "method": "event/assistantText",
+      "paramsSchema": "schemas/AssistantTextEvent.json",
+      "requiresStateEvents": false,
+      "paramsContract": "clientReaderWithRustMetadata"
+    },
+    {
+      "method": "event/assistantTextComplete",
+      "paramsSchema": "schemas/AssistantTextCompleteEvent.json",
+      "requiresStateEvents": false,
+      "paramsContract": "clientReaderWithRustMetadata"
+    },
+    {
+      "method": "event/thinking",
+      "paramsSchema": "schemas/ThinkingEvent.json",
+      "requiresStateEvents": false,
+      "paramsContract": "clientReaderWithRustMetadata"
+    },
+    {
+      "method": "event/thinkingComplete",
+      "paramsSchema": "schemas/ThinkingCompleteEvent.json",
+      "requiresStateEvents": false,
+      "paramsContract": "clientReaderWithRustMetadata"
+    },
+    {
+      "method": "event/toolCall",
+      "paramsSchema": "schemas/ToolCallEvent.json",
+      "requiresStateEvents": false,
+      "paramsContract": "clientReaderWithRustMetadata"
+    },
+    {
+      "method": "event/toolProgress",
+      "paramsSchema": "schemas/ToolProgressEvent.json",
+      "requiresStateEvents": false,
+      "paramsContract": "clientReaderWithRustMetadata"
+    },
+    {
+      "method": "event/toolResult",
+      "paramsSchema": "schemas/ToolResultEvent.json",
+      "requiresStateEvents": false,
+      "paramsContract": "clientReaderWithRustMetadata"
+    },
+    {
+      "method": "event/turnComplete",
+      "paramsSchema": "schemas/TurnCompleteEvent.json",
+      "requiresStateEvents": false,
+      "paramsContract": "clientReaderWithRustMetadata"
+    },
+    {
+      "method": "event/stop",
+      "paramsSchema": "schemas/StopEvent.json",
+      "requiresStateEvents": false,
+      "paramsContract": "clientReaderWithRustMetadata"
+    },
+    {
+      "method": "event/usage",
+      "paramsSchema": "schemas/UsageEvent.json",
+      "requiresStateEvents": false,
+      "paramsContract": "clientReaderWithRustMetadata"
+    },
+    {
+      "method": "event/error",
+      "paramsSchema": "schemas/ErrorEvent.json",
+      "requiresStateEvents": false,
+      "paramsContract": "clientReaderWithRustMetadata"
+    },
+    {
+      "method": "event/limitReached",
+      "paramsSchema": "schemas/LimitReachedEvent.json",
+      "requiresStateEvents": false,
+      "paramsContract": "clientReaderWithRustMetadata"
+    },
+    {
+      "method": "event/streamProgress",
+      "paramsSchema": "schemas/StreamProgressEvent.json",
+      "requiresStateEvents": false,
+      "paramsContract": "clientReaderWithRustMetadata"
+    },
+    {
+      "method": "event/steeringDelivered",
+      "paramsSchema": "schemas/SteeringDeliveredEvent.json",
+      "requiresStateEvents": false,
+      "paramsContract": "clientReaderWithRustMetadata"
+    },
+    {
+      "method": "event/taskCompleted",
+      "paramsSchema": "schemas/TaskCompletedEvent.json",
+      "requiresStateEvents": false,
+      "paramsContract": "clientReaderWithRustMetadata"
+    },
+    {
+      "method": "event/scheduleLifecycle",
+      "paramsSchema": "schemas/ScheduleLifecycleEvent.json",
+      "requiresStateEvents": false,
+      "paramsContract": "clientReaderWithRustMetadata"
+    },
+    {
+      "method": "event/promptRewritten",
+      "paramsSchema": "schemas/PromptRewrittenEvent.json",
+      "requiresStateEvents": false,
+      "paramsContract": "clientReaderWithRustMetadata"
+    },
+    {
+      "method": "event/responseRewritten",
+      "paramsSchema": "schemas/ResponseRewrittenEvent.json",
+      "requiresStateEvents": false,
+      "paramsContract": "clientReaderWithRustMetadata"
+    },
+    {
+      "method": "event/toolInputModified",
+      "paramsSchema": "schemas/ToolInputModifiedEvent.json",
+      "requiresStateEvents": false,
+      "paramsContract": "clientReaderWithRustMetadata"
+    },
+    {
+      "method": "event/toolResultModified",
+      "paramsSchema": "schemas/ToolResultModifiedEvent.json",
+      "requiresStateEvents": false,
+      "paramsContract": "clientReaderWithRustMetadata"
+    },
+    {
+      "method": "event/permissionDecided",
+      "paramsSchema": "schemas/PermissionDecidedEvent.json",
+      "requiresStateEvents": false,
+      "paramsContract": "clientReaderWithRustMetadata"
+    },
+    {
+      "method": "event/permissionsUpdated",
+      "paramsSchema": "schemas/PermissionsUpdatedEvent.json",
+      "requiresStateEvents": false,
+      "paramsContract": "clientReaderWithRustMetadata"
+    },
+    {
+      "method": "event/subagentBlocked",
+      "paramsSchema": "schemas/SubagentBlockedEvent.json",
+      "requiresStateEvents": false,
+      "paramsContract": "clientReaderWithRustMetadata"
+    },
+    {
+      "method": "event/subagentResultModified",
+      "paramsSchema": "schemas/SubagentResultModifiedEvent.json",
+      "requiresStateEvents": false,
+      "paramsContract": "clientReaderWithRustMetadata"
+    },
+    {
+      "method": "event/compactionCancelled",
+      "paramsSchema": "schemas/CompactionCancelledEvent.json",
+      "requiresStateEvents": false,
+      "paramsContract": "clientReaderWithRustMetadata"
+    },
+    {
+      "method": "event/postCompactContextInjected",
+      "paramsSchema": "schemas/PostCompactContextInjectedEvent.json",
+      "requiresStateEvents": false,
+      "paramsContract": "clientReaderWithRustMetadata"
+    },
+    {
+      "method": "event/activity",
+      "paramsSchema": "schemas/ActivityEvent.json",
+      "requiresStateEvents": true,
+      "paramsContract": "sharedPublisherWithMetadata"
+    },
+    {
+      "method": "event/turnEnded",
+      "paramsSchema": "schemas/TurnEndedEvent.json",
+      "requiresStateEvents": true,
+      "paramsContract": "sharedPublisherWithMetadata"
+    },
+    {
+      "method": "event/lifecycle",
+      "paramsSchema": "schemas/LifecycleEvent.json",
+      "requiresStateEvents": true,
+      "paramsContract": "sharedPublisherWithMetadata"
+    },
+    {
+      "method": "event/configChanged",
+      "paramsSchema": "schemas/ConfigChangedEvent.json",
+      "requiresStateEvents": true,
+      "paramsContract": "sharedPublisherWithMetadata"
+    },
+    {
+      "method": "event/steeringQueue",
+      "paramsSchema": "schemas/SteeringQueueEvent.json",
+      "requiresStateEvents": true,
+      "paramsContract": "sharedPublisherWithMetadata"
+    },
+    {
+      "method": "event/sessionChanged",
+      "paramsSchema": "schemas/SessionChangedEvent.json",
+      "requiresStateEvents": true,
+      "paramsContract": "sharedPublisherWithMetadata"
+    },
+    {
+      "method": "event/eventsDropped",
+      "paramsSchema": "schemas/EventsDroppedEvent.json",
+      "requiresStateEvents": true,
+      "paramsContract": "sharedPublisherWithMetadata"
+    },
+    {
+      "method": "event/requestPending",
+      "paramsSchema": "schemas/RequestPendingEvent.json",
+      "requiresStateEvents": true,
+      "paramsContract": "sharedPublisherWithMetadata"
+    },
+    {
+      "method": "event/requestResolved",
+      "paramsSchema": "schemas/RequestResolvedEvent.json",
+      "requiresStateEvents": true,
+      "paramsContract": "sharedPublisherWithMetadata"
+    }
+  ],
+  "supportSchemas": [
+    {
+      "schema": "schemas/EventEnvelope.json",
+      "role": "replayEnvelope"
+    },
+    {
+      "schema": "schemas/InitializeResult.json",
+      "role": "legacyCompatibleInitializeReader"
+    }
+  ],
+  "notes": [
+    "Schema links describe typed payloads, not JSON-RPC envelopes or every semantic validation.",
+    "Legacy client writer/reader shapes retain compatibility defaults; shared DTOs are used by the current engine.",
+    "Inspect ok as well as JSON-RPC errors: some legacy setters refuse through ok:false.",
+    "Availability describes the implementation, not current credentials or provider connectivity.",
+    "plugins/list is a compatibility stub; skills/trust is always refused.",
+    "Question cancellation is a JSON-RPC error or cancelRequest, never an invented answer."
+  ]
+}

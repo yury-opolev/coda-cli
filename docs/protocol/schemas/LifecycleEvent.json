@@ -1,0 +1,38 @@
+{
+  "type": "object",
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "engineInstanceId": {
+      "type": "string"
+    },
+    "lifecycle": {
+      "$ref": "#/$defs/EngineLifecycle"
+    },
+    "initialized": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "seq",
+    "engineInstanceId",
+    "lifecycle",
+    "initialized"
+  ],
+  "title": "LifecycleEvent",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "EngineLifecycle": {
+      "type": "string",
+      "enum": [
+        "initializing",
+        "ready",
+        "busy",
+        "stopping",
+        "stopped"
+      ]
+    }
+  }
+}

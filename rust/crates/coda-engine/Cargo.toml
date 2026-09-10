@@ -1,0 +1,28 @@
+[package]
+name = "coda-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Coda's core engine as a standalone, TUI-free binary: `coda-engine serve` runs the same JSON-RPC-over-stdio engine `coda serve` does, with no terminal renderer, clipboard, or agent-frontend dependency linked in. An external orchestrator/worker/bridge is expected to own the persistent process this binary becomes; coda-engine itself does not daemonize, detach, or supervise."
+
+[[bin]]
+name = "coda-engine"
+path = "src/main.rs"
+
+[dependencies]
+coda-boot = { workspace = true }
+coda-serve = { workspace = true }
+coda-diagnostics = { workspace = true }
+
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+coda-client = { workspace = true }
+coda-proto = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros"] }
+tempfile = "3"
+serde_json = { workspace = true }

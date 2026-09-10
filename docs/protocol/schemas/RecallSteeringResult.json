@@ -1,0 +1,37 @@
+{
+  "type": "object",
+  "properties": {
+    "messages": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/RecalledSteeringMessage"
+      }
+    }
+  },
+  "title": "RecallSteeringResult",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "RecalledSteeringMessage": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "enqueuedAt": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "id",
+        "text"
+      ]
+    }
+  }
+}

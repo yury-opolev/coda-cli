@@ -21,6 +21,14 @@ impl InMemoryStore {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Every key currently held, in arbitrary order.
+    ///
+    /// A test seam: it lets a transaction test prove that a rollback left no
+    /// extra metadata behind, which no `CredentialStore` method can show.
+    pub async fn keys(&self) -> Vec<String> {
+        self.map.lock().unwrap().keys().cloned().collect()
+    }
 }
 
 #[async_trait]

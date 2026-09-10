@@ -1,0 +1,43 @@
+{
+  "type": "object",
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "engineInstanceId": {
+      "type": "string"
+    },
+    "stopReason": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "interrupted": {
+      "type": "boolean",
+      "default": false
+    },
+    "rootTurnId": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "activityId": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    }
+  },
+  "required": [
+    "seq",
+    "engineInstanceId"
+  ],
+  "title": "TurnCompleteEvent",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

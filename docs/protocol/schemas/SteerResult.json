@@ -1,0 +1,26 @@
+{
+  "type": "object",
+  "properties": {
+    "ok": {
+      "type": "boolean",
+      "default": false
+    },
+    "messageId": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "rejectedReason": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Rejection classification such as `noActiveTurn`, `turnEnding` or `emptyText`.",
+      "default": null
+    }
+  },
+  "title": "SteerResult",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

@@ -1,5 +1,6 @@
 //! Coda terminal user interface.
 
+pub mod api;
 pub mod app;
 pub mod branding;
 pub mod browsers;
@@ -10,10 +11,12 @@ pub mod config;
 pub mod diagnostics;
 pub mod hint;
 pub mod keymap;
+pub mod local;
 pub mod render;
 pub use render::draw;
 pub mod overlay;
 pub mod pin;
+pub mod preflight;
 pub mod progress;
 pub mod selection;
 pub mod setup;

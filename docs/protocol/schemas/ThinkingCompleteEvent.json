@@ -1,0 +1,31 @@
+{
+  "type": "object",
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "engineInstanceId": {
+      "type": "string"
+    },
+    "elapsedMs": {
+      "type": "integer",
+      "format": "int64",
+      "default": 0
+    },
+    "thinkingTokens": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int32",
+      "default": null
+    }
+  },
+  "required": [
+    "seq",
+    "engineInstanceId"
+  ],
+  "title": "ThinkingCompleteEvent",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

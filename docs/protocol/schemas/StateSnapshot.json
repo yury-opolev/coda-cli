@@ -1,0 +1,1091 @@
+{
+  "type": "object",
+  "properties": {
+    "contractVersion": {
+      "type": "string"
+    },
+    "engineInstanceId": {
+      "type": "string"
+    },
+    "sessionId": {
+      "type": "string"
+    },
+    "workspacePath": {
+      "type": "string"
+    },
+    "cursor": {
+      "type": "integer",
+      "format": "int64",
+      "description": "Every event with `seq <= cursor` is already reflected in this\nsnapshot; no event with `seq > cursor` is (§2.5)."
+    },
+    "historyEpoch": {
+      "type": "integer",
+      "format": "int64",
+      "description": "Bumped on fork/rewind/compact/resume (§2.5)."
+    },
+    "historyLength": {
+      "type": "integer",
+      "format": "int64",
+      "description": "Number of **committed** conversation messages as of this snapshot.\n\nThis is the fence between committed history and `turn.liveEntries`\n(I1): the in-flight turn is *never* included here, and the moment it\nis, `turn` is already `None`. A client may therefore concatenate\n`history[..historyLength]` with `turn.liveEntries` without ever\ncounting the same content twice, at any instant, in any interleaving."
+    },
+    "lifecycle": {
+      "$ref": "#/$defs/EngineLifecycle"
+    },
+    "initialized": {
+      "type": "boolean"
+    },
+    "lastTurnOutcome": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/LastTurnOutcome"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "turn": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TurnState"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "steering": {
+      "$ref": "#/$defs/SteeringQueueState"
+    },
+    "tools": {
+      "$ref": "#/$defs/ToolsState"
+    },
+    "requests": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/PendingRequestDto"
+      },
+      "description": "Outstanding server-initiated requests (permission / question / plan\napproval). A reconnecting client discovers what the engine is waiting\nfor here rather than inferring it from silence.",
+      "default": []
+    },
+    "config": {
+      "$ref": "#/$defs/EffectiveConfig"
+    },
+    "usage": {
+      "$ref": "#/$defs/UsageState"
+    },
+    "limits": {
+      "$ref": "#/$defs/Limits"
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/CapabilityEntry"
+      }
+    }
+  },
+  "required": [
+    "contractVersion",
+    "engineInstanceId",
+    "sessionId",
+    "workspacePath",
+    "cursor",
+    "historyEpoch",
+    "historyLength",
+    "lifecycle",
+    "initialized",
+    "steering",
+    "tools",
+    "config",
+    "usage",
+    "limits",
+    "capabilities"
+  ],
+  "title": "StateSnapshot",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "EngineLifecycle": {
+      "type": "string",
+      "enum": [
+        "initializing",
+        "ready",
+        "busy",
+        "stopping",
+        "stopped"
+      ]
+    },
+    "LastTurnOutcome": {
+      "type": "object",
+      "properties": {
+        "turnId": {
+          "type": "string"
+        },
+        "endedAt": {
+          "type": "string"
+        },
+        "stopReason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "interrupted": {
+          "type": "boolean"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnErrorSummary"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Safe classification only — see [`TurnErrorSummary`]. The raw provider\nmessage is still returned once, synchronously, in the `session/prompt`\nreply; it is never retained here."
+        }
+      },
+      "required": [
+        "turnId",
+        "endedAt",
+        "interrupted"
+      ]
+    },
+    "TurnErrorSummary": {
+      "type": "object",
+      "properties": {
+        "category": {
+          "type": "string",
+          "description": "Closed set: `\"cancelled\"`, `\"incomplete\"`, `\"agent.other\"`,\n`\"engine.<reason>\"`, or `\"llm.<coda_llm::diagnostics::category>\"`."
+        },
+        "status": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "parameter": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "A bounded, allowlisted request-parameter path when the provider named\nexactly one from a fixed set — never derived from a message body."
+        }
+      },
+      "required": [
+        "category"
+      ],
+      "description": "Why a turn failed, in a form that is safe to retain and to serve from\n`session/getState` for the rest of the session.\n\n`AgentError`/`LlmError` `Display` and `Debug` carry provider-authored text\nand can embed a credential-bearing URL or a request body. None of that may\nend up here: a `lastTurnOutcome` is polled indefinitely by any connected\nclient, so it carries only a fixed classification token, the HTTP status\nwhen there was one, and — at most — one allowlisted request-parameter path\nextracted by `coda_llm::diagnostics` (never free text, never a message)."
+    },
+    "TurnState": {
+      "type": "object",
+      "properties": {
+        "turnId": {
+          "type": "string"
+        },
+        "startedAt": {
+          "type": "string",
+          "description": "When the turn began, as the **engine's** UTC wall clock.\n\nUseful for display, but never for measuring duration from a different\nmachine: a remote client's clock may be skewed, and re-deriving the\nelapsed time from this string makes a reconnecting timer jump. Use\n[`Self::elapsed_ms`] for that."
+        },
+        "elapsedMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "How long this turn has been running, measured by the **server's own\nmonotonic clock** at the instant the snapshot was taken.\n\nThis is what a rehydrating or remote client seeds its timer from:\nit needs no clock agreement, is immune to wall-clock adjustments, and\nnever rewinds across a resync. Absent only when the engine did not\nreport it (an older build) — never a confident `0`, which would look\nlike a turn that just started."
+        },
+        "phase": {
+          "$ref": "#/$defs/ActivityPhase"
+        },
+        "phaseSince": {
+          "type": "string"
+        },
+        "phaseElapsedMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "How long the turn has been in [`Self::phase`], on the same monotonic\nclock as [`Self::elapsed_ms`]. \"Waiting for the model for 40 s\" is a\ndifferent fact from \"this turn started 4 minutes ago\", and a client\nshowing a per-phase spinner needs the former."
+        },
+        "modelRequest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelRequestState"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "batches": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ToolBatchRef"
+          }
+        },
+        "liveEntries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/HistoryEntry"
+          },
+          "description": "The in-flight turn projected as the same `HistoryEntry` DTOs used by\n`session/getHistory` (§2.5). Committed history + `liveEntries` is the\nwhole conversation as of `StateSnapshot.cursor`."
+        },
+        "liveTruncated": {
+          "type": "boolean"
+        },
+        "liveOmittedBytes": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "activeConfig": {
+          "$ref": "#/$defs/ActiveConfig"
+        },
+        "concurrent": {
+          "$ref": "#/$defs/ConcurrentCounters",
+          "default": {}
+        }
+      },
+      "required": [
+        "turnId",
+        "startedAt",
+        "phase",
+        "phaseSince",
+        "batches",
+        "liveEntries",
+        "liveTruncated",
+        "liveOmittedBytes",
+        "activeConfig"
+      ]
+    },
+    "ActivityPhase": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "preparing",
+            "waitingForModel",
+            "reasoning",
+            "responding",
+            "runningTools",
+            "awaitingUserInput",
+            "compacting"
+          ]
+        },
+        {
+          "type": "string",
+          "const": "maintenance",
+          "description": "An administrative session mutation that owns the single-flight slot\nexactly like a turn does — `session/fork`, `session/rewind`. These\nrewrite the conversation, so a prompt must not run against a history\nthey are half way through replacing."
+        }
+      ]
+    },
+    "ModelRequestState": {
+      "type": "object",
+      "properties": {
+        "requestId": {
+          "type": "string"
+        },
+        "startedAt": {
+          "type": "string"
+        },
+        "observedReasoning": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "requestId",
+        "startedAt",
+        "observedReasoning"
+      ]
+    },
+    "ToolBatchRef": {
+      "type": "object",
+      "properties": {
+        "batchId": {
+          "type": "string"
+        },
+        "startedAt": {
+          "type": "string"
+        },
+        "callIds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "batchId",
+        "startedAt",
+        "callIds"
+      ]
+    },
+    "HistoryEntry": {
+      "type": "object",
+      "properties": {
+        "index": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "role": {
+          "type": "string",
+          "description": "`\"user\" | \"assistant\"` — exactly the provider protocol role."
+        },
+        "entryKind": {
+          "$ref": "#/$defs/HistoryEntryKind",
+          "description": "What this entry actually is. See [`HistoryEntryKind`]: a `user` role\ndoes **not** imply the operator typed anything.",
+          "default": "userPrompt"
+        },
+        "blocks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/HistoryBlock"
+          }
+        }
+      },
+      "required": [
+        "index",
+        "role",
+        "blocks"
+      ],
+      "description": "One role-tagged entry (committed message or in-flight live turn content)."
+    },
+    "HistoryEntryKind": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "userPrompt",
+          "description": "Text the operator actually sent."
+        },
+        {
+          "type": "string",
+          "const": "toolResults",
+          "description": "A user-role message carrying tool results (and possibly steering text\nappended at a delivery boundary). **Never** a new operator prompt."
+        },
+        {
+          "type": "string",
+          "const": "assistant",
+          "description": "An assistant message."
+        }
+      ],
+      "description": "What an entry *is*, independent of its wire `role`.\n\nA provider conversation encodes tool results as **user-role** messages.\nA client that renders `role == \"user\"` as \"something the operator typed\"\ntherefore invents user prompts that never happened. This discriminator\nexists so that mistake is not possible: `role` stays exactly what the\nprovider protocol says, and `entryKind` says what it means."
+    },
+    "HistoryBlock": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "omittedReason": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "`\"tooLarge\"` (a per-block cap) or `\"liveBudgetExceeded\"` (the\nlive-turn retention budget). Present exactly when `text` is\nshorter than what was actually said."
+            },
+            "fullLength": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64",
+              "description": "Byte length of the *original* text before any cap was applied.\nPresent exactly when `text` was truncated."
+            },
+            "kind": {
+              "type": "string",
+              "const": "text"
+            }
+          },
+          "required": [
+            "kind",
+            "text"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "redacted": {
+              "type": "boolean"
+            },
+            "omittedReason": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "See [`HistoryBlock::Text::omitted_reason`]."
+            },
+            "fullLength": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            },
+            "kind": {
+              "type": "string",
+              "const": "reasoningSummary"
+            }
+          },
+          "required": [
+            "kind",
+            "text",
+            "redacted"
+          ],
+          "description": "A reasoning summary — never the opaque provider signature/ciphertext.\n\n`redacted: true` means the provider withheld the text; that is a\npolicy statement, not a truncation, so it carries no `fullLength`."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "callId": {
+              "type": "string"
+            },
+            "toolName": {
+              "type": "string"
+            },
+            "inputJson": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "inputOmittedReason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "inputFullLength": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64",
+              "description": "Byte length of the *original* `input_json` before any cap was\napplied. Present exactly when `input_json` was truncated, so a\nclient can say how much it is not seeing instead of assuming the\ncapped string is the whole input (I8)."
+            },
+            "turnId": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "The turn that produced this call, when the stored message\nrecorded one. Provider `call_id`s are only unique within a\nrequest, so `(turn_id, batch_id, call_id)` is the identity a\nclient should key on. Omitted — never invented — for transcripts\nwritten before correlation ids existed."
+            },
+            "batchId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "toolCall"
+            }
+          },
+          "required": [
+            "kind",
+            "callId",
+            "toolName"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "callId": {
+              "type": "string"
+            },
+            "isError": {
+              "type": "boolean"
+            },
+            "status": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "content": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "omittedReason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "fullLength": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64",
+              "description": "Byte length of the *original* `content` before any cap was applied\n(I8). Present exactly when `content` was truncated."
+            },
+            "turnId": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "description": "See [`HistoryBlock::ToolCall::turn_id`]."
+            },
+            "batchId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "toolResult"
+            }
+          },
+          "required": [
+            "kind",
+            "callId",
+            "isError"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "mediaType": {
+              "type": "string"
+            },
+            "byteLength": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "kind": {
+              "type": "string",
+              "const": "image"
+            }
+          },
+          "required": [
+            "kind",
+            "mediaType",
+            "byteLength"
+          ],
+          "description": "Metadata only — never a base64 payload (secret deny-list)."
+        }
+      ],
+      "description": "One block of content within a [`HistoryEntry`].\n\nEvery variant that can carry capped free text also carries the pair\n(`omittedReason`, `fullLength`). They are present **exactly** when the\nprojection retained less than the original, so a client can always tell a\ncomplete value from a shortened one. Both are omitted — never `null`,\nnever a fabricated length — when nothing was dropped."
+    },
+    "ActiveConfig": {
+      "type": "object",
+      "properties": {
+        "providerId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "type": "string"
+        },
+        "effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effortIsAuto": {
+          "type": "boolean"
+        },
+        "permissionMode": {
+          "type": "string"
+        },
+        "systemPromptSource": {
+          "type": "string",
+          "description": "`\"default\" | \"sessionOverride\" | \"startup\"`."
+        }
+      },
+      "required": [
+        "model",
+        "effortIsAuto",
+        "permissionMode",
+        "systemPromptSource"
+      ]
+    },
+    "ConcurrentCounters": {
+      "type": "object",
+      "properties": {
+        "backgroundTasks": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "scheduledRuns": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      },
+      "description": "Background/subagent operation counters. `None` means \"unknown\" (services\nnot yet initialised) — never a confident zero."
+    },
+    "SteeringQueueState": {
+      "type": "object",
+      "properties": {
+        "pendingCount": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "pending": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SteeringPendingDto"
+          }
+        },
+        "outcomes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SteeringOutcomeDto"
+          },
+          "description": "Bounded ring, newest last."
+        },
+        "outcomesTruncated": {
+          "type": "boolean"
+        },
+        "retainedOutcomes": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "pendingCount",
+        "pending",
+        "outcomes",
+        "outcomesTruncated",
+        "retainedOutcomes"
+      ]
+    },
+    "SteeringPendingDto": {
+      "type": "object",
+      "properties": {
+        "messageId": {
+          "type": "string"
+        },
+        "enqueuedAt": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string",
+          "description": "The full original text (§2.3a) — never a preview. Capped; see\n`text_truncated`."
+        },
+        "textLength": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "textTruncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "messageId",
+        "enqueuedAt",
+        "text",
+        "textLength",
+        "textTruncated"
+      ]
+    },
+    "SteeringOutcomeDto": {
+      "type": "object",
+      "properties": {
+        "messageId": {
+          "type": "string"
+        },
+        "outcome": {
+          "$ref": "#/$defs/SteeringOutcomeKind"
+        },
+        "at": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "messageId",
+        "outcome",
+        "at"
+      ]
+    },
+    "SteeringOutcomeKind": {
+      "type": "string",
+      "enum": [
+        "delivered",
+        "recalled",
+        "cancelledTurnEnded",
+        "rejected"
+      ]
+    },
+    "ToolsState": {
+      "type": "object",
+      "properties": {
+        "active": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ToolCallState"
+          }
+        },
+        "recentlyCompleted": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ToolCallState"
+          },
+          "description": "Bounded ring of recently completed calls."
+        },
+        "truncated": {
+          "type": "boolean",
+          "description": "`true` once the bounded ring has dropped at least one call this\nsession: the two lists above are then explicitly **not** the complete\nset of calls, and a client must not treat them as one (C3).",
+          "default": false
+        },
+        "retained": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The advertised bound on how many calls are retained in total.",
+          "default": 0
+        }
+      },
+      "required": [
+        "active",
+        "recentlyCompleted"
+      ]
+    },
+    "ToolCallState": {
+      "type": "object",
+      "properties": {
+        "callId": {
+          "type": "string"
+        },
+        "batchId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        },
+        "toolName": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/ToolCallStateStatus"
+        },
+        "startedAt": {
+          "type": "string"
+        },
+        "elapsedMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "endedAt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "isError": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "resultSummary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "callId",
+        "batchId",
+        "turnId",
+        "toolName",
+        "status",
+        "startedAt"
+      ]
+    },
+    "ToolCallStateStatus": {
+      "type": "string",
+      "enum": [
+        "queued",
+        "running",
+        "awaitingPermission",
+        "completed",
+        "failed",
+        "cancelled",
+        "skipped"
+      ]
+    },
+    "PendingRequestDto": {
+      "type": "object",
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "description": "Opaque handle, bound to the engine instance that minted it. A handle\nfrom a previous engine process is rejected, never silently re-applied\nto whatever happens to be pending now."
+        },
+        "kind": {
+          "$ref": "#/$defs/PendingRequestKind"
+        },
+        "issuedAt": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "callId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The provider tool-call id, when the request is attached to one.\n\n**Reserved, and always omitted by the Rust engine.** The\npermission/question/plan-approval seams it would have to come from do\nnot carry the id, and inventing a plausible one would be worse than\nsaying nothing. `requests.callCorrelation` is advertised as\n`supported: false` for exactly this reason: correlate on `turnId`\ntogether with the `event/toolCall` stream instead. The field stays on\nthe wire shape so a host that *does* have the id can populate it\nwithout a contract change."
+        },
+        "display": true,
+        "failClosedDefault": {
+          "type": "string",
+          "description": "`\"deny\" | \"noAnswer\" | \"reject\"`."
+        }
+      },
+      "required": [
+        "requestId",
+        "kind",
+        "issuedAt",
+        "display",
+        "failClosedDefault"
+      ],
+      "description": "One outstanding server-initiated request, as seen by a client that did not\nissue the original `request/*` round-trip (or reconnected after it).\n\n`display` carries only what a UI needs to render the prompt: a tool name, a\ncapped input preview, the question and its options, or a capped plan. It\nnever carries a credential, a header value or an environment value."
+    },
+    "PendingRequestKind": {
+      "type": "string",
+      "enum": [
+        "permission",
+        "question",
+        "planApproval"
+      ]
+    },
+    "EffectiveConfig": {
+      "type": "object",
+      "properties": {
+        "active": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ActiveConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Captured into the running turn; `None` when idle."
+        },
+        "next": {
+          "$ref": "#/$defs/ActiveConfig",
+          "description": "What the next turn will use — read live from the engine's mutable\nconfig at snapshot time."
+        },
+        "differing": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ConfigDifference"
+          },
+          "description": "Derived, never invented: the fields where `active` and `next` really\ndiffer, each tagged with when the pending value actually takes hold.\nEmpty when idle (there is no captured config to differ from)."
+        }
+      },
+      "required": [
+        "next"
+      ]
+    },
+    "ConfigDifference": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "active": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "next": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "appliesWhen": {
+          "$ref": "#/$defs/AppliesWhen"
+        }
+      },
+      "required": [
+        "key",
+        "appliesWhen"
+      ],
+      "description": "One field where the running turn's captured config differs from what the\nnext turn / next check will use."
+    },
+    "AppliesWhen": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "immediately",
+          "description": "Observable on the very next read, with no turn boundary involved."
+        },
+        {
+          "type": "string",
+          "const": "nextPermissionCheck",
+          "description": "The running turn keeps its captured mode; the next permission\ndecision reads the new one."
+        },
+        {
+          "type": "string",
+          "const": "nextTurn",
+          "description": "The running turn keeps its captured value; the next turn is built\nwith the new one."
+        },
+        {
+          "type": "string",
+          "const": "newEngineInstance",
+          "description": "Only a new engine process picks this up."
+        },
+        {
+          "type": "string",
+          "const": "clientLocal",
+          "description": "The engine does not own this at all — it is the client's own setting."
+        }
+      ],
+      "description": "When a change to a config key actually takes hold."
+    },
+    "UsageState": {
+      "type": "object",
+      "properties": {
+        "lastResponse": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UsagePair"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UsagePair"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "contextLimit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "unknownFields": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        }
+      }
+    },
+    "UsagePair": {
+      "type": "object",
+      "properties": {
+        "inputTokens": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "outputTokens": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "inputTokens",
+        "outputTokens"
+      ]
+    },
+    "Limits": {
+      "type": "object",
+      "properties": {
+        "ringEnvelopes": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "ringBytes": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "liveBytesCap": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "outcomesRetained": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "historyBlockBytesCap": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "maxHistoryPage": {
+          "type": "integer",
+          "format": "int64",
+          "description": "Largest `limit` `session/getHistory` will honour. A larger request is\nclamped to this (`truncated`/`nextIndex` still say there is more); a\n`limit` below 1 is a typed `-32602`. Published so the ceiling is\ndiscoverable rather than folklore."
+        },
+        "maxSessionPage": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The same ceiling for `session/listSessions`."
+        }
+      },
+      "required": [
+        "ringEnvelopes",
+        "ringBytes",
+        "liveBytesCap",
+        "outcomesRetained",
+        "historyBlockBytesCap",
+        "maxHistoryPage",
+        "maxSessionPage"
+      ]
+    },
+    "CapabilityEntry": {
+      "type": "object",
+      "properties": {
+        "supported": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "supported"
+      ],
+      "description": "One entry in `InitializeResult.capabilities` — whether a named capability\nis supported by this engine build, with an explanatory reason when not."
+    }
+  }
+}

@@ -43,14 +43,20 @@ That means:
 | `coda-auth` | OAuth/PKCE and device-code flows, DPAPI/keyring/encrypted-file stores, single-flight refresh. |
 | `coda-serve` | The engine host: pure method dispatch, the event bridge, server-initiated prompts, and the stdio transport. |
 | `coda-diagnostics` | Leaf crate: the bounded, rotating JSONL diagnostic writer and the scoped async `DiagnosticContext`. Depends on nothing engine-specific (no `coda-auth`/`coda-agent`), so any process can wire it in at its own entry point. |
+| `coda-boot` | Headless bootstrap shared by `coda serve` and `coda-engine`: diagnostics init/forward, product version, `ServeArgs` parsing + startup env translation, pure session-intent resolution, the cooperative `settings.json` writer, and the host-local `auth` command runner (provider picker, masked key prompt, safe browser launch). No TUI, rendering, clipboard, or agent-runtime dependency — `crates/coda-engine/tests/independence.rs` guards that with a `cargo tree` check. |
 | `coda-diff` | Differential tests asserting the C# and Rust engines answer identically. |
-| `coda` | The shipping binary: interactive, `serve` and `run` modes. |
+| `coda` | The shipping binary: interactive, `serve`, `run` and `auth` modes. |
+| `coda-engine` | Standalone, TUI-free binary: `coda-engine serve` (or a bare invocation) runs the same JSON-RPC-over-stdio core `coda serve` does. Not a second supported UX — `--engine`/`CODA_ENGINE` can point at it instead of `coda`, and both share `coda-boot`'s `ServeArgs`/`prepare` byte-for-byte. Also offers the same host-local `coda-engine auth` commands through the shared `coda-boot` runner. Does not daemonize, detach, or supervise; an external orchestrator/worker/bridge owns the persistent process it becomes. |
 
 The dependency direction is strictly one way: `coda-tui → coda-render`,
 `coda-tui → coda-client → coda-proto`, and `coda-agent → {coda-llm, coda-mcp}
 → coda-tool`. Nothing below `coda-tui` knows about application state, nothing
 below `coda-client` performs I/O, and `coda-tool` is a leaf so that hosting a
-tool never drags in the agent.
+tool never drags in the agent. `coda-boot` is one-way too: `coda-tui` and
+`coda-engine` both depend on it (for diagnostics/version/`ServeArgs`), but it
+never depends on `coda-tui` or `coda-serve` — a binary chains `coda_boot::
+serve::prepare(&args)` with its own `coda_serve::serve_stdio()` call rather
+than `coda-boot` calling the transport itself.
 
 ## Building and testing
 
@@ -79,6 +85,17 @@ cargo run -p coda-tui                      # uses `coda` from PATH
 cargo run -p coda-tui -- --engine ./coda.exe -C C:\some\repo
 cargo run -p coda-tui -- --log-file coda.log --diagnostic-verbosity debug
 ```
+
+An explicit `--engine`/`CODA_ENGINE` names somebody else's binary or a proxy,
+so that session runs **API-only**: the engine-adjacent files on this machine
+(MCP servers, plugins, marketplaces, and the engine-owned values in
+`settings.json` — provider, per-provider model, per-model effort, permission
+mode, custom headers, telemetry) are not the ones that engine reads, and are
+therefore left alone rather than written with a claim that they took effect.
+Session-scoped changes — `session/setModel`, `session/setPermissionMode`,
+`session/setEffort` — are ordinary RPCs and keep working; only the promise
+that they survive a restart is withheld, and said so. The default launch,
+where this process starts its own core, behaves exactly as before.
 
 Because stdout carries the protocol, engine diagnostics go to stderr and are
 kept in a bounded ring for crash reporting, never persisted routinely. Every
@@ -147,12 +164,57 @@ TUI, the engine, and a headless mode:
 coda                  interactive TUI
 coda serve            JSON-RPC engine over stdio
 coda run -p "<task>"  headless one-shot
+coda auth <cmd>       host-local provider sign-in (status | login | logout)
 ```
 
 Interactive mode drives the engine over the same JSON-RPC seam, defaulting the
 engine to this same executable. Running the agent in-process would be slightly
 faster but would bypass the boundary the parity tests exercise, so it is
 deliberately not done.
+
+`auth` is deliberately *not* a serve-API method. Connecting an account touches
+this machine's credential store and this user's browser, which an external
+application supervising Coda does not own. `coda auth` and `coda-engine auth`
+are the same runner (`coda-boot`'s `auth_cli`), so both binaries offer the same
+commands, the same disclosures and the same exit codes:
+
+```
+0    the command did what it said
+1    an operational failure (store, network, provider, commit)
+2    invalid usage (a rejected option, a missing provider, unusable input)
+130  the user cancelled
+```
+
+An API key is never a command-line argument: it is read from a masked terminal
+prompt, or — when there is no terminal — only from an explicitly requested
+`--api-key-stdin`. Asking for `--api-key-stdin` *while stdin is a terminal* is
+refused rather than honoured, because typing into it would echo the key. A
+terminal that reports itself as one but cannot suppress echo (mintty/msys) is
+also refused, with a pipe-based alternative rather than an instruction to type
+the key somewhere visible.
+
+`auth login api-key` always checks the key against the provider before it
+commits, and `auth login api-key --use-env` selects the exported
+`ANTHROPIC_API_KEY` without storing anything. Both send the key to whatever
+`ANTHROPIC_BASE_URL` resolves to — disclosed by host before the key is sent
+anywhere, again after the commit, and in `auth status`. See
+[Anthropic API-key endpoint](#anthropic-api-key-endpoint).
+
+Authorization URLs and device codes are printed to the ephemeral CLI surface;
+an `auth` command never opens the diagnostic log. Set `CODA_AUTH_NO_BROWSER` to
+a non-empty value to keep it from launching a browser (the challenge is still
+printed, so a fixture-driven login is fully drivable).
+
+Cancellation means three different things and the command says which one
+happened. At a prompt, `Esc`/`Ctrl-C` cancel and the terminal mode is restored
+— `crates/coda-boot/tests/console_real_terminal.rs` proves that against a real
+console, by measuring the console mode before, during and after. While a login
+is being prepared, cancelling drops the flow (closing the loopback listener and
+the device poller) and exits `130` with nothing written. The **commit** is
+deliberately uninterruptible, so it always reaches a terminal outcome. The
+verification that follows is interruptible again — and if it is interrupted,
+the report says the credential is saved and simply unverified, never that the
+sign-in did not happen.
 
 ### Parity with the C# engine
 
@@ -269,9 +331,8 @@ assumptions; only cross-checking against the reference breaks the circularity.
 
 ### What remains
 
-- session transcript export/import and the setup/onboarding wizard;
-- five slash commands (`/compact` is wired; `/resume`, `/fork`, `/rewind`,
-  `/import`, `/login`, `/logout` need session-state or auth RPCs);
+- session transcript export/import;
+- two slash commands (`/import`, and `/rewind`'s server-side truncation);
 - the 30 FPS frame throttle and the assistant-buffering mode, including its
   withhold-on-interrupt rule;
 - **real-model validation.** The engine has been exercised by its own tests and
@@ -392,13 +453,80 @@ Behaviour notes:
   built-in system prompt for the session; the text is not appended to it.
 - `--endpoint` is retained for the whole session: a later `initialize(apiKey)`
   rebuilds the client at the configured endpoint rather than reverting to the
-  default host.
+  default host. It still requires `--api-key`; to redirect a *stored* or
+  *exported* key, set `ANTHROPIC_BASE_URL` instead — see
+  [Anthropic API-key endpoint](#anthropic-api-key-endpoint).
 - Invalid startup values (bad `--effort`, unknown `--permission-mode`, a
-  non-positive `--goal-timeout`, or a negative `--max-continuations`) fail
-  startup with an error instead of being silently defaulted or clamped.
+  non-positive `--goal-timeout`, a negative `--max-continuations`, or an
+  invalid `--endpoint`) fail startup with an error instead of being silently
+  defaulted or clamped. An `ANTHROPIC_BASE_URL` that fails validation fails
+  startup only for a session that would spend an Anthropic API key, and is
+  never quietly replaced by the default host — see
+  [Anthropic API-key endpoint](#anthropic-api-key-endpoint).
 - `--log-file`/`--diagnostic-verbosity` are always available and never opt
   in the essential diagnostic log itself, which is written regardless — see
   [Operational diagnostics](#operational-diagnostics).
+
+### Anthropic API-key endpoint
+
+Anthropic console-key requests go to `https://api.anthropic.com` unless
+`ANTHROPIC_BASE_URL` says otherwise — the variable the Anthropic ecosystem
+already uses, for a gateway, a corporate proxy or a compatible self-hosted
+deployment.
+
+One resolver (`coda_auth::service::endpoint`) decides this for the whole
+product, so the login's mandatory pre-commit credential check, the post-commit
+connection check and the engine that follows all send the key to the *same*
+host. Precedence, highest first:
+
+1. `coda serve --endpoint <URL>` (still requires `--api-key`);
+2. `ANTHROPIC_BASE_URL` from the process environment;
+3. `https://api.anthropic.com`.
+
+```powershell
+$env:ANTHROPIC_BASE_URL = "https://anthropic.gateway.internal"
+coda auth login api-key      # the key is validated against the gateway
+coda serve                   # and spent there
+```
+
+**Scope, and what it is not**
+
+- **Anthropic API keys only.** A Claude.ai subscription and GitHub Copilot
+  resolve their own endpoints and never see this variable; routing one
+  provider's token to another's host is exactly what this must not do.
+- **This process only.** It configures the process that reads it. It is not
+  persisted, it does not persist a key, and it does not travel — a CLI, an
+  engine and a TUI that must all reach the same gateway each need it exported
+  in their own environment.
+- **Not a place to put a secret.** A query string, a fragment and embedded
+  `user:password@` credentials are all refused, and only the host is ever
+  printed (`coda auth login`'s disclosure, `coda auth status`, diagnostics) —
+  never the configured URL, whose path could carry a tenant id.
+
+**Validation**
+
+`https` to any host, `http` only to a literal loopback address (`localhost`,
+`127.0.0.0/8`, `::1`) — plaintext to anywhere else would put the API key on the
+wire in clear. Backslashes, control characters and any other scheme are
+refused. A trailing slash is normalised away; a base path is kept.
+
+A non-empty value that fails validation is an **error**, never a fallback to
+`https://api.anthropic.com`: `coda auth login api-key` refuses before anything
+is sent or written, `coda serve` refuses to start *when it would spend an
+Anthropic API key* (`--provider anthropic`, an explicit `--api-key`, or a
+`initialize(apiKey)` handed to it later), and `coda auth status` reports the
+fault without contacting anyone. A user who pointed Coda at a gateway must
+never discover their key went to Anthropic instead.
+
+The refusal is scoped the same way the variable is. A session signed in to
+GitHub Copilot or Claude.ai starts, and runs, normally — those providers
+resolve their own endpoints — exactly as `coda auth login copilot` succeeds
+with the same value set. The refusal is not forgotten in that case: it is kept
+for the life of the process, so an engine that started as Copilot still refuses
+a later `initialize(apiKey)` rather than sending that key to the default host.
+
+`coda auth status` always names the host in force, so "which endpoint am I
+actually configured for?" is answerable without starting a session.
 
 ### GitHub Enterprise Copilot
 
@@ -591,6 +719,47 @@ both seams is what makes the front-end genuinely useful rather than read-only:
 |---|---|
 | `serve` JSON-RPC | turns, streaming, tool events, prompts, models, schedules, skills, plugins, hooks |
 | Local files | MCP configuration, task logs, settings, plugin state |
+| Host-local maintenance | signing in, switching account, signing out — the credential store and the two auth-owned settings keys |
+
+Authentication is deliberately *not* on the protocol. Signing in touches this
+profile's credential store and this user's browser, so an external application
+supervising the engine owns its lifecycle but never its keychain. `/login`,
+`/provider <id>`, `/logout` and `/setup` therefore go through the same
+`coda-auth` service `coda auth` uses, and refuse outright — **before** opening
+a credential store — when the front-end was pointed at an engine it did not
+start (`--engine`/`CODA_ENGINE`), naming `coda auth` on the engine host
+instead.
+
+A credential change is a lifecycle operation, not a settings edit. The order is
+fixed: disclose where the *chosen* account will authorize (host only, from the
+service's own resolved configuration), prepare (cancellable, writes nothing,
+the running engine stays up), stop **and await** the engine this process owns,
+commit the credential and settings in one transaction, then start a fresh
+engine told explicitly which account and which Copilot deployment to use and
+resume the same session. Merely writing `defaultProvider` and restarting —
+which is what `/provider` used to do — changes nothing about which credential
+the engine can find.
+
+Every slow step runs on a task and reports back to the loop, so the terminal
+keeps drawing and `Ctrl+C` keeps working while a browser is open, a device code
+is being polled, an engine is going away or a credential is being written. The
+transaction itself is never cancelled, and closing the application awaits it
+rather than leaving a half-written profile. Work reported by a sign-in the user
+cancelled is dropped rather than adopted by whatever started next.
+
+**Before the engine exists.** A first run — or a launch whose explicitly named
+provider (`--provider`, `--engine-arg --provider`, `CODA_SERVE_PROVIDER`) has
+no usable credential — is offered the same setup screen *before any engine is
+spawned*, by both `coda` and the standalone `coda-tui`. It runs without an
+engine, a connection or an application: the surfaces and the flow are the ones
+`/login` uses, and the loop around them is the launcher's. Cancelling starts no
+engine and changes nothing; connecting an account rebuilds the launch to name
+it, and a launch that then fails to start says exactly that — "credentials
+saved; engine startup failed" — rather than reporting a failed sign-in. A
+session pointed at somebody else's engine (`--engine`/`CODA_ENGINE`) skips all
+of this without opening a credential store at all, and `coda run` and
+`coda serve` remain fail-closed: a non-interactive process must not wait on a
+person who is not there.
 
 Settings are read once at engine start, so changing one only takes effect
 across a restart. `initialize` accepts a session id, so the front-end restarts

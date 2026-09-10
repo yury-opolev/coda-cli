@@ -2,14 +2,12 @@
 
 use coda_proto::messages::{self, method};
 use super::App;
-use crate::config::{ConfigError, Paths, Settings};
+use crate::config::Settings;
 use crate::surface::effort::{EffortPickerSurface, PickerCapability};
 use crate::transcript::NoticeLevel;
 
-fn save_effort(paths: &Paths, provider: &str, model: &str, current: Option<&str>) -> Result<(), ConfigError> {
-    let mut settings = Settings::load(paths)?;
+fn set_effort_in(settings: &mut Settings, provider: &str, model: &str, current: Option<&str>) {
     settings.set_effort_for(provider, model, current);
-    settings.save()
 }
 
 fn identity(capability: &messages::ReasoningCapabilityResult) -> Option<(String, String)> {
@@ -45,19 +43,19 @@ impl App {
             self.remember_effort(result.current.clone());
         }
         let label = result.current.clone().unwrap_or_else(|| "auto".into());
-        let paths = self.paths.clone();
-        let saved = tokio::task::spawn_blocking(move ||
-            save_effort(&paths, &result.provider_id, &result.model, result.current.as_deref())
-        ).await;
+        let saved = self
+            .persist_engine_default(move |settings| {
+                set_effort_in(settings, &result.provider_id, &result.model, result.current.as_deref())
+            })
+            .await;
         let status = match saved {
-            Ok(Ok(())) => format!("{model}: effort {label} saved"),
-            Ok(Err(error)) => {
-                let status = format!("{model}: effort {label} is session-only; could not save: {error}");
-                self.notice(status.clone(), NoticeLevel::Warning);
-                status
+            super::settings::Saved::Ok => format!("{model}: effort {label} saved"),
+            // The session change stands; only the durable half is impossible.
+            super::settings::Saved::Refused => {
+                format!("{model}: effort {label} for this session (the engine's defaults live on its own host)")
             }
-            Err(error) => {
-                let status = format!("{model}: effort {label} is session-only; save failed: {error}");
+            super::settings::Saved::Failed(error) => {
+                let status = format!("{model}: effort {label} is session-only; could not save: {error}");
                 self.notice(status.clone(), NoticeLevel::Warning);
                 status
             }
@@ -119,18 +117,24 @@ impl App {
             self.notice(format!("Effort set to {label} for this session."), NoticeLevel::Info);
             return;
         }
-        let paths = self.paths.clone();
-        let saved = tokio::task::spawn_blocking(move ||
-            save_effort(&paths, &for_model.0, &for_model.1, result.current.as_deref())
-        ).await;
+        let saved = self
+            .persist_engine_default(move |settings| {
+                set_effort_in(settings, &for_model.0, &for_model.1, result.current.as_deref())
+            })
+            .await;
         match saved {
-            Ok(Ok(())) => self.notice(format!("Effort set to {label} and saved."), NoticeLevel::Info),
-            Ok(Err(error)) => self.notice(
+            super::settings::Saved::Ok => {
+                self.notice(format!("Effort set to {label} and saved."), NoticeLevel::Info)
+            }
+            super::settings::Saved::Refused => {
+                let note = self.not_saved_remotely();
+                self.notice(
+                    format!("Effort set to {label} for this session.{note}"),
+                    NoticeLevel::Info,
+                )
+            }
+            super::settings::Saved::Failed(error) => self.notice(
                 format!("Effort set to {label} for this session; could not save: {error}"),
-                NoticeLevel::Warning,
-            ),
-            Err(error) => self.notice(
-                format!("Effort set to {label} for this session; save failed: {error}"),
                 NoticeLevel::Warning,
             ),
         }
@@ -198,6 +202,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Paths;
 
     #[test]
     fn effort_identity_uses_canonical_model_not_display_name() {
@@ -215,9 +220,15 @@ mod tests {
         let mut settings = Settings::empty_at(paths.settings());
         settings.set_effort_for("p", "other", Some("low"));
         settings.save().unwrap();
-        save_effort(&paths, "p", "model", Some("xhigh")).unwrap();
+
+        let mut settings = Settings::load(&paths).unwrap();
+        set_effort_in(&mut settings, "p", "model", Some("xhigh"));
+        settings.save().unwrap();
         assert_eq!(Settings::load(&paths).unwrap().effort_for("p", "model"), Some("xhigh"));
-        save_effort(&paths, "p", "model", None).unwrap();
+
+        let mut settings = Settings::load(&paths).unwrap();
+        set_effort_in(&mut settings, "p", "model", None);
+        settings.save().unwrap();
         let saved = Settings::load(&paths).unwrap();
         assert_eq!(saved.effort_for("p", "model"), None);
         assert_eq!(saved.effort_for("p", "other"), Some("low"));
@@ -228,7 +239,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths { user_root: dir.path().into(), project_root: dir.path().into() };
         std::fs::write(paths.settings(), "{broken").unwrap();
-        assert!(save_effort(&paths, "p", "m", Some("high")).is_err());
+        assert!(Settings::load(&paths).is_err());
         assert_eq!(std::fs::read_to_string(paths.settings()).unwrap(), "{broken");
     }
 }

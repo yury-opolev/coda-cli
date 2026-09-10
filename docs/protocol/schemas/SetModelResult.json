@@ -1,0 +1,42 @@
+{
+  "anyOf": [
+    {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "model": {
+          "type": "string"
+        },
+        "effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "ok",
+        "model"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "note": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "ok",
+        "note"
+      ]
+    }
+  ],
+  "title": "SetModelResult",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

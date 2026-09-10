@@ -26,6 +26,16 @@ pub enum Activity {
     Thinking,
     /// Blocked on the user answering a prompt.
     Waiting,
+    /// No engine is answering: a sign-out, or a replacement that did not
+    /// start.
+    ///
+    /// A state of its own rather than a quiet fall back to [`Activity::Ready`]
+    /// because "ready" is a claim about an engine. After a deliberate
+    /// disconnection the transcript, the draft and every local command still
+    /// work — but nothing may be sent, so saying "ready" in green next to the
+    /// model of a session that no longer exists is the one thing the status
+    /// line must not do.
+    Disconnected,
 }
 
 impl Activity {
@@ -36,6 +46,7 @@ impl Activity {
             Activity::Working => "working",
             Activity::Thinking => "thinking",
             Activity::Waiting => "waiting",
+            Activity::Disconnected => "disconnected",
         }
     }
 
@@ -47,7 +58,18 @@ impl Activity {
             Activity::Working => Role::OperationalWorking,
             Activity::Thinking => Role::OperationalThinking,
             Activity::Waiting => Role::OperationalWaiting,
+            // Not an operational state at all: nothing is running, and the
+            // warning role is what distinguishes it from a healthy idle.
+            Activity::Disconnected => Role::Warning,
         }
+    }
+
+    /// Whether an engine is believed to be answering.
+    ///
+    /// The rendering half of `App::engine_connected`, so a label, a model name
+    /// and a spinner cannot disagree with each other about the same session.
+    pub fn is_connected(self) -> bool {
+        !matches!(self, Activity::Disconnected)
     }
 
     /// Whether this state should show a moving indicator.
@@ -118,8 +140,68 @@ pub enum PendingPrompt {
     PlanApproval { plan: String },
 }
 
-/// Events the reducer understands.
+/// How an outstanding prompt ended when this client did not answer it.
 ///
+/// The engine publishes `kind` and `outcome` on `event/requestResolved`, and
+/// they are the only authority on what actually happened. A client that
+/// discarded them had to supply a decision of its own, and the one it supplied
+/// was always a refusal — so a permission granted from another client, a
+/// question answered in a web UI, or an approval given over the API all
+/// appeared here as denials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalResolution {
+    /// A terminal outcome the engine published:
+    /// `allowed`/`denied`/`approved`/`rejected`/`answered`/`noAnswer.<reason>`.
+    ///
+    /// Both fields are optional because an engine that predates them says
+    /// only *that* the request ended. "We do not know how" is then the truth,
+    /// and it is reported as such rather than being resolved into a verdict.
+    /// The answer *text* is never carried: `requestResolved` does not publish
+    /// it, so showing one would be this client inventing it.
+    Outcome { kind: Option<coda_proto::state::PendingRequestKind>, outcome: Option<String> },
+    /// The request is no longer addressable because the engine process that
+    /// raised it was replaced. Nothing was decided — here or anywhere — so
+    /// nothing is recorded as a decision.
+    Retired,
+}
+
+/// What to tell the user about a prompt that ended without them answering it.
+///
+/// `None` means there is nothing honest to say: either nothing was on screen,
+/// or the request was retired rather than decided. The wording states who
+/// decided (not this terminal) and exactly what the engine reported — an
+/// unrecognised label is quoted rather than mapped onto the nearest verdict,
+/// because guessing here is how a grant becomes a refusal.
+fn external_resolution_text(
+    resolution: &ExternalResolution,
+    prompt: Option<&PendingPrompt>,
+) -> Option<String> {
+    let ExternalResolution::Outcome { outcome, .. } = resolution else { return None };
+    let subject = match prompt? {
+        PendingPrompt::Permission { tool, .. } => format!("The permission request for {tool}"),
+        PendingPrompt::Question { .. } => "That question".to_string(),
+        PendingPrompt::PlanApproval { .. } => "The plan".to_string(),
+    };
+    let verdict = match outcome.as_deref() {
+        Some("allowed") => "was allowed on another client.".to_string(),
+        Some("denied") => "was denied on another client.".to_string(),
+        Some("approved") => "was approved on another client.".to_string(),
+        Some("rejected") => "was rejected on another client.".to_string(),
+        // The answer text is deliberately absent from the wire: it is not
+        // published, so it is not shown.
+        Some("answered") => {
+            "was answered on another client; the answer is not shown here.".to_string()
+        }
+        Some(other) => match other.strip_prefix("noAnswer.") {
+            Some(reason) => format!("ended with no answer ({reason})."),
+            None => format!("was resolved by the engine ({other})."),
+        },
+        None => "was resolved elsewhere; the engine did not say how.".to_string(),
+    };
+    Some(format!("{subject} {verdict}"))
+}
+
+/// Events the reducer understands.///
 /// Engine notifications and local user actions are unified so that ordering
 /// between them is explicit rather than accidental.
 #[derive(Debug, Clone)]
@@ -134,6 +216,8 @@ pub enum UiEvent {
     Queued { text: String, id: Option<String> },
     /// The engine atomically withdrew these entries before delivery.
     SteeringRecalled { message_ids: Vec<String> },
+    /// Delivery is confirmed, but its user text is already in rehydrated history.
+    SteeringDeliveryReflected { message_ids: Vec<String> },
     /// A turn finished, from the `session/prompt` response.
     TurnFinished { interrupted: bool, error: Option<String> },
     /// The user asked to interrupt.
@@ -142,6 +226,13 @@ pub enum UiEvent {
     PromptRequested(PendingPrompt),
     /// The user answered the outstanding prompt.
     PromptAnswered { allowed: bool, answer: Option<String> },
+    /// The outstanding prompt ended without this client answering it.
+    ///
+    /// Kept separate from [`UiEvent::PromptAnswered`] on purpose: that event
+    /// means "the operator at this terminal decided", and the transcript
+    /// records it as their decision. This one means the opposite, and must
+    /// never be rendered as though the person sitting here chose anything.
+    PromptResolved(ExternalResolution),
     /// Output produced locally by a slash command.
     CommandOutput { text: String },
     /// A git diff to display with syntax colouring.
@@ -171,6 +262,35 @@ pub enum UiEvent {
     /// is porting that).  The full reducer logic is implemented here so it is
     /// correct and tested, ready for when the hook seam closes.
     EnableAssistantBuffering,
+    /// The engine's own lifecycle, from `event/lifecycle` or a snapshot.
+    ///
+    /// Authoritative over anything derived locally: the engine is the only
+    /// thing that knows whether the single-flight slot is free, and a legacy
+    /// `event/turnComplete` arrives *before* it is released.
+    CoreLifecycle(coda_proto::state::EngineLifecycle),
+    /// The running turn's phase, from `event/activity`.
+    ///
+    /// Metadata only: it carries no conversation content, so applying it
+    /// alongside the legacy content events cannot double anything.
+    CoreActivity(coda_proto::state::ActivityPhase),
+    /// Engine-owned truth, reconciled in one transaction.
+    ///
+    /// Sent on connect, after a resync, and after an engine-owned reset —
+    /// never per token. Everything the engine owns (queue contents, effective
+    /// configuration, usage, the turn clock, lifecycle) is replaced; the
+    /// purely local presentation state (composer draft, unsent recovery,
+    /// selection) is not.
+    Snapshot(Box<coda_proto::state::StateSnapshot>),
+    /// The conversation was rebuilt from `session/getHistory`.
+    Rehydrated { blocks: Vec<Block>, notices: Vec<String> },
+    /// No engine is answering any more — a sign-out, an engine that went
+    /// away, or a replacement that did not start.
+    ///
+    /// The conversation, the draft and the session's metadata are kept: this
+    /// says what is *true now*, it does not throw anything away.
+    EngineDisconnected,
+    /// A freshly started engine was adopted as this session's connection.
+    EngineAdopted,
 }
 
 /// Everything the UI draws from.
@@ -210,6 +330,16 @@ pub struct UiState {
     /// `activity` so the row can show a truthful phase and elapsed time
     /// without changing what the status bar has always meant.
     pub turn_progress: Option<TurnProgress>,
+    /// The engine's id for the turn [`Self::turn_progress`] is timing, once a
+    /// snapshot has named it.
+    ///
+    /// `None` between a local submission and the first snapshot that
+    /// describes it: the client started the clock before the engine had
+    /// spoken, so it does not yet know the id. Single-flight means there is
+    /// at most one running turn, so an unnamed running clock and the turn a
+    /// snapshot reports are the same turn — but a *differently* named turn is
+    /// not, and must not inherit the previous turn's reasoning.
+    pub turn_id: Option<String>,
     /// The prompt currently blocking the turn, if any.
     pub prompt: Option<PendingPrompt>,
     /// Set once the user has asked to quit.
@@ -240,6 +370,27 @@ pub struct UiState {
     /// Timestamp source, injected so tests are deterministic.
     clock: fn() -> String,
     thinking_started_at: Option<std::time::Instant>,
+    /// The engine's own lifecycle, once it has reported one.
+    ///
+    /// `None` on a legacy connection, where nothing publishes it and the
+    /// pre-contract behaviour (a turn ends when `event/turnComplete` says so)
+    /// is all there is.
+    pub core_lifecycle: Option<coda_proto::state::EngineLifecycle>,
+    /// Set between a local submission and the engine's first acknowledgement.
+    ///
+    /// The window is real and visible: a prompt is sent, and until the engine
+    /// publishes `busy` a snapshot taken in between honestly reports an idle
+    /// engine. Reconciling that snapshot without this flag would flip the UI
+    /// back to "ready" under a submission the user has already made.
+    optimistic_submit: bool,
+    /// The model the **running** turn captured, when it differs from the one
+    /// the next turn will use. `None` when they agree or nothing is running.
+    ///
+    /// There is no pending-change scheduler in the engine: a mid-turn model
+    /// switch takes effect next turn, and this is what makes "changed" and
+    /// "in effect" distinguishable rather than the UI claiming a switch that
+    /// the running turn is not using.
+    pub active_model: Option<String>,
 }
 
 impl Default for UiState {
@@ -262,6 +413,7 @@ impl UiState {
             unsent: Vec::new(),
             pending_deliveries: Vec::new(),
             turn_progress: None,
+            turn_id: None,
             prompt: None,
             should_quit: false,
             interrupting: false,
@@ -272,6 +424,9 @@ impl UiState {
 
             clock: default_timestamp,
             thinking_started_at: None,
+            core_lifecycle: None,
+            optimistic_submit: false,
+            active_model: None,
         }
     }
 
@@ -289,6 +444,26 @@ impl UiState {
             self.activity,
             Activity::Working | Activity::Thinking | Activity::Waiting
         )
+    }
+
+    /// Whether the transcript currently shows any of the *conversation* —
+    /// as opposed to this client's own notices, banner and command output.
+    ///
+    /// The distinction matters when the engine reports an empty history: an
+    /// empty conversation must replace a conversation, but it is not a reason
+    /// to wipe the launch banner of a session that never had one.
+    pub fn has_conversation(&self) -> bool {
+        self.transcript.blocks().iter().any(|block| {
+            matches!(
+                block,
+                Block::User { .. }
+                    | Block::Assistant { .. }
+                    | Block::Thinking { .. }
+                    | Block::Tools { .. }
+                    | Block::Permission { .. }
+                    | Block::Question { .. }
+            )
+        })
     }
 
     /// Restores the most recently unsent message's text, removing it from
@@ -357,6 +532,28 @@ impl UiState {
                 self.session_id = Some(session_id);
                 self.activity = Activity::Ready;
             }
+            // The two ends of one lifetime, in the reducer rather than in the
+            // renderer: the label, the spinner and `is_busy` all read the same
+            // field, so they cannot describe different sessions.
+            UiEvent::EngineDisconnected => {
+                self.activity = Activity::Disconnected;
+                // Nothing is running any more, so nothing may claim to be.
+                self.interrupting = false;
+                self.optimistic_submit = false;
+                self.turn_progress = None;
+                self.turn_id = None;
+                self.thinking_started_at = None;
+                self.core_lifecycle = None;
+            }
+            UiEvent::EngineAdopted => {
+                // A different process, with no turn of its own yet.
+                self.activity = Activity::Ready;
+                self.interrupting = false;
+                self.optimistic_submit = false;
+                self.turn_progress = None;
+                self.turn_id = None;
+                self.core_lifecycle = None;
+            }
             UiEvent::Submitted { text } => {
                 self.close_open_and_flush();
                 self.transcript.push(Block::User {
@@ -367,10 +564,18 @@ impl UiState {
                 });
                 self.activity = Activity::Working;
                 self.interrupting = false;
+                // Optimism, on purpose: the engine has not been told yet, so
+                // a snapshot taken right now truthfully says "idle". This
+                // flag is what stops that honest answer from undoing the
+                // feedback the user has already been given.
+                self.optimistic_submit = true;
                 // Started before any engine or network event, so the pinned
                 // row has a truthful "0s, Working" to show on the very first
                 // frame rather than waiting for the first response.
                 self.turn_progress = Some(TurnProgress::start(now));
+                // The engine has not named this turn yet, and inventing an id
+                // would make the next snapshot look like a different turn.
+                self.turn_id = None;
             }
             UiEvent::Queued { text, id } => {
                 // Kept only here — never mirrored into the transcript as a
@@ -385,7 +590,8 @@ impl UiState {
                     queued_at: (self.clock)(),
                 });
             }
-            UiEvent::SteeringRecalled { message_ids } => {
+            UiEvent::SteeringRecalled { message_ids }
+            | UiEvent::SteeringDeliveryReflected { message_ids } => {
                 let retained = |message: &QueuedMessage| {
                     !message.id.as_ref().is_some_and(|id| message_ids.contains(id))
                 };
@@ -397,7 +603,7 @@ impl UiState {
                 self.close_open_and_flush();
                 self.transcript.finalize_activities(None);
                 self.strand_unsent_queue();
-                self.activity = Activity::Ready;
+                self.settle_after_turn();
                 self.interrupting = false;
                 self.prompt = None;
                 if let Some(progress) = self.turn_progress.as_mut() {
@@ -457,6 +663,30 @@ impl UiState {
                     None => {}
                 }
             }
+            UiEvent::PromptResolved(resolution) => {
+                // The decision was made somewhere else, or never made at all.
+                // The modal comes down and the turn stops waiting either way;
+                // what must *not* happen is a decision block, because this
+                // client did not decide anything and its transcript would be
+                // claiming that the operator here did.
+                let prompt = self.prompt.take();
+                self.activity = Activity::Working;
+                if let Some(progress) = self.turn_progress.as_mut() {
+                    progress.on_resumed();
+                }
+                if let Some(text) = external_resolution_text(&resolution, prompt.as_ref()) {
+                    let level = match &resolution {
+                        ExternalResolution::Outcome { outcome, .. } => match outcome.as_deref() {
+                            Some("allowed") | Some("approved") | Some("answered") => {
+                                NoticeLevel::Info
+                            }
+                            _ => NoticeLevel::Warning,
+                        },
+                        ExternalResolution::Retired => NoticeLevel::Warning,
+                    };
+                    self.notice(text, level);
+                }
+            }
             UiEvent::CommandOutput { text } => {
                 self.close_open_and_flush();
                 self.transcript.push(Block::CommandOutput { text });
@@ -491,6 +721,22 @@ impl UiState {
                 if self.assistant_buffer.is_none() {
                     self.assistant_buffer = Some(String::new());
                     self.buffer_rewritten_by_hook = false;
+                }
+            }
+            UiEvent::CoreLifecycle(lifecycle) => self.apply_lifecycle(lifecycle, now),
+            UiEvent::CoreActivity(phase) => self.apply_activity_phase(phase, now),
+            UiEvent::Snapshot(snapshot) => self.reconcile(&snapshot, now),
+            UiEvent::Rehydrated { blocks, notices } => {
+                // The engine owns what the *conversation* is. Anything the UI
+                // had of it is a projection of an older answer to the same
+                // question, so it is replaced outright — but the banner, the
+                // launch notices, slash-command output and a rendered diff
+                // are this client's own and no history read can return them,
+                // so they are kept rather than swept away with it.
+                self.transcript.replace_conversation(blocks);
+                self.pending_deliveries.clear();
+                for notice in notices {
+                    self.notice(notice, NoticeLevel::Warning);
                 }
             }
         }
@@ -697,7 +943,7 @@ impl UiState {
                 self.assistant_buffer = None;
                 self.buffer_rewritten_by_hook = false;
 
-                self.activity = Activity::Ready;
+                self.settle_after_turn();
                 self.interrupting = false;
                 if let Some(progress) = self.turn_progress.as_mut() {
                     progress.finish(now);
@@ -894,6 +1140,319 @@ impl UiState {
         });
     }
 
+    // ── Engine-owned truth ───────────────────────────────────────────────
+
+    /// What the UI reports once a turn's content is complete.
+    ///
+    /// A legacy `event/turnComplete` means "this turn produced its last
+    /// output". It does **not** mean the engine will accept another prompt:
+    /// the single-flight slot is released separately, and the engine's own
+    /// `lifecycle` is what says so. Claiming ready here — as this did before
+    /// the state contract existed — let the UI invite a prompt that the
+    /// engine then refused as busy, which read as the app losing a message.
+    ///
+    /// On a legacy connection there is no lifecycle to consult, so the old
+    /// behaviour is exactly preserved.
+    fn settle_after_turn(&mut self) {
+        self.optimistic_submit = false;
+        self.prompt = None;
+        match self.core_lifecycle {
+            Some(coda_proto::state::EngineLifecycle::Busy) => {
+                // The engine still owns the slot. Keep showing work in
+                // progress until it publishes `ready`.
+                self.activity = Activity::Working;
+            }
+            _ => self.activity = Activity::Ready,
+        }
+    }
+
+    fn apply_lifecycle(
+        &mut self,
+        lifecycle: coda_proto::state::EngineLifecycle,
+        now: std::time::Instant,
+    ) {
+        use coda_proto::state::EngineLifecycle as L;
+        self.core_lifecycle = Some(lifecycle);
+        match lifecycle {
+            L::Busy => {
+                self.optimistic_submit = false;
+                if self.activity == Activity::Ready || self.activity == Activity::Initializing {
+                    self.activity = Activity::Working;
+                }
+            }
+            L::Ready => {
+                // The slot is free. Anything still shown as running is over,
+                // including a turn whose own completion event never arrived.
+                if !matches!(self.activity, Activity::Waiting) || self.prompt.is_none() {
+                    self.activity = Activity::Ready;
+                }
+                self.optimistic_submit = false;
+                if let Some(progress) = self.turn_progress.as_mut() {
+                    progress.finish(now);
+                }
+            }
+            L::Initializing => self.activity = Activity::Initializing,
+            L::Stopping | L::Stopped => {
+                if let Some(progress) = self.turn_progress.as_mut() {
+                    progress.finish(now);
+                }
+            }
+        }
+    }
+
+    fn apply_activity_phase(
+        &mut self,
+        phase: coda_proto::state::ActivityPhase,
+        now: std::time::Instant,
+    ) {
+        use coda_proto::state::ActivityPhase as P;
+        use coda_proto::state::EngineLifecycle as L;
+        self.optimistic_submit = false;
+        // A phase frame is published only while a turn is open, so observing
+        // one *is* observing a busy engine. The engine does not publish a
+        // separate `lifecycle: busy` when a turn starts — it publishes the
+        // phase — so without this the client would only learn the slot was
+        // taken by taking a snapshot, and `event/turnComplete` would then be
+        // free to claim ready while the engine still held it.
+        if !matches!(self.core_lifecycle, Some(L::Stopping) | Some(L::Stopped)) {
+            self.core_lifecycle = Some(L::Busy);
+        }
+        let Some(progress) = self.turn_progress.as_mut() else {
+            // A phase for a turn this client never saw start: adopt the
+            // status without inventing a clock for it. The next snapshot
+            // seeds the clock from the engine's own elapsed time.
+            self.activity = match phase {
+                P::AwaitingUserInput => Activity::Waiting,
+                P::Reasoning => Activity::Thinking,
+                _ => Activity::Working,
+            };
+            return;
+        };
+        match phase {
+            // Reasoning is published only on a real provider thinking delta,
+            // never inferred from silence or from an effort setting.
+            P::Reasoning => {
+                progress.on_thinking_start(now);
+                self.activity = Activity::Thinking;
+            }
+            P::RunningTools => {
+                progress.on_tool_call_started(now);
+                self.activity = Activity::Working;
+            }
+            P::Responding => {
+                progress.on_responding(now);
+                self.activity = Activity::Working;
+            }
+            P::AwaitingUserInput => {
+                progress.on_awaiting_approval(now);
+                self.activity = Activity::Waiting;
+            }
+            P::Preparing | P::WaitingForModel | P::Compacting | P::Maintenance => {
+                if self.activity != Activity::Working {
+                    progress.on_resumed();
+                }
+                self.activity = Activity::Working;
+            }
+        }
+    }
+
+    /// Replaces everything the engine owns with what the engine says.
+    ///
+    /// Called on connect, after a resync and after an engine-owned reset —
+    /// never per token, and never as a substitute for the event stream.
+    /// Purely local presentation state (the composer draft, the unsent
+    /// recovery list, selection) is untouched: the engine has no opinion
+    /// about it and overwriting it would lose the user's own work.
+    pub fn reconcile(
+        &mut self,
+        snapshot: &coda_proto::state::StateSnapshot,
+        now: std::time::Instant,
+    ) {
+        use coda_proto::state::EngineLifecycle as L;
+
+        if !snapshot.session_id.is_empty() {
+            self.session_id = Some(snapshot.session_id.clone());
+        }
+        self.core_lifecycle = Some(snapshot.lifecycle);
+
+        // Configuration: `next` is what a change the user just made will
+        // apply to, which is what the header has always meant; `active` is
+        // what the running turn actually captured. Reporting `next` as if the
+        // running turn were using it is the specific dishonesty to avoid.
+        let next = &snapshot.config.next;
+        self.model = Some(next.model.clone());
+        self.effort = if next.effort_is_auto { None } else { next.effort.clone() };
+        self.active_model = snapshot
+            .config
+            .active
+            .as_ref()
+            .map(|active| active.model.clone())
+            .filter(|active| active != &next.model);
+
+        // Usage. `session` is the running total; `lastResponse` is one
+        // response's cost and must never be presented as a total.
+        if let Some(limit) = snapshot.usage.context_limit {
+            self.usage.context_limit = limit;
+        }
+        if let Some(session) = snapshot.usage.session {
+            self.usage.input_tokens = session.input_tokens;
+            self.usage.output_tokens = session.output_tokens;
+        }
+
+        self.reconcile_queue(&snapshot.steering);
+
+        // The turn clock, seeded from the engine's own monotonic elapsed
+        // time rather than re-derived from a remote wall clock.
+        match &snapshot.turn {
+            Some(turn) => {
+                // A snapshot reports how long the turn has run; it never
+                // reports how that time was spent. When it describes the turn
+                // this client is already timing, the observed accumulators —
+                // reasoning segments, whether reasoning happened at all, the
+                // last response's tokens — are facts the snapshot does not
+                // contradict, so they are kept and only the baseline moves.
+                let same_turn = self.turn_progress.as_ref().is_some_and(|p| !p.is_finished())
+                    && self.turn_id.as_deref().is_none_or(|id| id == turn.turn_id);
+                let mut progress = match (same_turn, turn.elapsed_ms) {
+                    (true, elapsed) => {
+                        let mut progress =
+                            self.turn_progress.clone().expect("same turn implies a clock");
+                        // No elapsed time reported (an older engine): the
+                        // local clock for this same turn is still valid and
+                        // is left exactly as it is, rather than reset.
+                        if let Some(elapsed) = elapsed {
+                            progress.adopt_elapsed(elapsed, now);
+                        }
+                        progress
+                    }
+                    (false, Some(elapsed)) => TurnProgress::rehydrate(elapsed, now),
+                    // A turn this client was not watching, with no elapsed
+                    // time reported: there is nothing to carry over, and the
+                    // previous turn's clock would be a different turn's.
+                    (false, None) => TurnProgress::start(now),
+                };
+                if let Some(usage) = snapshot.usage.last_response {
+                    progress.on_usage(usage.input_tokens, usage.output_tokens);
+                }
+                self.turn_progress = Some(progress);
+                self.turn_id = Some(turn.turn_id.clone());
+                self.apply_activity_phase(turn.phase, now);
+            }
+            None => {
+                if self.turn_progress.as_ref().is_some_and(|p| !p.is_finished()) {
+                    if let Some(progress) = self.turn_progress.as_mut() {
+                        progress.finish(now);
+                    }
+                }
+            }
+        }
+
+        // Lifecycle last, so it has the final word on what the status bar
+        // says — except during the optimistic window, where the engine
+        // genuinely has not been told about the submission yet.
+        match snapshot.lifecycle {
+            L::Ready if self.optimistic_submit => {}
+            L::Ready if !snapshot.requests.is_empty() => self.activity = Activity::Waiting,
+            lifecycle => self.apply_lifecycle(lifecycle, now),
+        }
+    }
+
+    /// Replaces the pending-steering queue with the engine's own list.
+    ///
+    /// The engine's `text` is the **full original message**, not a preview,
+    /// so adopting it cannot downgrade what the user typed. The one case
+    /// where it could — an over-cap message the engine marked
+    /// `textTruncated` — keeps the local copy, because this client still has
+    /// the whole thing and handing back a shortened version on recall would
+    /// silently mangle a draft.
+    ///
+    /// A local entry that has *disappeared* from the pending list is not
+    /// simply forgotten. The engine publishes a terminal outcome for every
+    /// message it stops holding, and that outcome is the only thing that says
+    /// whether the text reached the model:
+    ///
+    /// - `delivered` — it is part of the conversation now, so there is
+    ///   nothing to recover.
+    /// - any other terminal outcome — it never reached the model, so the full
+    ///   original draft moves to the recovery list, exactly as a turn ending
+    ///   with a queue would have done.
+    /// - **no outcome at all** — the outcome ring is bounded, so this is
+    ///   genuinely unknown. The text is kept recoverable and the doubt is
+    ///   stated; it is never resent, and it is never described as "not sent".
+    fn reconcile_queue(&mut self, steering: &coda_proto::state::SteeringQueueState) {
+        use coda_proto::state::SteeringOutcomeKind as Outcome;
+
+        let mut reconciled = Vec::with_capacity(steering.pending.len());
+        for entry in &steering.pending {
+            let local = self
+                .queued
+                .iter()
+                .find(|q| q.id.as_deref() == Some(entry.message_id.as_str()));
+            let text = match (entry.text_truncated, local) {
+                (true, Some(local)) => local.text.clone(),
+                _ => entry.text.clone(),
+            };
+            reconciled.push(QueuedMessage {
+                id: Some(entry.message_id.clone()),
+                text,
+                queued_at: local
+                    .map(|l| l.queued_at.clone())
+                    .unwrap_or_else(|| (self.clock)()),
+            });
+        }
+
+        // What happened to the entries the engine no longer lists.
+        let mut not_delivered: Vec<QueuedMessage> = Vec::new();
+        let mut unexplained: Vec<QueuedMessage> = Vec::new();
+        for local in &self.queued {
+            let Some(id) = local.id.as_deref() else { continue };
+            if steering.pending.iter().any(|p| p.message_id == id) {
+                continue;
+            }
+            match steering.outcomes.iter().rev().find(|o| o.message_id == id).map(|o| o.outcome) {
+                Some(Outcome::Delivered) => {}
+                Some(_) => not_delivered.push(local.clone()),
+                None => unexplained.push(local.clone()),
+            }
+        }
+
+        // A local entry the engine has never acknowledged (no id yet) is
+        // still the user's message and is kept: it is in flight, not gone.
+        let unacknowledged: Vec<QueuedMessage> =
+            self.queued.iter().filter(|q| q.id.is_none()).cloned().collect();
+        reconciled.extend(unacknowledged);
+        self.queued = reconciled;
+
+        if !not_delivered.is_empty() {
+            let n = not_delivered.len();
+            self.unsent.extend(not_delivered);
+            self.notice(
+                format!(
+                    "{n} queued {} did not reach the model — press Up on an empty message \
+                     box to recover {}.",
+                    if n == 1 { "message" } else { "messages" },
+                    if n == 1 { "it" } else { "them" },
+                ),
+                NoticeLevel::Warning,
+            );
+        }
+        if !unexplained.is_empty() {
+            let n = unexplained.len();
+            self.unsent.extend(unexplained);
+            self.notice(
+                format!(
+                    "The engine no longer lists {n} queued {} and did not report what \
+                     happened to {}; {} may already have been delivered, so nothing was \
+                     resent. The text is recoverable with Up.",
+                    if n == 1 { "message" } else { "messages" },
+                    if n == 1 { "it" } else { "them" },
+                    if n == 1 { "it" } else { "they" },
+                ),
+                NoticeLevel::Warning,
+            );
+        }
+    }
+
     /// Moves anything still queued when a turn ends into the recoverable
     /// `unsent` list, and says so once.
     ///
@@ -990,6 +1549,69 @@ fn default_timestamp() -> String {
     format!("{:02}:{:02}", now.hour(), now.minute())
 }
 
+/// Returns `true` for events that bypass the 30 FPS streaming throttle.
+///
+/// Lives beside the events it classifies rather than in the loop that acts on
+/// it: adding a variant and forgetting to say whether it is critical is a
+/// silent latency bug, and the two are easiest to keep in step when they are
+/// in the same file.
+///
+/// Mirrors `UiActor.IsCritical` in C#: turn boundaries, errors, prompts,
+/// session lifecycle, and mode changes all get immediate frames.
+pub(crate) fn is_critical_event(event: &UiEvent) -> bool {
+        match event {
+        UiEvent::TurnFinished { .. }
+        | UiEvent::Connected { .. }
+        | UiEvent::PromptRequested(_)
+        | UiEvent::PromptAnswered { .. }
+        | UiEvent::PromptResolved(_)
+        | UiEvent::Notice { .. }
+        | UiEvent::Cleared
+        | UiEvent::ModelChanged { .. }
+        | UiEvent::DisplayModeChanged(_)
+        // A fold is a direct response to a click, so it must repaint at once
+        // rather than waiting for the streaming throttle: an idle session
+        // produces no further frames to carry it.
+        | UiEvent::ThinkingFoldToggled { .. }
+        | UiEvent::ToolGroupFoldToggled { .. }
+        | UiEvent::Submitted { .. }
+        | UiEvent::Queued { .. }
+        | UiEvent::SteeringRecalled { .. }
+        | UiEvent::SteeringDeliveryReflected { .. }
+        | UiEvent::InterruptRequested => true,
+        UiEvent::Engine(inner) => match inner {
+            coda_proto::Event::TurnComplete { .. }
+            | Event::Error { .. }
+            | Event::LimitReached { .. }
+            | Event::AssistantTextComplete
+            | Event::ThinkingComplete { .. }
+            | Event::PermissionDecided { .. }
+            | Event::SteeringDelivered { .. } => true,
+            // Streaming events: subject to throttle.
+            Event::AssistantText { .. }
+            | Event::Thinking { .. }
+            | Event::ToolProgress { .. }
+            | Event::Usage { .. }
+            | Event::StreamProgress { .. } => false,
+            _ => true,
+        },
+        // The buffering activation seam is rare and user-visible.
+        UiEvent::EnableAssistantBuffering => true,
+        // Engine-owned truth: rare, and every one of them changes what the
+        // status line or the whole transcript says. None of them is a
+        // streaming delta, so throttling them would only add latency to a
+        // correction.
+        UiEvent::CoreLifecycle(_)
+        | UiEvent::CoreActivity(_)
+        | UiEvent::Snapshot(_)
+        | UiEvent::Rehydrated { .. } => true,
+        UiEvent::CommandOutput { .. } | UiEvent::DiffOutput { .. } => true,
+        // The status line's claim about the whole session changed. An idle
+        // disconnected terminal produces no further frames to carry it.
+        UiEvent::EngineDisconnected | UiEvent::EngineAdopted => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1009,6 +1631,7 @@ mod tests {
             activity_id: Some("a1".into()),
             call_id: Some(call_id.into()),
             source_id: Some("root:t1".into()),
+            ..Default::default()
         }
     }
 
@@ -1017,6 +1640,18 @@ mod tests {
             Block::Assistant { text, .. } => Some(text.as_str()),
             _ => None,
         })
+    }
+
+    fn notice_texts(state: &UiState) -> Vec<String> {
+        state
+            .transcript
+            .blocks()
+            .iter()
+            .filter_map(|b| match b {
+                Block::Notice { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     fn tools(state: &UiState) -> Option<&ToolActivity> {
@@ -1515,6 +2150,153 @@ mod tests {
             state.transcript.blocks().last(),
             Some(Block::Permission { decision: PermissionDecision::Denied, .. })
         ));
+    }
+
+    #[test]
+    fn a_permission_allowed_elsewhere_is_never_recorded_as_a_denial() {
+        // Another client answered. Fabricating a decision this client did not
+        // make — and always the *refusing* one — described an approval as a
+        // refusal, with a Denied block to prove it.
+        let mut state = state();
+        state.apply(UiEvent::PromptRequested(PendingPrompt::Permission {
+            tool: "run_command".into(),
+            preview: "ls".into(),
+        }));
+
+        state.apply(UiEvent::PromptResolved(ExternalResolution::Outcome {
+            kind: Some(coda_proto::state::PendingRequestKind::Permission),
+            outcome: Some("allowed".into()),
+        }));
+
+        assert!(state.prompt.is_none(), "the modal must come down");
+        assert_eq!(state.activity, Activity::Working);
+        assert!(
+            !state
+                .transcript
+                .blocks()
+                .iter()
+                .any(|b| matches!(b, Block::Permission { decision: PermissionDecision::Denied, .. })),
+            "a denial was invented: {:?}",
+            state.transcript.blocks()
+        );
+        let notices = notice_texts(&state);
+        assert!(
+            notices.iter().any(|n| n.contains("allowed") && n.contains("run_command")),
+            "the engine's own verdict must be what is shown: {notices:?}"
+        );
+    }
+
+    #[test]
+    fn a_permission_denied_elsewhere_says_so_as_the_engines_verdict() {
+        let mut state = state();
+        state.apply(UiEvent::PromptRequested(PendingPrompt::Permission {
+            tool: "run_command".into(),
+            preview: "ls".into(),
+        }));
+        state.apply(UiEvent::PromptResolved(ExternalResolution::Outcome {
+            kind: Some(coda_proto::state::PendingRequestKind::Permission),
+            outcome: Some("denied".into()),
+        }));
+
+        let notices = notice_texts(&state);
+        assert!(notices.iter().any(|n| n.contains("denied")), "{notices:?}");
+        assert!(state.prompt.is_none());
+    }
+
+    #[test]
+    fn a_question_answered_elsewhere_does_not_invent_the_answer() {
+        // `event/requestResolved` says *that* it was answered, never with
+        // what. Showing an answer here would be this client making one up.
+        let mut state = state();
+        state.apply(UiEvent::PromptRequested(PendingPrompt::Question {
+            question: "Which?".into(),
+            options: vec!["a".into()],
+            multi_select: false,
+            allow_free_text: true,
+        }));
+
+        state.apply(UiEvent::PromptResolved(ExternalResolution::Outcome {
+            kind: Some(coda_proto::state::PendingRequestKind::Question),
+            outcome: Some("answered".into()),
+        }));
+
+        assert!(
+            !state
+                .transcript
+                .blocks()
+                .iter()
+                .any(|b| matches!(b, Block::Question { answer: Some(_), .. })),
+            "an answer was fabricated: {:?}",
+            state.transcript.blocks()
+        );
+        let notices = notice_texts(&state);
+        assert!(
+            notices.iter().any(|n| n.contains("answered")),
+            "the resolution must still be reported: {notices:?}"
+        );
+    }
+
+    #[test]
+    fn a_question_that_ended_with_no_answer_reports_the_reason() {
+        let mut state = state();
+        state.apply(UiEvent::PromptRequested(PendingPrompt::Question {
+            question: "Which?".into(),
+            options: vec!["a".into()],
+            multi_select: false,
+            allow_free_text: true,
+        }));
+        state.apply(UiEvent::PromptResolved(ExternalResolution::Outcome {
+            kind: Some(coda_proto::state::PendingRequestKind::Question),
+            outcome: Some("noAnswer.cancelled".into()),
+        }));
+
+        let notices = notice_texts(&state);
+        assert!(
+            notices.iter().any(|n| n.contains("no answer") && n.contains("cancelled")),
+            "{notices:?}"
+        );
+    }
+
+    #[test]
+    fn a_resolution_without_a_verdict_says_only_what_is_known() {
+        let mut state = state();
+        state.apply(UiEvent::PromptRequested(PendingPrompt::PlanApproval {
+            plan: "do the thing".into(),
+        }));
+        state.apply(UiEvent::PromptResolved(ExternalResolution::Outcome {
+            kind: None,
+            outcome: None,
+        }));
+
+        let notices = notice_texts(&state);
+        assert!(notices.iter().any(|n| n.contains("resolved")), "{notices:?}");
+        assert!(
+            !notices.iter().any(|n| n.contains("rejected") || n.contains("approved")),
+            "an unknown outcome must not be guessed: {notices:?}"
+        );
+    }
+
+    #[test]
+    fn a_retired_prompt_records_no_decision_and_no_verdict() {
+        // The engine that raised it was replaced: nothing was decided, here
+        // or anywhere, so there is nothing to report as an outcome.
+        let mut state = state();
+        state.apply(UiEvent::PromptRequested(PendingPrompt::Permission {
+            tool: "run_command".into(),
+            preview: "ls".into(),
+        }));
+        let before = state.transcript.len();
+
+        state.apply(UiEvent::PromptResolved(ExternalResolution::Retired));
+
+        assert!(state.prompt.is_none(), "the modal must come down");
+        assert_eq!(state.activity, Activity::Working);
+        assert_eq!(
+            state.transcript.len(),
+            before,
+            "a retirement is not a decision: {:?}",
+            state.transcript.blocks()
+        );
     }
 
     #[test]
@@ -2512,5 +3294,677 @@ mod tests {
         state.apply_at(UiEvent::Submitted { text: "second".into() }, second_start);
         assert_eq!(state.turn_progress.as_ref().unwrap().elapsed_ms(second_start), 0);
         assert!(!state.turn_progress.as_ref().unwrap().is_finished());
+    }
+
+    // ── Engine-owned truth (Stage E) ─────────────────────────────────────
+
+    mod engine_truth {
+        use super::*;
+        use coda_proto::messages::CONTRACT_VERSION;
+        use coda_proto::state::{
+            ActiveConfig, ActivityPhase, EffectiveConfig, EngineLifecycle, Limits,
+            SteeringOutcomeDto, SteeringOutcomeKind, SteeringPendingDto, SteeringQueueState,
+            ToolsState, TurnState, UsagePair, UsageState,
+        };
+        use std::time::{Duration, Instant};
+
+        fn outcome(message_id: &str, kind: SteeringOutcomeKind) -> SteeringOutcomeDto {
+            SteeringOutcomeDto {
+                message_id: message_id.into(),
+                outcome: kind,
+                at: "now".into(),
+                turn_id: None,
+            }
+        }
+
+        /// Every notice currently in the transcript, for asserting on what the
+        /// user was actually told.
+        fn notice_texts(state: &UiState) -> Vec<String> {
+            state
+                .transcript
+                .blocks()
+                .iter()
+                .filter_map(|block| match block {
+                    Block::Notice { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn active_config(model: &str) -> ActiveConfig {
+            ActiveConfig {
+                provider_id: Some("anthropic".into()),
+                model: model.into(),
+                effort: None,
+                effort_is_auto: true,
+                permission_mode: "default".into(),
+                system_prompt_source: "default".into(),
+            }
+        }
+
+        fn snapshot(lifecycle: EngineLifecycle) -> coda_proto::state::StateSnapshot {
+            coda_proto::state::StateSnapshot {
+                contract_version: CONTRACT_VERSION.into(),
+                engine_instance_id: "e1".into(),
+                session_id: "s1".into(),
+                workspace_path: "/w".into(),
+                cursor: 10,
+                history_epoch: 0,
+                history_length: 4,
+                lifecycle,
+                initialized: true,
+                last_turn_outcome: None,
+                turn: None,
+                steering: SteeringQueueState::default(),
+                tools: ToolsState::default(),
+                requests: Vec::new(),
+                config: EffectiveConfig {
+                    active: None,
+                    next: active_config("claude-sonnet"),
+                    differing: Vec::new(),
+                },
+                usage: UsageState::default(),
+                limits: Limits {
+                    ring_envelopes: 2048,
+                    ring_bytes: 4 << 20,
+                    live_bytes_cap: 262_144,
+                    outcomes_retained: 64,
+                    history_block_bytes_cap: 65_536,
+                    max_history_page: 500,
+                    max_session_page: 200,
+                },
+                capabilities: Default::default(),
+            }
+        }
+
+        fn turn(phase: ActivityPhase, elapsed_ms: Option<i64>) -> TurnState {
+            TurnState {
+                turn_id: "t1".into(),
+                started_at: "2026-09-08T09:00:00+00:00".into(),
+                elapsed_ms,
+                phase,
+                phase_since: "2026-09-08T09:00:10+00:00".into(),
+                phase_elapsed_ms: Some(1_000),
+                model_request: None,
+                batches: Vec::new(),
+                live_entries: Vec::new(),
+                live_truncated: false,
+                live_omitted_bytes: 0,
+                active_config: active_config("claude-sonnet"),
+                concurrent: Default::default(),
+            }
+        }
+
+        #[test]
+        fn a_finished_turn_does_not_claim_ready_while_the_engine_still_holds_the_slot() {
+            // `event/turnComplete` says the turn produced its last output.
+            // The engine releases the single-flight slot separately, and
+            // until it does a new prompt is refused as busy. Showing "ready"
+            // in that window invited a prompt that would bounce.
+            let mut state = state();
+            state.apply(UiEvent::CoreLifecycle(EngineLifecycle::Busy));
+            state.apply(UiEvent::Submitted { text: "hi".into() });
+            state.apply(UiEvent::Engine(Event::TurnComplete {
+                stop_reason: None,
+                interrupted: false,
+                root_turn_id: None,
+                activity_id: None,
+            }));
+            assert_eq!(state.activity, Activity::Working, "the engine is still busy");
+            assert!(state.is_busy());
+
+            state.apply(UiEvent::CoreLifecycle(EngineLifecycle::Ready));
+            assert_eq!(state.activity, Activity::Ready);
+            assert!(!state.is_busy());
+        }
+
+        #[test]
+        fn a_legacy_connection_keeps_the_previous_turn_complete_behaviour() {
+            // No lifecycle is ever published by a legacy engine, so the old
+            // rule — the turn ends when its completion event says so — must
+            // still hold exactly.
+            let mut state = state();
+            state.apply(UiEvent::Submitted { text: "hi".into() });
+            state.apply(UiEvent::Engine(Event::TurnComplete {
+                stop_reason: None,
+                interrupted: false,
+                root_turn_id: None,
+                activity_id: None,
+            }));
+            assert_eq!(state.activity, Activity::Ready);
+        }
+
+        #[test]
+        fn a_snapshot_taken_in_the_optimistic_window_does_not_undo_the_submission() {
+            // Between the local submit and the engine being told, a snapshot
+            // honestly says "ready". Applying that literally would flip the
+            // UI back under a prompt the user has already sent.
+            let mut state = state();
+            state.apply(UiEvent::Submitted { text: "hi".into() });
+            state.apply(UiEvent::Snapshot(Box::new(snapshot(EngineLifecycle::Ready))));
+            assert_eq!(state.activity, Activity::Working);
+        }
+
+        #[test]
+        fn a_snapshot_seeds_the_turn_clock_from_the_engines_own_elapsed_time() {
+            // Server-monotonic duration, not a remote wall clock and not a
+            // reset to zero.
+            let mut state = state();
+            let now = Instant::now();
+            let mut snapshot = snapshot(EngineLifecycle::Busy);
+            snapshot.turn = Some(turn(ActivityPhase::RunningTools, Some(185_000)));
+            state.apply_at(UiEvent::Snapshot(Box::new(snapshot)), now);
+
+            let progress = state.turn_progress.as_ref().expect("a running turn has a clock");
+            assert_eq!(progress.elapsed_ms(now), 185_000);
+            assert_eq!(
+                progress.elapsed_ms(now + Duration::from_secs(5)),
+                190_000,
+                "the rehydrated clock keeps running"
+            );
+            assert_eq!(state.activity, Activity::Working);
+        }
+
+        #[test]
+        fn a_snapshot_never_claims_reasoning_the_client_did_not_observe() {
+            let mut state = state();
+            let now = Instant::now();
+            let mut snapshot = snapshot(EngineLifecycle::Busy);
+            snapshot.turn = Some(turn(ActivityPhase::WaitingForModel, Some(30_000)));
+            state.apply_at(UiEvent::Snapshot(Box::new(snapshot)), now);
+            assert_eq!(state.activity, Activity::Working, "silence is not reasoning");
+            assert_eq!(state.turn_progress.as_ref().unwrap().reasoning_ms(now), None);
+        }
+
+        #[test]
+        fn only_an_observed_reasoning_phase_shows_thinking() {
+            let mut state = state();
+            let now = Instant::now();
+            state.apply_at(UiEvent::Submitted { text: "hi".into() }, now);
+            state.apply_at(UiEvent::CoreActivity(ActivityPhase::Reasoning), now);
+            assert_eq!(state.activity, Activity::Thinking);
+            assert_eq!(state.turn_progress.as_ref().unwrap().reasoning_ms(now), Some(0));
+        }
+
+        #[test]
+        fn the_queue_comes_from_the_engine_and_keeps_the_users_own_full_text() {
+            let mut state = state();
+            state.apply(UiEvent::Queued { text: "one".into(), id: Some("m1".into()) });
+            state.apply(UiEvent::Queued { text: "two".into(), id: Some("m2".into()) });
+
+            // The engine says only m2 is still pending: m1 was delivered.
+            let mut snapshot = snapshot(EngineLifecycle::Busy);
+            snapshot.steering = SteeringQueueState {
+                pending_count: 1,
+                pending: vec![SteeringPendingDto {
+                    message_id: "m2".into(),
+                    enqueued_at: "now".into(),
+                    text: "two".into(),
+                    text_length: 3,
+                    text_truncated: false,
+                }],
+                outcomes: Vec::new(),
+                outcomes_truncated: false,
+                retained_outcomes: 64,
+            };
+            state.apply(UiEvent::Snapshot(Box::new(snapshot)));
+
+            assert_eq!(state.queued.len(), 1);
+            assert_eq!(state.queued[0].id.as_deref(), Some("m2"));
+            assert_eq!(state.queued[0].text, "two");
+        }
+
+        #[test]
+        fn an_over_cap_queued_message_keeps_the_local_full_draft() {
+            // The engine caps `text` at 64 KiB and says so. Adopting the
+            // shortened copy would silently mangle the draft the user gets
+            // back when they recall it.
+            let mut state = state();
+            let long = "x".repeat(200);
+            state.apply(UiEvent::Queued { text: long.clone(), id: Some("m1".into()) });
+
+            let mut snapshot = snapshot(EngineLifecycle::Busy);
+            snapshot.steering = SteeringQueueState {
+                pending_count: 1,
+                pending: vec![SteeringPendingDto {
+                    message_id: "m1".into(),
+                    enqueued_at: "now".into(),
+                    text: "x".repeat(50),
+                    text_length: 200,
+                    text_truncated: true,
+                }],
+                outcomes: Vec::new(),
+                outcomes_truncated: false,
+                retained_outcomes: 64,
+            };
+            state.apply(UiEvent::Snapshot(Box::new(snapshot)));
+            assert_eq!(state.queued[0].text, long, "the user's own full text survived");
+        }
+
+        #[test]
+        fn a_message_the_engine_has_not_acknowledged_yet_is_not_dropped() {
+            let mut state = state();
+            state.apply(UiEvent::Queued { text: "in flight".into(), id: None });
+            state.apply(UiEvent::Snapshot(Box::new(snapshot(EngineLifecycle::Busy))));
+            assert_eq!(state.queued.len(), 1);
+            assert_eq!(state.queued[0].text, "in flight");
+        }
+
+        #[test]
+        fn the_unsent_recovery_list_is_never_touched_by_reconciliation() {
+            // `unsent` is the user's own recoverable text. The engine has no
+            // opinion about it and must not be able to erase it.
+            let mut state = state();
+            state.apply(UiEvent::Queued { text: "lost".into(), id: Some("m1".into()) });
+            state.apply(UiEvent::TurnFinished { interrupted: true, error: None });
+            assert_eq!(state.unsent.len(), 1);
+
+            state.apply(UiEvent::Snapshot(Box::new(snapshot(EngineLifecycle::Ready))));
+            assert_eq!(state.unsent.len(), 1);
+            assert_eq!(state.recall_unsent().as_deref(), Some("lost"));
+        }
+
+        #[test]
+        fn configuration_distinguishes_what_the_running_turn_uses_from_what_is_next() {
+            let mut state = state();
+            let mut snapshot = snapshot(EngineLifecycle::Busy);
+            snapshot.config.active = Some(active_config("claude-haiku"));
+            snapshot.turn = Some(turn(ActivityPhase::Responding, Some(1_000)));
+            state.apply(UiEvent::Snapshot(Box::new(snapshot)));
+
+            assert_eq!(state.model.as_deref(), Some("claude-sonnet"), "next turn's model");
+            assert_eq!(
+                state.active_model.as_deref(),
+                Some("claude-haiku"),
+                "the running turn kept the model it captured"
+            );
+        }
+
+        #[test]
+        fn usage_reports_the_session_total_and_the_last_response_separately() {
+            let mut state = state();
+            let mut snapshot = snapshot(EngineLifecycle::Busy);
+            snapshot.usage = UsageState {
+                last_response: Some(UsagePair { input_tokens: 10, output_tokens: 3 }),
+                session: Some(UsagePair { input_tokens: 900, output_tokens: 120 }),
+                context_limit: Some(200_000),
+                unknown_fields: Vec::new(),
+            };
+            snapshot.turn = Some(turn(ActivityPhase::Responding, Some(1_000)));
+            state.apply(UiEvent::Snapshot(Box::new(snapshot)));
+
+            assert_eq!(state.usage.input_tokens, 900, "the session total, not one response");
+            assert_eq!(state.usage.context_limit, 200_000);
+            assert_eq!(
+                state.turn_progress.as_ref().unwrap().last_response_tokens(),
+                Some((10, 3)),
+                "the pinned row reports the last response, labelled as such"
+            );
+        }
+
+        #[test]
+        fn a_mid_turn_resync_keeps_the_reasoning_this_client_already_watched() {
+            // The snapshot brings back one fact — how long the engine says the
+            // turn has run — and says nothing about how that time was spent.
+            // Rebuilding the clock from it wiped the reasoning segment this
+            // client observed, so a turn that reasoned for three seconds and
+            // then ran a tool reported no reasoning at all after a resync.
+            let mut state = state();
+            let start = Instant::now();
+            state.apply_at(UiEvent::Submitted { text: "hi".into() }, start);
+            state.apply_at(UiEvent::CoreActivity(ActivityPhase::Reasoning), start);
+            state.apply_at(
+                UiEvent::CoreActivity(ActivityPhase::RunningTools),
+                start + Duration::from_secs(3),
+            );
+            state.apply_at(
+                UiEvent::Engine(Event::Usage { input_tokens: 11, output_tokens: 7 }),
+                start + Duration::from_secs(3),
+            );
+
+            let now = start + Duration::from_secs(4);
+            let mut snapshot = snapshot(EngineLifecycle::Busy);
+            snapshot.turn = Some(turn(ActivityPhase::RunningTools, Some(120_000)));
+            state.apply_at(UiEvent::Snapshot(Box::new(snapshot)), now);
+
+            let progress = state.turn_progress.as_ref().expect("the turn still has a clock");
+            assert_eq!(progress.elapsed_ms(now), 120_000, "the engine owns the duration");
+            assert_eq!(
+                progress.reasoning_ms(now),
+                Some(3_000),
+                "the reasoning this client observed was discarded by the resync"
+            );
+            assert_eq!(
+                progress.last_response_tokens(),
+                Some((11, 7)),
+                "the last response's tokens were discarded by the resync"
+            );
+        }
+
+        #[test]
+        fn a_snapshot_describing_a_different_turn_starts_a_fresh_clock() {
+            // Carrying reasoning across a turn boundary would credit the new
+            // turn with the previous one's thinking.
+            let mut state = state();
+            let start = Instant::now();
+            state.apply_at(UiEvent::Submitted { text: "hi".into() }, start);
+            state.apply_at(UiEvent::CoreActivity(ActivityPhase::Reasoning), start);
+
+            let now = start + Duration::from_secs(2);
+            let mut first = snapshot(EngineLifecycle::Busy);
+            first.turn = Some(turn(ActivityPhase::Reasoning, Some(2_000)));
+            state.apply_at(UiEvent::Snapshot(Box::new(first)), now);
+
+            let mut second = snapshot(EngineLifecycle::Busy);
+            let mut other = turn(ActivityPhase::WaitingForModel, Some(500));
+            other.turn_id = "t2".into();
+            second.turn = Some(other);
+            state.apply_at(UiEvent::Snapshot(Box::new(second)), now);
+
+            let progress = state.turn_progress.as_ref().expect("a clock for the new turn");
+            assert_eq!(progress.elapsed_ms(now), 500);
+            assert_eq!(
+                progress.reasoning_ms(now),
+                None,
+                "the new turn inherited the previous turn's reasoning"
+            );
+        }
+
+        #[test]
+        fn a_queued_message_the_engine_reports_as_delivered_is_not_kept_as_unsent() {
+            let mut state = state();
+            state.apply(UiEvent::Queued { text: "one".into(), id: Some("m1".into()) });
+
+            let mut snapshot = snapshot(EngineLifecycle::Busy);
+            snapshot.steering = SteeringQueueState {
+                pending_count: 0,
+                pending: Vec::new(),
+                outcomes: vec![outcome("m1", SteeringOutcomeKind::Delivered)],
+                outcomes_truncated: false,
+                retained_outcomes: 64,
+            };
+            state.apply(UiEvent::Snapshot(Box::new(snapshot)));
+
+            assert!(state.queued.is_empty());
+            assert!(state.unsent.is_empty(), "a delivered message is in the conversation");
+        }
+
+        #[test]
+        fn a_queued_message_the_engine_reports_as_not_delivered_stays_recoverable() {
+            // `cancelledTurnEnded` is a terminal outcome that says the message
+            // never reached the model. Dropping it silently loses text the
+            // user typed; the recovery list is where it belongs.
+            let mut state = state();
+            state.apply(UiEvent::Queued {
+                text: "  the whole draft  ".into(),
+                id: Some("m1".into()),
+            });
+
+            let mut snapshot = snapshot(EngineLifecycle::Ready);
+            snapshot.steering = SteeringQueueState {
+                pending_count: 0,
+                pending: Vec::new(),
+                outcomes: vec![outcome("m1", SteeringOutcomeKind::CancelledTurnEnded)],
+                outcomes_truncated: false,
+                retained_outcomes: 64,
+            };
+            state.apply(UiEvent::Snapshot(Box::new(snapshot)));
+
+            assert!(state.queued.is_empty());
+            assert_eq!(
+                state.unsent.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
+                ["  the whole draft  "],
+                "the original draft must survive intact, whitespace included"
+            );
+        }
+
+        #[test]
+        fn a_queued_message_with_no_reported_outcome_is_kept_and_the_doubt_is_stated() {
+            // The outcome ring is bounded, so "not listed and no outcome" is
+            // genuinely unknown. Claiming "not sent" would be a guess, and
+            // resending it would be a guess with consequences.
+            let mut state = state();
+            state.apply(UiEvent::Queued { text: "ambiguous".into(), id: Some("m1".into()) });
+
+            let mut snapshot = snapshot(EngineLifecycle::Busy);
+            snapshot.steering = SteeringQueueState {
+                pending_count: 0,
+                pending: Vec::new(),
+                outcomes: vec![outcome("m9", SteeringOutcomeKind::Delivered)],
+                outcomes_truncated: true,
+                retained_outcomes: 64,
+            };
+            state.apply(UiEvent::Snapshot(Box::new(snapshot)));
+
+            assert!(state.queued.is_empty());
+            assert_eq!(state.unsent.len(), 1, "the text is kept for recovery");
+            assert_eq!(state.unsent[0].text, "ambiguous");
+
+            let notices = notice_texts(&state);
+            assert!(
+                notices.iter().any(|n| n.contains("did not report")),
+                "the uncertainty must be stated, not hidden: {notices:?}"
+            );
+            assert!(
+                !notices.iter().any(|n| n.contains("was not sent")),
+                "an unknown outcome must not be reported as a fact: {notices:?}"
+            );
+        }
+
+        #[test]
+        fn rehydrating_replaces_the_conversation_rather_than_appending_to_it() {
+            let mut state = state();
+            state.apply(UiEvent::Submitted { text: "stale".into() });
+            state.apply(UiEvent::Rehydrated {
+                blocks: vec![
+                    Block::User {
+                        text: "from history".into(),
+                        timestamp: String::new(),
+                        pending: false,
+                        queue_id: None,
+                    },
+                    Block::Assistant { text: "answered".into(), complete: true },
+                ],
+                notices: Vec::new(),
+            });
+            assert_eq!(state.transcript.len(), 2);
+            match &state.transcript.blocks()[0] {
+                Block::User { text, .. } => assert_eq!(text, "from history"),
+                other => panic!("expected the rehydrated prompt, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn rehydrating_keeps_the_blocks_this_client_owns() {
+            // The banner, the launch notice, `/help` output and a `/diff` are
+            // not a projection of the engine's history and no history read
+            // can return them. Clearing the transcript wholesale lost them on
+            // every resume, gap and compaction.
+            let mut state = state();
+            state.transcript.push(Block::Banner {
+                wordmark: vec!["coda".into()],
+                details: vec!["cwd: /w".into()],
+            });
+            state.notice("Forked from session abc; the original is untouched.", NoticeLevel::Info);
+            state.apply(UiEvent::Submitted { text: "stale".into() });
+            state.apply(UiEvent::CommandOutput { text: "Permission mode: plan".into() });
+            state.apply(UiEvent::DiffOutput { text: "diff --git a b".into() });
+
+            state.apply(UiEvent::Rehydrated {
+                blocks: vec![
+                    Block::User {
+                        text: "from history".into(),
+                        timestamp: String::new(),
+                        pending: false,
+                        queue_id: None,
+                    },
+                    Block::Assistant { text: "answered".into(), complete: true },
+                ],
+                notices: Vec::new(),
+            });
+
+            let blocks = state.transcript.blocks();
+            assert!(matches!(blocks.first(), Some(Block::Banner { .. })), "{blocks:?}");
+            assert!(
+                blocks.iter().any(|b| matches!(b, Block::Notice { text, .. } if text.contains("Forked"))),
+                "the launch notice was thrown away: {blocks:?}"
+            );
+            assert!(
+                blocks.iter().any(|b| matches!(b, Block::CommandOutput { .. })),
+                "slash-command output was thrown away: {blocks:?}"
+            );
+            assert!(
+                blocks.iter().any(|b| matches!(b, Block::Diff { .. })),
+                "a rendered diff was thrown away: {blocks:?}"
+            );
+            assert!(
+                !blocks.iter().any(|b| matches!(b, Block::User { text, .. } if text == "stale")),
+                "the replaced conversation is still on screen: {blocks:?}"
+            );
+            assert!(
+                blocks
+                    .iter()
+                    .any(|b| matches!(b, Block::User { text, .. } if text == "from history")),
+                "{blocks:?}"
+            );
+        }
+
+        #[test]
+        fn rehydrating_an_empty_conversation_clears_the_old_one_but_not_the_banner() {
+            // A rewind to the very start: the engine says there is no
+            // conversation, and the screen must agree — without losing the
+            // client's own blocks in the process.
+            let mut state = state();
+            state.transcript.push(Block::Banner {
+                wordmark: vec!["coda".into()],
+                details: vec![],
+            });
+            state.apply(UiEvent::Submitted { text: "stale".into() });
+
+            state.apply(UiEvent::Rehydrated { blocks: Vec::new(), notices: Vec::new() });
+
+            assert!(!state.has_conversation(), "{:?}", state.transcript.blocks());
+            assert!(matches!(state.transcript.blocks().first(), Some(Block::Banner { .. })));
+        }
+
+        #[test]
+        fn rehydrating_keeps_a_queued_message_out_of_the_transcript_and_in_the_queue() {
+            // A queued preview is deliberately not a transcript block: it is
+            // state.queued, drawn by the composer's own pending list. A
+            // rebuild of the conversation must therefore neither lose it nor
+            // turn it into a bubble that the next rebuild would wipe.
+            let mut state = state();
+            state.apply(UiEvent::Queued { text: "send this next".into(), id: Some("m1".into()) });
+            assert_eq!(state.queued.len(), 1);
+
+            state.apply(UiEvent::Rehydrated {
+                blocks: vec![Block::Assistant { text: "from history".into(), complete: true }],
+                notices: Vec::new(),
+            });
+
+            assert_eq!(state.queued.len(), 1, "the queued message was lost with the transcript");
+            assert_eq!(state.queued[0].text, "send this next");
+            assert!(
+                !state
+                    .transcript
+                    .blocks()
+                    .iter()
+                    .any(|b| matches!(b, Block::User { pending: true, .. })),
+                "a queued preview must never be mirrored into the transcript: {:?}",
+                state.transcript.blocks()
+            );
+        }
+
+        #[test]
+        fn rehydrating_keeps_the_decisions_taken_at_this_terminal() {
+            let mut state = state();
+            state.apply(UiEvent::PromptRequested(PendingPrompt::Permission {
+                tool: "run_command".into(),
+                preview: "ls".into(),
+            }));
+            state.apply(UiEvent::PromptAnswered { allowed: true, answer: None });
+            state.apply(UiEvent::Submitted { text: "stale".into() });
+
+            state.apply(UiEvent::Rehydrated {
+                blocks: vec![Block::Assistant { text: "from history".into(), complete: true }],
+                notices: Vec::new(),
+            });
+
+            assert!(
+                state.transcript.blocks().iter().any(|b| matches!(
+                    b,
+                    Block::Permission { decision: PermissionDecision::Allowed, .. }
+                )),
+                "the operator's own decision was erased: {:?}",
+                state.transcript.blocks()
+            );
+        }
+
+        #[test]
+        fn a_live_result_never_rewrites_a_replayed_call_that_merely_shares_an_id() {
+            // The transcript can now hold a rehydrated call from an earlier
+            // turn *and* a live call with the same provider id. Matching on
+            // the id alone would put the live output into the old call.
+            let mut state = state();
+            state.apply(UiEvent::Rehydrated {
+                blocks: vec![Block::Tools {
+                    activity: ToolActivity {
+                        calls: vec![{
+                            let mut call = ToolCall::new("read_file", "{}");
+                            call.result = Some("old output".into());
+                            call.status = CallStatus::Succeeded;
+                            call
+                        }],
+                        complete: true,
+                        ..Default::default()
+                    },
+                    key: ActivityKey {
+                        root_turn_id: Some("old-turn".into()),
+                        activity_id: Some("old-batch".into()),
+                    },
+                    calls: vec![Correlation {
+                        root_turn_id: Some("old-turn".into()),
+                        activity_id: Some("old-batch".into()),
+                        call_id: Some("toolu_1".into()),
+                        source_id: Some("toolu_1".into()),
+                        ..Default::default()
+                    }],
+                }],
+                notices: Vec::new(),
+            });
+
+            let live = Correlation {
+                root_turn_id: Some("new-turn".into()),
+                activity_id: Some("new-batch".into()),
+                call_id: Some("toolu_1".into()),
+                source_id: Some("toolu_1".into()),
+                ..Default::default()
+            };
+            state.apply(UiEvent::Engine(Event::ToolCall {
+                tool_name: "read_file".into(),
+                input_json: "{}".into(),
+                correlation: live.clone(),
+            }));
+            state.apply(UiEvent::Engine(Event::ToolResult {
+                tool_name: "read_file".into(),
+                content: "new output".into(),
+                is_error: false,
+                status: Some(ToolCallStatus::Succeeded),
+                correlation: live,
+            }));
+
+            let groups: Vec<&ToolActivity> = state
+                .transcript
+                .blocks()
+                .iter()
+                .filter_map(|b| match b {
+                    Block::Tools { activity, .. } => Some(activity),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(groups.len(), 2, "the live call opened its own group");
+            assert_eq!(groups[0].calls[0].result.as_deref(), Some("old output"));
+            assert_eq!(groups[1].calls[0].result.as_deref(), Some("new output"));
+        }
     }
 }

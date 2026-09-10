@@ -1,0 +1,44 @@
+{
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "prompt": {
+      "type": "string"
+    },
+    "every": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Exactly one of `every`, `at` or `cron` must be set."
+    },
+    "at": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "cron": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "timeZone": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "prompt"
+  ],
+  "title": "ScheduleCreateParams",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

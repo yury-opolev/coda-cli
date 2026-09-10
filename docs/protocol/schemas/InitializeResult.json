@@ -1,0 +1,82 @@
+{
+  "type": "object",
+  "properties": {
+    "protocolVersion": {
+      "type": "string"
+    },
+    "sessionId": {
+      "type": "string"
+    },
+    "serverInfo": {
+      "type": "string"
+    },
+    "telemetryLogPath": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "contractVersion": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Additive fields since Slice 0 (§2.1). All `#[serde(default)]` so a\nlegacy engine's response — missing these keys entirely — still parses.",
+      "default": null
+    },
+    "engineInstanceId": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "eventCursor": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64",
+      "description": "The authoritative start cursor for `session/getEvents`, valid at the\nmoment this `initialize` call returned.",
+      "default": null
+    },
+    "capabilities": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": {
+        "$ref": "#/$defs/CapabilityEntry"
+      },
+      "default": null
+    }
+  },
+  "required": [
+    "protocolVersion",
+    "sessionId",
+    "serverInfo"
+  ],
+  "title": "InitializeResult",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "CapabilityEntry": {
+      "type": "object",
+      "properties": {
+        "supported": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "supported"
+      ],
+      "description": "One entry in `InitializeResult.capabilities` — whether a named capability\nis supported by this engine build, with an explanatory reason when not."
+    }
+  }
+}

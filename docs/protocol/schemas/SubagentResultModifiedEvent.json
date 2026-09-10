@@ -1,0 +1,34 @@
+{
+  "type": "object",
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "engineInstanceId": {
+      "type": "string"
+    },
+    "hookCommand": {
+      "type": "string",
+      "default": ""
+    },
+    "taskId": {
+      "type": "string",
+      "default": ""
+    },
+    "originalResult": {
+      "type": "string",
+      "default": ""
+    },
+    "modifiedResult": {
+      "type": "string",
+      "default": ""
+    }
+  },
+  "required": [
+    "seq",
+    "engineInstanceId"
+  ],
+  "title": "SubagentResultModifiedEvent",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

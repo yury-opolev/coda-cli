@@ -1,0 +1,17 @@
+{
+  "type": "object",
+  "properties": {
+    "requestId": {
+      "type": "string",
+      "default": ""
+    },
+    "reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "title": "CancelRequestParams",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

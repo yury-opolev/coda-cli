@@ -1,0 +1,34 @@
+{
+  "type": "object",
+  "properties": {
+    "question": {
+      "type": "string",
+      "default": ""
+    },
+    "options": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "multiSelect": {
+      "type": "boolean",
+      "default": false
+    },
+    "allowFreeText": {
+      "type": "boolean",
+      "default": false
+    },
+    "requestId": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "See [`PermissionRequest::request_id`].",
+      "default": null
+    }
+  },
+  "title": "QuestionRequest",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}
