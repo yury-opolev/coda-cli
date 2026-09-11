@@ -16,8 +16,8 @@ pub mod context;
 pub mod sandbox;
 
 pub use context::{
-    AnswerOutcome, NoAnswerReason, OpaqueServiceHandle, PlanApprover, ServiceMap, ToolContext,
-    ToolDescriptor, UserQuestion,
+    AnswerOutcome, NoAnswerReason, OpaqueServiceHandle, PlanApprover, ScheduleOrigin, ServiceMap,
+    ToolContext, ToolDescriptor, UserQuestion,
 };
 pub use sandbox::{is_within_root, resolve_path, try_resolve_within_root};
 

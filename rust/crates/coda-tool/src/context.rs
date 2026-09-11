@@ -179,6 +179,31 @@ pub struct ToolDescriptor {
     pub search_hint: Option<String>,
 }
 
+// ── ScheduleOrigin ────────────────────────────────────────────────────────────
+
+/// Provenance stamp identifying the scheduled definition a run originated from.
+///
+/// # Trust
+/// This value is **only** constructed by trusted Rust callers — the schedule
+/// runtime's runner and the subagent host that propagates it to nested
+/// children. It is never parsed from tool arguments, model output, or a wire
+/// request, so a model cannot claim to be running on behalf of another job.
+/// Tools may read it (a later stage uses it for self-cancellation) but a tool
+/// can only ever observe the origin of the run it is already executing in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleOrigin {
+    /// Id of the `ScheduledTask` definition that triggered this run.
+    pub definition_id: String,
+    /// Human-readable definition name, when the definition has one.
+    pub definition_name: Option<String>,
+}
+
+impl ScheduleOrigin {
+    pub fn new(definition_id: impl Into<String>, definition_name: Option<String>) -> Self {
+        Self { definition_id: definition_id.into(), definition_name }
+    }
+}
+
 // ── OpaqueServiceHandle ───────────────────────────────────────────────────────
 
 /// A type-erased, `Send + Sync`, heap-allocated handle to an engine-specific
@@ -253,6 +278,9 @@ pub struct ToolContext {
     pub plan_approver: Option<Arc<dyn PlanApprover>>,
     pub all_tools: Option<Vec<ToolDescriptor>>,
     pub caller_task_id: Option<String>,
+    /// Set only when this run was launched by the schedule runtime (directly or
+    /// as a nested child of such a run).  Trusted: see [`ScheduleOrigin`].
+    pub schedule_origin: Option<ScheduleOrigin>,
 
     // ── Service handles: engine-specific, opaque to coda-tool ─────────────────
     // coda-agent provides typed accessors via ToolContextServiceExt.
@@ -273,6 +301,7 @@ impl std::fmt::Debug for ToolContext {
             .field("plan_approver", &self.plan_approver.is_some())
             .field("all_tools", &self.all_tools.as_ref().map(|v| v.len()))
             .field("caller_task_id", &self.caller_task_id)
+            .field("schedule_origin", &self.schedule_origin)
             .field("lsp_manager", &self.lsp_manager.is_some())
             .field("task_manager", &self.task_manager.is_some())
             .field("schedule_store", &self.schedule_store.is_some())
@@ -292,6 +321,7 @@ impl ToolContext {
             plan_approver: None,
             all_tools: None,
             caller_task_id: None,
+            schedule_origin: None,
             lsp_manager: None,
             task_manager: None,
             schedule_store: None,
@@ -327,6 +357,13 @@ impl ToolContext {
 
     pub fn with_caller_task_id(mut self, task_id: impl Into<String>) -> Self {
         self.caller_task_id = Some(task_id.into());
+        self
+    }
+
+    /// Stamp the run's scheduled provenance.  Trusted callers only — never
+    /// build this from tool arguments or model output.
+    pub fn with_schedule_origin(mut self, origin: ScheduleOrigin) -> Self {
+        self.schedule_origin = Some(origin);
         self
     }
 }

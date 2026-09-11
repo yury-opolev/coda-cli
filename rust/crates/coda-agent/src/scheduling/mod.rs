@@ -15,9 +15,9 @@ pub mod scheduled_task_store;
 
 pub use cron_expression::CronExpression;
 pub use runtime::{
-    NullScheduleLifecycleSink, ScheduleLifecycleEvent, ScheduleLifecycleSink,
+    NullScheduleLifecycleSink, ScheduleClock, ScheduleLifecycleEvent, ScheduleLifecycleSink,
     ScheduleRuntimeSnapshot, ScheduleRuntimeState, ScheduleRuntimeStatus, ScheduleRuntimeView,
-    ScheduleRuntime, ScheduledAgentRunner, TaskManagerRunner,
+    ScheduleRuntime, ScheduledAgentRunner, ScheduledRun, SystemClock, TaskManagerRunner,
 };
 pub use schedule_recurrence::ScheduleRecurrence;
 pub use scheduled_task::{

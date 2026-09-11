@@ -59,6 +59,13 @@ impl Tool for TaskWaitTool {
             None => return ToolResult::error("Task manager is not available."),
         };
 
+        // Authorization is checked BEFORE any target lookup so an unauthorized
+        // caller cannot distinguish "unknown" from "exists but not mine" — both
+        // report identical "not found" wording (mirrors task_get/task_stop).
+        if !mgr.is_authorized_caller(task_id, ctx.caller_task_id.as_deref()) {
+            return ToolResult::error(format!("Task '{task_id}' not found."));
+        }
+
         let task = match mgr.find_task(task_id) {
             Some(t) => t,
             None => return ToolResult::error(format!("Task '{task_id}' not found.")),
@@ -120,8 +127,17 @@ mod tests {
     use crate::tasks::{TaskExecutionMode, TaskKind, TaskManager};
     use std::sync::Arc;
 
+    /// Marker string a denied caller must never see in a tool's response.
+    const SIBLING_CANARY: &str = "SIBLING_CANARY_WAIT_RESULT";
+
     fn ctx(mgr: Arc<TaskManager>) -> ToolContext {
         ToolContext::new(".").with_task_manager(mgr)
+    }
+
+    fn ctx_with_caller(mgr: Arc<TaskManager>, caller_id: &str) -> ToolContext {
+        ToolContext::new(".")
+            .with_task_manager(mgr)
+            .with_caller_task_id(caller_id)
     }
 
     #[tokio::test]
@@ -182,5 +198,134 @@ mod tests {
             )
             .await;
         assert!(result.is_error, "expected timeout error: {}", result.content);
+    }
+
+    // ── SECURITY: authorization gate ─────────────────────────────────────────
+
+    /// A sibling must not be able to wait on another sibling's terminal
+    /// status/result. The denial must look identical to "not found".
+    #[tokio::test]
+    async fn wait_denied_for_sibling_looks_like_not_found_and_leaks_no_result() {
+        let m = TaskManager::with_defaults("session");
+        let a = m
+            .register(TaskKind::Subagent, "a", None, TaskExecutionMode::Background)
+            .unwrap();
+        let b = m
+            .register(TaskKind::Subagent, "b", None, TaskExecutionMode::Background)
+            .unwrap();
+        m.complete(&b.id, Some(SIBLING_CANARY.into()));
+
+        let result = TaskWaitTool
+            .execute(
+                &serde_json::json!({"taskId": b.id, "timeoutSeconds": 1}),
+                &ctx_with_caller(m, &a.id),
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(result.is_error);
+        assert_eq!(result.content, format!("Task '{}' not found.", b.id));
+        assert!(
+            !result.content.contains(SIBLING_CANARY),
+            "denied wait must not leak the sibling's result: {}",
+            result.content
+        );
+        assert!(
+            !result.content.contains("completed"),
+            "denied wait must not leak the sibling's status: {}",
+            result.content
+        );
+    }
+
+    /// A child must not be able to wait on its own ancestor.
+    #[tokio::test]
+    async fn wait_denied_for_ancestor_looks_like_not_found() {
+        let m = TaskManager::with_defaults("session");
+        let parent = m
+            .register(TaskKind::Subagent, "parent", None, TaskExecutionMode::Background)
+            .unwrap();
+        m.complete(&parent.id, Some(SIBLING_CANARY.into()));
+        let child = m
+            .register(TaskKind::Subagent, "child", Some(&parent.id), TaskExecutionMode::Background)
+            .unwrap();
+
+        let result = TaskWaitTool
+            .execute(
+                &serde_json::json!({"taskId": parent.id, "timeoutSeconds": 1}),
+                &ctx_with_caller(m, &child.id),
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(result.is_error);
+        assert_eq!(result.content, format!("Task '{}' not found.", parent.id));
+        assert!(!result.content.contains(SIBLING_CANARY), "{}", result.content);
+    }
+
+    /// A task must not be authorized to wait on itself.
+    #[tokio::test]
+    async fn wait_denied_for_self_looks_like_not_found() {
+        let m = TaskManager::with_defaults("session");
+        let t = m
+            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .unwrap();
+        m.complete(&t.id, Some(SIBLING_CANARY.into()));
+
+        let result = TaskWaitTool
+            .execute(
+                &serde_json::json!({"taskId": t.id, "timeoutSeconds": 1}),
+                &ctx_with_caller(m, &t.id),
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(result.is_error);
+        assert_eq!(result.content, format!("Task '{}' not found.", t.id));
+    }
+
+    /// An unregistered caller id must fail closed.
+    #[tokio::test]
+    async fn wait_denied_for_unknown_caller_looks_like_not_found() {
+        let m = TaskManager::with_defaults("session");
+        let t = m
+            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .unwrap();
+        m.complete(&t.id, Some(SIBLING_CANARY.into()));
+
+        let result = TaskWaitTool
+            .execute(
+                &serde_json::json!({"taskId": t.id, "timeoutSeconds": 1}),
+                &ctx_with_caller(m, "task-9999"),
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(result.is_error);
+        assert_eq!(result.content, format!("Task '{}' not found.", t.id));
+        assert!(!result.content.contains(SIBLING_CANARY), "{}", result.content);
+    }
+
+    /// A parent must still be able to wait on its own descendant.
+    #[tokio::test]
+    async fn wait_allowed_for_own_descendant() {
+        let m = TaskManager::with_defaults("session");
+        let parent = m
+            .register(TaskKind::Subagent, "parent", None, TaskExecutionMode::Background)
+            .unwrap();
+        let child = m
+            .register(TaskKind::Subagent, "child", Some(&parent.id), TaskExecutionMode::Background)
+            .unwrap();
+        m.complete(&child.id, Some("child result".into()));
+
+        let result = TaskWaitTool
+            .execute(
+                &serde_json::json!({"taskId": child.id, "timeoutSeconds": 1}),
+                &ctx_with_caller(m, &parent.id),
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains("child result"), "{}", result.content);
     }
 }

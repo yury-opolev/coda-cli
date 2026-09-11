@@ -62,6 +62,8 @@ pub(crate) struct BatchContext<'a> {
     pub task_manager: Option<Arc<TaskManager>>,
     pub schedule_store: Option<Arc<ScheduledTaskStore>>,
     pub caller_task_id: Option<String>,
+    /// Scheduled provenance for this run (trusted; never model-supplied).
+    pub schedule_origin: Option<coda_tool::ScheduleOrigin>,
     pub subagent_factory: Option<Arc<dyn SubagentFactory>>,
 }
 
@@ -102,6 +104,7 @@ impl<'a> BatchContext<'a> {
             plan_approver: self.plan_approver.clone(),
             all_tools: Some(all_tools),
             caller_task_id: self.caller_task_id.clone(),
+            schedule_origin: self.schedule_origin.clone(),
             lsp_manager: None,
             task_manager: None,
             schedule_store: None,

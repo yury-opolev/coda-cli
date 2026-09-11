@@ -33,7 +33,7 @@ use crate::steering::SteeringInbox;
 use crate::subagents::SubagentFactory;
 use crate::tasks::TaskManager;
 use crate::todos::TodoStore;
-use crate::tool::{PlanApprover, ToolQuarantine, ToolRegistry, UserQuestion};
+use crate::tool::{PlanApprover, ScheduleOrigin, ToolQuarantine, ToolRegistry, UserQuestion};
 
 pub mod stop;
 pub mod stream;
@@ -155,6 +155,8 @@ pub struct AgentLoop {
     schedule_store: Option<Arc<ScheduledTaskStore>>,
     /// Id of the owning task (set when this loop runs inside a subagent task).
     caller_task_id: Option<String>,
+    /// Scheduled provenance of this run, stamped by the trusted host/runner.
+    schedule_origin: Option<ScheduleOrigin>,
     /// Subagent factory for the `task` tool.
     subagent_factory: Option<Arc<dyn SubagentFactory>>,
 
@@ -574,6 +576,7 @@ impl AgentLoop {
                     task_manager: self.task_manager.clone(),
                     schedule_store: self.schedule_store.clone(),
                     caller_task_id: self.caller_task_id.clone(),
+                    schedule_origin: self.schedule_origin.clone(),
                     subagent_factory: self.subagent_factory.clone(),
                 };
 
@@ -754,6 +757,7 @@ pub struct AgentLoopBuilder {
     task_manager: Option<Arc<TaskManager>>,
     schedule_store: Option<Arc<ScheduledTaskStore>>,
     caller_task_id: Option<String>,
+    schedule_origin: Option<ScheduleOrigin>,
     subagent_factory: Option<Arc<dyn SubagentFactory>>,
     model: String,
     system_prompt: Option<String>,
@@ -794,6 +798,7 @@ impl AgentLoopBuilder {
             task_manager: None,
             schedule_store: None,
             caller_task_id: None,
+            schedule_origin: None,
             subagent_factory: None,
             model: "claude-opus-4-5".into(),
             system_prompt: None,
@@ -935,6 +940,16 @@ impl AgentLoopBuilder {
         self
     }
 
+    /// Stamp this run's scheduled provenance.
+    ///
+    /// Only the trusted subagent host / schedule runner call this; the value
+    /// reaches tools read-only through `ToolContext::schedule_origin` and is
+    /// never derived from model input.
+    pub fn with_schedule_origin(mut self, origin: ScheduleOrigin) -> Self {
+        self.schedule_origin = Some(origin);
+        self
+    }
+
     pub fn with_subagent_factory(mut self, factory: Arc<dyn SubagentFactory>) -> Self {
         self.subagent_factory = Some(factory);
         self
@@ -960,6 +975,7 @@ impl AgentLoopBuilder {
             task_manager: self.task_manager,
             schedule_store: self.schedule_store,
             caller_task_id: self.caller_task_id,
+            schedule_origin: self.schedule_origin,
             subagent_factory: self.subagent_factory,
             model: self.model,
             system_prompt: self.system_prompt,

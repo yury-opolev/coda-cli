@@ -72,9 +72,9 @@ pub use permission::{
     PermissionRuleStore,
 };
 pub use scheduling::{
-    NullScheduleLifecycleSink, ScheduleLifecycleEvent, ScheduleLifecycleSink,
+    NullScheduleLifecycleSink, ScheduleClock, ScheduleLifecycleEvent, ScheduleLifecycleSink,
     ScheduleRuntimeSnapshot, ScheduleRuntimeState, ScheduleRuntimeStatus, ScheduleRuntimeView,
-    ScheduleRuntime, ScheduledAgentRunner, TaskManagerRunner,
+    ScheduleRuntime, ScheduledAgentRunner, ScheduledRun, SystemClock, TaskManagerRunner,
 };
 pub use session::{
     AuditToolCall, AuditTurn, BundleTurn, ImportError, SessionAuditStore, SessionBundle,
@@ -85,7 +85,8 @@ pub use steering::{SteeringEntry, SteeringInbox};
 pub use subagents::{BuiltInAgents, SubagentDefinition, SubagentFactory, SubagentRequest, SubagentRegistry, PluginAgentLoader};
 pub use todos::{TodoItem, TodoStatus, TodoStore};
 pub use tool::{
-    AnswerOutcome, NoAnswerReason, PlanApprover, Tool, ToolContext, ToolControl, ToolDescriptor,
-    ToolNameFilter, ToolOutcome, ToolQuarantine, ToolRegistry, ToolResult, UserQuestion,
+    AnswerOutcome, NoAnswerReason, PlanApprover, ScheduleOrigin, Tool, ToolContext, ToolControl,
+    ToolDescriptor, ToolNameFilter, ToolOutcome, ToolQuarantine, ToolRegistry, ToolResult,
+    UserQuestion,
 };
 pub use tools::{built_in_file_tools, built_in_tools};

@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 // ── Re-exports from coda-tool ─────────────────────────────────────────────────
 pub use coda_tool::context::{
-    OpaqueServiceHandle, PlanApprover, TodoItem, TodoStatus, TodoStore, ToolContext,
+    OpaqueServiceHandle, PlanApprover, ScheduleOrigin, TodoItem, TodoStatus, TodoStore, ToolContext,
     ToolDescriptor, UserQuestion,
 };
 pub use coda_tool::sandbox::{is_within_root, resolve_path, try_resolve_within_root};

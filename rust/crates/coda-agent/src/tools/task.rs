@@ -89,7 +89,16 @@ impl Tool for TaskTool {
         };
 
         // Derive the caller's depth so the child depth is caller + 1.
-        let caller_depth = caller_depth(ctx);
+        //
+        // A caller id that cannot be verified against the task manager is a
+        // hard refusal, never "assume depth 0". Treating an unknown id as the
+        // main agent would let any unwired or forged identity mint an endless
+        // chain of depth-1 children and would silently grant it the main
+        // agent's session-wide authority.
+        let caller_depth = match caller_depth(ctx) {
+            Ok(d) => d,
+            Err(e) => return ToolResult::error(e),
+        };
         let child_depth = caller_depth + 1;
 
         if child_depth > MAX_SUBAGENT_DEPTH {
@@ -115,6 +124,9 @@ impl Tool for TaskTool {
             uuid::Uuid::new_v4().to_string()
         };
 
+        // Trusted fields come from the context, never from `input`: the model
+        // cannot choose its own caller identity, depth, task id, or claim that
+        // its work belongs to somebody else's scheduled job.
         let request = SubagentRequest {
             agent_type,
             prompt,
@@ -123,6 +135,7 @@ impl Tool for TaskTool {
             model,
             foreground: true,
             caller_task_id: ctx.caller_task_id.clone(),
+            schedule_origin: ctx.schedule_origin.clone(),
         };
 
         let sink = std::sync::Arc::new(NullSink);
@@ -146,17 +159,31 @@ impl Tool for TaskTool {
 
 /// Derive the current agent's depth from the task manager.
 ///
-/// Returns 0 (main agent) when no task id or manager is available.
-fn caller_depth(ctx: &ToolContext) -> u32 {
+/// - No caller id at all → the main agent, depth 0.
+/// - A caller id that the task manager can resolve → that task's depth.
+/// - A caller id that cannot be resolved (no manager wired, or an id the
+///   manager has never registered) → `Err`: fail closed.
+///
+/// The last case is the security-relevant one. `TaskManager::is_authorized_caller`
+/// already treats `None` as the main agent with session-wide authority, so the
+/// one thing this function must never do is *collapse* an unverifiable identity
+/// into that same `None`-shaped answer.
+fn caller_depth(ctx: &ToolContext) -> Result<u32, String> {
     let task_id = match ctx.caller_task_id.as_deref() {
         Some(id) => id,
-        None => return 0,
+        None => return Ok(0),
     };
-    let mgr = match ctx.get_task_manager() {
-        Some(m) => m,
-        None => return 0,
-    };
-    mgr.get(task_id).map(|s| s.depth).unwrap_or(0)
+    let mgr = ctx.get_task_manager().ok_or_else(|| {
+        "Subagent nesting is unavailable: this run carries a task identity but no task \
+         manager is wired, so its depth and authority cannot be verified."
+            .to_owned()
+    })?;
+    mgr.get(task_id).map(|s| s.depth).ok_or_else(|| {
+        format!(
+            "Subagent nesting is unavailable: the calling task '{task_id}' is not registered, \
+             so its depth and authority cannot be verified."
+        )
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -243,5 +270,135 @@ mod tests {
             .await;
         assert!(result.is_error);
         assert!(result.content.contains("Missing required 'prompt'"));
+    }
+
+    // ── STAGE 0: caller identity must fail closed ────────────────────────────
+
+    /// Records the request the tool built so the trusted fields can be checked.
+    struct RecordingFactory {
+        seen: Arc<std::sync::Mutex<Vec<SubagentRequest>>>,
+    }
+
+    #[async_trait]
+    impl SubagentFactory for RecordingFactory {
+        async fn spawn(
+            &self,
+            request: SubagentRequest,
+            _sink: Arc<dyn crate::events::AgentSink>,
+            _cancel: CancellationToken,
+        ) -> Result<String, String> {
+            self.seen.lock().unwrap().push(request);
+            Ok("ok".into())
+        }
+    }
+
+    /// A caller id the task manager has never heard of must NOT be treated
+    /// like the main agent (depth 0, full session authority). Inferring
+    /// "unknown id ⇒ root" lets any unwired or forged identity spawn an
+    /// unbounded chain of depth-1 children.
+    #[tokio::test]
+    async fn unknown_caller_task_id_fails_closed_instead_of_claiming_main_privilege() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = crate::tasks::TaskManager::new(
+            "task-tool-guard",
+            Some(dir.path().to_owned()),
+            4096,
+            16,
+        );
+        let ctx = ToolContext::new(".")
+            .with_subagent_factory(Arc::new(RecordingFactory { seen: Arc::clone(&seen) }))
+            .with_task_manager(Arc::clone(&mgr))
+            .with_caller_task_id("task-9999");
+
+        let result = TaskTool
+            .execute(
+                &serde_json::json!({"prompt": "do something"}),
+                &ctx,
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(result.is_error, "an unverifiable caller identity must be refused");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "nothing may be spawned for an unverifiable caller identity"
+        );
+        assert!(
+            mgr.list().is_empty(),
+            "no task may be registered for an unverifiable caller identity"
+        );
+    }
+
+    /// A caller id with no task manager at all cannot be verified either.
+    #[tokio::test]
+    async fn caller_task_id_without_a_task_manager_fails_closed() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ctx = ToolContext::new(".")
+            .with_subagent_factory(Arc::new(RecordingFactory { seen: Arc::clone(&seen) }))
+            .with_caller_task_id("task-0001");
+
+        let result = TaskTool
+            .execute(
+                &serde_json::json!({"prompt": "do something"}),
+                &ctx,
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(result.is_error, "an unverifiable caller identity must be refused");
+        assert!(seen.lock().unwrap().is_empty(), "nothing may be spawned");
+    }
+
+    /// Model-supplied JSON keys never reach the trusted fields of the request.
+    #[tokio::test]
+    async fn model_supplied_keys_cannot_forge_caller_identity() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = crate::tasks::TaskManager::new(
+            "task-tool-spoof",
+            Some(dir.path().to_owned()),
+            4096,
+            16,
+        );
+        let parent = mgr
+            .register(
+                crate::tasks::TaskKind::Subagent,
+                "parent",
+                None,
+                crate::tasks::TaskExecutionMode::Foreground,
+            )
+            .unwrap();
+        let ctx = ToolContext::new(".")
+            .with_subagent_factory(Arc::new(RecordingFactory { seen: Arc::clone(&seen) }))
+            .with_task_manager(Arc::clone(&mgr))
+            .with_caller_task_id(&parent.id);
+
+        let result = TaskTool
+            .execute(
+                &serde_json::json!({
+                    "prompt": "do something",
+                    "callerTaskId": "task-0001",
+                    "depth": 0,
+                    "taskId": "task-0001",
+                }),
+                &ctx,
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+
+        let requests = seen.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].caller_task_id.as_deref(),
+            Some(parent.id.as_str()),
+            "the caller identity comes from the trusted context, never from tool arguments"
+        );
+        assert_eq!(requests[0].depth, 2, "depth is derived from the registered parent");
+        assert_ne!(
+            requests[0].task_id, "task-0001",
+            "the child's own id is assigned by the task manager"
+        );
     }
 }

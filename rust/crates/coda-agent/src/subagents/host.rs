@@ -26,6 +26,7 @@ use crate::agent::{AgentError, AgentLoopBuilder};
 use crate::events::{AgentSink, CollectingSink};
 use crate::hooks::HookRunner;
 use crate::permission::{PermissionModeState, PermissionPrompt};
+use crate::scheduling::ScheduledTaskStore;
 use crate::tasks::{TaskExecutionMode, TaskKind, TaskManager};
 use crate::tool::{ToolRegistry, ToolQuarantine};
 
@@ -46,6 +47,11 @@ pub struct SubagentHost {
     tools: Arc<ToolRegistry>,
     quarantine: Arc<ToolQuarantine>,
     task_manager: Arc<TaskManager>,
+    /// Shared, session-scoped schedule definitions.  Wired into every child so
+    /// `schedule_*` tools inside a subagent see the same store the main agent
+    /// and the schedule runtime use.  `None` keeps the host usable in tests
+    /// and headless setups that never schedule anything.
+    schedule_store: Option<Arc<ScheduledTaskStore>>,
     base_model: Arc<dyn Fn() -> String + Send + Sync>,
     base_max_tokens: u32,
     base_max_iterations: usize,
@@ -78,6 +84,7 @@ impl SubagentHost {
             tools,
             quarantine,
             task_manager,
+            schedule_store: None,
             base_model: Arc::new(move || base_model.clone()),
             base_max_tokens,
             base_max_iterations,
@@ -96,6 +103,26 @@ impl SubagentHost {
         let mut host = self.clone_for_background();
         host.base_model = source;
         Arc::new(host)
+    }
+
+    /// Share the session's schedule definition store with every child this
+    /// host spawns.  The SAME `Arc` must be handed to the main agent loop and
+    /// to every host (hook-free and hooked) so a schedule created by a
+    /// subagent is visible to the main agent and to the schedule runtime.
+    pub fn with_schedule_store(self: Arc<Self>, store: Arc<ScheduledTaskStore>) -> Arc<Self> {
+        let mut host = self.clone_for_background();
+        host.schedule_store = Some(store);
+        Arc::new(host)
+    }
+
+    /// Read-only accessor for the schedule store this host was wired with
+    /// (or `None` when the host has no schedule store attached). Lets a
+    /// caller confirm store-sharing directly, without going through a
+    /// schedule tool call — useful now that `schedule_create`/`schedule_list`
+    /// are (mostly) main-agent-only, so a child spawn can no longer be used
+    /// to probe the wiring end-to-end.
+    pub fn schedule_store(&self) -> Option<&Arc<ScheduledTaskStore>> {
+        self.schedule_store.as_ref()
     }
 
     pub fn with_defaults(
@@ -239,7 +266,22 @@ impl SubagentHost {
         };
 
         // Build the child loop.
-        let loop_ = AgentLoopBuilder::new(
+        //
+        // The child is a *trusted* execution context: it receives the shared
+        // TaskManager, the shared schedule store, a factory that reuses this
+        // host's concurrency pool, and — critically — its OWN registered task
+        // id.  Passing the parent's id (or `None`, which `TaskManager` reads as
+        // "the main agent") would hand the child authority over tasks it does
+        // not own.  Without this wiring every stateful tool inside a child
+        // answered "… is not available".
+        //
+        // `clone_for_background` shares the `Arc<Semaphore>`, so the nested
+        // factory draws from the same pool rather than minting a fresh limit,
+        // and it copies `hook_runner` verbatim: a hook-free host stays
+        // hook-free, so agent-type hooks cannot re-enter the hook system.
+        let child_factory: Arc<dyn SubagentFactory> = Arc::new(self.clone_for_background());
+
+        let mut builder = AgentLoopBuilder::new(
             self.client.clone(),
             self.permission_prompt.clone(),
             Arc::new(child_tools),
@@ -251,7 +293,20 @@ impl SubagentHost {
         .with_max_iterations(self.base_max_iterations)
         .with_working_directory(self.working_directory.clone())
         .with_quarantine(self.quarantine.clone())
-        .build();
+        .with_task_manager(Arc::clone(&self.task_manager))
+        .with_caller_task_id(request.task_id.clone())
+        .with_subagent_factory(child_factory);
+
+        if let Some(store) = &self.schedule_store {
+            builder = builder.with_schedule_store(Arc::clone(store));
+        }
+        // A nested child inherits the scheduled provenance of the run that
+        // spawned it; ordinary main-agent children carry `None`.
+        if let Some(origin) = &request.schedule_origin {
+            builder = builder.with_schedule_origin(origin.clone());
+        }
+
+        let loop_ = builder.build();
 
         let collecting_sink = Arc::new(CollectingSink::new());
 
@@ -353,7 +408,12 @@ impl SubagentFactory for SubagentHost {
 
             let task_id = task.id.clone();
             let self_arc = Arc::new(self.clone_for_background());
-            let req2 = request.clone();
+            // The background run's identity is the task just registered — not
+            // the id the caller happened to put in the request. `run_inner`
+            // uses `task_id` as the child's `caller_task_id`, so a stale value
+            // here would give the child another task's authority.
+            let mut req2 = request.clone();
+            req2.task_id = task_id.clone();
             let sink2 = sink.clone();
             let cancel2 = cancel.clone();
             let mgr = self.task_manager.clone();
@@ -385,6 +445,7 @@ impl SubagentHost {
             tools: self.tools.clone(),
             quarantine: self.quarantine.clone(),
             task_manager: self.task_manager.clone(),
+            schedule_store: self.schedule_store.clone(),
             base_model: self.base_model.clone(),
             base_max_tokens: self.base_max_tokens,
             base_max_iterations: self.base_max_iterations,
@@ -593,6 +654,7 @@ mod tests {
             model: None,
             foreground: true,
             caller_task_id: None,
+            schedule_origin: None,
         };
         let result = factory.spawn(bad_request, Arc::new(crate::events::NullSink), CancellationToken::new()).await;
         assert!(result.is_err(), "depth > MAX must be rejected");
@@ -824,5 +886,742 @@ mod tests {
             0,
             "no task must be registered in the task manager when the slot is unavailable"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // STAGE 0 — trusted child execution context
+    //
+    // `run_inner` used to build the child `AgentLoop` with only
+    // client/tools/mode/model/system.  Every stateful tool inside a child
+    // therefore answered "… is not available", the child had no identity of
+    // its own (so `TaskManager` authorisation could not be evaluated), and
+    // nested `task` calls were impossible.  These tests exercise the real
+    // child loop through a scripted model.
+    // ─────────────────────────────────────────────────────────────────────────
+    mod trusted_child_context {
+        use super::*;
+        use std::collections::VecDeque;
+        use std::sync::Mutex;
+
+        use async_trait::async_trait as at;
+        use coda_llm::anthropic::StreamEvent;
+        use coda_llm::{Content, Correlation, LlmError, Usage};
+
+        use crate::events::{AgentEvent, CollectingSink};
+        use crate::permission::PermissionPrompt;
+        use crate::scheduling::ScheduledTaskStore;
+        use crate::tasks::{TaskExecutionMode, TaskKind, TaskManager};
+        use crate::tool::{Tool, ToolContext, ToolOutcome, ToolRegistry, ToolResult};
+
+        // ── Scripted model ────────────────────────────────────────────────────
+
+        /// Returns one scripted stream per `stream()` call, in order.
+        pub(super) struct ScriptedClient {
+            turns: Mutex<VecDeque<Vec<StreamEvent>>>,
+        }
+
+        impl ScriptedClient {
+            fn new(turns: Vec<Vec<StreamEvent>>) -> Arc<Self> {
+                Arc::new(Self { turns: Mutex::new(turns.into()) })
+            }
+        }
+
+        #[at]
+        impl coda_llm::LlmClient for ScriptedClient {
+            fn provider_id(&self) -> &str {
+                "scripted"
+            }
+            async fn stream(
+                &self,
+                _: coda_llm::ChatRequest,
+            ) -> Result<coda_llm::ResponseStream, LlmError> {
+                let events = self
+                    .turns
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_else(|| vec![text_turn("(script exhausted)")].remove(0));
+                let (tx, rx) = tokio::sync::mpsc::channel(16);
+                tokio::spawn(async move {
+                    for e in events {
+                        let _ = tx.send(Ok(e)).await;
+                    }
+                });
+                Ok(coda_llm::ResponseStream::new(rx))
+            }
+        }
+
+        fn done_event() -> StreamEvent {
+            StreamEvent::Done { stop_reason: Some("end_turn".into()), usage: Usage::ZERO }
+        }
+
+        fn text_turn(text: &str) -> Vec<StreamEvent> {
+            vec![StreamEvent::TextDelta(text.into()), done_event()]
+        }
+
+        fn tool_turn(id: &str, name: &str, input_json: &str) -> Vec<StreamEvent> {
+            vec![
+                StreamEvent::ToolUse(Content::ToolUse {
+                    id: id.into(),
+                    name: name.into(),
+                    input_json: input_json.into(),
+                    correlation: Correlation::default(),
+                }),
+                done_event(),
+            ]
+        }
+
+        // ── Probe tool ────────────────────────────────────────────────────────
+
+        #[derive(Clone)]
+        pub(super) struct ProbeCapture {
+            pub caller_task_id: Option<String>,
+            pub task_manager: Option<Arc<TaskManager>>,
+            pub schedule_store: Option<Arc<ScheduledTaskStore>>,
+            pub has_factory: bool,
+            pub schedule_origin: Option<crate::tool::ScheduleOrigin>,
+            /// Names of the tools the child loop actually offered.
+            pub available_tools: Vec<String>,
+        }
+
+        /// Read-only tool that records the service wiring it was handed.
+        pub(super) struct ProbeTool {
+            pub seen: Arc<Mutex<Vec<ProbeCapture>>>,
+        }
+
+        #[at]
+        impl Tool for ProbeTool {
+            fn name(&self) -> &str {
+                "probe"
+            }
+            fn description(&self) -> &str {
+                "records the tool context wiring"
+            }
+            fn input_schema_json(&self) -> &str {
+                r#"{"type":"object","properties":{}}"#
+            }
+            fn is_read_only(&self) -> bool {
+                true
+            }
+            async fn execute(
+                &self,
+                _: &serde_json::Value,
+                ctx: &ToolContext,
+                _: CancellationToken,
+            ) -> ToolOutcome {
+                use crate::tool::ToolContextServiceExt as _;
+                self.seen.lock().unwrap().push(ProbeCapture {
+                    caller_task_id: ctx.caller_task_id.clone(),
+                    task_manager: ctx.get_task_manager().cloned(),
+                    schedule_store: ctx.get_schedule_store().cloned(),
+                    has_factory: ctx.get_subagent_factory().is_some(),
+                    schedule_origin: ctx.schedule_origin.clone(),
+                    available_tools: ctx
+                        .all_tools
+                        .as_ref()
+                        .map(|t| t.iter().map(|d| d.name.clone()).collect())
+                        .unwrap_or_default(),
+                });
+                ToolResult::ok("probed")
+            }
+        }
+
+        pub(super) struct AllowAll;
+        #[at]
+        impl PermissionPrompt for AllowAll {
+            async fn request(
+                &self,
+                _: &dyn crate::tool::Tool,
+                _: &str,
+                _: CancellationToken,
+            ) -> bool {
+                true
+            }
+        }
+
+        pub(super) fn manager(dir: &tempfile::TempDir) -> Arc<TaskManager> {
+            TaskManager::new("stage0-session", Some(dir.path().to_owned()), 4096, 64)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub(super) fn host_with(
+            client: Arc<dyn coda_llm::LlmClient>,
+            tools: Vec<Arc<dyn Tool>>,
+            mgr: Arc<TaskManager>,
+            max_concurrent: usize,
+        ) -> Arc<SubagentHost> {
+            SubagentHost::new(
+                client,
+                Arc::new(AllowAll),
+                Arc::new(PermissionModeState::new(
+                    crate::permission::PermissionMode::Default,
+                )),
+                Arc::new(ToolRegistry::new(tools)),
+                Arc::new(crate::tool::ToolQuarantine::new()),
+                mgr,
+                "model",
+                256,
+                10,
+                ".",
+                None,
+                max_concurrent,
+            )
+        }
+
+        pub(super) fn tool_results(sink: &CollectingSink) -> Vec<(String, String, bool)> {
+            sink.snapshot()
+                .into_iter()
+                .filter_map(|e| match e {
+                    AgentEvent::ToolResult { tool_name, content, is_error, .. } => {
+                        Some((tool_name, content, is_error))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        // ── Test 1 ────────────────────────────────────────────────────────────
+
+        /// A tool executed by a real child `AgentLoop` must see the SAME
+        /// `TaskManager` Arc the host owns and the child's OWN registered task
+        /// id — not the parent's, and never `None` (which would grant the
+        /// child main-agent authority over the whole session).
+        #[tokio::test]
+        async fn child_loop_tool_sees_shared_task_manager_and_own_task_id() {
+            let dir = tempfile::tempdir().unwrap();
+            let mgr = manager(&dir);
+            let seen = Arc::new(Mutex::new(Vec::new()));
+
+            let client = ScriptedClient::new(vec![
+                tool_turn("p1", "probe", "{}"),
+                text_turn("child done"),
+            ]);
+            let host = host_with(
+                client,
+                vec![
+                    Arc::new(ProbeTool { seen: Arc::clone(&seen) }) as Arc<dyn Tool>,
+                    Arc::new(crate::tools::TaskListTool) as Arc<dyn Tool>,
+                ],
+                Arc::clone(&mgr),
+                4,
+            );
+
+            // The child's own task, as the `task` tool registers it.
+            let child = mgr
+                .register(TaskKind::Subagent, "child work", None, TaskExecutionMode::Foreground)
+                .unwrap();
+
+            let mut request =
+                SubagentRequest::foreground("general-purpose", "probe please", &child.id, 1);
+            request.caller_task_id = None;
+
+            let sink = Arc::new(CollectingSink::new());
+            host.spawn(request, sink.clone(), CancellationToken::new()).await.unwrap();
+
+            let captures = seen.lock().unwrap().clone();
+            assert_eq!(captures.len(), 1, "the probe tool must have run in the child loop");
+            let c = &captures[0];
+            assert_eq!(
+                c.caller_task_id.as_deref(),
+                Some(child.id.as_str()),
+                "the child loop must carry its OWN registered task id"
+            );
+            let child_mgr = c.task_manager.as_ref().expect("child must receive the task manager");
+            assert!(
+                Arc::ptr_eq(child_mgr, &mgr),
+                "the child must share the host's TaskManager instance, not a new one"
+            );
+            assert!(c.has_factory, "the child must receive a subagent factory");
+        }
+
+        /// A stateful tool inside the child must not answer "not available".
+        #[tokio::test]
+        async fn child_loop_stateful_tools_are_wired() {
+            let dir = tempfile::tempdir().unwrap();
+            let mgr = manager(&dir);
+
+            let client = ScriptedClient::new(vec![
+                tool_turn("t1", "task_list", "{}"),
+                text_turn("child done"),
+            ]);
+            let host = host_with(
+                client,
+                vec![Arc::new(crate::tools::TaskListTool) as Arc<dyn Tool>],
+                Arc::clone(&mgr),
+                4,
+            );
+
+            let child = mgr
+                .register(TaskKind::Subagent, "child work", None, TaskExecutionMode::Foreground)
+                .unwrap();
+            let request =
+                SubagentRequest::foreground("general-purpose", "list tasks", &child.id, 1);
+
+            let sink = Arc::new(CollectingSink::new());
+            host.spawn(request, sink.clone(), CancellationToken::new()).await.unwrap();
+
+            let results = tool_results(&sink);
+            let (_, content, is_error) = results
+                .iter()
+                .find(|(name, _, _)| name == "task_list")
+                .expect("task_list must produce a result");
+            assert!(!is_error, "task_list must succeed inside a child loop; got: {content}");
+            assert!(
+                !content.contains("not available"),
+                "the child must reach the shared task manager; got: {content}"
+            );
+        }
+
+        // ── Test 2 ────────────────────────────────────────────────────────────
+
+        /// The real `task` tool inside a depth-1 child registers a depth-2
+        /// grandchild under the child, and the grandchild cannot nest further.
+        #[tokio::test]
+        async fn nested_task_tool_builds_the_authorization_tree_and_stops_at_depth_two() {
+            let dir = tempfile::tempdir().unwrap();
+            let mgr = manager(&dir);
+            let seen = Arc::new(Mutex::new(Vec::new()));
+
+            let client = ScriptedClient::new(vec![
+                // depth-1 child: spawn a grandchild
+                tool_turn("c1", "task", r#"{"prompt":"grandchild work"}"#),
+                // depth-2 grandchild: probe, then try to nest further
+                tool_turn("g1", "probe", "{}"),
+                tool_turn("g2", "task", r#"{"prompt":"great-grandchild"}"#),
+                text_turn("grandchild done"),
+                // back in the depth-1 child
+                text_turn("child done"),
+            ]);
+            let host = host_with(
+                client,
+                vec![
+                    Arc::new(ProbeTool { seen: Arc::clone(&seen) }) as Arc<dyn Tool>,
+                    Arc::new(crate::tools::TaskTool) as Arc<dyn Tool>,
+                ],
+                Arc::clone(&mgr),
+                8,
+            );
+
+            let child = mgr
+                .register(TaskKind::Subagent, "child work", None, TaskExecutionMode::Foreground)
+                .unwrap();
+            let request =
+                SubagentRequest::foreground("general-purpose", "delegate", &child.id, 1);
+
+            let sink = Arc::new(CollectingSink::new());
+            host.spawn(request, sink.clone(), CancellationToken::new()).await.unwrap();
+
+            let captures = seen.lock().unwrap().clone();
+            assert_eq!(captures.len(), 1, "the grandchild probe must have run");
+            let grandchild_id = captures[0]
+                .caller_task_id
+                .clone()
+                .expect("the grandchild must have its own task identity");
+            let snapshot = mgr
+                .get(&grandchild_id)
+                .expect("the grandchild id must be registered with the shared manager");
+            assert_eq!(snapshot.depth, 2, "a child of a depth-1 task is depth 2");
+            assert_eq!(
+                snapshot.parent_id.as_deref(),
+                Some(child.id.as_str()),
+                "the authorization tree must record the depth-1 child as the parent"
+            );
+            assert!(
+                mgr.is_authorized_caller(&grandchild_id, Some(&child.id)),
+                "the parent must be authorized over its descendant"
+            );
+            assert!(
+                !mgr.is_authorized_caller(&child.id, Some(&grandchild_id)),
+                "a grandchild must NOT be authorized over its own parent"
+            );
+
+            // Depth-2 children never receive task-management tools, so the
+            // grandchild's attempt to nest further has nothing to call and no
+            // depth-3 task can ever be registered.
+            assert!(
+                !captures[0].available_tools.iter().any(|n| n == "task"),
+                "a depth-2 grandchild must not be offered the task tool; offered: {:?}",
+                captures[0].available_tools
+            );
+            assert!(
+                mgr.list().iter().all(|t| t.depth <= 2),
+                "no task deeper than {MAX_SUBAGENT_DEPTH} may ever be registered; got: {:?}",
+                mgr.list().iter().map(|t| (t.id.clone(), t.depth)).collect::<Vec<_>>()
+            );
+        }
+
+        /// The factory handed to a child must reuse the host's semaphore.
+        /// A fresh `Semaphore` in the clone would silently multiply the
+        /// configured concurrency ceiling by the nesting depth.
+        #[tokio::test]
+        async fn child_factory_shares_the_parent_concurrency_pool() {
+            let dir = tempfile::tempdir().unwrap();
+            let mgr = manager(&dir);
+
+            let client = ScriptedClient::new(vec![
+                tool_turn("c1", "task", r#"{"prompt":"grandchild work"}"#),
+                text_turn("child done"),
+            ]);
+            // Pool of 2: one permit held below, one taken by the child itself.
+            let host = host_with(
+                client,
+                vec![Arc::new(crate::tools::TaskTool) as Arc<dyn Tool>],
+                Arc::clone(&mgr),
+                2,
+            );
+            let _held = host.semaphore.try_acquire().expect("a slot must be free");
+
+            let child = mgr
+                .register(TaskKind::Subagent, "child work", None, TaskExecutionMode::Foreground)
+                .unwrap();
+            let request =
+                SubagentRequest::foreground("general-purpose", "delegate", &child.id, 1);
+
+            let sink = Arc::new(CollectingSink::new());
+            host.spawn(request, sink.clone(), CancellationToken::new()).await.unwrap();
+
+            let results = tool_results(&sink);
+            let (_, content, is_error) = results
+                .iter()
+                .find(|(name, _, _)| name == "task")
+                .expect("the nested task call must produce a result");
+            assert!(is_error, "the nested spawn must be refused; got: {content}");
+            assert!(
+                content.contains("slots are taken"),
+                "the child factory must draw from the SAME pool; got: {content}"
+            );
+        }
+
+        /// A read-only definition keeps read-only tools and loses every
+        /// mutating / task-management tool, even with the services wired.
+        #[tokio::test]
+        async fn read_only_child_keeps_probe_but_loses_task_tools() {
+            let dir = tempfile::tempdir().unwrap();
+            let mgr = manager(&dir);
+            let seen = Arc::new(Mutex::new(Vec::new()));
+
+            let client = ScriptedClient::new(vec![
+                tool_turn("r1", "probe", "{}"),
+                tool_turn("r2", "task_list", "{}"),
+                text_turn("explore done"),
+            ]);
+            let host = host_with(
+                client,
+                vec![
+                    Arc::new(ProbeTool { seen: Arc::clone(&seen) }) as Arc<dyn Tool>,
+                    Arc::new(crate::tools::TaskListTool) as Arc<dyn Tool>,
+                    Arc::new(crate::tools::TaskTool) as Arc<dyn Tool>,
+                ],
+                Arc::clone(&mgr),
+                4,
+            );
+
+            let child = mgr
+                .register(TaskKind::Subagent, "explore work", None, TaskExecutionMode::Foreground)
+                .unwrap();
+            let request = SubagentRequest::foreground("explore", "investigate", &child.id, 1);
+
+            let sink = Arc::new(CollectingSink::new());
+            host.spawn(request, sink.clone(), CancellationToken::new()).await.unwrap();
+
+            assert_eq!(
+                seen.lock().unwrap().len(),
+                1,
+                "a read-only child must still run read-only tools"
+            );
+            let results = tool_results(&sink);
+            assert!(
+                results
+                    .iter()
+                    .any(|(name, content, _)| name == "task_list"
+                        && content.contains("Unknown tool")),
+                "task_list must be stripped from a read-only child; results: {results:?}"
+            );
+        }
+
+        /// A hook-free host must stay hook-free through every clone used to
+        /// build the child's factory (otherwise agent-type hooks re-enter).
+        #[tokio::test]
+        async fn hook_free_host_clones_stay_hook_free() {
+            let dir = tempfile::tempdir().unwrap();
+            let mgr = manager(&dir);
+            let client = ScriptedClient::new(vec![text_turn("done")]);
+            let host = host_with(client, vec![], Arc::clone(&mgr), 4);
+
+            assert!(host.hook_runner.is_none(), "fixture must be hook-free");
+            assert!(
+                host.clone_for_background().hook_runner.is_none(),
+                "the factory clone handed to children must not gain a hook runner"
+            );
+        }
+
+        /// A background spawn must run under the task it just registered, not
+        /// under whatever id the caller happened to put in the request.
+        #[tokio::test]
+        async fn background_child_runs_under_its_own_registered_task_id() {
+            let dir = tempfile::tempdir().unwrap();
+            let mgr = manager(&dir);
+            let seen = Arc::new(Mutex::new(Vec::new()));
+
+            let client = ScriptedClient::new(vec![
+                tool_turn("b1", "probe", "{}"),
+                text_turn("background done"),
+            ]);
+            let host = host_with(
+                client,
+                vec![Arc::new(ProbeTool { seen: Arc::clone(&seen) }) as Arc<dyn Tool>],
+                Arc::clone(&mgr),
+                4,
+            );
+
+            let mut request =
+                SubagentRequest::foreground("general-purpose", "background work", "", 1);
+            request.foreground = false;
+            let task_id = host
+                .spawn(request, Arc::new(CollectingSink::new()), CancellationToken::new())
+                .await
+                .unwrap();
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while seen.lock().unwrap().is_empty() {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the background child must run the probe");
+
+            let captures = seen.lock().unwrap().clone();
+            assert_eq!(
+                captures[0].caller_task_id.as_deref(),
+                Some(task_id.as_str()),
+                "the background child's identity must be the task the host registered"
+            );
+            assert!(mgr.get(&task_id).is_some());
+        }
+
+        // ── Test 3: schedule store + scheduled origin ─────────────────────────
+
+        /// The child must see the SAME schedule store the session owns — a
+        /// definition created by a subagent has to be visible to the main
+        /// agent and to the schedule runtime. An ordinary (non-scheduled)
+        /// child still gets no `schedule_list` visibility of its own: the
+        /// main-agent-only / origin-scoped policy refuses it, but the
+        /// refusal must come from the policy check, never from the store
+        /// wiring itself being missing.
+        #[tokio::test]
+        async fn child_loop_shares_the_hosts_schedule_store() {
+            let dir = tempfile::tempdir().unwrap();
+            let mgr = manager(&dir);
+            let store = ScheduledTaskStore::new();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+
+            let client = ScriptedClient::new(vec![
+                tool_turn("p1", "probe", "{}"),
+                tool_turn("s1", "schedule_list", "{}"),
+                text_turn("done"),
+            ]);
+            let host = host_with(
+                client,
+                vec![
+                    Arc::new(ProbeTool { seen: Arc::clone(&seen) }) as Arc<dyn Tool>,
+                    Arc::new(crate::tools::ScheduleListTool) as Arc<dyn Tool>,
+                ],
+                Arc::clone(&mgr),
+                4,
+            )
+            .with_schedule_store(Arc::clone(&store));
+
+            let child = mgr
+                .register(TaskKind::Subagent, "child work", None, TaskExecutionMode::Foreground)
+                .unwrap();
+            let request = SubagentRequest::foreground("general-purpose", "look", &child.id, 1);
+
+            let sink = Arc::new(CollectingSink::new());
+            host.spawn(request, sink.clone(), CancellationToken::new()).await.unwrap();
+
+            let captures = seen.lock().unwrap().clone();
+            let child_store = captures[0]
+                .schedule_store
+                .as_ref()
+                .expect("the child must receive the schedule store");
+            assert!(
+                Arc::ptr_eq(child_store, &store),
+                "the child must share the session's schedule store instance"
+            );
+
+            let results = tool_results(&sink);
+            let (_, content, is_error) = results
+                .iter()
+                .find(|(name, _, _)| name == "schedule_list")
+                .expect("schedule_list must produce a result");
+            assert!(
+                is_error,
+                "an ordinary child with no scheduled-run origin must be refused; got: {content}"
+            );
+            assert_ne!(
+                content, "Schedule store is not available.",
+                "the refusal must come from the origin policy, not missing wiring"
+            );
+            assert!(
+                content.contains("scheduled-run origin"),
+                "the refusal must state the reason clearly; got: {content}"
+            );
+        }
+
+        /// A scheduled run's origin travels into the child AND into a nested
+        /// grandchild, while ordinary main-agent work carries no origin.
+        #[tokio::test]
+        async fn scheduled_origin_propagates_to_child_and_nested_grandchild() {
+            use crate::tool::ScheduleOrigin;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mgr = manager(&dir);
+            let seen = Arc::new(Mutex::new(Vec::new()));
+
+            let client = ScriptedClient::new(vec![
+                // scheduled depth-1 run: probe, then delegate
+                tool_turn("s1", "probe", "{}"),
+                tool_turn("s2", "task", r#"{"prompt":"sub-work","originScheduleId":"other-job"}"#),
+                // grandchild
+                tool_turn("g1", "probe", "{}"),
+                text_turn("grandchild done"),
+                text_turn("scheduled done"),
+                // second run: ordinary main-agent child
+                tool_turn("o1", "probe", "{}"),
+                text_turn("ordinary done"),
+            ]);
+            let host = host_with(
+                client,
+                vec![
+                    Arc::new(ProbeTool { seen: Arc::clone(&seen) }) as Arc<dyn Tool>,
+                    Arc::new(crate::tools::TaskTool) as Arc<dyn Tool>,
+                ],
+                Arc::clone(&mgr),
+                8,
+            );
+
+            let origin = ScheduleOrigin::new("sched-42", Some("nightly audit".into()));
+            let scheduled = mgr
+                .register(TaskKind::Scheduled, "Scheduled: nightly", None, TaskExecutionMode::Background)
+                .unwrap();
+            let request =
+                SubagentRequest::foreground("general-purpose", "run job", &scheduled.id, 1)
+                    .with_schedule_origin(Some(origin.clone()));
+            host.spawn(request, Arc::new(CollectingSink::new()), CancellationToken::new())
+                .await
+                .unwrap();
+
+            let ordinary = mgr
+                .register(TaskKind::Subagent, "ordinary", None, TaskExecutionMode::Foreground)
+                .unwrap();
+            host.spawn(
+                SubagentRequest::foreground("general-purpose", "plain work", &ordinary.id, 1),
+                Arc::new(CollectingSink::new()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+            let captures = seen.lock().unwrap().clone();
+            assert_eq!(captures.len(), 3, "scheduled child, grandchild, ordinary child");
+            assert_eq!(
+                captures[0].schedule_origin.as_ref(),
+                Some(&origin),
+                "the scheduled run's child must carry the trusted origin"
+            );
+            assert_eq!(
+                captures[1].schedule_origin.as_ref(),
+                Some(&origin),
+                "a nested child inherits the origin of the job it runs inside — and the \
+                 model's 'originScheduleId' argument must not have changed it"
+            );
+            assert_eq!(
+                captures[2].schedule_origin, None,
+                "ordinary main-agent work carries no scheduled origin"
+            );
+        }
+
+        // ── Test 4: real child loop cannot probe a sibling task ──────────────
+
+        /// A depth-1 child gets the full task-management tool set (see
+        /// `resolve_child_tools`), but it must still be unable to reach a
+        /// SIBLING task's output or terminal status via `task_peek` /
+        /// `task_wait` — the manager-level authorization gate must hold
+        /// through a real scripted `AgentLoop`, not just in isolated tool
+        /// unit tests.
+        #[tokio::test]
+        async fn real_child_loop_cannot_peek_or_wait_on_a_sibling_task() {
+            const SIBLING_CANARY: &str = "SIBLING_CANARY_REAL_CHILD_LOOP";
+
+            let dir = tempfile::tempdir().unwrap();
+            let mgr = manager(&dir);
+
+            // An unrelated top-level task the child has no authority over.
+            let sibling = mgr
+                .register(TaskKind::Subagent, "sibling work", None, TaskExecutionMode::Foreground)
+                .unwrap();
+            mgr.append_output(&sibling.id, SIBLING_CANARY);
+            mgr.complete(&sibling.id, Some(SIBLING_CANARY.into()));
+
+            let client = ScriptedClient::new(vec![
+                tool_turn("peek1", "task_peek", &format!(r#"{{"taskId":"{}"}}"#, sibling.id)),
+                tool_turn("wait1", "task_wait", &format!(r#"{{"taskId":"{}"}}"#, sibling.id)),
+                text_turn("done"),
+            ]);
+            let host = host_with(
+                client,
+                vec![
+                    Arc::new(crate::tools::TaskPeekTool) as Arc<dyn Tool>,
+                    Arc::new(crate::tools::TaskWaitTool) as Arc<dyn Tool>,
+                ],
+                Arc::clone(&mgr),
+                4,
+            );
+
+            let child = mgr
+                .register(TaskKind::Subagent, "child work", None, TaskExecutionMode::Foreground)
+                .unwrap();
+            let request =
+                SubagentRequest::foreground("general-purpose", "probe sibling", &child.id, 1);
+
+            let sink = Arc::new(CollectingSink::new());
+            host.spawn(request, sink.clone(), CancellationToken::new()).await.unwrap();
+
+            let results = tool_results(&sink);
+            let (_, peek_content, peek_is_error) = results
+                .iter()
+                .find(|(name, _, _)| name == "task_peek")
+                .expect("task_peek must produce a result");
+            let (_, wait_content, wait_is_error) = results
+                .iter()
+                .find(|(name, _, _)| name == "task_wait")
+                .expect("task_wait must produce a result");
+
+            assert!(peek_is_error, "task_peek on a sibling must be denied");
+            assert_eq!(
+                *peek_content,
+                format!("Task '{}' not found.", sibling.id),
+                "the denial must look identical to not-found"
+            );
+            assert!(
+                !peek_content.contains(SIBLING_CANARY),
+                "task_peek must not leak the sibling's output: {peek_content}"
+            );
+
+            assert!(wait_is_error, "task_wait on a sibling must be denied");
+            assert_eq!(
+                *wait_content,
+                format!("Task '{}' not found.", sibling.id),
+                "the denial must look identical to not-found"
+            );
+            assert!(
+                !wait_content.contains(SIBLING_CANARY),
+                "task_wait must not leak the sibling's result: {wait_content}"
+            );
+            assert!(
+                !wait_content.contains("completed"),
+                "task_wait must not leak the sibling's terminal status: {wait_content}"
+            );
+        }
     }
 }

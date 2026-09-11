@@ -43,6 +43,14 @@ impl Tool for ScheduleCreateTool {
     }
 
     async fn execute(&self, input: &Value, ctx: &ToolContext, _cancel: CancellationToken) -> ToolOutcome {
+        // POLICY: arbitrary schedule management is main-agent only. A trusted
+        // scheduled-run origin does NOT grant create rights either — the only
+        // origin-scoped self-action is a future, targetless self-cancel.
+        // Reject before any lookup or mutation.
+        if ctx.caller_task_id.is_some() {
+            return ToolResult::error("schedule_create is only available to the main agent.");
+        }
+
         let prompt = match input.get("prompt").and_then(Value::as_str) {
             Some(p) if !p.trim().is_empty() => p.trim().to_owned(),
             _ => return ToolResult::error("Missing required 'prompt'."),
@@ -210,6 +218,12 @@ mod tests {
         ToolContext::new(".").with_schedule_store(store)
     }
 
+    fn ctx_with_caller(store: Arc<ScheduledTaskStore>, caller_id: &str) -> ToolContext {
+        ToolContext::new(".")
+            .with_schedule_store(store)
+            .with_caller_task_id(caller_id)
+    }
+
     #[tokio::test]
     async fn create_interval_schedule() {
         let s = ScheduledTaskStore::new();
@@ -277,5 +291,47 @@ mod tests {
             )
             .await;
         assert!(result.is_error);
+    }
+
+    // ── POLICY: schedule management is main-agent only ───────────────────────
+
+    /// A child (subagent) must be refused before any mutation, even though the
+    /// schedule store is injected into its tool context.
+    #[tokio::test]
+    async fn child_caller_cannot_create_schedule_store_unchanged() {
+        let s = ScheduledTaskStore::new();
+        let result = ScheduleCreateTool
+            .execute(
+                &serde_json::json!({"prompt": "run this", "every": "30m"}),
+                &ctx_with_caller(s.clone(), "task-0001"),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(result.is_error, "children must be refused");
+        assert!(
+            s.items().is_empty(),
+            "no schedule may be created on behalf of a child"
+        );
+    }
+
+    /// Even a run stamped with a trusted scheduled origin (a nested child of a
+    /// scheduled job) must not be able to create new arbitrary schedules —
+    /// only a dedicated, targetless self-action (Stage 1) may use its origin.
+    #[tokio::test]
+    async fn child_caller_with_schedule_origin_still_cannot_create() {
+        use crate::tool::ScheduleOrigin;
+
+        let s = ScheduledTaskStore::new();
+        let ctx = ctx_with_caller(s.clone(), "task-0001")
+            .with_schedule_origin(ScheduleOrigin::new("sched-1", None));
+        let result = ScheduleCreateTool
+            .execute(
+                &serde_json::json!({"prompt": "run this", "every": "30m"}),
+                &ctx,
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(result.is_error, "trusted origin does not grant create rights");
+        assert!(s.items().is_empty());
     }
 }

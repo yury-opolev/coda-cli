@@ -314,6 +314,12 @@ impl ForkedAgent for LlmForkedAgent {
 struct SessionServices {
     hook_runner: Arc<HookRunner>,
     subagent_host: Arc<SubagentHost>,
+    /// The hook-free host handed to the `HookRunner` for agent-type hooks.
+    /// Test-only: retained so tests can assert it shares exactly the same
+    /// service handles as the hooked host. Production code reaches it
+    /// through the hook runner and never needs this field directly.
+    #[cfg(test)]
+    hook_free_subagent_host: Arc<SubagentHost>,
     schedule_runtime: Arc<ScheduleRuntime>,
 }
 
@@ -1794,6 +1800,9 @@ impl ServeHost {
             runtime.lock().expect("runtime config poisoned").model.clone()
         });
         // 1. Hook-free subagent (prevents hook re-entrancy for agent-type hooks).
+        //    It receives the SAME in-memory schedule store as the main agent
+        //    loop and the hooked host, so a definition created anywhere in the
+        //    session is visible everywhere (and to the schedule runtime).
         let hook_free_subagent = SubagentHost::with_defaults(
             Arc::clone(&client),
             Arc::clone(&self.permission_prompt),
@@ -1801,7 +1810,9 @@ impl ServeHost {
             Arc::clone(&self.tools),
             Arc::clone(&self.task_manager),
             self.working_dir.clone(),
-        ).with_model_source(Arc::clone(&model_source));
+        )
+        .with_model_source(Arc::clone(&model_source))
+        .with_schedule_store(Arc::clone(&self.schedule_store));
 
         // 2. Trust guard using the session-scoped trust store.
         let trust_guard = HookTrustGuard::new(
@@ -1818,7 +1829,7 @@ impl ServeHost {
             executor,
             Some(Arc::new(trust_guard)),
             None,
-            Some(hook_free_subagent as Arc<dyn SubagentFactory>),
+            Some(Arc::clone(&hook_free_subagent) as Arc<dyn SubagentFactory>),
             Vec::new(), // no HTTP allowlist; http hooks require explicit opt-in
         ));
 
@@ -1836,7 +1847,9 @@ impl ServeHost {
             self.working_dir.clone(),
             Some(Arc::clone(&hook_runner)),
             MAX_CONCURRENT_SUBAGENTS,
-        ).with_model_source(model_source);
+        )
+        .with_model_source(model_source)
+        .with_schedule_store(Arc::clone(&self.schedule_store));
 
         // 5. Schedule runtime — fires due scheduled tasks via the main subagent.
         let runner = TaskManagerRunner::new(
@@ -1852,6 +1865,8 @@ impl ServeHost {
         SessionServices {
             hook_runner,
             subagent_host: main_subagent,
+            #[cfg(test)]
+            hook_free_subagent_host: hook_free_subagent,
             schedule_runtime,
         }
     }
@@ -9202,11 +9217,19 @@ mod tests {
         let runner = TaskManagerRunner::new(host.task_manager.clone(), services.subagent_host.clone());
         let (done, completed) = tokio::sync::oneshot::channel();
         let done = Mutex::new(Some(done));
-        runner.start("scheduled reply".into(), "scheduled".into(), Arc::new(move |_| {
-            if let Some(done) = done.lock().unwrap().take() {
-                let _ = done.send(());
-            }
-        })).unwrap();
+        runner.start(
+            coda_agent::scheduling::ScheduledRun {
+                definition_id: "sched-1".into(),
+                definition_name: Some("scheduled".into()),
+                prompt: "scheduled reply".into(),
+                description: "scheduled".into(),
+            },
+            Arc::new(move |_| {
+                if let Some(done) = done.lock().unwrap().take() {
+                    let _ = done.send(());
+                }
+            }),
+        ).unwrap();
         tokio::time::timeout(Duration::from_secs(5), completed).await.unwrap().unwrap();
 
         let mut background = request();
@@ -9221,6 +9244,39 @@ mod tests {
         let models: Vec<_> = client.requests.lock().unwrap().iter()
             .map(|request| request.model.clone()).collect();
         assert_eq!(models, ["model-a", "model-b", "explicit-model", "model-b", "model-b"]);
+    }
+
+    // ── STAGE 0: one in-memory schedule store for the whole session ──────────
+
+    /// Both the hooked and the hook-free subagent host must write into the
+    /// SAME session schedule store the main agent loop and the schedule
+    /// runtime use.  A per-host store would make a schedule created inside a
+    /// subagent invisible to everything that can actually fire it.
+    ///
+    /// STAGE0 made `schedule_create`/`schedule_delete`/`schedule_list`
+    /// (mostly) main-agent-only, so this can no longer be proven by spawning
+    /// a child to call a schedule tool (that call is now correctly refused).
+    /// Instead this asserts the wiring directly: every host must hold the
+    /// exact same `Arc<ScheduledTaskStore>` as the session.
+    #[tokio::test]
+    async fn session_schedule_store_is_shared_by_main_and_hook_free_subagent_hosts() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = ScriptedClient::new(vec![]);
+        let host = make_host_in_dir(dir.path().to_str().unwrap(), client.clone());
+        let services = host.build_session_services(client);
+
+        for (host_under_test, label) in [
+            (&services.subagent_host, "main"),
+            (&services.hook_free_subagent_host, "hook-free"),
+        ] {
+            let wired = host_under_test
+                .schedule_store()
+                .unwrap_or_else(|| panic!("{label} host must have a schedule store wired"));
+            assert!(
+                Arc::ptr_eq(wired, &host.schedule_store),
+                "the {label} host must share the SAME schedule store instance as the session"
+            );
+        }
     }
 
     #[tokio::test]

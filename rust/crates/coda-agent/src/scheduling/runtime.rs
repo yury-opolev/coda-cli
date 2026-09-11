@@ -39,6 +39,7 @@ use super::scheduled_task::{
 };
 use super::scheduled_task_store::ScheduledTaskStore;
 use crate::tasks::{TaskKind, TaskExecutionMode, TaskManager, TaskSnapshot};
+use crate::tool::ScheduleOrigin;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public types
@@ -99,8 +100,57 @@ pub trait ScheduleRuntimeView: Send + Sync {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Clock seam
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The runtime's source of "now".
+///
+/// Every scheduling *decision* (is a definition due? what is the next
+/// boundary? when did this run reach a terminal state?) reads this seam rather
+/// than `Utc::now()` directly, so tests can drive hours of schedule behaviour
+/// deterministically without sleeping.
+///
+/// `TaskManager`'s own bookkeeping timestamps are deliberately *not* routed
+/// through this trait: they record when a process actually ran, not when the
+/// scheduler decided something.
+pub trait ScheduleClock: Send + Sync {
+    fn now(&self) -> DateTime<Utc>;
+}
+
+/// Wall-clock implementation; the default for every production runtime.
+pub struct SystemClock;
+
+impl ScheduleClock for SystemClock {
+    fn now(&self) -> DateTime<Utc> {
+        Utc::now()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ScheduledAgentRunner — launches one agent run per scheduled task
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// One launch request produced by the schedule runtime.
+///
+/// Carries the definition identity alongside the prompt so the runner can
+/// stamp the run's provenance ([`ScheduleOrigin`]). The origin travels with
+/// the request through the subagent host into `ToolContext`; a later stage
+/// uses it for self-cancellation, which is why it must come from the runtime
+/// and never from the prompt text.
+#[derive(Debug, Clone)]
+pub struct ScheduledRun {
+    pub definition_id: String,
+    pub definition_name: Option<String>,
+    pub prompt: String,
+    pub description: String,
+}
+
+impl ScheduledRun {
+    /// The trusted provenance stamp for this run.
+    pub fn origin(&self) -> ScheduleOrigin {
+        ScheduleOrigin::new(self.definition_id.clone(), self.definition_name.clone())
+    }
+}
 
 /// Trait for launching a scheduled agent execution.
 /// Implementors register a task with the manager, start the agent, and call
@@ -110,8 +160,7 @@ pub trait ScheduledAgentRunner: Send + Sync {
     /// message when registration / launch fails.
     fn start(
         &self,
-        prompt: String,
-        description: String,
+        run: ScheduledRun,
         on_terminal: Arc<dyn Fn(TaskSnapshot) + Send + Sync>,
     ) -> Result<String, String>;
 }
@@ -134,13 +183,12 @@ impl TaskManagerRunner {
 impl ScheduledAgentRunner for TaskManagerRunner {
     fn start(
         &self,
-        prompt: String,
-        description: String,
+        run: ScheduledRun,
         on_terminal: Arc<dyn Fn(TaskSnapshot) + Send + Sync>,
     ) -> Result<String, String> {
         let task = self.task_manager.register(
             TaskKind::Scheduled,
-            &description,
+            &run.description,
             None,
             TaskExecutionMode::Background,
         )?;
@@ -151,14 +199,19 @@ impl ScheduledAgentRunner for TaskManagerRunner {
         let mgr = self.task_manager.clone();
         let tid = task_id.clone();
         let sink = Arc::new(crate::events::NullSink);
+        let origin = run.origin();
+        let prompt = run.prompt;
 
         tokio::spawn(async move {
+            // The scheduled run's own registered task is the child's caller
+            // identity, and the definition id is its trusted origin.
             let request = crate::subagents::SubagentRequest::foreground(
                 "general-purpose",
-                prompt.clone(),
+                prompt,
                 tid.clone(),
                 1,
-            );
+            )
+            .with_schedule_origin(Some(origin));
 
             let run_cancel = task_cancel.clone();
             match factory.spawn(request, sink, run_cancel).await {
@@ -228,10 +281,26 @@ pub struct ScheduleRuntime {
 }
 
 impl ScheduleRuntime {
+    /// Runtime driven by the wall clock.
     pub fn new(
         store: Arc<ScheduledTaskStore>,
         runner: Arc<dyn ScheduledAgentRunner>,
         lifecycle_sink: Arc<dyn ScheduleLifecycleSink>,
+    ) -> Arc<Self> {
+        Self::new_with_clock(store, runner, lifecycle_sink, Arc::new(SystemClock))
+    }
+
+    /// Runtime driven by an injected clock.
+    ///
+    /// Tests use this to evaluate due-ness, recurrence advancement and
+    /// terminal timestamps at arbitrary points in time without sleeping.  The
+    /// loop still wakes on store-version notifications, so a test advances the
+    /// clock and then touches the store to force a re-evaluation.
+    pub fn new_with_clock(
+        store: Arc<ScheduledTaskStore>,
+        runner: Arc<dyn ScheduledAgentRunner>,
+        lifecycle_sink: Arc<dyn ScheduleLifecycleSink>,
+        clock: Arc<dyn ScheduleClock>,
     ) -> Arc<Self> {
         let (tx, rx) = mpsc::unbounded_channel();
         let cancel = CancellationToken::new();
@@ -263,6 +332,7 @@ impl ScheduleRuntime {
             loop_commands_tx,
             loop_view,
             loop_cancel,
+            clock,
         ));
 
         // Store handle — but we can't block here (async context), so we use
@@ -316,6 +386,7 @@ async fn run_loop(
     commands_tx: UnboundedSender<TerminalCommand>,
     view: Arc<RwLock<HashMap<String, ScheduleRuntimeState>>>,
     cancel: CancellationToken,
+    clock: Arc<dyn ScheduleClock>,
 ) {
     let mut entries: HashMap<String, Entry> = HashMap::new();
 
@@ -331,13 +402,13 @@ async fn run_loop(
         // 2. Process queued terminal callbacks.
         while let Ok(cmd) = commands_rx.try_recv() {
             if cancel.is_cancelled() { break; }
-            process_terminal(&mut entries, cmd, &store, &runner, &sink, &commands_tx, &view).await;
+            process_terminal(&mut entries, cmd, &store, &runner, &sink, &commands_tx, &view, &clock).await;
         }
 
         if cancel.is_cancelled() { break; }
 
         // 3. Evaluate due definitions.
-        evaluate_due(&mut entries, &store, &runner, &sink, &commands_tx, &view, &cancel).await;
+        evaluate_due(&mut entries, &store, &runner, &sink, &commands_tx, &view, &cancel, &clock).await;
 
         if cancel.is_cancelled() { break; }
 
@@ -346,7 +417,7 @@ async fn run_loop(
         reconcile(&mut entries, &wait_snapshot, &view);
 
         // 5. Wait for next event.
-        let now = Utc::now();
+        let now = clock.now();
         let delay = compute_delay(&entries, now);
         let observed_version = wait_snapshot.version;
 
@@ -416,8 +487,9 @@ async fn evaluate_due(
     commands_tx: &UnboundedSender<TerminalCommand>,
     view: &Arc<RwLock<HashMap<String, ScheduleRuntimeState>>>,
     cancel: &CancellationToken,
+    clock: &Arc<dyn ScheduleClock>,
 ) {
-    let now = Utc::now();
+    let now = clock.now();
     let ids: Vec<String> = entries.keys().cloned().collect();
 
     for id in ids {
@@ -528,7 +600,14 @@ fn launch(
         def_clone.name.as_deref().unwrap_or(&def_clone.prompt)
     );
 
-    match runner_clone.start(def_clone.prompt.clone(), description, on_terminal) {
+    let scheduled_run = ScheduledRun {
+        definition_id: def_clone.id.clone(),
+        definition_name: def_clone.name.clone(),
+        prompt: def_clone.prompt.clone(),
+        description,
+    };
+
+    match runner_clone.start(scheduled_run, on_terminal) {
         Ok(task_id) => {
             let entry = entries.get_mut(id).unwrap();
             entry.status = RuntimeStatus::Running;
@@ -611,6 +690,7 @@ async fn process_terminal(
     sink: &Arc<dyn ScheduleLifecycleSink>,
     commands_tx: &UnboundedSender<TerminalCommand>,
     view: &Arc<RwLock<HashMap<String, ScheduleRuntimeState>>>,
+    clock: &Arc<dyn ScheduleClock>,
 ) {
     let entry = match entries.get(&command.definition_id) {
         Some(e) => e,
@@ -621,7 +701,7 @@ async fn process_terminal(
         return; // Stale terminal for a different task
     }
 
-    let now = Utc::now();
+    let now = clock.now();
     let definition = entry.definition.clone();
     let deleted = entry.deleted;
     let was_pending = entry.status == RuntimeStatus::Pending;
@@ -773,6 +853,8 @@ pub(crate) mod tests {
     pub struct MockRunner {
         pub launch_count: Arc<AtomicUsize>,
         pub task_ids: std::sync::Mutex<Vec<String>>,
+        /// Every `ScheduledRun` the runtime handed to this runner, in order.
+        pub runs: std::sync::Mutex<Vec<ScheduledRun>>,
         /// When true, immediately call on_terminal with Completed status.
         pub auto_complete: bool,
         /// When set, calls on_terminal with Failed status.
@@ -784,7 +866,19 @@ pub(crate) mod tests {
             Arc::new(Self {
                 launch_count: Arc::new(AtomicUsize::new(0)),
                 task_ids: std::sync::Mutex::new(Vec::new()),
+                runs: std::sync::Mutex::new(Vec::new()),
                 auto_complete: true,
+                fail_on_launch: false,
+            })
+        }
+
+        /// Runner that never completes its launches (keeps tasks Running).
+        pub fn never_completes() -> Arc<Self> {
+            Arc::new(Self {
+                launch_count: Arc::new(AtomicUsize::new(0)),
+                task_ids: std::sync::Mutex::new(Vec::new()),
+                runs: std::sync::Mutex::new(Vec::new()),
+                auto_complete: false,
                 fail_on_launch: false,
             })
         }
@@ -793,13 +887,13 @@ pub(crate) mod tests {
     impl ScheduledAgentRunner for MockRunner {
         fn start(
             &self,
-            _prompt: String,
-            _description: String,
+            run: ScheduledRun,
             on_terminal: Arc<dyn Fn(TaskSnapshot) + Send + Sync>,
         ) -> Result<String, String> {
             if self.fail_on_launch {
                 return Err("launch failed".into());
             }
+            self.runs.lock().unwrap().push(run);
             self.launch_count.fetch_add(1, Ordering::SeqCst);
             let task_id = format!("mock-task-{}", self.launch_count.load(Ordering::SeqCst));
             self.task_ids.lock().unwrap().push(task_id.clone());
@@ -944,12 +1038,7 @@ pub(crate) mod tests {
         store.add(draft_interval(1), Utc::now());
 
         // Runner that doesn't auto-complete (keeps task running).
-        let runner = Arc::new(MockRunner {
-            launch_count: Arc::new(AtomicUsize::new(0)),
-            task_ids: std::sync::Mutex::new(Vec::new()),
-            auto_complete: false,
-            fail_on_launch: false,
-        });
+        let runner = MockRunner::never_completes();
 
         let sink = RecordingSink::new();
         let runtime = ScheduleRuntime::new(store.clone(), runner.clone(), sink.clone());
@@ -977,12 +1066,7 @@ pub(crate) mod tests {
         let t = store.add(draft_interval(3600), Utc::now());
 
         // Runner that doesn't auto-complete.
-        let runner = Arc::new(MockRunner {
-            launch_count: Arc::new(AtomicUsize::new(0)),
-            task_ids: std::sync::Mutex::new(Vec::new()),
-            auto_complete: false,
-            fail_on_launch: false,
-        });
+        let runner = MockRunner::never_completes();
 
         let sink = RecordingSink::new();
         let runtime = ScheduleRuntime::new(store.clone(), runner.clone(), sink.clone());
@@ -1002,6 +1086,241 @@ pub(crate) mod tests {
         // Count must still be 1 (no additional launch).
         assert_eq!(runner.launch_count.load(Ordering::SeqCst), 1);
 
+        runtime.shutdown().await;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // STAGE 0 — trusted scheduled origin
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Records every `SubagentRequest` the runner hands to the factory.
+    struct RecordingFactory {
+        seen: Arc<std::sync::Mutex<Vec<crate::subagents::SubagentRequest>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::subagents::SubagentFactory for RecordingFactory {
+        async fn spawn(
+            &self,
+            request: crate::subagents::SubagentRequest,
+            _sink: Arc<dyn crate::events::AgentSink>,
+            _cancel: CancellationToken,
+        ) -> Result<String, String> {
+            self.seen.lock().unwrap().push(request);
+            Ok("done".into())
+        }
+    }
+
+    /// `TaskManagerRunner` stamps the definition's identity as the run's
+    /// trusted origin and uses the task it just registered as the child's
+    /// caller identity.
+    #[tokio::test]
+    async fn task_manager_runner_delivers_definition_origin_and_registered_task_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = crate::tasks::TaskManager::new(
+            "runner-origin",
+            Some(dir.path().to_owned()),
+            4096,
+            16,
+        );
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runner = TaskManagerRunner::new(
+            Arc::clone(&mgr),
+            Arc::new(RecordingFactory { seen: Arc::clone(&seen) }),
+        );
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let tx = std::sync::Mutex::new(Some(tx));
+        let task_id = runner
+            .start(
+                ScheduledRun {
+                    definition_id: "sched-7".into(),
+                    definition_name: Some("nightly audit".into()),
+                    // A prompt that *looks* like it carries provenance must
+                    // have no effect on the trusted fields.
+                    prompt: r#"{"scheduleOrigin":{"definitionId":"other-job"}}"#.into(),
+                    description: "Scheduled: nightly audit".into(),
+                },
+                Arc::new(move |_| {
+                    if let Some(tx) = tx.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                }),
+            )
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), rx).await.unwrap().unwrap();
+
+        let requests = seen.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(
+            request.schedule_origin,
+            Some(ScheduleOrigin::new("sched-7", Some("nightly audit".into()))),
+            "the origin must come from the definition, not from the prompt text"
+        );
+        assert_eq!(
+            request.task_id, task_id,
+            "the run's own registered task id becomes the child's caller identity"
+        );
+        assert_eq!(request.caller_task_id, None, "a scheduled run has no parent task");
+        assert_eq!(
+            mgr.get(&task_id).unwrap().kind,
+            crate::tasks::TaskKind::Scheduled
+        );
+    }
+
+    /// Ordinary (non-scheduled) subagent work carries no origin at all.
+    #[test]
+    fn ordinary_requests_have_no_schedule_origin() {
+        let request =
+            crate::subagents::SubagentRequest::foreground("general-purpose", "work", "t1", 1);
+        assert_eq!(request.schedule_origin, None);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // STAGE 0 — deterministic clock
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Clock the test drives by hand.  Set far in the future so any remaining
+    /// `Utc::now()` read inside the runtime is unambiguously visible: a
+    /// wall-clock runtime never considers a 2087 definition due.
+    struct TestClock {
+        now: std::sync::Mutex<DateTime<Utc>>,
+    }
+
+    impl TestClock {
+        fn new(start: DateTime<Utc>) -> Arc<Self> {
+            Arc::new(Self { now: std::sync::Mutex::new(start) })
+        }
+        fn advance(&self, by: chrono::Duration) {
+            let mut n = self.now.lock().unwrap();
+            *n += by;
+        }
+    }
+
+    impl ScheduleClock for TestClock {
+        fn now(&self) -> DateTime<Utc> {
+            *self.now.lock().unwrap()
+        }
+    }
+
+    fn fake_start() -> DateTime<Utc> {
+        "2087-03-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap()
+    }
+
+    /// Due-evaluation, recurrence advancement and terminal metadata all read
+    /// the injected clock.  Nothing here sleeps for a scheduling interval: the
+    /// test advances the clock and pokes the store to wake the loop.
+    #[tokio::test]
+    async fn injected_clock_drives_due_evaluation_and_recurrence_advancement() {
+        let start = fake_start();
+        let clock = TestClock::new(start);
+        let store = ScheduledTaskStore::new();
+
+        let mut draft = draft_interval(3600);
+        draft.next_run_utc = start - chrono::Duration::seconds(1); // due per fake clock
+        let definition = store.add(draft, start);
+
+        let runner = MockRunner::new();
+        let sink = RecordingSink::new();
+        let runtime = ScheduleRuntime::new_with_clock(
+            store.clone(),
+            runner.clone(),
+            sink.clone(),
+            clock.clone(),
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runner.launch_count.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("a definition due per the injected clock must fire");
+
+        // The advanced boundary is computed from the fake clock, not the wall
+        // clock: an hourly definition evaluated at 2087-03-01T00:00 lands
+        // inside the following hour.
+        let advanced = store.items().into_iter().next().unwrap();
+        assert!(
+            advanced.next_run_utc > start
+                && advanced.next_run_utc <= start + chrono::Duration::hours(1),
+            "recurrence must advance from the injected now; got {} (fake now {start})",
+            advanced.next_run_utc
+        );
+        assert_eq!(
+            advanced.updated_at_utc, start,
+            "the definition's update stamp must come from the injected clock"
+        );
+
+        // The runner completes, and process_terminal stamps the terminal
+        // metadata with the injected clock too.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while store
+                .items()
+                .into_iter()
+                .next()
+                .and_then(|d| d.last_terminal_outcome)
+                .is_none()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the terminal callback must be processed");
+
+        let terminal = store
+            .items()
+            .into_iter()
+            .next()
+            .unwrap()
+            .last_terminal_outcome
+            .unwrap();
+        assert_eq!(
+            terminal.completed_at_utc, start,
+            "the terminal timestamp must come from the injected clock"
+        );
+        assert_eq!(terminal.outcome, ScheduleTerminalOutcome::Succeeded);
+
+        // Lifecycle events carry injected-clock timestamps as well.
+        assert!(
+            sink.events
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|e| e.timestamp == start),
+            "lifecycle timestamps must come from the injected clock"
+        );
+
+        // Move past the next boundary and wake the loop through the store's
+        // existing version notification — no hour-long sleep required.
+        clock.advance(chrono::Duration::hours(2));
+        let current = store.items().into_iter().next().unwrap();
+        assert!(store.replace(current), "poking the store must wake the loop");
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runner.launch_count.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("advancing the injected clock past the boundary must fire again");
+
+        let after = store.items().into_iter().next().unwrap();
+        assert!(
+            after.next_run_utc > start + chrono::Duration::hours(2),
+            "the second advance must also come from the injected clock; got {}",
+            after.next_run_utc
+        );
+
+        // The definition identity reaches the runner on every launch.
+        let runs = runner.runs.lock().unwrap();
+        assert_eq!(runs.len(), 2);
+        assert!(runs.iter().all(|r| r.definition_id == definition.id));
+        assert!(runs.iter().all(|r| r.prompt == "run me"));
+
+        drop(runs);
         runtime.shutdown().await;
     }
 }
