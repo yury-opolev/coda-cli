@@ -52,6 +52,11 @@ pub struct SubagentHost {
     /// and the schedule runtime use.  `None` keeps the host usable in tests
     /// and headless setups that never schedule anything.
     schedule_store: Option<Arc<ScheduledTaskStore>>,
+    /// Shared, engine-owned user-notification bus (Stage 2 `notify_user`).
+    /// Same sharing invariant as `schedule_store`: every child must receive
+    /// the SAME `Arc` the main agent and the schedule runtime use, never a
+    /// per-child bus and never a lazily-created one.
+    message_bus: Option<Arc<crate::message::MessageBus>>,
     base_model: Arc<dyn Fn() -> String + Send + Sync>,
     base_max_tokens: u32,
     base_max_iterations: usize,
@@ -85,6 +90,7 @@ impl SubagentHost {
             quarantine,
             task_manager,
             schedule_store: None,
+            message_bus: None,
             base_model: Arc::new(move || base_model.clone()),
             base_max_tokens,
             base_max_iterations,
@@ -123,6 +129,21 @@ impl SubagentHost {
     /// to probe the wiring end-to-end.
     pub fn schedule_store(&self) -> Option<&Arc<ScheduledTaskStore>> {
         self.schedule_store.as_ref()
+    }
+
+    /// Share the session's engine-owned message bus with every child this
+    /// host spawns, so `notify_user` inside a subagent (or a scheduled run,
+    /// which spawns through this same host) publishes onto the SAME bus the
+    /// main agent and `coda-serve` observe.
+    pub fn with_message_bus(self: Arc<Self>, bus: Arc<crate::message::MessageBus>) -> Arc<Self> {
+        let mut host = self.clone_for_background();
+        host.message_bus = Some(bus);
+        Arc::new(host)
+    }
+
+    /// Read-only accessor for the message bus this host was wired with.
+    pub fn message_bus(&self) -> Option<&Arc<crate::message::MessageBus>> {
+        self.message_bus.as_ref()
     }
 
     pub fn with_defaults(
@@ -300,6 +321,9 @@ impl SubagentHost {
         if let Some(store) = &self.schedule_store {
             builder = builder.with_schedule_store(Arc::clone(store));
         }
+        if let Some(bus) = &self.message_bus {
+            builder = builder.with_message_bus(Arc::clone(bus));
+        }
         // A nested child inherits the scheduled provenance of the run that
         // spawned it; ordinary main-agent children carry `None`.
         if let Some(origin) = &request.schedule_origin {
@@ -446,6 +470,7 @@ impl SubagentHost {
             quarantine: self.quarantine.clone(),
             task_manager: self.task_manager.clone(),
             schedule_store: self.schedule_store.clone(),
+            message_bus: self.message_bus.clone(),
             base_model: self.base_model.clone(),
             base_max_tokens: self.base_max_tokens,
             base_max_iterations: self.base_max_iterations,
@@ -1132,6 +1157,62 @@ mod tests {
                 "the child must share the host's TaskManager instance, not a new one"
             );
             assert!(c.has_factory, "the child must receive a subagent factory");
+        }
+
+        /// A scheduled run's child (spawned through this same host, exactly
+        /// as `ScheduleRuntime`'s runner does — see `scheduling/runtime.rs`)
+        /// must reach the SAME message bus the host was wired with by an
+        /// actual `notify_user` call from inside a real spawned `AgentLoop`
+        /// — not merely a `host.message_bus()` getter equality check.
+        #[tokio::test]
+        async fn scheduled_child_notify_user_publishes_onto_the_shared_message_bus() {
+            let dir = tempfile::tempdir().unwrap();
+            let mgr = manager(&dir);
+            let bus = Arc::new(crate::message::MessageBus::new());
+
+            let client = ScriptedClient::new(vec![
+                tool_turn("n1", "notify_user", r#"{"text":"nightly audit complete"}"#),
+                text_turn("done"),
+            ]);
+            let host = host_with(
+                client,
+                vec![Arc::new(crate::tools::NotifyUserTool) as Arc<dyn Tool>],
+                Arc::clone(&mgr),
+                4,
+            )
+            .with_message_bus(Arc::clone(&bus));
+
+            // The schedule runtime registers its own task id for this firing
+            // (exactly like `ScheduleRuntime`'s runner does) before handing
+            // the request to the factory — this is that same registered id,
+            // not the parent's and not a fabricated one.
+            let child = mgr
+                .register(TaskKind::Scheduled, "nightly audit", None, TaskExecutionMode::Background)
+                .unwrap();
+            let mut request = SubagentRequest::foreground(
+                "general-purpose",
+                "run the nightly audit",
+                &child.id,
+                1,
+            );
+            request.caller_task_id = None;
+            request.schedule_origin =
+                Some(crate::tool::ScheduleOrigin::new("def-nightly", Some("nightly audit".into())));
+
+            let sink = Arc::new(CollectingSink::new());
+            host.spawn(request, sink, CancellationToken::new()).await.unwrap();
+
+            let since = bus.user_since(0, None);
+            assert_eq!(
+                since.messages.len(),
+                1,
+                "notify_user called inside the spawned child must reach the SAME bus"
+            );
+            let msg = &since.messages[0];
+            assert_eq!(msg.source_kind, "scheduledTask");
+            assert_eq!(msg.task_id.as_deref(), Some(child.id.as_str()));
+            assert_eq!(msg.schedule_definition_id.as_deref(), Some("def-nightly"));
+            assert_eq!(msg.body, "nightly audit complete");
         }
 
         /// A stateful tool inside the child must not answer "not available".

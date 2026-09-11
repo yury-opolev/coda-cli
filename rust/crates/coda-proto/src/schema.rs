@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 use crate::state_events::{
-    ActivityEvent, ConfigChangedEvent, EventsDroppedEvent, LifecycleEvent,
+    ActivityEvent, AgentMessageEvent, ConfigChangedEvent, EventsDroppedEvent, LifecycleEvent,
     RequestPendingEvent, RequestResolvedEvent, Sequenced, SessionChangedEvent,
     SteeringQueueEvent, TurnEndedEvent,
 };
@@ -59,6 +59,9 @@ pub fn documents() -> BTreeMap<&'static str, Value> {
         ("RequestPendingEvent.json", schemars::schema_for!(Sequenced<RequestPendingEvent>).to_value()),
         ("RequestResolvedEvent.json", schemars::schema_for!(Sequenced<RequestResolvedEvent>).to_value()),
         ("EventsDroppedEvent.json", schemars::schema_for!(Sequenced<EventsDroppedEvent>).to_value()),
+        ("AgentMessageEvent.json", schemars::schema_for!(Sequenced<AgentMessageEvent>).to_value()),
+        ("PendingMessagesParams.json", schemars::schema_for!(crate::requests::PendingMessagesParams).to_value()),
+        ("PendingMessagesResult.json", schemars::schema_for!(crate::responses::PendingMessagesResult).to_value()),
     ]);
     for (name, schema) in legacy::documents() {
         assert!(schemas.insert(name, schema).is_none(), "duplicate schema name: {name}");

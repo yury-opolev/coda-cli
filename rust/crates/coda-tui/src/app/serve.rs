@@ -50,6 +50,19 @@ pub(crate) const DEFAULT_METADATA_TIMEOUT: std::time::Duration =
 /// conversation, before the engine's own advertised maximum is applied.
 const HISTORY_TAIL: i64 = 200;
 
+/// Bound on [`super::App::pending_messages_seen`] — how many out-of-order
+/// live `event/agentMessage` cursors this client will hold locally while
+/// waiting for the hole before them to close.
+///
+/// A client-local constant, deliberately **not** imported from
+/// `coda_agent::message::DEFAULT_RING_CAPACITY`: `coda-agent` is a dev-only
+/// dependency of `coda-tui` (tests/fixtures only), and reaching for its
+/// constant here would make an ordinary build depend on it. The two numbers
+/// happen to coincide because both bound "how much of the bus this side can
+/// disagree with the other about at once", not because one derives from the
+/// other.
+pub(in crate::app) const PENDING_MESSAGES_SEEN_CAPACITY: usize = 200;
+
 /// Why an engine read produced no answer.
 ///
 /// The three are deliberately distinct: a refusal is the engine's own typed
@@ -240,6 +253,12 @@ impl App {
         );
         self.needs_resync = true;
         self.needs_rehydrate = true;
+        // The dropped events may have included one or more `event/agentMessage`
+        // notifications (they ride the same wire stream): re-recovering from
+        // this client's own last-known bus cursor is cheap and idempotent
+        // (dedup by stable id), and is the only way to notice a gap the
+        // engine's own `gap`/`dropped` reporting can name exactly.
+        self.needs_pending_messages = true;
     }
 
     /// The engine behind this connection was replaced.
@@ -283,6 +302,18 @@ impl App {
         // else happens to refresh it.
         self.state.model_labels.clear();
         self.needs_model_refresh = true;
+        // The message bus's own cursor is engine-scoped and does not survive
+        // a replacement: a new process starts its notifications from cursor
+        // 0 again, so the previous process's dedup ids must not linger and
+        // suppress genuinely new ones with coincidentally-reused ids.
+        self.state.reset_agent_message_dedup();
+        self.pending_messages_cursor = 0;
+        // Any out-of-order live cursors held from the superseded process
+        // address a cursor space that no longer exists; keeping them would
+        // let a coincidentally-reused cursor from the *new* process fold in
+        // as though it continued the old one's contiguous run.
+        self.pending_messages_seen.clear();
+        self.needs_pending_messages = true;
     }
 
     /// Applies one accepted frame: state metadata, or ordinary content.
@@ -320,6 +351,24 @@ impl App {
                 // History does not contain usage, errors, limits or hook/task
                 // notices. Their event cursor is not a content-coverage claim.
                 _ => {}
+            }
+        }
+        // Live delivery's own contribution to the contiguous "proven
+        // covered" prefix `pending_messages_cursor` tracks — see
+        // `record_live_pending_message_cursor`. Must happen before `apply`
+        // only because it reads no transcript state; ordering relative to
+        // the reducer (which owns dedup-by-id) does not matter here.
+        if let Event::AgentMessage { cursor, .. } = &event {
+            if !self.record_live_pending_message_cursor((*cursor).max(0) as u64) {
+                // Capacity-deferred (see `record_live_pending_message_cursor`):
+                // this cursor could not be tracked locally without evicting a
+                // receipt already recorded, so its content must not be shown
+                // yet either. Showing it now while leaving no local receipt
+                // behind would make a later, truthful "this was evicted from
+                // the ring and never recovered" report a lie — the client
+                // would have shown it after all. `pending_messages_at` is
+                // where it is actually applied, the first and only time.
+                return;
             }
         }
         self.apply(UiEvent::Engine(event));
@@ -533,6 +582,10 @@ impl App {
             // re-read rather than continued.
             self.on_events_lost(&format!("The engine's events {from}-{to} never arrived"));
         }
+        // Covered notifications may be buffered here or still in transit.
+        // Neither state nor history contains them, so every snapshot needs
+        // an independent mailbox read, even when the frame buffer is empty.
+        self.needs_pending_messages = true;
         if !outcome.opened.is_empty() || closed {
             self.open_current_prompt();
         }
@@ -756,6 +809,9 @@ impl App {
         if self.needs_rehydrate && self.rehydrate_recovery.ready(now) {
             self.rehydrate_at(now).await;
         }
+        if self.needs_pending_messages && self.pending_messages_recovery.ready(now) {
+            self.pending_messages_at(now).await;
+        }
         if self.needs_model_refresh {
             // Best-effort and one-shot: a failed read here leaves the flag
             // cleared rather than retried on its own schedule, exactly like
@@ -765,6 +821,274 @@ impl App {
             // picker open) tries again regardless.
             self.needs_model_refresh = false;
             self.load_models().await;
+        }
+    }
+
+    /// Folds one *live* `event/agentMessage` cursor into
+    /// [`Self::pending_messages_cursor`], the contiguously proven-covered
+    /// prefix.
+    ///
+    /// Live delivery is not itself a recovery read and must not be trusted
+    /// to prove a range covered on its own: this client's own bootstrap or
+    /// gap-triggered [`Self::pending_messages_at`] read can still be in
+    /// flight (or not yet armed) for cursors *before* this one, and jumping
+    /// the watermark straight to whatever arrived would silently assume that
+    /// unread hole was covered — exactly the false "already-shown messages
+    /// lost" report this exists to prevent (see the review this fixes).
+    ///
+    /// A cursor is folded in only when it is exactly the next one owed;
+    /// anything further ahead is held in [`Self::pending_messages_seen`]
+    /// until the hole before it is filled in — delivered, or explicitly
+    /// reported lost — by a recovery read via
+    /// [`Self::advance_pending_messages_baseline`].
+    ///
+    /// Detecting a hole is not merely bookkeeping: the recovery read that
+    /// will fill it (or report it lost) must actually get scheduled, so a
+    /// genuinely new out-of-order cursor arms [`super::App::needs_pending_messages`]
+    /// itself rather than relying on some other caller to have set it —
+    /// see the regression this fixes,
+    /// `an_out_of_order_live_cursor_is_held_until_the_hole_before_it_is_filled`.
+    ///
+    /// Returns whether this cursor was admitted — folded into the watermark,
+    /// recognised as an already-held duplicate, or newly tracked in
+    /// [`Self::pending_messages_seen`]. `false` means the tracking set was
+    /// already at [`PENDING_MESSAGES_SEEN_CAPACITY`] and this is a cursor it
+    /// has never seen before: admitting it would mean either growing the set
+    /// without bound (a hole that never closes, under sustained live
+    /// traffic) or quietly forgetting a receipt already recorded, and neither
+    /// is acceptable. The caller must not apply this event now — see
+    /// `dispatch_frame` — because the message is still safely recoverable
+    /// through the engine's own ring via [`Self::pending_messages_at`], which
+    /// both applies it for real and prunes this set once its read proves the
+    /// watermark past it.
+    pub(in crate::app) fn record_live_pending_message_cursor(&mut self, cursor: u64) -> bool {
+        if cursor <= self.pending_messages_cursor {
+            // Already covered: a recovery read reached here first, or this
+            // is a replay this client has already accounted for. No new
+            // information — and folding it in again could only ever hold
+            // the watermark still, never move it backwards.
+            return true;
+        }
+        if cursor == self.pending_messages_cursor + 1 {
+            self.pending_messages_cursor = cursor;
+            self.drain_contiguous_pending_messages_seen();
+            return true;
+        }
+        if self.pending_messages_seen.contains(&cursor) {
+            // A duplicate out-of-order receipt (a replay, a retried frame):
+            // already accounted for regardless of whether the tracking set
+            // happens to be at capacity right now.
+            return true;
+        }
+        if self.pending_messages_seen.len() >= PENDING_MESSAGES_SEEN_CAPACITY {
+            // A genuinely new cursor with the set already full. The hole
+            // before it still owes a recovery read either way.
+            self.needs_pending_messages = true;
+            return false;
+        }
+        self.pending_messages_seen.insert(cursor);
+        self.needs_pending_messages = true;
+        true
+    }
+
+    /// Advances [`Self::pending_messages_cursor`] to (at least) `baseline` —
+    /// the position a `session/pendingMessages` read has just *proven*
+    /// covered, by delivering every message up to it, by reporting the gap up
+    /// to it explicitly, or both — then folds in whatever live cursors are
+    /// now contiguous with the new watermark.
+    ///
+    /// Never regresses: a baseline behind what live delivery already proved
+    /// (a live publish that lands while a recovery read for an earlier range
+    /// is still in flight) must not un-prove it.
+    pub(in crate::app) fn advance_pending_messages_baseline(&mut self, baseline: u64) {
+        if baseline > self.pending_messages_cursor {
+            self.pending_messages_cursor = baseline;
+        }
+        // Anything already at or behind the new watermark is subsumed by it
+        // regardless of how this client came to hold it — including a live
+        // cursor that arrived out of order and is now behind a read that
+        // reached further than it did.
+        let cursor = self.pending_messages_cursor;
+        self.pending_messages_seen.retain(|&seen| seen > cursor);
+        self.drain_contiguous_pending_messages_seen();
+    }
+
+    /// Consumes every held cursor immediately following the current
+    /// watermark, advancing it through each contiguous run.
+    fn drain_contiguous_pending_messages_seen(&mut self) {
+        while let Some(&next) = self.pending_messages_seen.iter().next() {
+            if next != self.pending_messages_cursor + 1 {
+                break;
+            }
+            self.pending_messages_cursor = next;
+            self.pending_messages_seen.remove(&next);
+        }
+    }
+
+    /// Formats a `session/pendingMessages` gap's reported `[from, to]` range
+    /// (inclusive) into a notice detail, or `None` when nothing in it is
+    /// actually unaccounted for.
+    ///
+    /// A cursor already in [`Self::pending_messages_seen`] arrived live, out
+    /// of order, before this read went out: this client has already shown
+    /// it (or, capacity-permitting, is holding it to show once its own hole
+    /// closes) regardless of whether the bus's ring later evicted it. Saying
+    /// so was "lost" would tell the operator a notification never arrived
+    /// when it did.
+    fn describe_unrecovered_range(&self, from: u64, to: u64) -> Option<String> {
+        let (unknown, ranges) = self.narrow_dropped_range(from, to);
+        if unknown == 0 {
+            // Every cursor in the reported range was already received live —
+            // genuinely nothing to report as lost.
+            return None;
+        }
+        match ranges.as_slice() {
+            [(lo, hi)] if lo == hi => Some(format!(" ({unknown} lost, cursor {lo})")),
+            [(lo, hi)] => Some(format!(" ({unknown} lost, cursors {lo}-{hi})")),
+            _ => {
+                // More than one disjoint hole remains inside the reported
+                // range — some cursor(s) strictly between them were already
+                // received live. Naming the outer bounds as a single range
+                // ("cursors {from}-{to}") would falsely claim those as lost
+                // too, so this states the count *within* the range instead
+                // of a range that does not hold uniformly across it.
+                Some(format!(" ({unknown} lost within cursors {from}-{to})"))
+            }
+        }
+    }
+
+    /// Subtracts [`Self::pending_messages_seen`] (already-received cursors)
+    /// from the inclusive range `[from, to]`, returning the total count still
+    /// genuinely unaccounted for and the disjoint sub-ranges it falls into.
+    ///
+    /// `pending_messages_seen` is bounded by [`PENDING_MESSAGES_SEEN_CAPACITY`]
+    /// (at most a few hundred entries), so this walks only the *known*
+    /// cursors inside the range via `BTreeSet::range` — never the range
+    /// itself, which is an engine-reported `u64` span that can be
+    /// arbitrarily large.
+    fn narrow_dropped_range(&self, from: u64, to: u64) -> (u64, Vec<(u64, u64)>) {
+        if from > to {
+            return (0, Vec::new());
+        }
+        let mut ranges = Vec::new();
+        let mut count: u64 = 0;
+        let mut cursor = from;
+        for &known in self.pending_messages_seen.range(from..=to) {
+            if known > cursor {
+                ranges.push((cursor, known - 1));
+                count += known - cursor;
+            }
+            cursor = known + 1;
+        }
+        if cursor <= to {
+            ranges.push((cursor, to));
+            count += to - cursor + 1;
+        }
+        (count, ranges)
+    }
+
+    /// Recovers engine-owned user notifications via `session/pendingMessages`
+    /// (Stage 2 `notify_user`): at bootstrap (`needs_pending_messages` starts
+    /// `true` in [`Self::attach`]), after a dropped-event gap
+    /// ([`Self::on_events_lost`]) and after an engine replacement
+    /// ([`Self::on_engine_replaced`]) — the same "settle with the engine"
+    /// shape as [`Self::resync_at`]/[`Self::rehydrate_at`], with its own
+    /// bounded retry schedule.
+    ///
+    /// The read is fenced on the current engine instance id exactly like
+    /// `session/getHistory`'s: a cursor minted by a different process is not
+    /// a position in this one's bus, so the engine refuses it rather than
+    /// silently answering from the wrong ring.
+    pub(in crate::app) async fn pending_messages_at(&mut self, now: std::time::Instant) {
+        self.needs_pending_messages = false;
+        let fenced_instance = self.view.engine_instance_id().map(str::to_string);
+        let result = match self
+            .bounded(api::get_pending_messages(
+                &self.connection,
+                self.pending_messages_cursor,
+                fenced_instance.as_deref(),
+            ))
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                // The need survives the failure, exactly like a failed
+                // rehydrate: dropping it here would leave a background
+                // notification unrecovered forever with nothing left to ask
+                // again.
+                self.needs_pending_messages = true;
+                if self.pending_messages_recovery.on_failure(now) {
+                    self.apply(UiEvent::NotificationRecoveryWarning {
+                        text: format!(
+                            "Could not recover pending notifications (attempt {}): {error}{}",
+                            self.pending_messages_recovery.failures(),
+                            quiet_from_now_on(self.pending_messages_recovery.failures()),
+                        ),
+                    });
+                }
+                return;
+            }
+        };
+        self.pending_messages_recovery.on_success();
+
+        if result.gap {
+            // Some notifications between this client's cursor and the oldest
+            // one the bus still retains were evicted. But "evicted from the
+            // bus" is not the same claim as "lost to this client": a cursor
+            // this client already has — held in `pending_messages_seen`
+            // after arriving live out of order, still waiting for exactly
+            // this hole to close — was received regardless of what the ring
+            // did with it afterwards. Narrowing the reported range to what is
+            // actually unaccounted for happens *before* the baseline below
+            // moves past it and prunes those receipts away.
+            if let Some(dropped) = result.dropped.as_ref() {
+                let from = dropped.from.max(0) as u64;
+                let to = dropped.to.max(0) as u64;
+                if let Some(detail) = self.describe_unrecovered_range(from, to) {
+                    self.apply(UiEvent::NotificationRecoveryWarning {
+                        text: format!(
+                            "Some background notifications could not be recovered{detail}; \
+                             the bus's retention window had already moved past them."
+                        ),
+                    });
+                }
+            } else {
+                // The engine signalled a gap without an exact range: there is
+                // nothing here to narrow against, so this is reported exactly
+                // as before — honestly, if less precisely.
+                self.apply(UiEvent::NotificationRecoveryWarning {
+                    text: "The background notification mailbox reported a retention gap; \
+                           the exact number of missing messages is unavailable.".into(),
+                });
+            }
+        }
+
+        // Fed through the ordinary `Event::AgentMessage` reducer path — the
+        // same dedup-by-id the live wire notification uses — so a
+        // notification already shown live (e.g. before a reconnect) is never
+        // shown a second time, and ordering follows the bus's own cursor.
+        for message in result.messages {
+            self.apply(UiEvent::Engine(Event::AgentMessage {
+                id: message.id,
+                cursor: message.cursor,
+                label: message.label,
+                text: message.text,
+                context: message.context,
+                source: message.source,
+                task_id: message.task_id,
+                schedule_definition_id: message.schedule_definition_id,
+            }));
+        }
+        // Proof, not merely a maximum: this read either delivered every
+        // message up to `next_cursor` or explicitly reported the gap up to
+        // it above, so the prefix is genuinely covered regardless of what
+        // live delivery raced it with — see `advance_pending_messages_baseline`.
+        self.advance_pending_messages_baseline(result.next_cursor.max(0) as u64);
+        if result.truncated {
+            // More to fetch immediately — not a spin: the next
+            // `settle_with_engine` iteration picks this back up because the
+            // flag is armed again, at the ordinary cadence a `settle` runs.
+            self.needs_pending_messages = true;
         }
     }
 
@@ -1123,8 +1447,12 @@ impl App {
             needs_resync: true,
             needs_rehydrate: true,
             needs_model_refresh: false,
+            needs_pending_messages: true,
+            pending_messages_cursor: 0,
+            pending_messages_seen: std::collections::BTreeSet::new(),
             resync_recovery: Default::default(),
             rehydrate_recovery: Default::default(),
+            pending_messages_recovery: Default::default(),
             access_mode,
             metadata_timeout: DEFAULT_METADATA_TIMEOUT,
             config_catalog: None,
@@ -1839,6 +2167,111 @@ pub(in crate::app) mod tests {
         );
     }
 
+    /// I1 (Stage 2 review): `arm_spinner_wakeup`'s owed array must cover
+    /// `needs_pending_messages`/`pending_messages_recovery` exactly like it
+    /// already does `needs_resync`/`needs_rehydrate` — a failed
+    /// `session/pendingMessages` read that sends no events otherwise wakes
+    /// nothing on an idle screen, so the backed-off retry would never
+    /// actually run without a keypress.
+    #[tokio::test]
+    async fn a_failed_pending_messages_read_wakes_the_loop_even_when_idle() {
+        // `session/getState` always answers validly and `session/getHistory`
+        // is never asked for (`needs_rehydrate` stays `false` throughout), so
+        // the *only* thing left owed after the warm-up settle is the pending-
+        // messages retry — proving this test isolates exactly the gap I1
+        // describes rather than riding some other read's coincidentally
+        // identical backoff deadline.
+        let pending_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = std::sync::Arc::clone(&pending_calls);
+        let mut harness = app_answering(crate::local::AccessMode::TrustedLocal, move |method, _| {
+            match method {
+                "session/getState" => Ok(snapshot_value(1, 0, 500)),
+                "session/pendingMessages" => {
+                    if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        Ok(empty_pending_messages())
+                    } else {
+                        Err((-32000, "no".into()))
+                    }
+                }
+                _ => Ok(json!({})),
+            }
+        });
+        let app = &mut harness.app;
+        app.needs_rehydrate = false;
+
+        // Warm-up settle: resync succeeds (clearing `view.needs_snapshot()`
+        // and `resync_recovery`) and the bootstrap pending-messages read
+        // succeeds too (clearing `needs_pending_messages`).
+        app.settle_with_engine_at(std::time::Instant::now()).await;
+        assert!(!app.needs_resync, "the warm-up resync must have succeeded");
+        assert!(!app.view.needs_snapshot(), "the warm-up resync must have succeeded");
+        assert!(!app.needs_pending_messages, "the bootstrap read must have succeeded");
+        assert!(app.resync_recovery.next_attempt().is_none());
+
+        // Now the actual case under test: pending messages come due again
+        // (a reported gap, an engine replacement — the trigger is irrelevant
+        // here) and the read fails.
+        app.needs_pending_messages = true;
+        let now = std::time::Instant::now();
+        app.settle_with_engine_at(now).await;
+        assert!(app.needs_pending_messages, "the failure must leave the need armed");
+        assert!(!app.needs_resync, "nothing here should have re-armed a resync");
+        assert!(app.resync_recovery.next_attempt().is_none(), "resync must stay untouched");
+        let due = app
+            .pending_messages_recovery
+            .next_attempt()
+            .expect("a failed read schedules a retry");
+        app.frame_deadline = None;
+
+        app.arm_spinner_wakeup();
+
+        assert_eq!(
+            app.frame_deadline,
+            Some(tokio::time::Instant::from_std(due)),
+            "the wake must be the scheduled pending-messages retry, not left unarmed"
+        );
+    }
+
+    /// The success half of the same gap: a page reported `truncated: true`
+    /// leaves `needs_pending_messages` armed with no backoff running (the
+    /// read *succeeded*), and the loop must still wake itself to fetch the
+    /// rest rather than waiting for the next unrelated frame or keystroke.
+    #[tokio::test]
+    async fn a_truncated_pending_messages_page_still_owed_wakes_the_loop() {
+        let mut harness = app_answering(crate::local::AccessMode::TrustedLocal, |method, _| {
+            match method {
+                "session/getState" => Ok(snapshot_value(1, 0, 500)),
+                "session/pendingMessages" => Ok(json!({
+                    "messages": [],
+                    "nextCursor": 5,
+                    "gap": false,
+                    "truncated": true,
+                })),
+                _ => Ok(json!({})),
+            }
+        });
+        let app = &mut harness.app;
+        app.needs_rehydrate = false;
+
+        let now = std::time::Instant::now();
+        app.settle_with_engine_at(now).await;
+        assert!(!app.needs_resync, "the resync must have succeeded");
+        assert!(app.resync_recovery.next_attempt().is_none(), "resync must not be backed off");
+        assert!(app.needs_pending_messages, "a truncated page owes an immediate follow-up read");
+        assert!(
+            app.pending_messages_recovery.next_attempt().is_none(),
+            "the read succeeded — nothing should be backed off"
+        );
+        app.frame_deadline = None;
+
+        app.arm_spinner_wakeup();
+
+        assert!(
+            app.frame_deadline.is_some(),
+            "an owed pending-messages page must wake the loop even though nothing failed"
+        );
+    }
+
     // -- Session teardown ----------------------------------------------------
     //
     // These drive the production exit path — the same `finish` every way out
@@ -2514,6 +2947,15 @@ pub(in crate::app) mod tests {
             .collect()
     }
 
+    /// A `session/pendingMessages` stub answer: nothing pending, no gap.
+    /// `settle_with_engine_at` calls this on every settle
+    /// (`needs_pending_messages` starts `true` on every `attach`ed `App`), so
+    /// any fixture driving `settle_with_engine_at` directly needs a shape
+    /// `PendingMessagesResult` can actually parse — an empty `{}` is not one.
+    fn empty_pending_messages() -> Value {
+        json!({ "messages": [], "nextCursor": 0, "gap": false, "truncated": false })
+    }
+
     #[tokio::test]
     async fn reasoning_the_snapshot_covers_is_shown_live_not_only_once_it_ends() {
         // The reported failure, through the public API. The first
@@ -2532,12 +2974,20 @@ pub(in crate::app) mod tests {
                     coda_proto::state::ActivityPhase::Reasoning,
                     Some(4_000),
                 )),
+                "session/pendingMessages" => Ok(empty_pending_messages()),
                 _ => Ok(json!({})),
             }
         });
         let app = &mut harness.app;
         app.needs_rehydrate = false;
         app.needs_resync = true;
+        // FIX B (Stage 2 review): a successful resync now unconditionally
+        // arms a cheap pending-messages recovery read whenever a frame was
+        // buffered during it — exactly the case this test constructs below —
+        // since a buffered `event/agentMessage` at/below the new cursor would
+        // otherwise be discarded with no trace. The fixture above answers it
+        // with an empty page rather than suppressing the flag.
+        app.needs_pending_messages = false;
 
         // The engine streams the start of reasoning while the read is out.
         app.view.begin_resync();
@@ -2599,13 +3049,26 @@ pub(in crate::app) mod tests {
 
     #[tokio::test]
     async fn a_conversation_reread_mid_burst_keeps_the_reasoning_live() {
+        assert_reread_preserves_live_reasoning(false).await;
+    }
+
+    #[tokio::test]
+    async fn a_notification_recovery_failure_does_not_split_live_reasoning() {
+        assert_reread_preserves_live_reasoning(true).await;
+    }
+
+    async fn assert_reread_preserves_live_reasoning(fail_notifications: bool) {
         // The other half of the same failure: the read returns the running
         // turn's reasoning as a live entry, and hydrating it as *finished*
         // replaced the live row with a completed one and stopped its clock.
         const TOTAL: i64 = 2;
         const CURSOR: i64 = 12;
-        let mut harness = app_answering(crate::local::AccessMode::TrustedLocal, |method, params| {
+        let mut harness = app_answering(crate::local::AccessMode::TrustedLocal, move |method, params| {
             match method {
+                "session/pendingMessages" if fail_notifications => {
+                    Err((-32603, "notification recovery unavailable".into()))
+                }
+                "session/pendingMessages" => Ok(empty_pending_messages()),
                 "session/getState" => Ok(snapshot_in_phase(
                     CURSOR,
                     TOTAL,
@@ -2629,7 +3092,6 @@ pub(in crate::app) mod tests {
         let app = &mut harness.app;
         app.needs_resync = true;
         app.needs_rehydrate = true;
-
         let start = std::time::Instant::now();
         app.settle_with_engine_at(start).await;
 
@@ -2660,6 +3122,1011 @@ pub(in crate::app) mod tests {
             .collect();
         assert_eq!(bursts.len(), 1, "the burst was split in two: {bursts:?}");
         assert!(matches!(bursts[0], Block::Thinking { text, .. } if text == "half a thought, continued"));
+        app.apply(UiEvent::Engine(Event::ThinkingComplete {
+            elapsed_ms: 4000,
+            thinking_tokens: None,
+        }));
+        let warnings = app.state.transcript.blocks().iter().filter(|block| {
+            matches!(block, Block::Notice { text, .. } if text.contains("Could not recover pending notifications"))
+        }).count();
+        assert_eq!(warnings, usize::from(fail_notifications), "the warning must be released at completion");
+    }
+
+    // -- `session/pendingMessages` recovery (Stage 2 `notify_user`) ---------
+
+    /// Bootstrap: `needs_pending_messages` starts `true` on every `attach`ed
+    /// `App`, so the very first `settle_with_engine_at` recovers whatever the
+    /// bus already holds and materialises it as `Block::AgentMessage` — real
+    /// public API, not only the `UiState`-level unit tests.
+    #[tokio::test]
+    async fn bootstrap_recovers_pending_notifications_through_the_real_api() {
+        let mut harness = app_answering(crate::local::AccessMode::TrustedLocal, |method, _| {
+            match method {
+                "session/pendingMessages" => Ok(json!({
+                    "messages": [{
+                        "id": "m1",
+                        "cursor": 3,
+                        "label": "nightly audit",
+                        "text": "report ready",
+                        "context": null,
+                        "source": "scheduledTask",
+                        "taskId": "task-1",
+                        "scheduleDefinitionId": "def-1",
+                    }],
+                    "nextCursor": 3,
+                    "gap": false,
+                    "truncated": false,
+                })),
+                _ => Ok(empty_pending_messages()),
+            }
+        });
+        let app = &mut harness.app;
+        app.needs_resync = false;
+        app.needs_rehydrate = false;
+
+        app.settle_with_engine_at(std::time::Instant::now()).await;
+
+        let messages: Vec<_> = app
+            .state
+            .transcript
+            .blocks()
+            .iter()
+            .filter_map(|b| match b {
+                Block::AgentMessage { text, source, task_id, schedule_definition_id, .. } => {
+                    Some((text.clone(), source.clone(), task_id.clone(), schedule_definition_id.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            messages,
+            vec![(
+                "report ready".to_string(),
+                "scheduledTask".to_string(),
+                Some("task-1".to_string()),
+                Some("def-1".to_string()),
+            )]
+        );
+        assert_eq!(app.pending_messages_cursor, 3, "the cursor advances to the read's own nextCursor");
+        assert!(!app.needs_pending_messages, "a fully-consumed page owes no immediate re-read");
+    }
+
+    /// A gap is reported honestly, with the exact evicted range/count when
+    /// the engine provides one — never silently resumed from wherever
+    /// happens to remain.
+    #[tokio::test]
+    async fn a_reported_gap_surfaces_the_exact_dropped_range_as_a_notice() {
+        let mut harness = app_answering(crate::local::AccessMode::TrustedLocal, |method, _| {
+            match method {
+                "session/pendingMessages" => Ok(json!({
+                    "messages": [],
+                    "nextCursor": 50,
+                    "gap": true,
+                    "dropped": { "from": 1, "to": 49, "count": 49 },
+                    "truncated": false,
+                })),
+                _ => Ok(empty_pending_messages()),
+            }
+        });
+        let app = &mut harness.app;
+        app.needs_resync = false;
+        app.needs_rehydrate = false;
+
+        app.settle_with_engine_at(std::time::Instant::now()).await;
+
+        let notices: Vec<String> = app
+            .state
+            .transcript
+            .blocks()
+            .iter()
+            .filter_map(|b| match b {
+                Block::Notice { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            notices.iter().any(|n| n.contains("49") && n.contains("1-49")),
+            "the exact dropped range/count must be named, not just a boolean gap: {notices:?}"
+        );
+        assert_eq!(app.pending_messages_cursor, 50);
+    }
+
+    /// FIX C (Stage 2 review): a cursor already in `pending_messages_seen`
+    /// arrived live, out of order, before this read went out — this client
+    /// has already shown it, whatever the engine's ring did with it
+    /// afterwards. Reporting the engine's raw dropped range/count verbatim
+    /// would claim an already-seen notification was lost. Here only cursor
+    /// 3 is genuinely unaccounted for: 4 and 5 are already held.
+    #[tokio::test]
+    async fn only_the_genuinely_unaccounted_prefix_of_a_dropped_range_is_reported_as_lost() {
+        let mut harness = app_answering(crate::local::AccessMode::TrustedLocal, |method, _| {
+            match method {
+                "session/pendingMessages" => Ok(json!({
+                    "messages": [],
+                    "nextCursor": 5,
+                    "gap": true,
+                    "dropped": { "from": 3, "to": 5, "count": 3 },
+                    "truncated": false,
+                })),
+                _ => Ok(empty_pending_messages()),
+            }
+        });
+        let app = &mut harness.app;
+        app.pending_messages_cursor = 2;
+        app.pending_messages_seen = std::collections::BTreeSet::from([4, 5]);
+
+        app.pending_messages_at(std::time::Instant::now()).await;
+
+        let notices: Vec<String> = app
+            .state
+            .transcript
+            .blocks()
+            .iter()
+            .filter_map(|b| match b {
+                Block::Notice { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            notices.iter().any(|n| n.contains("1 lost") && n.contains("cursor 3")),
+            "cursors 4 and 5 were already received live and must not be reported lost: {notices:?}"
+        );
+        assert!(
+            !notices.iter().any(|n| n.contains("3 lost")),
+            "the engine's raw count of 3 must be narrowed to what is actually unaccounted for: \
+             {notices:?}"
+        );
+        assert_eq!(app.pending_messages_cursor, 5);
+        assert!(app.pending_messages_seen.is_empty(), "subsumed receipts must be pruned");
+    }
+
+    /// The other half of the same regression: two disjoint holes inside one
+    /// reported range must not be collapsed into "the whole range is lost" —
+    /// cursor 4 sits between them, already received live, and a single
+    /// `cursors 3-5` claim would misreport it as lost too.
+    #[tokio::test]
+    async fn disjoint_known_cursors_inside_a_dropped_range_are_not_claimed_as_lost() {
+        let mut harness = app_answering(crate::local::AccessMode::TrustedLocal, |method, _| {
+            match method {
+                "session/pendingMessages" => Ok(json!({
+                    "messages": [],
+                    "nextCursor": 5,
+                    "gap": true,
+                    "dropped": { "from": 3, "to": 5, "count": 3 },
+                    "truncated": false,
+                })),
+                _ => Ok(empty_pending_messages()),
+            }
+        });
+        let app = &mut harness.app;
+        app.pending_messages_cursor = 2;
+        app.pending_messages_seen = std::collections::BTreeSet::from([4]);
+
+        app.pending_messages_at(std::time::Instant::now()).await;
+
+        let notices: Vec<String> = app
+            .state
+            .transcript
+            .blocks()
+            .iter()
+            .filter_map(|b| match b {
+                Block::Notice { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            notices.iter().any(|n| n.contains("2 lost within cursors 3-5")),
+            "cursors 3 and 5 are genuinely unaccounted for; the count-within-range wording avoids \
+             claiming a uniform 3-5 loss: {notices:?}"
+        );
+        assert!(
+            !notices.iter().any(|n| n.contains("lost, cursors 3-5")),
+            "must not describe the range as uniformly lost — cursor 4 was already received: \
+             {notices:?}"
+        );
+    }
+
+    /// The clean case: every cursor the engine reports dropped was already
+    /// received live, so nothing was actually lost and no warning is shown
+    /// at all.
+    #[tokio::test]
+    async fn a_dropped_range_entirely_covered_by_already_seen_cursors_reports_no_loss() {
+        let mut harness = app_answering(crate::local::AccessMode::TrustedLocal, |method, _| {
+            match method {
+                "session/pendingMessages" => Ok(json!({
+                    "messages": [],
+                    "nextCursor": 5,
+                    "gap": true,
+                    "dropped": { "from": 3, "to": 5, "count": 3 },
+                    "truncated": false,
+                })),
+                _ => Ok(empty_pending_messages()),
+            }
+        });
+        let app = &mut harness.app;
+        app.pending_messages_cursor = 2;
+        app.pending_messages_seen = std::collections::BTreeSet::from([3, 4, 5]);
+
+        app.pending_messages_at(std::time::Instant::now()).await;
+
+        let notices: Vec<String> = app
+            .state
+            .transcript
+            .blocks()
+            .iter()
+            .filter_map(|b| match b {
+                Block::Notice { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !notices.iter().any(|n| n.contains("could not be recovered")),
+            "every cursor in the reported range was already received live; nothing was lost: \
+             {notices:?}"
+        );
+        assert_eq!(app.pending_messages_cursor, 5);
+    }
+
+    /// A replaced engine invalidates the previous process's cursor — the bus
+    /// is scoped to that process — so the next recovery must ask from `0`
+    /// again, and the flag must be armed rather than left however
+    /// `on_engine_replaced` found it.
+    #[tokio::test]
+    async fn engine_replacement_resets_the_pending_messages_cursor_and_refetches_from_zero() {
+        let mut harness = app_answering(crate::local::AccessMode::TrustedLocal, |method, _| {
+            match method {
+                "session/pendingMessages" => Ok(json!({
+                    "messages": [],
+                    "nextCursor": 7,
+                    "gap": false,
+                    "truncated": false,
+                })),
+                _ => Ok(empty_pending_messages()),
+            }
+        });
+        let app = &mut harness.app;
+        app.needs_resync = false;
+        app.needs_rehydrate = false;
+        app.settle_with_engine_at(std::time::Instant::now()).await;
+        assert_eq!(app.pending_messages_cursor, 7);
+
+        // A different process behind the same connection.
+        let _ = app.accept(
+            "event/assistantText".to_string(),
+            Some(json!({ "delta": "x", "seq": 1, "engineInstanceId": "a-different-engine" })),
+        );
+        assert_eq!(app.pending_messages_cursor, 0, "a replaced engine's bus starts over at cursor 0");
+        assert!(app.needs_pending_messages, "the replacement must arm a fresh recovery");
+
+        app.needs_resync = false;
+        app.needs_rehydrate = false;
+        app.settle_with_engine_at(std::time::Instant::now()).await;
+
+        let sent_after_cursors: Vec<i64> = harness
+            .frames()
+            .into_iter()
+            .filter(|f| f["method"] == "session/pendingMessages")
+            .map(|f| f["params"]["afterCursor"].as_i64().unwrap())
+            .collect();
+        assert_eq!(
+            sent_after_cursors,
+            vec![0, 0],
+            "the post-replacement read must ask from cursor 0, not the previous process's 7"
+        );
+    }
+
+    /// A minimal `event/agentMessage` wire payload, fenced with `seq`/
+    /// `engineInstanceId` like the real engine sends it.
+    fn agent_message_frame(id: &str, cursor: i64, seq: i64) -> Value {
+        json!({
+            "id": id,
+            "cursor": cursor,
+            "label": "main",
+            "text": format!("message {id}"),
+            "context": null,
+            "source": "main",
+            "taskId": null,
+            "scheduleDefinitionId": null,
+            "seq": seq,
+            "engineInstanceId": "e1",
+        })
+    }
+
+    /// FIX B (Stage 2 review): a `session/getState` resync can silently
+    /// discard a buffered `event/agentMessage` frame whose `seq` falls at or
+    /// below the new snapshot's cursor — `ServeView::apply_snapshot` drops it
+    /// as "already reflected", but the message bus has no state/history
+    /// representation, so nothing about that specific loss is ever reported.
+    /// Proven here by constructing exactly that race: begin a resync, buffer
+    /// a message behind it, then let the snapshot cover it with no further
+    /// live delivery — recovery must still pick it up, exactly once.
+    #[tokio::test]
+    async fn a_resync_that_discards_a_buffered_agent_message_is_recovered_via_pending_messages() {
+        assert_resync_recovers_covered_agent_message(true).await;
+    }
+
+    #[tokio::test]
+    async fn a_resync_recovers_an_agent_message_that_arrives_after_the_snapshot() {
+        assert_resync_recovers_covered_agent_message(false).await;
+    }
+
+    async fn assert_resync_recovers_covered_agent_message(buffer_before_snapshot: bool) {
+        let recovered_after: std::sync::Arc<std::sync::Mutex<Vec<i64>>> = Default::default();
+        let recorded = std::sync::Arc::clone(&recovered_after);
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let call_counter = std::sync::Arc::clone(&calls);
+        let mut harness = app_answering(crate::local::AccessMode::TrustedLocal, move |method, params| {
+            match method {
+                // Cursor 5: at or above the buffered frame's `seq` of 3, so
+                // `drain_buffer` discards it as already reflected.
+                "session/getState" => Ok(snapshot_value(5, 0, 500)),
+                "session/pendingMessages" => {
+                    let after = params["afterCursor"].as_i64().unwrap_or(-1);
+                    recorded.lock().unwrap().push(after);
+                    if call_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        // The bootstrap read: nothing published yet.
+                        return Ok(empty_pending_messages());
+                    }
+                    if after == 0 {
+                        Ok(json!({
+                            "messages": [{
+                                "id": "m1",
+                                "cursor": 1,
+                                "label": "main",
+                                "text": "message m1",
+                                "context": null,
+                                "source": "main",
+                                "taskId": null,
+                                "scheduleDefinitionId": null,
+                            }],
+                            "nextCursor": 1,
+                            "gap": false,
+                            "truncated": false,
+                        }))
+                    } else {
+                        Ok(empty_pending_messages())
+                    }
+                }
+                _ => Ok(json!({})),
+            }
+        });
+        let app = &mut harness.app;
+        app.needs_rehydrate = false;
+        // Bootstrap the pending-messages recovery out of the way first — this
+        // test is about what the RESYNC arms on its own, not the bootstrap
+        // read.
+        app.needs_resync = false;
+        app.settle_with_engine_at(std::time::Instant::now()).await;
+        assert_eq!(app.pending_messages_cursor, 0);
+
+        // A resync begins; a background notification arrives mid-flight and
+        // is buffered rather than applied.
+        app.view.begin_resync();
+        if buffer_before_snapshot {
+            for frame in
+                app.accept("event/agentMessage".into(), Some(agent_message_frame("m1", 1, 3)))
+            {
+                app.dispatch_frame(frame);
+            }
+        }
+        assert_eq!(app.pending_messages_cursor, 0, "buffered, not yet dispatched");
+
+        // The snapshot lands, covering seq 3: the buffered frame is
+        // discarded by `ServeView` with no gap reported for it specifically.
+        app.needs_resync = true;
+        app.resync_at(std::time::Instant::now()).await;
+        if !buffer_before_snapshot {
+            assert!(
+                app.accept("event/agentMessage".into(), Some(agent_message_frame("m1", 1, 3)))
+                    .is_empty(),
+                "a delayed frame already covered by the snapshot is discarded too"
+            );
+        }
+        assert_eq!(
+            app.pending_messages_cursor, 0,
+            "the buffered notification's cursor was never folded in — it was discarded, not applied"
+        );
+        assert!(
+            app.needs_pending_messages,
+            "the resync must arm a recovery read on its own, regardless of any reported gap"
+        );
+
+        app.settle_with_engine_at(std::time::Instant::now()).await;
+
+        assert_eq!(
+            recorded_after_cursors(&recovered_after),
+            vec![0, 0],
+            "the recovery read must ask from the untouched watermark"
+        );
+        let ids: Vec<String> = app
+            .state
+            .transcript
+            .blocks()
+            .iter()
+            .filter_map(|b| match b {
+                Block::AgentMessage { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["m1".to_string()],
+            "the discarded notification must be shown exactly once, via recovery"
+        );
+        assert_eq!(app.pending_messages_cursor, 1);
+    }
+
+    /// Small helper so the assertion above reads as "what was asked", not
+    /// "unwrap this lock".
+    fn recorded_after_cursors(recorded: &std::sync::Arc<std::sync::Mutex<Vec<i64>>>) -> Vec<i64> {
+        recorded.lock().unwrap().clone()
+    }
+
+    /// I2 (Stage 2 review): live `event/agentMessage` delivery is the ONLY
+    /// way most notifications are ever seen — `pending_messages_at` (the RPC
+    /// recovery path) previously was the sole writer of
+    /// `pending_messages_cursor`, so a client that received every
+    /// notification live still asked a *later* recovery read to start from
+    /// its stale (often `0`) cursor. Proven here through the real API: a run
+    /// of contiguous live cursors must advance the watermark on its own.
+    #[tokio::test]
+    async fn contiguous_live_delivery_advances_the_pending_messages_cursor() {
+        let mut harness = app_answering(crate::local::AccessMode::TrustedLocal, |method, _| {
+            match method {
+                "session/pendingMessages" => Ok(empty_pending_messages()),
+                _ => Ok(json!({})),
+            }
+        });
+        let app = &mut harness.app;
+        app.needs_resync = false;
+        app.needs_rehydrate = false;
+        // Bootstrap the pending-messages recovery out of the way first —
+        // this test is about what LIVE delivery does afterwards.
+        app.settle_with_engine_at(std::time::Instant::now()).await;
+        assert_eq!(app.pending_messages_cursor, 0);
+
+        for (seq, cursor) in (1..=5i64).enumerate().map(|(i, c)| (i as i64 + 1, c)) {
+            for frame in app.accept(
+                "event/agentMessage".into(),
+                Some(agent_message_frame(&format!("m{cursor}"), cursor, seq)),
+            ) {
+                app.dispatch_frame(frame);
+            }
+        }
+
+        assert_eq!(
+            app.pending_messages_cursor, 5,
+            "five contiguous live cursors must fully advance the watermark"
+        );
+        assert!(
+            app.pending_messages_seen.is_empty(),
+            "nothing should be left held once every cursor arrived in order"
+        );
+    }
+
+    /// The false-positive the review flagged: once live delivery has already
+    /// advanced the watermark past what a later recovery read would
+    /// otherwise think is the oldest surviving cursor, that recovery read
+    /// must ask from the ADVANCED cursor — never the stale bootstrap one —
+    /// so it does not report already-shown messages as lost.
+    #[tokio::test]
+    async fn a_recovery_after_contiguous_live_delivery_asks_from_the_advanced_cursor_not_zero() {
+        let after_cursors: std::sync::Arc<std::sync::Mutex<Vec<i64>>> = Default::default();
+        let recorded = std::sync::Arc::clone(&after_cursors);
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let call_counter = std::sync::Arc::clone(&calls);
+        let mut harness = app_answering(crate::local::AccessMode::TrustedLocal, move |method, params| {
+            match method {
+                "session/pendingMessages" => {
+                    let after = params["afterCursor"].as_i64().unwrap_or(-1);
+                    recorded.lock().unwrap().push(after);
+                    if call_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        // The bootstrap read: nothing published yet.
+                        return Ok(empty_pending_messages());
+                    }
+                    if after == 0 {
+                        // What a stale cursor would wrongly see: eviction far
+                        // beyond what a fresh bus could have produced by
+                        // now, standing in for "the ring rotated past
+                        // messages this client already showed live".
+                        Ok(json!({
+                            "messages": [],
+                            "nextCursor": 200,
+                            "gap": true,
+                            "dropped": { "from": 1, "to": 200, "count": 200 },
+                            "truncated": false,
+                        }))
+                    } else {
+                        Ok(json!({ "messages": [], "nextCursor": after, "gap": false, "truncated": false }))
+                    }
+                }
+                _ => Ok(json!({})),
+            }
+        });
+        let app = &mut harness.app;
+        app.needs_resync = false;
+        app.needs_rehydrate = false;
+        app.settle_with_engine_at(std::time::Instant::now()).await;
+        assert_eq!(app.pending_messages_cursor, 0);
+
+        for (seq, cursor) in (1..=3i64).enumerate().map(|(i, c)| (i as i64 + 1, c)) {
+            for frame in app.accept(
+                "event/agentMessage".into(),
+                Some(agent_message_frame(&format!("m{cursor}"), cursor, seq)),
+            ) {
+                app.dispatch_frame(frame);
+            }
+        }
+        assert_eq!(app.pending_messages_cursor, 3, "live delivery must have advanced the watermark");
+
+        // A genuine event gap (unrelated frames dropped) re-arms recovery —
+        // it must NOT reset the watermark this client already proved.
+        app.on_events_lost("simulated drop, unrelated to the message bus");
+        assert!(app.needs_pending_messages);
+        assert_eq!(app.pending_messages_cursor, 3, "a re-armed recovery must not roll the watermark back");
+
+        app.settle_with_engine_at(std::time::Instant::now()).await;
+
+        assert_eq!(
+            after_cursors.lock().unwrap().clone(),
+            vec![0, 3],
+            "the second read must ask from the cursor live delivery already proved, not 0 again"
+        );
+        let notices: Vec<String> = app
+            .state
+            .transcript
+            .blocks()
+            .iter()
+            .filter_map(|b| match b {
+                Block::Notice { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !notices.iter().any(|n| n.contains("could not be recovered")),
+            "messages already shown live must never be reported lost: {notices:?}"
+        );
+    }
+
+    /// The hole is preserved, not silently skipped: a live cursor that
+    /// arrives AHEAD of the contiguous watermark (an earlier one never
+    /// arrived, or has not yet) must be held rather than folded in with a
+    /// blind `max`, and the missing cursor must still be recovered once a
+    /// read fills it in.
+    ///
+    /// FIX A (Stage 2 review, I1's sibling regression): detecting the
+    /// out-of-order cursor must itself arm the recovery read — production
+    /// code, not a test manually setting `needs_pending_messages` — or a
+    /// hole this client already knows about could sit unrecovered forever
+    /// with nothing left to notice it is owed.
+    #[tokio::test]
+    async fn an_out_of_order_live_cursor_is_held_until_the_hole_before_it_is_filled() {
+        let after_cursors: std::sync::Arc<std::sync::Mutex<Vec<i64>>> = Default::default();
+        let recorded = std::sync::Arc::clone(&after_cursors);
+        let mut harness = app_answering(crate::local::AccessMode::TrustedLocal, move |method, params| {
+            match method {
+                "session/pendingMessages" => {
+                    let after = params["afterCursor"].as_i64().unwrap_or(-1);
+                    recorded.lock().unwrap().push(after);
+                    if after == 1 {
+                        // Fills the hole: cursor 2 was never delivered live,
+                        // and is still in the bus for this read to recover.
+                        Ok(json!({
+                            "messages": [{
+                                "id": "m2",
+                                "cursor": 2,
+                                "label": "main",
+                                "text": "message m2",
+                                "context": null,
+                                "source": "main",
+                                "taskId": null,
+                                "scheduleDefinitionId": null,
+                            }],
+                            "nextCursor": 2,
+                            "gap": false,
+                            "truncated": false,
+                        }))
+                    } else {
+                        Ok(empty_pending_messages())
+                    }
+                }
+                _ => Ok(json!({})),
+            }
+        });
+        let app = &mut harness.app;
+        app.needs_resync = false;
+        app.needs_rehydrate = false;
+        app.settle_with_engine_at(std::time::Instant::now()).await;
+        assert_eq!(app.pending_messages_cursor, 0);
+
+        // Cursor 1 arrives live, contiguous.
+        for frame in
+            app.accept("event/agentMessage".into(), Some(agent_message_frame("m1", 1, 1)))
+        {
+            app.dispatch_frame(frame);
+        }
+        assert_eq!(app.pending_messages_cursor, 1);
+
+        // Cursor 2 never arrives live (lost, or simply not yet). Cursor 3
+        // arrives live — out of order relative to the watermark.
+        for frame in
+            app.accept("event/agentMessage".into(), Some(agent_message_frame("m3", 3, 2)))
+        {
+            app.dispatch_frame(frame);
+        }
+        assert_eq!(
+            app.pending_messages_cursor, 1,
+            "a live cursor ahead of the watermark must not skip the hole before it"
+        );
+        assert!(app.pending_messages_seen.contains(&3), "cursor 3 must be held, not discarded");
+        assert!(
+            app.needs_pending_messages,
+            "detecting the out-of-order cursor must itself arm recovery — nothing here \
+             manually set the flag"
+        );
+
+        // No manual arming: the flag production already set is what drives
+        // this settle.
+        app.settle_with_engine_at(std::time::Instant::now()).await;
+
+        assert_eq!(
+            after_cursors.lock().unwrap().clone(),
+            vec![0, 1],
+            "the recovery read must ask from the watermark (1), not from the held cursor (3)"
+        );
+        assert_eq!(
+            app.pending_messages_cursor, 3,
+            "filling the hole must fold in the already-held cursor 3 right after it"
+        );
+        assert!(app.pending_messages_seen.is_empty());
+        let notices: Vec<String> = app
+            .state
+            .transcript
+            .blocks()
+            .iter()
+            .filter_map(|b| match b {
+                Block::Notice { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !notices.iter().any(|n| n.contains("could not be recovered")),
+            "cursor 2 was actually recovered, not lost: {notices:?}"
+        );
+        let ids: Vec<String> = app
+            .state
+            .transcript
+            .blocks()
+            .iter()
+            .filter_map(|b| match b {
+                Block::AgentMessage { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec!["m1".to_string(), "m3".to_string(), "m2".to_string()]);
+    }
+
+    /// FIX D (Stage 2 review): `pending_messages_seen` is bounded by
+    /// `PENDING_MESSAGES_SEEN_CAPACITY` — a persistent missing prefix (the
+    /// hole never closes) combined with sustained live delivery must not
+    /// grow it forever. A NEW out-of-order cursor that arrives once the set
+    /// is already full is neither tracked nor shown yet; it stays
+    /// recoverable through the engine's own ring, and `pending_messages_at`
+    /// is where it is actually applied — exactly once, alongside a cursor
+    /// already shown live (proving dedup, not a fixture that never resends
+    /// one) and the still-missing prefix.
+    #[tokio::test]
+    async fn a_capacity_bounded_out_of_order_cursor_is_deferred_then_recovered_exactly_once() {
+        let mut harness = app_answering(crate::local::AccessMode::TrustedLocal, |method, params| {
+            match method {
+                "session/getState" => Ok(snapshot_value(0, 0, 500)),
+                "session/pendingMessages" => {
+                    let after = params["afterCursor"].as_i64().unwrap_or(-1);
+                    if after == 0 {
+                        Ok(json!({
+                            "messages": [
+                                {
+                                    "id": "m1", "cursor": 1, "label": "main",
+                                    "text": "message m1", "context": null, "source": "main",
+                                    "taskId": null, "scheduleDefinitionId": null,
+                                },
+                                // Already shown live: a real bus read would
+                                // include it too, since it never learns what
+                                // this client happened to display.
+                                {
+                                    "id": "m100", "cursor": 100, "label": "main",
+                                    "text": "message m100", "context": null, "source": "main",
+                                    "taskId": null, "scheduleDefinitionId": null,
+                                },
+                                {
+                                    "id": "m202", "cursor": 202, "label": "main",
+                                    "text": "message m202", "context": null, "source": "main",
+                                    "taskId": null, "scheduleDefinitionId": null,
+                                },
+                            ],
+                            "nextCursor": 202,
+                            "gap": false,
+                            "truncated": false,
+                        }))
+                    } else {
+                        Ok(empty_pending_messages())
+                    }
+                }
+                _ => Ok(json!({})),
+            }
+        });
+        let app = &mut harness.app;
+        app.needs_resync = false;
+        app.needs_rehydrate = false;
+
+        // Cursor 1 never arrives live — the persistent missing prefix.
+        // Cursors 2..=201 (exactly `PENDING_MESSAGES_SEEN_CAPACITY`) arrive
+        // live, out of order: every one fits and is admitted.
+        for (i, cursor) in (2..=201u64).enumerate() {
+            let seq = i as i64 + 1;
+            for frame in app.accept(
+                "event/agentMessage".into(),
+                Some(agent_message_frame(&format!("m{cursor}"), cursor as i64, seq)),
+            ) {
+                app.dispatch_frame(frame);
+            }
+        }
+        assert_eq!(app.pending_messages_cursor, 0, "the missing prefix still holds the watermark");
+        assert_eq!(
+            app.pending_messages_seen.len(),
+            PENDING_MESSAGES_SEEN_CAPACITY,
+            "every cursor up to capacity must have been admitted"
+        );
+        assert_eq!(
+            app.state.transcript.blocks().iter().filter(|b| matches!(b, Block::AgentMessage { .. })).count(),
+            200,
+            "all 200 admitted cursors must already be shown"
+        );
+
+        // Cursor 202: a NEW out-of-order cursor with the set already full.
+        for frame in
+            app.accept("event/agentMessage".into(), Some(agent_message_frame("m202", 202, 201)))
+        {
+            app.dispatch_frame(frame);
+        }
+        assert_eq!(
+            app.pending_messages_seen.len(),
+            PENDING_MESSAGES_SEEN_CAPACITY,
+            "capacity must never be exceeded"
+        );
+        assert!(
+            !app.pending_messages_seen.contains(&202),
+            "an over-capacity cursor is never tracked, so it can never falsely count as received"
+        );
+        assert!(
+            !app.state.transcript.blocks().iter().any(|b| matches!(
+                b,
+                Block::AgentMessage { id, .. } if id == "m202"
+            )),
+            "an over-capacity cursor must not be shown yet — it is deferred, not lost"
+        );
+        assert!(app.needs_pending_messages, "the deferral must owe a recovery read");
+
+        // A recovery read reaches all the way to cursor 202 (nothing evicted).
+        app.settle_with_engine_at(std::time::Instant::now()).await;
+
+        let ids: Vec<String> = app
+            .state
+            .transcript
+            .blocks()
+            .iter()
+            .filter_map(|b| match b {
+                Block::AgentMessage { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ids.iter().filter(|id| id.as_str() == "m100").count(),
+            1,
+            "a cursor already shown live must not be shown a second time by recovery: {ids:?}"
+        );
+        assert_eq!(
+            ids.iter().filter(|id| id.as_str() == "m202").count(),
+            1,
+            "the deferred cursor must now be shown exactly once: {ids:?}"
+        );
+        assert_eq!(
+            ids.iter().filter(|id| id.as_str() == "m1").count(),
+            1,
+            "the missing prefix is recovered too: {ids:?}"
+        );
+        assert_eq!(app.pending_messages_cursor, 202, "the baseline must advance past the deferred cursor");
+        assert!(app.pending_messages_seen.is_empty(), "receipts must be pruned once subsumed");
+    }
+
+    /// The other side of the same deferral: if the engine's ring genuinely
+    /// evicts a deferred (never tracked, never shown) cursor before recovery
+    /// reaches it, the loss is real and must be reported honestly — nothing
+    /// here silently swallows it just because it is the same kind of cursor
+    /// the capacity bound otherwise protects.
+    #[tokio::test]
+    async fn a_deferred_cursor_evicted_before_recovery_is_reported_as_a_genuine_loss() {
+        let mut harness = app_answering(crate::local::AccessMode::TrustedLocal, |method, params| {
+            match method {
+                "session/getState" => Ok(snapshot_value(0, 0, 500)),
+                "session/pendingMessages" => {
+                    let after = params["afterCursor"].as_i64().unwrap_or(-1);
+                    assert_eq!(after, 0, "the watermark never advanced — the prefix is still missing");
+                    Ok(json!({
+                        "messages": [],
+                        "nextCursor": 202,
+                        "gap": true,
+                        "dropped": { "from": 1, "to": 202, "count": 202 },
+                        "truncated": false,
+                    }))
+                }
+                _ => Ok(json!({})),
+            }
+        });
+        let app = &mut harness.app;
+        app.needs_resync = false;
+        app.needs_rehydrate = false;
+
+        for (i, cursor) in (2..=201u64).enumerate() {
+            let seq = i as i64 + 1;
+            for frame in app.accept(
+                "event/agentMessage".into(),
+                Some(agent_message_frame(&format!("m{cursor}"), cursor as i64, seq)),
+            ) {
+                app.dispatch_frame(frame);
+            }
+        }
+        for frame in
+            app.accept("event/agentMessage".into(), Some(agent_message_frame("m202", 202, 201)))
+        {
+            app.dispatch_frame(frame);
+        }
+        assert!(
+            !app.pending_messages_seen.contains(&202),
+            "the over-capacity cursor was deferred, never tracked"
+        );
+
+        app.settle_with_engine_at(std::time::Instant::now()).await;
+
+        let notices: Vec<String> = app
+            .state
+            .transcript
+            .blocks()
+            .iter()
+            .filter_map(|b| match b {
+                Block::Notice { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            notices.iter().any(|n| n.contains("2 lost within cursors 1-202")),
+            "cursor 1 (never arrived) and cursor 202 (deferred, then evicted) are genuinely \
+             lost; cursors 2..=201 were already received and must not be claimed lost: {notices:?}"
+        );
+    }
+
+    /// A failed recovery keeps the need alive and retries later, exactly
+    /// like `resync_at`/`rehydrate_at` — dropping it here would leave a
+    /// background notification unrecovered forever.
+    #[tokio::test]
+    async fn a_failed_pending_messages_read_keeps_the_need_and_is_reported() {
+        let mut harness = app_answering(crate::local::AccessMode::TrustedLocal, |method, _| {
+            match method {
+                "session/pendingMessages" => Err((-32603, "temporarily unavailable".into())),
+                _ => Ok(empty_pending_messages()),
+            }
+        });
+        let app = &mut harness.app;
+        app.needs_resync = false;
+        app.needs_rehydrate = false;
+
+        app.settle_with_engine_at(std::time::Instant::now()).await;
+
+        assert!(app.needs_pending_messages, "a failed read must not be dropped");
+        let notices: Vec<String> = app
+            .state
+            .transcript
+            .blocks()
+            .iter()
+            .filter_map(|b| match b {
+                Block::Notice { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            notices.iter().any(|n| n.contains("pending notifications")),
+            "the failure must be reported: {notices:?}"
+        );
+    }
+
+    /// The acceptance-critical end-to-end proof: a notification parked
+    /// behind a still-open `Assistant` block survives a REAL
+    /// `session/getHistory` rehydration through the real `App`/`Connection`
+    /// harness (not only the `UiState`-level unit test) — it is neither
+    /// dropped nor duplicated, and lands after the rebuilt conversation.
+    #[tokio::test]
+    async fn a_parked_notification_survives_a_real_history_rehydration() {
+        let mut harness = app_with(crate::local::AccessMode::TrustedLocal, |method, _| match method {
+            "session/getHistory" => json!({
+                "sessionId": "s1",
+                "engineInstanceId": "e1",
+                "isLiveSession": true,
+                "historyEpoch": 0,
+                "cursor": 0,
+                "historyLength": 1,
+                "entries": [
+                    { "index": 0, "role": "assistant", "entryKind": "assistant",
+                      "blocks": [{ "kind": "text", "text": "rebuilt reply" }] },
+                ],
+                "nextIndex": 1,
+                "totalKnown": 1,
+                "truncated": false,
+            }),
+            "session/pendingMessages" => empty_pending_messages(),
+            _ => json!({}),
+        });
+        let app = &mut harness.app;
+        app.needs_pending_messages = false;
+
+        // A reply is streaming...
+        for frame in app.accept(
+            "event/assistantText".into(),
+            Some(json!({ "delta": "still typing", "seq": 1, "engineInstanceId": "e1" })),
+        ) {
+            app.dispatch_frame(frame);
+        }
+        assert!(matches!(
+            app.state.transcript.blocks().last(),
+            Some(Block::Assistant { complete: false, .. })
+        ));
+
+        // ...and a background notification arrives while it is still open.
+        for frame in app.accept(
+            "event/agentMessage".into(),
+            Some(json!({
+                "id": "m1", "cursor": 1, "label": "main", "text": "parked note",
+                "context": null, "source": "main", "seq": 2, "engineInstanceId": "e1",
+            })),
+        ) {
+            app.dispatch_frame(frame);
+        }
+        assert!(
+            !app.state.transcript.blocks().iter().any(|b| matches!(b, Block::AgentMessage { .. })),
+            "parked behind the open block, not shown yet"
+        );
+
+        // A rehydration (e.g. a gap/reconnect) rebuilds the conversation
+        // while the notification is still parked.
+        app.needs_rehydrate = true;
+        app.rehydrate_at(std::time::Instant::now()).await;
+
+        let texts: Vec<&str> = app
+            .state
+            .transcript
+            .blocks()
+            .iter()
+            .filter_map(|b| match b {
+                Block::Assistant { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["rebuilt reply"], "the engine's rebuild is authoritative over the streamed reply");
+
+        let agent_messages: Vec<&str> = app
+            .state
+            .transcript
+            .blocks()
+            .iter()
+            .filter_map(|b| match b {
+                Block::AgentMessage { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            agent_messages,
+            vec!["parked note"],
+            "the parked notification must survive the rebuild exactly once — never dropped, never doubled"
+        );
     }
 
     #[tokio::test]

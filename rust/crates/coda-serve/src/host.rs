@@ -59,9 +59,9 @@ use uuid::Uuid;
 use crate::dispatch::{
     CancelRequestParams, CompactParams, ConfigSetParams, ForkParams, GetEventsParams,
     GetHistoryParams, GetStateParams, HooksInfoParams, HooksTrustParams, InitParams,
-    ListSessionsParams, MessagesParams, ModelsParams, PromptParams, ResolveRequestParams,
-    RewindParams, RpcError, ScheduleCreateParams, ScheduleDeleteParams, ServeBackend,
-    SetEffortParams, SetGoalParams, SetModelParams, SetPermissionModeParams,
+    ListSessionsParams, MessagesParams, ModelsParams, PendingMessagesParams, PromptParams,
+    ResolveRequestParams, RewindParams, RpcError, ScheduleCreateParams, ScheduleDeleteParams,
+    ServeBackend, SetEffortParams, SetGoalParams, SetModelParams, SetPermissionModeParams,
     SetSystemPromptParams, SteerParams,
 };
 use crate::dispatch::AdjustEffortParams;
@@ -890,6 +890,12 @@ pub struct ServeHost {
     // ── Session-scoped services ──────────────────────────────────────────────
     task_manager: Arc<TaskManager>,
     schedule_store: Arc<ScheduledTaskStore>,
+    /// Engine-owned in-memory user-notification bus (Stage 2). Created
+    /// eagerly here, next to `schedule_store`, so it exists before the lazy
+    /// `SessionServices` and can serve `session/pendingMessages` recovery
+    /// even before the first prompt/provider is wired. RAM-only: never
+    /// persisted, never continues across a restart.
+    message_bus: Arc<coda_agent::MessageBus>,
     lsp_manager: Arc<LspServerManager>,
     /// Trust decisions for project-scoped hooks; persists within the session.
     hook_trust_store: Arc<InMemoryHookTrustStore>,
@@ -1182,6 +1188,18 @@ impl ServeHost {
         });
 
         let bus = sink.bus();
+        // Engine-owned notification bus, created here (eagerly, next to
+        // `schedule_store` above) — before `SessionServices` (which builds
+        // lazily on the first prompt) so `session/pendingMessages` recovery
+        // and `notify_user` are both available immediately, independent of
+        // whether a provider has ever been wired. The bridge publishes each
+        // acceptance onto the SAME authoritative `EventBus` every other
+        // `event/*` notification uses; the bus's own cursor (carried in the
+        // event payload) is distinct from that `EventBus`'s seq.
+        let message_bus_bridge = crate::state::message_bus_observer::MessageBusEventBridge::new(Arc::clone(&bus));
+        let message_bus: Arc<coda_agent::MessageBus> = Arc::new(coda_agent::MessageBus::with_observer(Some(
+            message_bus_bridge as Arc<dyn coda_agent::message::MessageBusObserver>,
+        )));
         // The public read model is seeded with the *real* startup
         // configuration before anything can read it: model, effort, permission
         // mode, prompt source and the provider actually wired (genuinely
@@ -1243,6 +1261,7 @@ impl ServeHost {
             current_session_id: Mutex::new(session_id),
             task_manager,
             schedule_store,
+            message_bus,
             lsp_manager,
             hook_trust_store,
             user_hooks,
@@ -1826,7 +1845,8 @@ impl ServeHost {
             self.working_dir.clone(),
         )
         .with_model_source(Arc::clone(&model_source))
-        .with_schedule_store(Arc::clone(&self.schedule_store));
+        .with_schedule_store(Arc::clone(&self.schedule_store))
+        .with_message_bus(Arc::clone(&self.message_bus));
 
         // 2. Trust guard using the session-scoped trust store.
         let trust_guard = HookTrustGuard::new(
@@ -1863,7 +1883,8 @@ impl ServeHost {
             MAX_CONCURRENT_SUBAGENTS,
         )
         .with_model_source(model_source)
-        .with_schedule_store(Arc::clone(&self.schedule_store));
+        .with_schedule_store(Arc::clone(&self.schedule_store))
+        .with_message_bus(Arc::clone(&self.message_bus));
 
         // 5. Schedule runtime — fires due scheduled tasks via the main subagent.
         let runner = TaskManagerRunner::new(
@@ -2336,6 +2357,12 @@ impl ServeBackend for ServeHost {
         if let Some(manager) = &self.mcp_manager {
             manager.shutdown().await;
         }
+        // Close the engine-owned notification bus: no further `notify_user`
+        // publication is meaningful once the engine itself has begun
+        // shutting down, and closing it makes that refusal explicit rather
+        // than leaving a background task's publish silently succeed into a
+        // bus nothing will ever read from again.
+        self.message_bus.close();
         self.engine_state.shutdown_completed();
         Ok(json!({ "ok": true }))
     }
@@ -3429,6 +3456,55 @@ impl ServeBackend for ServeHost {
         let result = self.mcp_inventory().await;
         serde_json::to_value(&result).map_err(|e| RpcError::internal(e.to_string()))
     }
+
+    /// Non-destructive recovery of engine-owned user notifications.
+    /// `afterCursor` addresses the message bus's own cursor, never the
+    /// `EventBus` seq — see `coda_agent::message` module docs.
+    ///
+    /// `engineInstanceId`, when supplied, fences this read the same way
+    /// `session/getHistory` fences its own: the bus is scoped to this engine
+    /// process, so a cursor minted by a different process is refused rather
+    /// than silently read against the wrong ring.
+    async fn session_pending_messages(&self, p: PendingMessagesParams) -> Result<Value, RpcError> {
+        let current_instance = self.engine_state.bus_ref().engine_instance_id();
+        if let Some(expected) = &p.engine_instance_id {
+            if expected != current_instance {
+                return Err(RpcError::instance_changed(format!(
+                    "this engine is instance {current_instance}; a cursor from another process \
+                     is not a position in this bus — re-read from cursor 0"
+                )));
+            }
+        }
+        let since =
+            self.message_bus.user_since(p.after_cursor, p.limit.map(|n| n.max(0) as usize));
+        let messages: Vec<coda_proto::responses::AgentMessageDto> = since
+            .messages
+            .into_iter()
+            .map(|m| coda_proto::responses::AgentMessageDto {
+                id: m.id,
+                cursor: m.cursor as i64,
+                label: m.label,
+                text: m.body,
+                context: m.context,
+                source: m.source_kind.to_owned(),
+                task_id: m.task_id,
+                schedule_definition_id: m.schedule_definition_id,
+            })
+            .collect();
+        let dropped = since.dropped.map(|d| coda_proto::responses::DroppedRangeDto {
+            from: d.from as i64,
+            to: d.to as i64,
+            count: d.count as i64,
+        });
+        let result = coda_proto::responses::PendingMessagesResult {
+            messages,
+            next_cursor: since.next_cursor as i64,
+            gap: since.gap,
+            dropped,
+            truncated: since.truncated,
+        };
+        serde_json::to_value(&result).map_err(|e| RpcError::internal(e.to_string()))
+    }
 }
 
 /// Maps a registry refusal onto a typed JSON-RPC error.
@@ -3791,6 +3867,8 @@ impl ServeHost {
         .with_schedule_store(Arc::clone(&self.schedule_store))
         .with_lsp_manager(Arc::clone(&self.lsp_manager))
         .with_subagent_factory(Arc::clone(&services.subagent_host) as Arc<dyn SubagentFactory>)
+        .with_message_bus(Arc::clone(&self.message_bus))
+        .with_main_context()
         .with_hook_runner(Arc::clone(&services.hook_runner));
 
         // Apply the session-only system prompt override the captured record
@@ -5556,6 +5634,104 @@ mod tests {
         assert_eq!(start["turn_id"], end["turn_id"], "start/end share the same turn id");
         assert_eq!(end["stop_reason"], "end_turn");
         assert_eq!(start["provider"], "scripted");
+    }
+
+    /// Poison canary: a real turn in which the model calls `notify_user` with
+    /// a distinctive, secret-shaped body must never leak that body into the
+    /// operational diagnostics log — at any of the three verbosity levels a
+    /// user can select. This crate's `Event` enum structurally carries no
+    /// tool-call content today (see `coda_diagnostics::event`/`detail`
+    /// module docs), so this is a regression lock: if a future change ever
+    /// added tool-call logging without redaction, this test would catch the
+    /// poison string appearing in the log file, rather than the safety
+    /// resting on an assumption about `Debug` derives or the diagnostics
+    /// event shape staying exactly as it is today.
+    #[tokio::test]
+    async fn notify_user_body_never_reaches_the_diagnostics_log_at_any_verbosity() {
+        use coda_llm::anthropic::StreamEvent;
+        use coda_llm::{Content, Correlation, Usage};
+
+        const POISON: &str = "PoisonCanary-secret-shaped-token-sk-live-do-not-log-me";
+
+        for verbosity in
+            [coda_diagnostics::Verbosity::Normal, coda_diagnostics::Verbosity::Debug, coda_diagnostics::Verbosity::Trace]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let logger = coda_diagnostics::Logger::open(
+                coda_diagnostics::Options {
+                    directory: dir.path().to_path_buf(),
+                    file: None,
+                    role: coda_diagnostics::ProcessRole::Serve,
+                    version: "test".into(),
+                    verbosity,
+                },
+                coda_diagnostics::Limits::default(),
+            )
+            .expect("logger opens");
+            let ctx = coda_diagnostics::DiagnosticContext::root(Arc::new(logger), "run-1");
+
+            let client = ScriptedClient::new(vec![
+                vec![
+                    StreamEvent::ToolUse(Content::ToolUse {
+                        id: "call-1".into(),
+                        name: "notify_user".into(),
+                        input_json: format!(r#"{{"text":"{POISON}"}}"#),
+                        correlation: Correlation::default(),
+                    }),
+                    StreamEvent::Done {
+                        stop_reason: Some("tool_use".into()),
+                        usage: Usage { input_tokens: 10, output_tokens: 5, ..Usage::ZERO },
+                    },
+                ],
+                vec![
+                    StreamEvent::TextDelta("done".into()),
+                    StreamEvent::Done { stop_reason: Some("end_turn".into()), usage: Usage::ZERO },
+                ],
+            ]);
+
+            let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            let sink = Arc::new(ServeSink::new(tx.clone()));
+            let ch = Arc::new(PromptChannel::new(tx));
+            let host = ServeHost::new_with_optional_client_and_mcp(
+                Some(client),
+                sink,
+                ch,
+                ".".into(),
+                crate::mcp::McpBundle::disabled(),
+                StartupOptions::default(),
+                None,
+                Some(ctx.clone()),
+            );
+            host.initialize(InitParams::default()).await.unwrap();
+            let result = host
+                .session_prompt(PromptParams { text: Some("send the report".into()), images: None })
+                .await
+                .expect("prompt succeeds");
+            assert!(result["ok"].as_bool().unwrap_or(false));
+
+            // The notification really was published (proves the tool ran,
+            // not that it was silently skipped) — recovered independently of
+            // diagnostics, through the documented public API.
+            let pending = host
+                .session_pending_messages(PendingMessagesParams {
+                    after_cursor: 0,
+                    limit: None,
+                    engine_instance_id: None,
+                })
+                .await
+                .unwrap();
+            assert_eq!(pending["messages"][0]["text"], POISON);
+
+            // The diagnostics log — the actual writer path, not a
+            // hypothetical one — must never contain it, at this verbosity.
+            let raw_log = std::fs::read_to_string(ctx.logger().status().path.expect("a log path"))
+                .unwrap();
+            assert!(
+                !raw_log.contains(POISON),
+                "the poison string leaked into the {:?} diagnostics log:\n{raw_log}",
+                verbosity
+            );
+        }
     }
 
     #[tokio::test]
@@ -7496,6 +7672,19 @@ mod tests {
             host.session_get_state(GetStateParams::default()).await.unwrap()["lifecycle"],
             "stopped"
         );
+    }
+
+    /// The engine-owned message bus is closed as part of shutdown, so a
+    /// `notify_user` call racing the teardown gets an explicit refusal
+    /// rather than silently publishing into a bus nobody will ever read from
+    /// again.
+    #[tokio::test]
+    async fn shutdown_closes_the_message_bus() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, _rx) = host_with_events(dir.path());
+        assert!(!host.message_bus.is_closed());
+        host.shutdown().await.unwrap();
+        assert!(host.message_bus.is_closed());
     }
 
     /// Diagnostic: does the engine find a usable provider on this machine?
@@ -9494,6 +9683,200 @@ mod tests {
                 "the {label} host must share the SAME schedule store instance as the session"
             );
         }
+    }
+
+    /// Same invariant as the schedule-store test above, but for the Stage 2
+    /// engine-owned message bus: every host must share the SAME
+    /// `Arc<coda_agent::MessageBus>` as the session, never a per-host or
+    /// lazily-created one.
+    #[tokio::test]
+    async fn message_bus_is_shared_by_main_and_hook_free_subagent_hosts() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = ScriptedClient::new(vec![]);
+        let host = make_host_in_dir(dir.path().to_str().unwrap(), client.clone());
+        let services = host.build_session_services(client);
+
+        for (host_under_test, label) in [
+            (&services.subagent_host, "main"),
+            (&services.hook_free_subagent_host, "hook-free"),
+        ] {
+            let wired = host_under_test
+                .message_bus()
+                .unwrap_or_else(|| panic!("{label} host must have a message bus wired"));
+            assert!(
+                Arc::ptr_eq(wired, &host.message_bus),
+                "the {label} host must share the SAME message bus instance as the session"
+            );
+        }
+    }
+
+    /// End-to-end: a notification published via the `notify_user` tool
+    /// (using the session's own message bus and task manager) is recovered
+    /// through `session/pendingMessages`, independent of any prompt/provider.
+    #[tokio::test]
+    async fn notify_user_publication_is_recovered_via_pending_messages() {
+        use coda_agent::tool::{ToolContext, ToolContextServiceExt as _};
+        use coda_agent::tools::NotifyUserTool;
+        use coda_agent::Tool as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let client = ScriptedClient::new(vec![]);
+        let host = make_host_in_dir(dir.path().to_str().unwrap(), client);
+
+        let ctx = ToolContext::new(host.working_dir.clone())
+            .with_message_bus(Arc::clone(&host.message_bus))
+            .with_main_context();
+
+        let out = NotifyUserTool
+            .execute(
+                &serde_json::json!({"text": "background work is done"}),
+                &ctx,
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+
+        let result = host
+            .session_pending_messages(PendingMessagesParams {
+                after_cursor: 0,
+                limit: None,
+                engine_instance_id: None,
+            })
+            .await
+            .unwrap();
+        let messages = result["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["text"], "background work is done");
+        assert_eq!(messages[0]["source"], "main");
+        assert_eq!(result["gap"], false);
+        // No task at all for `main` — never a fabricated id.
+        assert!(messages[0]["taskId"].is_null());
+        assert!(messages[0]["scheduleDefinitionId"].is_null());
+    }
+
+    /// A scheduled/subagent notification's trusted `taskId` is recovered
+    /// through `session/pendingMessages`, not just its (non-unique) label —
+    /// an external client needs a stable id to correlate against
+    /// `TaskManager` state.
+    #[tokio::test]
+    async fn notify_user_publication_carries_its_trusted_task_id_through_pending_messages() {
+        use coda_agent::tasks::{TaskExecutionMode, TaskKind, TaskManager};
+        use coda_agent::tool::{ToolContext, ToolContextServiceExt as _};
+        use coda_agent::tools::NotifyUserTool;
+        use coda_agent::Tool as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let client = ScriptedClient::new(vec![]);
+        let host = make_host_in_dir(dir.path().to_str().unwrap(), client);
+        let manager = TaskManager::with_defaults("session");
+        let task = manager
+            .register(TaskKind::Subagent, "background audit", None, TaskExecutionMode::Background)
+            .unwrap();
+
+        let ctx = ToolContext::new(host.working_dir.clone())
+            .with_message_bus(Arc::clone(&host.message_bus))
+            .with_task_manager(manager)
+            .with_caller_task_id(task.id.clone());
+
+        let out = NotifyUserTool
+            .execute(&serde_json::json!({"text": "audit finished"}), &ctx, CancellationToken::new())
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+
+        let result = host
+            .session_pending_messages(PendingMessagesParams {
+                after_cursor: 0,
+                limit: None,
+                engine_instance_id: None,
+            })
+            .await
+            .unwrap();
+        let messages = result["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["taskId"], task.id);
+        assert!(messages[0]["scheduleDefinitionId"].is_null());
+    }
+
+    /// `engineInstanceId` fences `session/pendingMessages` exactly like
+    /// `session/getHistory`: a stale id from another process is refused
+    /// rather than silently read against this process's bus.
+    #[tokio::test]
+    async fn pending_messages_refuses_a_stale_engine_instance_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = ScriptedClient::new(vec![]);
+        let host = make_host_in_dir(dir.path().to_str().unwrap(), client);
+
+        let err = host
+            .session_pending_messages(PendingMessagesParams {
+                after_cursor: 0,
+                limit: None,
+                engine_instance_id: Some("a-different-process".into()),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, crate::dispatch::error_code::INSTANCE_CHANGED);
+    }
+
+    /// The matching (current) engine instance id is accepted, proving the
+    /// fence checks identity rather than merely presence.
+    #[tokio::test]
+    async fn pending_messages_accepts_the_current_engine_instance_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = ScriptedClient::new(vec![]);
+        let host = make_host_in_dir(dir.path().to_str().unwrap(), client);
+        let current = host.engine_state.bus_ref().engine_instance_id().to_owned();
+
+        let result = host
+            .session_pending_messages(PendingMessagesParams {
+                after_cursor: 0,
+                limit: None,
+                engine_instance_id: Some(current),
+            })
+            .await
+            .unwrap();
+        assert!(result["messages"].as_array().unwrap().is_empty());
+    }
+
+    /// Reviewer follow-up (Stage 2 re-review): a TUI-side fixture proved a
+    /// recovery read that asks from an already-advanced cursor never reports
+    /// a spurious gap, but only against a fake engine — never against the
+    /// real `MessageBus` and its actual ring-eviction accounting. Proven here
+    /// end to end: publish well past `DEFAULT_RING_CAPACITY` through the real
+    /// bus, then read from its own latest cursor (exactly where "this client
+    /// received every notification live" would leave it) and confirm no gap
+    /// is reported — the eviction that genuinely happened is irrelevant to a
+    /// caller who was never behind it.
+    #[tokio::test]
+    async fn pending_messages_read_from_the_latest_cursor_reports_no_gap_after_ring_overflow() {
+        use coda_agent::message::DEFAULT_RING_CAPACITY;
+        use coda_agent::MessageSource;
+
+        let dir = tempfile::tempdir().unwrap();
+        let client = ScriptedClient::new(vec![]);
+        let host = make_host_in_dir(dir.path().to_str().unwrap(), client);
+
+        let total = DEFAULT_RING_CAPACITY + 50;
+        for i in 0..total {
+            host.message_bus
+                .publish_user(&MessageSource::Main, format!("note {i}"), None, None)
+                .unwrap();
+        }
+        let latest = host.message_bus.cursor();
+
+        let result = host
+            .session_pending_messages(PendingMessagesParams {
+                after_cursor: latest,
+                limit: None,
+                engine_instance_id: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result["gap"], false, "a client already caught up must never see a gap: {result}");
+        assert!(
+            result["dropped"].is_null(),
+            "no dropped range is reported when nothing was actually lost: {result}"
+        );
+        assert!(result["messages"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

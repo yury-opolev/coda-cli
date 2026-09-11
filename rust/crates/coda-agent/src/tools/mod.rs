@@ -16,6 +16,7 @@ mod glob_tool;
 mod grep_tool;
 mod list_dir;
 mod notebook_edit;
+mod notify_user;
 mod read_file;
 mod run_command;
 mod schedule_cancel_self;
@@ -60,6 +61,7 @@ pub use glob_tool::GlobTool;
 pub use grep_tool::GrepTool;
 pub use list_dir::ListDirTool;
 pub use notebook_edit::NotebookEditTool;
+pub use notify_user::NotifyUserTool;
 pub use read_file::ReadFileTool;
 pub use run_command::{RunCommandTool, DEFAULT_TIMEOUT_SECS, TIMEOUT_ENV};
 pub use schedule_cancel_self::ScheduleCancelSelfTool;
@@ -120,6 +122,7 @@ pub fn built_in_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(SleepTool),
         Arc::new(ToolSearchTool),
         Arc::new(GitWorktreeTool),
+        Arc::new(NotifyUserTool),
         // ── LSP ───────────────────────────────────────────────────────────────
         Arc::new(LspDiagnosticsTool),
         Arc::new(crate::lsp::LspTool),

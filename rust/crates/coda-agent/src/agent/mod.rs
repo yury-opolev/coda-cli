@@ -159,6 +159,10 @@ pub struct AgentLoop {
     schedule_origin: Option<ScheduleOrigin>,
     /// Subagent factory for the `task` tool.
     subagent_factory: Option<Arc<dyn SubagentFactory>>,
+    /// Engine-owned user-notification bus for `notify_user` (Stage 2).
+    message_bus: Option<Arc<crate::message::MessageBus>>,
+    /// `true` only for the trusted top-level (main) conversation loop.
+    is_main_context: bool,
 
     // Configuration.
     model: String,
@@ -578,6 +582,8 @@ impl AgentLoop {
                     caller_task_id: self.caller_task_id.clone(),
                     schedule_origin: self.schedule_origin.clone(),
                     subagent_factory: self.subagent_factory.clone(),
+                    message_bus: self.message_bus.clone(),
+                    is_main_context: self.is_main_context,
                 };
 
                 let ToolBatchResult { result_blocks, abort_reason, control_abort } =
@@ -759,6 +765,8 @@ pub struct AgentLoopBuilder {
     caller_task_id: Option<String>,
     schedule_origin: Option<ScheduleOrigin>,
     subagent_factory: Option<Arc<dyn SubagentFactory>>,
+    message_bus: Option<Arc<crate::message::MessageBus>>,
+    is_main_context: bool,
     model: String,
     system_prompt: Option<String>,
     max_tokens: u32,
@@ -800,6 +808,8 @@ impl AgentLoopBuilder {
             caller_task_id: None,
             schedule_origin: None,
             subagent_factory: None,
+            message_bus: None,
+            is_main_context: false,
             model: "claude-opus-4-5".into(),
             system_prompt: None,
             max_tokens: 4096,
@@ -955,6 +965,23 @@ impl AgentLoopBuilder {
         self
     }
 
+    /// Wire the engine-owned user-notification bus so `notify_user` is
+    /// available to this run. Shared clones (main loop, subagent host,
+    /// scheduled runs) must all receive the **same** `Arc` — see
+    /// `crate::message` module docs.
+    pub fn with_message_bus(mut self, bus: Arc<crate::message::MessageBus>) -> Self {
+        self.message_bus = Some(bus);
+        self
+    }
+
+    /// Mark this build as the trusted top-level (main) conversation loop.
+    /// Only the top-level agent-construction path may call this — a
+    /// subagent host or scheduled-run builder must never set it.
+    pub fn with_main_context(mut self) -> Self {
+        self.is_main_context = true;
+        self
+    }
+
     pub fn build(self) -> AgentLoop {
         AgentLoop {
             client: self.client,
@@ -977,6 +1004,8 @@ impl AgentLoopBuilder {
             caller_task_id: self.caller_task_id,
             schedule_origin: self.schedule_origin,
             subagent_factory: self.subagent_factory,
+            message_bus: self.message_bus,
+            is_main_context: self.is_main_context,
             model: self.model,
             system_prompt: self.system_prompt,
             max_tokens: self.max_tokens,

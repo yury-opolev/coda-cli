@@ -90,6 +90,7 @@ pub(super) fn document() -> Value {
         rpc(m::CONFIG_DESCRIBE, None, Some("ConfigDescribeResult"), S, S),
         rpc(m::CONFIG_SET, Some("ConfigSetParams"), Some("ConfigSetResult"), S, S),
         rpc(m::MCP_LIST, None, Some("McpListResult"), S, S),
+        rpc(m::PENDING_MESSAGES, Some("PendingMessagesParams"), Some("PendingMessagesResult"), S, S),
     ];
     let mut events: Vec<_> = [
         e::ASSISTANT_TEXT, e::ASSISTANT_TEXT_COMPLETE, e::THINKING, e::THINKING_COMPLETE,
@@ -98,7 +99,7 @@ pub(super) fn document() -> Value {
         e::TASK_COMPLETED, e::SCHEDULE_LIFECYCLE, e::PROMPT_REWRITTEN, e::RESPONSE_REWRITTEN,
         e::TOOL_INPUT_MODIFIED, e::TOOL_RESULT_MODIFIED, e::PERMISSION_DECIDED,
         e::PERMISSIONS_UPDATED, e::SUBAGENT_BLOCKED, e::SUBAGENT_RESULT_MODIFIED,
-        e::COMPACTION_CANCELLED, e::POST_COMPACT_CONTEXT_INJECTED,
+        e::COMPACTION_CANCELLED, e::POST_COMPACT_CONTEXT_INJECTED, e::AGENT_MESSAGE,
     ].into_iter().map(|method| event(method, false)).collect();
     events.extend([
         e::ACTIVITY, e::TURN_ENDED, e::LIFECYCLE, e::CONFIG_CHANGED, e::STEERING_QUEUE,

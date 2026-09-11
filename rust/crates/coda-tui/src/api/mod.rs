@@ -32,6 +32,7 @@ use coda_proto::config::ConfigDescribeResult;
 use coda_proto::history::{GetHistoryResult, ListSessionsResult};
 use coda_proto::mcp::McpListResult;
 use coda_proto::messages::method;
+use coda_proto::responses::PendingMessagesResult;
 use coda_proto::state::{PendingRequestDto, StateSnapshot};
 use serde_json::{json, Value};
 
@@ -175,6 +176,26 @@ pub async fn config_describe(
 /// `mcp/list` — read-only MCP server inventory as the engine sees it.
 pub async fn mcp_list(connection: &Connection) -> Result<McpListResult, ClientError> {
     fetch(connection, method::MCP_LIST, Some(json!({}))).await
+}
+
+/// `session/pendingMessages` — non-destructive recovery of engine-owned user
+/// notifications (Stage 2 `notify_user`). Public and valid **before**
+/// `initialize`, exactly like `session/getHistory`/`session/listSessions`.
+///
+/// `after_cursor` is the message bus's own cursor (see `coda_agent::message`
+/// module docs) — never an `EventBus` seq. `engine_instance_id`, when
+/// supplied, fences the read: a cursor minted by a different process is
+/// refused rather than silently read against the wrong bus.
+pub async fn get_pending_messages(
+    connection: &Connection,
+    after_cursor: u64,
+    engine_instance_id: Option<&str>,
+) -> Result<PendingMessagesResult, ClientError> {
+    let mut params = json!({ "afterCursor": after_cursor });
+    if let Some(instance) = engine_instance_id {
+        params["engineInstanceId"] = json!(instance);
+    }
+    fetch(connection, method::PENDING_MESSAGES, Some(params)).await
 }
 
 /// The allowed values `config/describe` publishes for one key.

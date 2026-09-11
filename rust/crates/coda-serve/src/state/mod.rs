@@ -35,6 +35,7 @@
 //! `.await` anywhere on this path.
 
 pub mod live;
+pub mod message_bus_observer;
 pub mod requests;
 pub mod steering_observer;
 

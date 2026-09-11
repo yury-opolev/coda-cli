@@ -281,6 +281,12 @@ pub struct ToolContext {
     /// Set only when this run was launched by the schedule runtime (directly or
     /// as a nested child of such a run).  Trusted: see [`ScheduleOrigin`].
     pub schedule_origin: Option<ScheduleOrigin>,
+    /// Set only by the trusted top-level (main) agent construction path —
+    /// never by a subagent/task/scheduled-run builder. Lets tools such as
+    /// `notify_user` distinguish "the real main conversation" from an
+    /// ordinary unauthenticated/test context with no caller task id, without
+    /// promoting the latter to main authority (fail-closed).
+    pub is_main_context: bool,
 
     // ── Service handles: engine-specific, opaque to coda-tool ─────────────────
     // coda-agent provides typed accessors via ToolContextServiceExt.
@@ -288,6 +294,8 @@ pub struct ToolContext {
     pub task_manager: Option<OpaqueServiceHandle>,
     pub schedule_store: Option<OpaqueServiceHandle>,
     pub subagent_factory: Option<OpaqueServiceHandle>,
+    /// Engine-owned user-notification bus (Stage 2, `notify_user`).
+    pub message_bus: Option<OpaqueServiceHandle>,
 }
 
 impl std::fmt::Debug for ToolContext {
@@ -302,10 +310,12 @@ impl std::fmt::Debug for ToolContext {
             .field("all_tools", &self.all_tools.as_ref().map(|v| v.len()))
             .field("caller_task_id", &self.caller_task_id)
             .field("schedule_origin", &self.schedule_origin)
+            .field("is_main_context", &self.is_main_context)
             .field("lsp_manager", &self.lsp_manager.is_some())
             .field("task_manager", &self.task_manager.is_some())
             .field("schedule_store", &self.schedule_store.is_some())
             .field("subagent_factory", &self.subagent_factory.is_some())
+            .field("message_bus", &self.message_bus.is_some())
             .finish()
     }
 }
@@ -322,10 +332,12 @@ impl ToolContext {
             all_tools: None,
             caller_task_id: None,
             schedule_origin: None,
+            is_main_context: false,
             lsp_manager: None,
             task_manager: None,
             schedule_store: None,
             subagent_factory: None,
+            message_bus: None,
         }
     }
 
@@ -364,6 +376,14 @@ impl ToolContext {
     /// build this from tool arguments or model output.
     pub fn with_schedule_origin(mut self, origin: ScheduleOrigin) -> Self {
         self.schedule_origin = Some(origin);
+        self
+    }
+
+    /// Mark this context as the trusted top-level (main) conversation.
+    /// Trusted callers only (the top-level agent-loop construction path) —
+    /// never set by a subagent host or scheduled-run builder.
+    pub fn with_main_context(mut self) -> Self {
+        self.is_main_context = true;
         self
     }
 }

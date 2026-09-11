@@ -43,6 +43,7 @@ pub mod events;
 pub mod goal;
 pub mod hooks;
 pub mod lsp;
+pub mod message;
 pub mod output_styles;
 pub mod permission;
 pub mod scheduling;
@@ -65,6 +66,10 @@ pub use goal::{
 pub use hooks::{
     HookContentHash, HookEventPolicy, HookMatcher, HookRunEntry, HookRunLog, HookRunner,
     HookScope, HookTrustGuard, HookTrustStore, InMemoryHookTrustStore, UserHook,
+};
+pub use message::{
+    MessageBus, MessageBusObserver, MessageSource, PublishError, PublishReceipt, SinceResult,
+    UserMessage,
 };
 pub use output_styles::{BuiltInOutputStyles, DynOutputStyle, OutputStyle};
 pub use permission::{

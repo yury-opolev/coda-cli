@@ -454,6 +454,7 @@ pub fn build_markdown_export(blocks: &[crate::transcript::Block]) -> String {
             | Block::CommandOutput { .. }
             | Block::Thinking { .. }
             | Block::Banner { .. }
+            | Block::AgentMessage { .. }
             | Block::SessionBoundary { .. } => {}
         }
     }

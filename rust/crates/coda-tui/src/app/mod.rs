@@ -150,10 +150,51 @@ pub struct App {
     /// This is staged exactly once per replacement and consumed by
     /// `settle_with_engine_at`.
     pub(crate) needs_model_refresh: bool,
+    /// Set when engine-owned user notifications (`session/pendingMessages`)
+    /// must be (re-)recovered: at bootstrap, after a dropped-event gap, and
+    /// after an engine replacement. Consumed by `settle_with_engine_at`
+    /// exactly like `needs_resync`/`needs_rehydrate`.
+    pub(crate) needs_pending_messages: bool,
+    /// This bus's own cursor (see `coda_agent::message` module docs — NOT an
+    /// `EventBus` seq): the *contiguously proven-covered* prefix — every
+    /// notification up to and including this cursor has either been shown
+    /// (live or via recovery) or explicitly reported lost. Reset to `0`
+    /// whenever the engine instance is replaced, since the bus is scoped to
+    /// that process.
+    ///
+    /// This is deliberately **not** simply the highest cursor seen: live
+    /// delivery (`app/serve.rs::dispatch_frame`) and recovery
+    /// (`pending_messages_at`) are two separate paths that can race and
+    /// reorder relative to each other (a bootstrap read still in flight while
+    /// a later live message already arrived), and a cursor this client never
+    /// actually accounted for — parked in [`Self::pending_messages_seen`] —
+    /// must not be silently assumed covered just because something newer
+    /// came in. Advanced only by [`serve::App::record_live_pending_message_cursor`]
+    /// (contiguous live receipts) and
+    /// [`serve::App::advance_pending_messages_baseline`] (a recovery read's
+    /// own proof, gap or no gap).
+    pub(crate) pending_messages_cursor: u64,
+    /// Cursors this client has received *live* that are ahead of
+    /// [`Self::pending_messages_cursor`] — out of order relative to the
+    /// contiguous watermark, so held rather than folded in immediately. Each
+    /// one is consumed once the watermark actually reaches it (a recovery
+    /// read fills, or explicitly reports lost, whatever hole came before it).
+    /// Cleared whenever the engine instance is replaced, alongside the
+    /// cursor itself.
+    ///
+    /// Bounded by [`serve::PENDING_MESSAGES_SEEN_CAPACITY`]: a persistent
+    /// missing prefix (the hole never fills) combined with unbounded live
+    /// delivery would otherwise grow this set forever. A *new* out-of-order
+    /// cursor that arrives once this is already at capacity is never
+    /// admitted — see [`serve::App::record_live_pending_message_cursor`] for
+    /// what happens to it instead of being tracked here.
+    pub(crate) pending_messages_seen: std::collections::BTreeSet<u64>,
     /// Retry schedule for `session/getState`.
     pub(crate) resync_recovery: serve::Recovery,
     /// Retry schedule for `session/getHistory`.
     pub(crate) rehydrate_recovery: serve::Recovery,
+    /// Retry schedule for `session/pendingMessages`.
+    pub(crate) pending_messages_recovery: serve::Recovery,
     /// Whether this client may maintain the engine-adjacent files itself.
     pub(crate) access_mode: crate::local::AccessMode,
     /// How long the UI waits for one engine read before treating the silence
@@ -1030,11 +1071,18 @@ impl App {
         // failing engine sends no events at all. Either way an idle screen
         // would sit on state it already knows is stale until the user typed.
         //
+        // `needs_pending_messages` owes the loop a wakeup for exactly the
+        // same reason: a failed `session/pendingMessages` read (or a
+        // truncated page still owed a follow-up) leaves nothing else armed,
+        // and without an entry here an idle screen with no other traffic
+        // never retries it until the user happens to press a key.
+        //
         // Gated by each read's own schedule, so a failing engine is retried
         // at the backoff rather than at the speed of this wakeup.
         let owed = [
             (self.needs_resync || self.view.needs_snapshot(), self.resync_recovery.next_attempt()),
             (self.needs_rehydrate, self.rehydrate_recovery.next_attempt()),
+            (self.needs_pending_messages, self.pending_messages_recovery.next_attempt()),
         ];
         for due in owed
             .into_iter()

@@ -74,6 +74,32 @@ pub struct GetEventsParams {
     pub limit: Option<i64>,
 }
 
+/// `session/pendingMessages` — non-destructive recovery of engine-owned user
+/// notifications (Stage 2 `notify_user`).
+///
+/// `after_cursor` is the **bus's own cursor**, not an `EventBus` seq (see
+/// `coda_agent::message` module docs) — `0` means "from the beginning".
+/// Public and valid **before** `initialize`: an API-only external frontend
+/// must be able to recover pending notifications without any local state.
+///
+/// `engine_instance_id`, when supplied, fences the read exactly like
+/// `session/getHistory`'s: the bus is engine-process-scoped (a fresh process
+/// starts a fresh bus at cursor `0`), so a cursor minted by a previous
+/// process is not a position in the current one's ring. Supplying it lets a
+/// client detect a silent engine replacement instead of reading a
+/// coincidentally-valid cursor into the wrong process's notifications.
+#[derive(Debug, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct PendingMessagesParams {
+    #[serde(default)]
+    pub after_cursor: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_instance_id: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

@@ -65,6 +65,8 @@ pub(crate) struct BatchContext<'a> {
     /// Scheduled provenance for this run (trusted; never model-supplied).
     pub schedule_origin: Option<coda_tool::ScheduleOrigin>,
     pub subagent_factory: Option<Arc<dyn SubagentFactory>>,
+    pub message_bus: Option<Arc<crate::message::MessageBus>>,
+    pub is_main_context: bool,
 }
 
 impl<'a> BatchContext<'a> {
@@ -105,10 +107,12 @@ impl<'a> BatchContext<'a> {
             all_tools: Some(all_tools),
             caller_task_id: self.caller_task_id.clone(),
             schedule_origin: self.schedule_origin.clone(),
+            is_main_context: self.is_main_context,
             lsp_manager: None,
             task_manager: None,
             schedule_store: None,
             subagent_factory: None,
+            message_bus: None,
         };
 
         if let Some(mgr) = &self.lsp_manager {
@@ -122,6 +126,9 @@ impl<'a> BatchContext<'a> {
         }
         if let Some(factory) = &self.subagent_factory {
             ctx = ctx.with_subagent_factory(Arc::clone(factory));
+        }
+        if let Some(bus) = &self.message_bus {
+            ctx = ctx.with_message_bus(Arc::clone(bus));
         }
         ctx
     }

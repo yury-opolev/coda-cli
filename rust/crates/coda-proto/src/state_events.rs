@@ -117,3 +117,8 @@ pub struct EventsDroppedEvent {
     pub to_cursor: i64,
     pub reason: String,
 }
+
+/// Payload of `event/agentMessage` (Stage 2 `notify_user`). Same shape as
+/// `session/pendingMessages`' list entries (`AgentMessageDto`) so a client
+/// can merge live and recovered notifications with one type.
+pub type AgentMessageEvent = crate::responses::AgentMessageDto;

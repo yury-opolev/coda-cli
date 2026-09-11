@@ -174,6 +174,31 @@ pub enum Block {
     Diff { raw: String },
     /// A marker separating resumed sessions.
     SessionBoundary { id: String },
+    /// A passive, one-way notification from a background context (a
+    /// scheduled run, a subagent, or trusted main), delivered via
+    /// `notify_user` (Stage 2). Distinct from `Notice` (a client-local
+    /// status line) and from `Assistant` (foreground model prose): this is
+    /// engine-owned content, badged with its source, that the client only
+    /// ever displays — it never re-enters the conversation the model sees.
+    AgentMessage {
+        /// Stable id from the engine's message bus; used for dedup across
+        /// live delivery, recovery, and engine replacement resets.
+        id: String,
+        /// Bounded, sanitized origin label ("nightly audit", "main", ...).
+        label: String,
+        text: String,
+        context: Option<String>,
+        /// `"scheduledTask"` | `"subagent"` | `"main"`.
+        source: String,
+        /// The trusted task id this notification is scoped to (`None` for
+        /// `source == "main"`). Not rendered directly, but carried so a
+        /// future surface (or `/tasks`) can correlate a notification back to
+        /// its task without re-deriving it from the (non-unique) label.
+        task_id: Option<String>,
+        /// The scheduled definition id this notification originated from,
+        /// set exactly when `source == "scheduledTask"`.
+        schedule_definition_id: Option<String>,
+    },
     /// The startup banner: wordmark plus session details.
     ///
     /// Rendered in the transcript rather than written to the raw console, so it
@@ -211,6 +236,7 @@ impl Block {
                 | Block::SessionBoundary { .. }
                 | Block::Permission { .. }
                 | Block::Question { .. }
+                | Block::AgentMessage { .. }
         )
     }
 
@@ -313,6 +339,29 @@ impl Block {
                         .collect();
                 }
                 coda_render::diff::render(&diff, width, false)
+            }
+            Block::AgentMessage { label, text, context, source, .. } => {
+                let source_word = match source.as_str() {
+                    "scheduledTask" => "scheduled",
+                    "subagent" => "subagent",
+                    "main" => "main",
+                    other => other,
+                };
+                let mut lines: Vec<RenderLine> = text::wrap(
+                    &format!("[{source_word}: {label}] {text}"),
+                    width,
+                )
+                .into_iter()
+                .map(|chunk| RenderLine::new(chunk, Role::CalloutNote))
+                .collect();
+                if let Some(ctx) = context {
+                    lines.extend(
+                        text::wrap(ctx, width)
+                            .into_iter()
+                            .map(|chunk| RenderLine::new(chunk, Role::Notification)),
+                    );
+                }
+                lines
             }
             Block::SessionBoundary { id } => {
                 let label = format!("{0}{0} session {id} {0}{0}", glyphs::RULE);

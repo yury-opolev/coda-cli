@@ -10,7 +10,7 @@ use serde_json::Value;
 
 pub use coda_proto::requests::{
     CancelRequestParams, ConfigSetParams, GetEventsParams, GetHistoryParams,
-    GetStateParams, ListSessionsParams, ResolveRequestParams, SetModelParams,
+    GetStateParams, ListSessionsParams, PendingMessagesParams, ResolveRequestParams, SetModelParams,
     HooksInfoParams, HooksTrustParams, ForkParams, RewindParams,
 };
 
@@ -334,6 +334,24 @@ impl NormalizeQuery for ListSessionsParams {
     }
 }
 
+/// Ceiling for `session/pendingMessages`' `limit`. Matches the message bus's
+/// own default ring capacity (`coda_agent::message::DEFAULT_RING_CAPACITY`):
+/// asking for more than the ring can ever hold is never meaningful.
+pub const MAX_PENDING_MESSAGES_LIMIT: i64 = coda_agent::message::DEFAULT_RING_CAPACITY as i64;
+
+impl NormalizeQuery for PendingMessagesParams {
+    /// A `limit` of `0` used to fall through to "no limit" inside the bus
+    /// itself (see `coda_agent::message::MessageBus::user_since`'s own
+    /// defense-in-depth fix) — here it is refused outright with a typed
+    /// `-32602`, exactly like `session/getHistory`'s `limit`, so a caller
+    /// never has to guess whether an empty page meant "caught up" or "asked
+    /// for zero by mistake".
+    fn normalise(&mut self) -> Result<(), RpcError> {
+        self.limit = normalise_limit(self.limit, MAX_PENDING_MESSAGES_LIMIT)?;
+        Ok(())
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ServeBackend trait — one method per protocol operation
 // ─────────────────────────────────────────────────────────────────────────────
@@ -408,6 +426,10 @@ pub trait ServeBackend: Send + Sync {
     async fn config_set(&self, p: ConfigSetParams) -> Result<Value, RpcError>;
     /// Read-only, secret-free MCP inventory. Valid before `initialize`.
     async fn mcp_list(&self) -> Result<Value, RpcError>;
+    /// Non-destructive recovery of engine-owned user notifications (Stage 2
+    /// `notify_user`). Public and valid before `initialize` (§ same
+    /// discovery rationale as `session/getHistory`/`session/listSessions`).
+    async fn session_pending_messages(&self, p: PendingMessagesParams) -> Result<Value, RpcError>;
 
     /// Whether `initialize` has completed on this connection.
     ///
@@ -533,6 +555,11 @@ pub async fn dispatch(
         "config/describe" => backend.config_describe().await,
         "config/set" => backend.config_set(required(params)?).await,
         "mcp/list" => backend.mcp_list().await,
+        "session/pendingMessages" => {
+            let mut p: PendingMessagesParams = optional_strict(params)?;
+            p.normalise()?;
+            backend.session_pending_messages(p).await
+        }
         _ => Err(RpcError::method_not_found(method)),
     }
 }
@@ -699,6 +726,9 @@ mod tests {
         async fn mcp_list(&self) -> Result<Value, RpcError> {
             Ok(json!({ "servers": [], "enabled": true, "managerAvailable": false }))
         }
+        async fn session_pending_messages(&self, p: PendingMessagesParams) -> Result<Value, RpcError> {
+            Ok(json!({ "messages": [], "nextCursor": p.after_cursor, "gap": false, "truncated": false }))
+        }
         fn is_initialized(&self) -> bool {
             true
         }
@@ -831,6 +861,9 @@ mod tests {
         }
         async fn mcp_list(&self) -> Result<Value, RpcError> {
             self.0.mcp_list().await
+        }
+        async fn session_pending_messages(&self, p: PendingMessagesParams) -> Result<Value, RpcError> {
+            self.0.session_pending_messages(p).await
         }
         fn is_initialized(&self) -> bool {
             false
@@ -1101,6 +1134,79 @@ mod tests {
         .unwrap();
         assert!(r["messages"].is_array());
         assert_eq!(r["nextIndex"], 5);
+    }
+
+    #[tokio::test]
+    async fn dispatches_session_pending_messages() {
+        let r = dispatch(
+            "session/pendingMessages",
+            Some(json!({"afterCursor": 3})),
+            &FakeBackend,
+        )
+        .await
+        .unwrap();
+        assert!(r["messages"].is_array());
+        assert_eq!(r["nextCursor"], 3);
+    }
+
+    #[tokio::test]
+    async fn pending_messages_rejects_a_negative_after_cursor() {
+        // `afterCursor` is wire-typed as an unsigned bus cursor; a negative
+        // number is a malformed value, not a legitimate position, and must
+        // be a typed refusal rather than silently reinterpreted or defaulted.
+        let err = dispatch(
+            "session/pendingMessages",
+            Some(json!({"afterCursor": -1})),
+            &FakeBackend,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, -32602);
+    }
+
+    #[tokio::test]
+    async fn pending_messages_rejects_a_zero_limit() {
+        // A `limit` of `0` must never silently fall back to "no limit" (the
+        // bus-level bug this guards against): it is refused outright.
+        let err = dispatch(
+            "session/pendingMessages",
+            Some(json!({"afterCursor": 0, "limit": 0})),
+            &FakeBackend,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, -32602);
+    }
+
+    #[tokio::test]
+    async fn pending_messages_clamps_an_oversized_limit_rather_than_refusing_it() {
+        let r = dispatch(
+            "session/pendingMessages",
+            Some(json!({"afterCursor": 0, "limit": 999_999})),
+            &FakeBackend,
+        )
+        .await
+        .unwrap();
+        // The FakeBackend just echoes what it was handed back via nextCursor
+        // above; the clamp itself is proven by not erroring — the exact
+        // ceiling value is asserted directly against `normalise_limit` in
+        // `history::tests` and reused here via the same constant.
+        assert!(r["messages"].is_array());
+    }
+
+    #[tokio::test]
+    async fn pending_messages_accepts_a_future_oversized_cursor_without_erroring() {
+        // A cursor far beyond anything the bus has ever issued is not
+        // malformed — it must not park the client forever; it is simply
+        // "nothing new yet".
+        let r = dispatch(
+            "session/pendingMessages",
+            Some(json!({"afterCursor": u64::MAX})),
+            &FakeBackend,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["nextCursor"].as_u64(), Some(u64::MAX));
     }
 
     #[tokio::test]
@@ -1446,6 +1552,9 @@ mod tests {
             Err(RpcError { code: self.0, message: self.1.into() })
         }
         async fn mcp_list(&self) -> Result<Value, RpcError> {
+            Err(RpcError { code: self.0, message: self.1.into() })
+        }
+        async fn session_pending_messages(&self, _p: PendingMessagesParams) -> Result<Value, RpcError> {
             Err(RpcError { code: self.0, message: self.1.into() })
         }
         fn is_initialized(&self) -> bool {

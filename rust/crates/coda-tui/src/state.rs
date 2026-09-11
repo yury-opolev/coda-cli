@@ -256,6 +256,8 @@ pub enum UiEvent {
     DiffOutput { text: String },
     /// A local status or error line.
     Notice { text: String, level: NoticeLevel },
+    /// Passive recovery warnings obey the same safe boundaries as notifications.
+    NotificationRecoveryWarning { text: String },
     /// The transcript was cleared.
     Cleared,
     /// The active model changed.
@@ -455,6 +457,13 @@ pub struct UiState {
     /// still lands as one assistant block, with the delivered message
     /// appended right after in chronological order.
     pending_deliveries: Vec<Block>,
+    /// `event/agentMessage` notifications parked behind an open block for
+    /// the same reason as `pending_deliveries` above — but tracked
+    /// separately (see `flush_pending_agent_messages`) because a rehydration
+    /// rescue for a *steering* delivery relies on the engine's own history
+    /// already containing it, which is never true of a bus notification: a
+    /// shared list would let it be silently dropped instead of flushed.
+    pending_agent_messages: Vec<Block>,
     /// Text this client knows reached the model but which the engine's own
     /// rebuilt conversation does not contain.
     ///
@@ -550,6 +559,15 @@ pub struct UiState {
     /// carries the canonical model id and nothing else, and this is how it
     /// still shows a name instead of regressing to that id.
     pub model_labels: ModelLabelCache,
+    /// Stable ids of `event/agentMessage` notifications already materialised
+    /// as a `Block::AgentMessage`, scoped to the current engine instance.
+    ///
+    /// Live delivery and recovery can both describe the same notification
+    /// (e.g. a reconnect replays what was already seen live), so dedup is by
+    /// this stable id, never by content or position. Cleared whenever the
+    /// engine instance is replaced (see `serve.rs::adopt_engine`), so a new
+    /// process's ids are never compared against the previous one's.
+    agent_message_ids: std::collections::HashSet<String>,
 }
 
 impl Default for UiState {
@@ -571,6 +589,7 @@ impl UiState {
             queued: Vec::new(),
             unsent: Vec::new(),
             pending_deliveries: Vec::new(),
+            pending_agent_messages: Vec::new(),
             delivered_local: Vec::new(),
             history_coverage: None,
             turn_progress: None,
@@ -589,6 +608,7 @@ impl UiState {
             optimistic_submit: false,
             active_model: None,
             model_labels: ModelLabelCache::default(),
+            agent_message_ids: std::collections::HashSet::new(),
         }
     }
 
@@ -657,7 +677,7 @@ impl UiState {
     /// actually finishes.
     fn close_open_and_flush(&mut self) {
         self.transcript.close_open();
-        self.flush_pending_deliveries();
+        self.flush_pending_content();
     }
 
     /// Appends the deliveries that were waiting for the open block to close.
@@ -675,6 +695,30 @@ impl UiState {
         for block in std::mem::take(&mut self.pending_deliveries) {
             self.transcript.push(block);
         }
+    }
+
+    /// Appends `event/agentMessage` notifications that were parked behind an
+    /// open block — the same "never split active text" rule
+    /// [`Self::flush_pending_deliveries`] exists for, kept as its own list
+    /// (see [`Self::push_agent_message`]) rather than sharing
+    /// `pending_deliveries`: a rebuild's rescue path
+    /// ([`Self::retain_parked_deliveries`]) is specific to steering
+    /// deliveries the engine's own history is guaranteed to already contain,
+    /// which is not true of a notification from this bus — sharing the list
+    /// would let a rebuild silently discard a still-parked notification
+    /// instead of flushing it.
+    fn flush_pending_agent_messages(&mut self) {
+        for block in std::mem::take(&mut self.pending_agent_messages) {
+            self.transcript.push(block);
+        }
+    }
+
+    /// Every safe-boundary flush in one call: both kinds of content parked
+    /// behind an open block land together, in the order they were parked
+    /// within each list.
+    fn flush_pending_content(&mut self) {
+        self.flush_pending_deliveries();
+        self.flush_pending_agent_messages();
     }
 
     /// Appends a delivered user message, deferring it if the transcript's
@@ -1175,11 +1219,15 @@ impl UiState {
                 self.transcript.push(Block::Diff { raw: text });
             }
             UiEvent::Notice { text, level } => self.notice(text, level),
+            UiEvent::NotificationRecoveryWarning { text } => {
+                self.push_notification_block(Block::Notice { text, level: NoticeLevel::Warning });
+            }
             UiEvent::Cleared => {
                 self.transcript.clear();
                 self.queued.clear();
                 self.unsent.clear();
                 self.pending_deliveries.clear();
+                self.pending_agent_messages.clear();
                 self.delivered_local.clear();
                 // The conversation that read described is not on screen any
                 // more, so it can no longer vouch for anything.
@@ -1219,10 +1267,35 @@ impl UiState {
                 //
                 // A rebuild taken mid-burst still describes the burst that is
                 // running, so the live row's clock and fold survive it rather
-                // than the reasoning appearing to start over.
+                // than the reasoning appearing to start over. `take_live_thinking`
+                // reads `Transcript::open_tail`, which only ever looks at the
+                // literal last block — so a parked notification must NOT be
+                // flushed onto the transcript before this runs: doing so
+                // stops the still-open `Thinking` block from being the tail,
+                // losing the clock, and then leaves the rebuilt (still open)
+                // burst sitting *behind* the notification, no longer the
+                // tail either — so the next delta would silently open a
+                // second `Thinking`/`Assistant` block instead of continuing
+                // the first.
                 let carried = self.take_live_thinking();
                 self.transcript.replace_conversation(blocks);
                 self.restore_live_thinking(carried, now);
+                // A notification parked behind the block this rebuild just
+                // replaced has no engine-side history to fall back on
+                // (unlike a delivered steering message — see
+                // `retain_parked_deliveries`), so it must still land rather
+                // than being dropped with the old transcript. It is flushed
+                // only now, and only at the same safe boundary
+                // `push_agent_message` itself requires: if the rebuild
+                // carried the burst over still open, the park must survive
+                // it too — the burst has not ended, so nothing here is a
+                // safe boundary yet. A later terminal event
+                // (`ThinkingComplete`/`AssistantTextComplete`/`TurnComplete`/
+                // `Error`/`LimitReached`) already flushes pending content at
+                // its own boundary and releases it then.
+                if self.transcript.open_tail().is_none() {
+                    self.flush_pending_agent_messages();
+                }
                 // The claim travels with the rebuild it came from: a read
                 // whose provenance is unknown replaces the previous claim
                 // with nothing rather than leaving it to describe a
@@ -1272,7 +1345,7 @@ impl UiState {
                         *complete = true;
                         // The reply is over, and that is exactly the boundary
                         // a delivery parked behind it was waiting for.
-                        self.flush_pending_deliveries();
+                        self.flush_pending_content();
                     }
                 }
             }
@@ -1331,7 +1404,7 @@ impl UiState {
                     *done_at_field = Some(done_at);
                     // The burst is over: anything parked behind it lands now
                     // rather than waiting for some later boundary.
-                    self.flush_pending_deliveries();
+                    self.flush_pending_content();
                 } else {
                     // No block to finish. Either none was ever started — a
                     // provider that encrypts its reasoning sends no deltas at
@@ -1514,6 +1587,9 @@ impl UiState {
                 };
                 self.notice(format!("Task {status}: {description}"), level);
             }
+            Event::AgentMessage { id, label, text, context, source, task_id, schedule_definition_id, .. } => {
+                self.push_agent_message(id, label, text, context, source, task_id, schedule_definition_id);
+            }
             Event::PromptRewritten { hook_command, .. } => {
                 self.notice(
                     format!("Prompt rewritten by hook: {hook_command}"),
@@ -1648,6 +1724,55 @@ impl UiState {
             level,
         });
     }
+
+    /// Materialises one `event/agentMessage` notification, deduplicated by
+    /// its stable id.
+    ///
+    /// Parked behind an open block rather than appended unconditionally —
+    /// the same "safe append, never split" rule `notice()` relies on does
+    /// **not** hold for a whole new block: `Transcript::open_tail` only ever
+    /// looks at the literal last block, so pushing straight through would
+    /// stop being that tail and the next streamed delta would open a *second*
+    /// `Assistant`/`Thinking` block instead of continuing the first. See
+    /// `flush_pending_agent_messages` for where a parked one actually lands.
+    fn push_agent_message(
+        &mut self,
+        id: String,
+        label: String,
+        text: String,
+        context: Option<String>,
+        source: String,
+        task_id: Option<String>,
+        schedule_definition_id: Option<String>,
+    ) {
+        if !self.agent_message_ids.insert(id.clone()) {
+            return;
+        }
+        let block =
+            Block::AgentMessage { id, label, text, context, source, task_id, schedule_definition_id };
+        self.push_notification_block(block);
+    }
+
+    fn push_notification_block(&mut self, block: Block) {
+        if self.transcript.open_tail().is_some() {
+            self.pending_agent_messages.push(block);
+        } else {
+            self.transcript.push(block);
+        }
+    }
+
+    /// Resets agent-message dedup bookkeeping. Called on engine-instance
+    /// replacement (`serve.rs::adopt_engine`) so a new process's ids are
+    /// never compared against a previous instance's — the bus cursor is
+    /// engine-scoped and does not survive a replacement either. Any
+    /// notification still parked from the superseded process is dropped
+    /// along with it — it is engine-scoped and would otherwise resurface
+    /// under a process it no longer belongs to.
+    pub fn reset_agent_message_dedup(&mut self) {
+        self.agent_message_ids.clear();
+        self.pending_agent_messages.clear();
+    }
+
 
     // ── Engine-owned truth ───────────────────────────────────────────────
 
@@ -2193,6 +2318,7 @@ pub(crate) fn is_critical_event(event: &UiEvent) -> bool {
         | UiEvent::PromptAnswered { .. }
         | UiEvent::PromptResolved(_)
         | UiEvent::Notice { .. }
+        | UiEvent::NotificationRecoveryWarning { .. }
         | UiEvent::Cleared
         | UiEvent::ModelChanged { .. }
         | UiEvent::DisplayModeChanged(_)
@@ -4830,6 +4956,179 @@ mod tests {
             );
         }
 
+        /// I3 (Stage 2 review): a rebuild taken mid-reasoning-burst must park
+        /// a still-parked `event/agentMessage` notification *across* the
+        /// rebuild, not flush it before the live `Thinking` row's clock/fold
+        /// are carried over. Flushing first pushes the notification onto the
+        /// OLD transcript's tail, so `take_live_thinking` (which only ever
+        /// looks at the literal last block) finds no open `Thinking` there
+        /// any more, loses the clock, and the rebuilt open `Thinking` block
+        /// ends up *behind* the notification — no longer the transcript's
+        /// tail — so the next delta opens a SECOND `Thinking` block instead
+        /// of continuing the first.
+        #[test]
+        fn rehydrating_mid_burst_parks_a_notification_across_the_rebuild_and_flushes_at_the_next_safe_boundary(
+        ) {
+            let mut state = state();
+            state.apply(UiEvent::Engine(Event::Thinking { delta: "first ".into() }));
+            assert!(state.thinking_clock.is_some(), "the live burst must have started a clock");
+
+            state.apply(UiEvent::Engine(Event::AgentMessage {
+                id: "m1".into(),
+                cursor: 1,
+                label: "main".into(),
+                text: "background note".into(),
+                context: None,
+                source: "main".into(),
+                task_id: None,
+                schedule_definition_id: None,
+            }));
+            assert!(
+                state
+                    .transcript
+                    .blocks()
+                    .iter()
+                    .all(|b| !matches!(b, Block::AgentMessage { .. })),
+                "parked behind the open block, not shown yet"
+            );
+
+            // The engine reports the SAME burst still running (a reconnect
+            // mid-turn), exactly as `Transcript::replace_conversation`
+            // requires for it to be carried over open.
+            state.apply(UiEvent::Rehydrated {
+                blocks: vec![Block::Thinking {
+                    text: "first ".into(),
+                    elapsed_ms: 0,
+                    tokens: None,
+                    complete: false,
+                    expanded: false,
+                    done_at: None,
+                }],
+                notices: Vec::new(),
+                coverage: None,
+            });
+
+            let thinking_blocks: Vec<_> = state
+                .transcript
+                .blocks()
+                .iter()
+                .filter(|b| matches!(b, Block::Thinking { .. }))
+                .collect();
+            assert_eq!(
+                thinking_blocks.len(),
+                1,
+                "the rebuild must not have already split the burst: {:?}",
+                state.transcript.blocks()
+            );
+            assert!(
+                state.thinking_clock.is_some(),
+                "the live clock must survive a rebuild that reports the same open burst"
+            );
+            assert!(
+                state
+                    .transcript
+                    .blocks()
+                    .iter()
+                    .all(|b| !matches!(b, Block::AgentMessage { .. })),
+                "still parked across the rebuild — the burst has not ended"
+            );
+
+            // Further reasoning must continue the SAME block.
+            state.apply(UiEvent::Engine(Event::Thinking { delta: "second".into() }));
+            let thinking_blocks: Vec<_> = state
+                .transcript
+                .blocks()
+                .iter()
+                .filter(|b| matches!(b, Block::Thinking { .. }))
+                .collect();
+            assert_eq!(
+                thinking_blocks.len(),
+                1,
+                "a second Thinking block means the rebuild silently ended the first: {:?}",
+                state.transcript.blocks()
+            );
+            assert!(matches!(
+                thinking_blocks[0],
+                Block::Thinking { text, .. } if text == "first second"
+            ));
+
+            // The safe boundary: the parked notification lands only now.
+            state.apply(UiEvent::Engine(Event::ThinkingComplete {
+                elapsed_ms: 10,
+                thinking_tokens: None,
+            }));
+            let agent_texts: Vec<String> = state
+                .transcript
+                .blocks()
+                .iter()
+                .filter_map(|b| match b {
+                    Block::AgentMessage { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(agent_texts, vec!["background note".to_string()]);
+        }
+
+        /// The idle/terminal release half of the same fix: if the rebuilt
+        /// burst never receives another delta at all (the turn was actually
+        /// interrupted, or errored, or simply completed exactly as the
+        /// engine last reported it), the parked notification must still be
+        /// released by whichever terminal event closes the block — not left
+        /// parked forever because `Rehydrated` itself declined to flush it.
+        #[test]
+        fn a_parked_notification_across_a_rehydrate_is_released_by_turn_complete_with_no_further_delta()
+        {
+            let mut state = state();
+            state.apply(UiEvent::Engine(Event::Thinking { delta: "first ".into() }));
+            state.apply(UiEvent::Engine(Event::AgentMessage {
+                id: "m1".into(),
+                cursor: 1,
+                label: "main".into(),
+                text: "background note".into(),
+                context: None,
+                source: "main".into(),
+                task_id: None,
+                schedule_definition_id: None,
+            }));
+
+            state.apply(UiEvent::Rehydrated {
+                blocks: vec![Block::Thinking {
+                    text: "first ".into(),
+                    elapsed_ms: 0,
+                    tokens: None,
+                    complete: false,
+                    expanded: false,
+                    done_at: None,
+                }],
+                notices: Vec::new(),
+                coverage: None,
+            });
+
+            // No further `Thinking` delta ever arrives — the turn simply
+            // ends (interrupted, errored, or completed exactly as reported).
+            state.apply(UiEvent::Engine(Event::TurnComplete {
+                stop_reason: None,
+                interrupted: false,
+                root_turn_id: None,
+                activity_id: None,
+            }));
+
+            let agent_texts: Vec<String> = state
+                .transcript
+                .blocks()
+                .iter()
+                .filter_map(|b| match b {
+                    Block::AgentMessage { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                agent_texts,
+                vec!["background note".to_string()],
+                "a parked notification must not be stranded forever with no further delta"
+            );
+        }
+
         #[test]
         fn a_live_result_never_rewrites_a_replayed_call_that_merely_shares_an_id() {
             // The transcript can now hold a rehydrated call from an earlier
@@ -4897,5 +5196,242 @@ mod tests {
             assert_eq!(groups[0].calls[0].result.as_deref(), Some("old output"));
             assert_eq!(groups[1].calls[0].result.as_deref(), Some("new output"));
         }
+    }
+
+    // ── Stage 2: `event/agentMessage` reducer ─────────────────────────────
+
+    fn agent_message_texts(state: &UiState) -> Vec<String> {
+        state
+            .transcript
+            .blocks()
+            .iter()
+            .filter_map(|b| match b {
+                Block::AgentMessage { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn agent_message_event_materialises_a_distinct_block() {
+        let mut state = state();
+        state.apply(UiEvent::Engine(Event::AgentMessage {
+            id: "m1".into(),
+            cursor: 1,
+            label: "nightly audit".into(),
+            text: "report ready".into(),
+            context: None,
+            source: "scheduledTask".into(),
+            task_id: Some("task-1".into()),
+            schedule_definition_id: Some("def-1".into()),
+        }));
+        assert_eq!(agent_message_texts(&state), vec!["report ready".to_string()]);
+        // Never a Notice and never an Assistant block: it is its own kind.
+        assert!(notice_texts(&state).is_empty());
+        assert!(assistant_text(&state).is_none());
+    }
+
+    #[test]
+    fn agent_message_is_deduplicated_by_stable_id_not_content() {
+        let mut state = state();
+        let make = || Event::AgentMessage {
+            id: "dup".into(),
+            cursor: 1,
+            label: "main".into(),
+            text: "same text".into(),
+            context: None,
+            source: "main".into(),
+            task_id: None,
+            schedule_definition_id: None,
+        };
+        state.apply(UiEvent::Engine(make()));
+        state.apply(UiEvent::Engine(make()));
+        assert_eq!(agent_message_texts(&state).len(), 1, "a repeated id must not duplicate the block");
+    }
+
+    #[test]
+    fn agent_message_with_different_id_but_same_text_is_not_deduplicated() {
+        let mut state = state();
+        state.apply(UiEvent::Engine(Event::AgentMessage {
+            id: "a".into(),
+            cursor: 1,
+            label: "main".into(),
+            text: "same text".into(),
+            context: None,
+            source: "main".into(),
+            task_id: None,
+            schedule_definition_id: None,
+        }));
+        state.apply(UiEvent::Engine(Event::AgentMessage {
+            id: "b".into(),
+            cursor: 2,
+            label: "main".into(),
+            text: "same text".into(),
+            context: None,
+            source: "main".into(),
+            task_id: None,
+            schedule_definition_id: None,
+        }));
+        assert_eq!(agent_message_texts(&state).len(), 2);
+    }
+
+    /// The critical regression this stage's own review flagged: pushing a
+    /// whole new block straight onto the tail while an `Assistant` block is
+    /// still open stops it being `Transcript::open_tail` (which only ever
+    /// looks at the literal last block) — so the *next* delta would silently
+    /// open a SECOND `Assistant` block instead of continuing the first one,
+    /// splitting one reply into two. A notification must park behind the
+    /// open block and only land once it is actually safe.
+    #[test]
+    fn agent_message_never_splits_an_open_assistant_block_across_further_deltas() {
+        let mut state = state();
+        state.apply(UiEvent::Engine(Event::AssistantText { delta: "partial ".into() }));
+
+        // The notification arrives mid-burst — it must NOT be visible yet
+        // (that would require inserting ahead of/through the open block).
+        state.apply(UiEvent::Engine(Event::AgentMessage {
+            id: "m1".into(),
+            cursor: 1,
+            label: "subagent".into(),
+            text: "child finished".into(),
+            context: None,
+            source: "subagent".into(),
+            task_id: Some("task-1".into()),
+            schedule_definition_id: None,
+        }));
+        assert!(
+            agent_message_texts(&state).is_empty(),
+            "a notification behind a still-open block must be parked, not shown yet"
+        );
+
+        // Further assistant deltas AND reasoning deltas must still continue
+        // the SAME open block — proving nothing was split by the park.
+        state.apply(UiEvent::Engine(Event::AssistantText { delta: "reply".into() }));
+        let assistant_blocks: Vec<_> = state
+            .transcript
+            .blocks()
+            .iter()
+            .filter(|b| matches!(b, Block::Assistant { .. }))
+            .collect();
+        assert_eq!(
+            assistant_blocks.len(),
+            1,
+            "the notification must never cause a second Assistant block to open"
+        );
+        assert!(matches!(
+            assistant_blocks[0],
+            Block::Assistant { text, complete: false } if text == "partial reply"
+        ));
+
+        // Completing the turn is the safe boundary: the parked notification
+        // lands now, after the reply it was parked behind.
+        state.apply(UiEvent::Engine(Event::AssistantTextComplete));
+        assert_eq!(agent_message_texts(&state), vec!["child finished".to_string()]);
+        let blocks = state.transcript.blocks();
+        let assistant_index =
+            blocks.iter().position(|b| matches!(b, Block::Assistant { .. })).unwrap();
+        let agent_index =
+            blocks.iter().position(|b| matches!(b, Block::AgentMessage { .. })).unwrap();
+        assert!(agent_index > assistant_index, "the notification lands AFTER the reply it interrupted");
+    }
+
+    /// Same invariant, proven through a `Thinking` burst instead of an
+    /// `Assistant` one, and through `ThinkingComplete` (the boundary that
+    /// finishes a block "in place" rather than through `Transcript::close_open`).
+    #[test]
+    fn agent_message_never_splits_an_open_thinking_block_and_flushes_on_thinking_complete() {
+        let mut state = state();
+        state.apply(UiEvent::Engine(Event::Thinking { delta: "first ".into() }));
+
+        state.apply(UiEvent::Engine(Event::AgentMessage {
+            id: "m1".into(),
+            cursor: 1,
+            label: "main".into(),
+            text: "background note".into(),
+            context: None,
+            source: "main".into(),
+            task_id: None,
+            schedule_definition_id: None,
+        }));
+        assert!(agent_message_texts(&state).is_empty());
+
+        state.apply(UiEvent::Engine(Event::Thinking { delta: "second".into() }));
+        let thinking_blocks: Vec<_> = state
+            .transcript
+            .blocks()
+            .iter()
+            .filter(|b| matches!(b, Block::Thinking { .. }))
+            .collect();
+        assert_eq!(thinking_blocks.len(), 1, "reasoning must never be split by a parked notification");
+        assert!(matches!(
+            thinking_blocks[0],
+            Block::Thinking { text, .. } if text == "first second"
+        ));
+
+        state.apply(UiEvent::Engine(Event::ThinkingComplete { elapsed_ms: 10, thinking_tokens: None }));
+        assert_eq!(agent_message_texts(&state), vec!["background note".to_string()]);
+    }
+
+    #[test]
+    fn reset_agent_message_dedup_allows_a_previously_seen_id_again() {
+        let mut state = state();
+        let make = || Event::AgentMessage {
+            id: "m1".into(),
+            cursor: 1,
+            label: "main".into(),
+            text: "hello".into(),
+            context: None,
+            source: "main".into(),
+            task_id: None,
+            schedule_definition_id: None,
+        };
+        state.apply(UiEvent::Engine(make()));
+        state.reset_agent_message_dedup();
+        state.apply(UiEvent::Engine(make()));
+        // Two distinct materialisations after the reset — a new engine
+        // instance's cursor space starts over and must not be suppressed by
+        // the previous instance's ids.
+        assert_eq!(agent_message_texts(&state).len(), 2);
+    }
+
+    /// A notification still parked behind an open block when the engine
+    /// instance is replaced must not resurface once the new process's
+    /// content starts arriving — it belonged to a process that is gone.
+    #[test]
+    fn reset_agent_message_dedup_drops_a_still_parked_notification() {
+        let mut state = state();
+        state.apply(UiEvent::Engine(Event::AssistantText { delta: "mid reply".into() }));
+        state.apply(UiEvent::Engine(Event::AgentMessage {
+            id: "m1".into(),
+            cursor: 1,
+            label: "main".into(),
+            text: "stale notification".into(),
+            context: None,
+            source: "main".into(),
+            task_id: None,
+            schedule_definition_id: None,
+        }));
+        assert!(agent_message_texts(&state).is_empty(), "parked, not yet shown");
+
+        state.reset_agent_message_dedup();
+        state.apply(UiEvent::Engine(Event::AssistantTextComplete));
+        assert!(
+            agent_message_texts(&state).is_empty(),
+            "a notification parked by a superseded engine instance must not surface later"
+        );
+    }
+
+    #[test]
+    fn agent_message_block_is_client_owned_and_survives_history_hydration() {
+        assert!(Block::AgentMessage {
+            id: "m1".into(),
+            label: "main".into(),
+            text: "hi".into(),
+            context: None,
+            source: "main".into(),
+            task_id: None,
+            schedule_definition_id: None,
+        }
+        .is_client_owned());
     }
 }

@@ -69,6 +69,15 @@ pub fn capability_catalog() -> HashMap<String, CapabilityEntry> {
     // the last one resolves, restoring the phase the turn was in.
     m.insert("state.awaitingUserInput".into(), CapabilityEntry::supported());
 
+    // ── Stage 2: engine-owned in-memory user-notification bus ────────────
+    // `notify_user` (a tool available to the main agent, subagents, and
+    // scheduled runs) publishes onto an engine-owned, RAM-only bus.
+    // `session/pendingMessages` recovers it non-destructively (public, valid
+    // before `initialize`); `event/agentMessage` announces new publications
+    // live. Never persisted across a restart, and never wakes the main
+    // conversation on its own — it is a one-way, passive notification.
+    m.insert("messaging.notifyUser".into(), CapabilityEntry::supported());
+
     // ── Accepted-but-unimplemented surfaces, declared rather than silently
     // ignored. `session/getState` rejects `sections` outright instead of
     // answering a different question than the client asked. ──────────────

@@ -75,6 +75,12 @@ pub mod method {
     pub const CONFIG_SET: &str = "config/set";
     /// Read-only, secret-free MCP server inventory.
     pub const MCP_LIST: &str = "mcp/list";
+    /// Non-destructive recovery of engine-owned user notifications
+    /// (Stage 2 `notify_user`), paged by the bus's own cursor — distinct
+    /// from the `EventBus` seq used by `session/getEvents`. Public and
+    /// available before `initialize` so an API-only external frontend can
+    /// recover without local state.
+    pub const PENDING_MESSAGES: &str = "session/pendingMessages";
 }
 
 /// Method names the server may call on us. Each expects a reply.

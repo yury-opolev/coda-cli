@@ -70,6 +70,7 @@ might infer from its name. Unsupported operations are listed separately.
 | `skills/list` | Reusable | Discover skills on the engine host. |
 | `skills/trust` | Unsupported | Always refused in serve mode. |
 | `plugins/list` | Limited | Compatibility route currently returns an empty list; not an authoritative installed-plugin inventory. |
+| `session/pendingMessages` | Reusable | Non-destructive recovery of engine-owned background notifications (`notify_user`, Stage 2). Available before initialize; see [Background notifications](#background-notifications-notify_user). |
 
 The new `session/getHistory`, `session/getPendingRequests`,
 `session/resolveRequest`, `session/cancelRequest` and `config/set` methods
@@ -134,6 +135,7 @@ the same structured projection regardless of that hint.
 | `event/configChanged`, `event/steeringQueue` | **Gated:** effective configuration and authoritative queue state/outcomes. |
 | `event/requestPending`, `event/requestResolved` | **Gated:** interaction registry changes and actual resolution outcomes. |
 | `event/eventsDropped` | **Gated:** explicit loss of retained event coverage; obtain an authoritative snapshot/history instead of guessing missing deltas. |
+| `event/agentMessage` | A background context (a scheduled run, a subagent, or trusted main) published a passive notification via `notify_user`. See [Background notifications](#background-notifications-notify_user). |
 
 `request/permission`, `request/question` and `request/planApproval` are
 server-initiated JSON-RPC requests, not notifications. Reply using their RPC
@@ -214,6 +216,72 @@ literally:
 Schedules are engine-scoped and **in memory only** in the Rust engine: nothing
 survives an engine restart, and no schedule state is written to disk. Do not
 build resumption on top of `session/scheduleList`.
+
+## Background notifications (`notify_user`)
+
+`messaging.notifyUser` (see `initialize.capabilities`) is a **passive,
+one-way** channel from background work (a scheduled run, a subagent, or the
+trusted main context) to the user's chat surface. It is entirely separate
+from the conversation the model sees:
+
+- It never wakes, resumes or feeds text into the main agent loop. There is
+  no reply channel and no way for the user's response (if any) to reach the
+  background context that sent it. Delivering an automatic reply into the
+  main conversation ("ask_main"/a pump loop) is an explicitly out-of-scope,
+  later stage — nothing described here does that.
+- It is **entirely in-memory (RAM) and engine-process-scoped**. There is no
+  disk persistence and no continuation across an engine restart: a fresh
+  engine process starts a fresh, empty notification bus at cursor `0`.
+  Normal chat/session persistence (`.coda/sessions`, rich history) is
+  completely unaffected — this bus never writes anything to disk and never
+  reads anything back from it.
+- Publishing (via the `notify_user` tool) returns a **receipt**, not a
+  delivery confirmation: `accepted` only ever means "the bus took custody of
+  this notification". It is never presented as, and must never be read as,
+  "the user has seen it" — there is no acknowledgement channel from the
+  presentation layer back to the bus.
+
+### `session/pendingMessages` — recovery
+
+`session/pendingMessages` non-destructively pages through the bus starting
+after `afterCursor` (the bus's **own** monotonic cursor — unrelated to the
+`EventBus` `seq` space carried elsewhere in this contract; do not mix the
+two). It is available before `initialize`, exactly like `session/getHistory`
+and `session/listSessions`, so a client can recover missed notifications
+without any other local state.
+
+- `limit` must be a positive integer if supplied; `0` is refused
+  (`-32602`), never silently reinterpreted as "no limit". An over-large
+  value is clamped to the engine's own ring capacity.
+- `engineInstanceId`, when supplied, fences the read exactly like
+  `session/getHistory`'s: a cursor minted by a different engine process is
+  refused (instance-changed error) rather than silently answered from a
+  different process's bus.
+- The result's `gap: true` means some notifications between `afterCursor`
+  and the oldest one still retained were evicted from the ring and can
+  never be recovered. `dropped: { from, to, count }` names the exact evicted
+  cursor range/count whenever `gap` is true — never only a boolean.
+- `truncated: true` means more messages exist beyond this page; call again
+  with the response's `nextCursor`.
+- Each returned message carries `taskId`/`scheduleDefinitionId` — the
+  *trusted* provenance derived from the engine's own `TaskManager`/schedule
+  state, suitable for correlation — in addition to the display-only
+  `label`, which is bounded/sanitized but **not** guaranteed unique.
+
+### Retention and idempotency bounds
+
+The bus is a bounded ring (`200` notifications by default); once full, the
+oldest entries are evicted to make room for new ones — this is what
+`gap`/`dropped` report honestly rather than hiding. A caller-supplied
+`idempotency_key` scopes deduplication to `(origin, key)`: reusing a key
+with identical content is a no-op replay that returns the original receipt;
+reusing it with **different** content is rejected as a conflict, never
+silently accepted as new content under an old key. The idempotency record
+for a key is retained only as long as its originating message is still in
+the ring — once evicted, the key becomes reusable again. Body/context/label
+are each length-bounded (oversized user-supplied text is rejected outright,
+never silently truncated); a caller-supplied idempotency key is bounded too
+and rejected outright when oversized.
 
 ## Unsupported and client-local surfaces
 

@@ -345,6 +345,15 @@
       "resultContract": "sharedServerDto",
       "requiresInitialize": false,
       "availability": "reusable"
+    },
+    {
+      "method": "session/pendingMessages",
+      "paramsSchema": "schemas/PendingMessagesParams.json",
+      "resultSchema": "schemas/PendingMessagesResult.json",
+      "paramsContract": "sharedParser",
+      "resultContract": "sharedServerDto",
+      "requiresInitialize": false,
+      "availability": "reusable"
     }
   ],
   "serverRequests": [
@@ -521,6 +530,12 @@
     {
       "method": "event/postCompactContextInjected",
       "paramsSchema": "schemas/PostCompactContextInjectedEvent.json",
+      "requiresStateEvents": false,
+      "paramsContract": "clientReaderWithRustMetadata"
+    },
+    {
+      "method": "event/agentMessage",
+      "paramsSchema": "schemas/AgentMessageEvent.json",
       "requiresStateEvents": false,
       "paramsContract": "clientReaderWithRustMetadata"
     },

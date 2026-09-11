@@ -1,0 +1,27 @@
+{
+  "type": "object",
+  "properties": {
+    "afterCursor": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0,
+      "default": 0
+    },
+    "limit": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "engineInstanceId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "description": "`session/pendingMessages` — non-destructive recovery of engine-owned user\nnotifications (Stage 2 `notify_user`).\n\n`after_cursor` is the **bus's own cursor**, not an `EventBus` seq (see\n`coda_agent::message` module docs) — `0` means \"from the beginning\".\nPublic and valid **before** `initialize`: an API-only external frontend\nmust be able to recover pending notifications without any local state.\n\n`engine_instance_id`, when supplied, fences the read exactly like\n`session/getHistory`'s: the bus is engine-process-scoped (a fresh process\nstarts a fresh bus at cursor `0`), so a cursor minted by a previous\nprocess is not a position in the current one's ring. Supplying it lets a\nclient detect a silent engine replacement instead of reading a\ncoincidentally-valid cursor into the wrong process's notifications.",
+  "title": "PendingMessagesParams",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}
