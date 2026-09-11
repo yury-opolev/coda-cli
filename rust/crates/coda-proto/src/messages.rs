@@ -399,6 +399,7 @@ pub struct ModelsParams {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ModelsResult {
     /// `"live"`, `"catalog"` or `"builtin"`.
@@ -485,8 +486,17 @@ pub struct WireModel {
 }
 
 impl WireModel {
+    /// The provider's own name for this model, when it gave one worth
+    /// showing — falling back to the canonical id otherwise.
+    ///
+    /// A provider that reports an empty or whitespace-only `displayName` has
+    /// not really named the model at all; showing it verbatim would draw a
+    /// blank cell in the picker where the id at least says which model it is.
     pub fn label(&self) -> &str {
-        self.display_name.as_deref().unwrap_or(&self.id)
+        match self.display_name.as_deref().map(str::trim) {
+            Some(name) if !name.is_empty() => name,
+            _ => &self.id,
+        }
     }
 }
 
@@ -1238,6 +1248,29 @@ mod tests {
 
         assert_eq!(result.active_label(), Some("some-unlisted-model"));
         assert_eq!(result.active_context_limit(), None);
+    }
+
+    #[test]
+    fn a_blank_or_whitespace_display_name_falls_back_to_the_id() {
+        // A provider that sends `""` or `"   "` has not actually named the
+        // model; showing it verbatim would draw a blank cell where the id at
+        // least identifies which model this is.
+        let blank: WireModel = serde_json::from_value(json!({
+            "id": "model-a", "displayName": "",
+        }))
+        .expect("model");
+        let whitespace: WireModel = serde_json::from_value(json!({
+            "id": "model-b", "displayName": "   ",
+        }))
+        .expect("model");
+        let padded: WireModel = serde_json::from_value(json!({
+            "id": "model-c", "displayName": "  Readable Name  ",
+        }))
+        .expect("model");
+
+        assert_eq!(blank.label(), "model-a");
+        assert_eq!(whitespace.label(), "model-b");
+        assert_eq!(padded.label(), "Readable Name");
     }
 
     #[test]

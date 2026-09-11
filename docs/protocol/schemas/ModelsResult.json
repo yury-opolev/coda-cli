@@ -20,7 +20,7 @@
       "description": "The model the engine will actually use.\n\nThe list alone does not say which entry is active, and the obvious\nguess — the first — is only whatever order the provider returned.",
       "default": null
     },
-    "provider_id": {
+    "providerId": {
       "type": [
         "string",
         "null"

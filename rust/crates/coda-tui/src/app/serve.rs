@@ -276,6 +276,13 @@ impl App {
         );
         self.needs_resync = true;
         self.needs_rehydrate = true;
+        // A different process's names are not evidence about this one's,
+        // even for an id the two happen to share — and unlike `adopt_engine`,
+        // nothing here awaits a fresh `session/models` read to replace them,
+        // so the stale cache must go now rather than linger until something
+        // else happens to refresh it.
+        self.state.model_labels.clear();
+        self.needs_model_refresh = true;
     }
 
     /// Applies one accepted frame: state metadata, or ordinary content.
@@ -749,6 +756,16 @@ impl App {
         if self.needs_rehydrate && self.rehydrate_recovery.ready(now) {
             self.rehydrate_at(now).await;
         }
+        if self.needs_model_refresh {
+            // Best-effort and one-shot: a failed read here leaves the flag
+            // cleared rather than retried on its own schedule, exactly like
+            // the ordinary post-switch refresh this reuses — `load_models`
+            // already no-ops on a request that fails or does not parse, and
+            // the next legitimate reason to read the catalogue (a switch, a
+            // picker open) tries again regardless.
+            self.needs_model_refresh = false;
+            self.load_models().await;
+        }
     }
 
     /// Shows the oldest outstanding decision, if one is not already on screen.
@@ -1105,6 +1122,7 @@ impl App {
             pending: Default::default(),
             needs_resync: true,
             needs_rehydrate: true,
+            needs_model_refresh: false,
             resync_recovery: Default::default(),
             rehydrate_recovery: Default::default(),
             access_mode,
@@ -2214,6 +2232,162 @@ pub(in crate::app) mod tests {
             capabilities: Default::default(),
         };
         serde_json::to_value(snapshot).expect("snapshot")
+    }
+
+    /// [`snapshot_value`], but naming a specific provider and model — for
+    /// proving what a resync does with the friendly name a `session/models`
+    /// read already taught the client, which `snapshot_value`'s fixed
+    /// `"m"`/`None` cannot exercise.
+    fn snapshot_naming(provider_id: &str, model: &str) -> Value {
+        use coda_proto::state::*;
+        let snapshot = StateSnapshot {
+            contract_version: CONTRACT_VERSION.into(),
+            engine_instance_id: "e1".into(),
+            session_id: "s1".into(),
+            workspace_path: "/w".into(),
+            cursor: 1,
+            history_epoch: 0,
+            history_length: 0,
+            lifecycle: EngineLifecycle::Ready,
+            initialized: true,
+            last_turn_outcome: None,
+            turn: None,
+            steering: SteeringQueueState::default(),
+            tools: ToolsState::default(),
+            requests: Vec::new(),
+            config: EffectiveConfig {
+                active: None,
+                next: ActiveConfig {
+                    provider_id: Some(provider_id.into()),
+                    model: model.into(),
+                    effort: None,
+                    effort_is_auto: true,
+                    permission_mode: "default".into(),
+                    system_prompt_source: "default".into(),
+                },
+                differing: Vec::new(),
+            },
+            usage: UsageState::default(),
+            limits: Limits {
+                ring_envelopes: 2048,
+                ring_bytes: 4 << 20,
+                live_bytes_cap: 262_144,
+                outcomes_retained: 64,
+                history_block_bytes_cap: 65_536,
+                max_history_page: 500,
+                max_session_page: 200,
+            },
+            capabilities: Default::default(),
+        };
+        serde_json::to_value(snapshot).expect("snapshot")
+    }
+
+    // -- The friendly name a resync must not regress -------------------------
+    //
+    // `session/models` is a separate read from `session/getState`: the list
+    // carries display names the snapshot cannot. A client that read the list
+    // once and is then re-synced (a missed event, a periodic settle) must
+    // keep showing the name it already learned rather than falling back to
+    // the canonical id the snapshot reports.
+
+    #[tokio::test]
+    async fn an_explicit_model_catalog_refresh_updates_the_display_labels() {
+        let mut harness = app_with(crate::local::AccessMode::ApiOnly, |method, params| match method {
+            "session/models" => json!({
+                "providerId": "provider", "model": "model-a", "source": "live",
+                "models": [{ "id": "model-a", "displayName":
+                    if params["refresh"] == true { "Renamed Model" } else { "Original Model" }
+                }]
+            }),
+            _ => json!({}),
+        });
+        harness.app.load_models().await;
+        assert_eq!(harness.app.state.model.as_deref(), Some("Original Model"));
+        harness.app.run_command(invocation("/models --refresh")).await;
+        assert_eq!(harness.app.state.model.as_deref(), Some("Renamed Model"));
+        assert_eq!(
+            harness.app.state.model_labels.resolve(Some("provider"), "model-a"),
+            "Renamed Model",
+        );
+    }
+
+    #[tokio::test]
+    async fn model_labels_are_single_line_in_the_header_cache_and_picker() {
+        let mut harness = app_with(crate::local::AccessMode::ApiOnly, |_, _| json!({}));
+        let result = serde_json::from_value::<coda_proto::messages::ModelsResult>(json!({
+            "providerId": "provider", "model": "model-a",
+            "models": [{ "id": "model-a", "displayName": "\x1b[31mReadable\nName\x1b[0m" }]
+        })).unwrap();
+        harness.app.ingest_models_result(&result);
+        assert_eq!(harness.app.state.model.as_deref(), Some("Readable Name"));
+        assert_eq!(harness.app.state.model_labels.resolve(Some("provider"), "model-a"), "Readable Name");
+        let picker = crate::browsers::models(&result.models, Some("model-a"), "live");
+        assert_eq!(picker.items()[0].cells[1], "Readable Name");
+        assert_eq!(picker.items()[0].id, "model-a");
+    }
+
+    #[tokio::test]
+    async fn effort_picker_shows_the_friendly_label_but_returns_the_model_id() {
+        let mut harness = app_with(crate::local::AccessMode::ApiOnly, |_, _| json!({
+            "providerId": "provider", "model": "model-a",
+            "supported": true, "supportsAuto": true, "levels": ["low", "high"],
+            "current": "low"
+        }));
+        let result = serde_json::from_value::<coda_proto::messages::ModelsResult>(json!({
+            "providerId": "provider", "model": "model-a",
+            "models": [{ "id": "model-a", "displayName": "Readable Model" }]
+        })).unwrap();
+        harness.app.ingest_models_result(&result);
+        harness.app.open_effort_picker(None).await;
+        let mut picker = harness.app.surfaces.pop().expect("effort picker opened");
+        assert_eq!(picker.title(), "Effort - Readable Model");
+        let result = picker.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter, crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(matches!(result,
+            crate::surface::SurfaceOutcome::Emit(crate::surface::SurfaceAction::SetEffort {
+                for_model, ..
+            }) if for_model == ("provider".into(), "model-a".into())
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_resync_after_reading_the_model_list_keeps_the_friendly_name() {
+        // The reported bug, end to end: `session/models` names the active
+        // model, the status line shows it correctly — and the very next
+        // `session/getState` read overwrote it with the raw id, because
+        // reconciliation assigned the canonical model verbatim instead of
+        // resolving it through what `session/models` had just taught it.
+        let mut harness = app_with(crate::local::AccessMode::TrustedLocal, |method, _| match method {
+            "session/models" => json!({
+                "source": "live",
+                "models": [{
+                    "id": "model-a",
+                    "displayName": "Readable Model A",
+                }],
+                "model": "model-a",
+                "providerId": "provider",
+            }),
+            "session/getState" => snapshot_naming("provider", "model-a"),
+            _ => json!({ "ok": true }),
+        });
+
+        harness.app.load_models().await;
+        assert_eq!(
+            harness.app.state.model.as_deref(),
+            Some("Readable Model A"),
+            "the model list read must already show the friendly name"
+        );
+
+        tokio::time::timeout(NO_HANG, harness.app.resync_at(std::time::Instant::now()))
+            .await
+            .expect("the resync never returned");
+
+        assert_eq!(
+            harness.app.state.model.as_deref(),
+            Some("Readable Model A"),
+            "a resync regressed the header from the friendly name back to the raw id"
+        );
     }
 
     /// A committed conversation of `total` alternating messages, paged the way

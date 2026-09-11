@@ -28,6 +28,7 @@ mod effort;
 mod engine;
 mod identity;
 mod image;
+mod models;
 mod queue;
 mod serve;
 mod settings;
@@ -138,6 +139,17 @@ pub struct App {
     pub(crate) needs_resync: bool,
     /// Set when the conversation itself must be rebuilt from the engine.
     pub(crate) needs_rehydrate: bool,
+    /// Set when the model catalogue must be re-read after an engine
+    /// replacement this client did not itself stage (an `InstanceChanged`
+    /// reception, handled by `on_engine_replaced` in `app/serve.rs`).
+    ///
+    /// A dedicated flag rather than folding this into every resync: a
+    /// resync happens for reasons that say nothing about the model list (a
+    /// missed event, a config change), and re-reading `session/models` on
+    /// each of those would be a network round-trip this cache does not need.
+    /// This is staged exactly once per replacement and consumed by
+    /// `settle_with_engine_at`.
+    pub(crate) needs_model_refresh: bool,
     /// Retry schedule for `session/getState`.
     pub(crate) resync_recovery: serve::Recovery,
     /// Retry schedule for `session/getHistory`.
@@ -408,50 +420,6 @@ impl App {
                 error: Some(error.to_string()),
             }),
         }
-    }
-
-    /// Fetches the model list so the status bar can name the active model.
-    ///
-    /// The engine reports which model is active; the list is only how it is
-    /// labelled. Taking the first entry instead named whatever the provider
-    /// happened to return first, so the status bar could disagree with the
-    /// engine and switching a model looked as though it had not been saved.
-    async fn load_models(&mut self) {
-        if !self.engine_connected {
-            return;
-        }
-        // Bounded like every other read the loop awaits: this one runs at
-        // startup and after a model switch, and an unbounded await here would
-        // freeze the UI before it had drawn a single frame.
-        let Ok(value) = self
-            .bounded(
-                self.connection
-                    .request(method::MODELS, Some(serde_json::json!({ "refresh": false }))),
-            )
-            .await
-        else {
-            return;
-        };
-        let Ok(result) = serde_json::from_value::<messages::ModelsResult>(value) else {
-            return;
-        };
-        // Remembered so a model switch is saved under the provider the engine
-        // connected with, rather than the one settings nominate.
-        if let Some(provider) = result.provider_id.clone() {
-            self.connected_provider = Some(provider);
-        }
-        if let Some(label) = result.active_label() {
-            let context_limit = result.active_context_limit();
-            let price = result.active_price();
-            self.apply(UiEvent::ModelChanged {
-                id: label.to_string(),
-                context_limit,
-            });
-            // Carried on the state so the renderer can show a running cost
-            // without reaching for a catalogue of its own.
-            self.state.usage.price_per_million = price;
-        }
-        self.refresh_effort().await;
     }
 
     // -- Terminal input -----------------------------------------------------

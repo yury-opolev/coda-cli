@@ -114,6 +114,12 @@ impl App {
         self.adopt_engine(booted);
         let escaped = coda_render::text::sanitize(&session_id);
         self.notice(format!("Resumed session {escaped}."), NoticeLevel::Info);
+        // The resumed session can be on a different provider or model than
+        // the one just left; `adopt_engine` already dropped the previous
+        // engine's cached names (see `UiEvent::EngineAdopted`), and this is
+        // what re-earns them from the process actually running now, exactly
+        // as a fresh sign-in does.
+        self.load_models().await;
     }
 
     /// `/fork` — branch the live conversation into a new session.

@@ -71,9 +71,7 @@ impl App {
                     .await
                 {
                     Ok(result) => {
-                        if let Some(provider) = &result.provider_id {
-                            self.connected_provider = Some(provider.clone());
-                        }
+                        self.ingest_models_result(&result);
                         rows::models(&result.models, result.model.as_deref(), &result.source)
                     }
                     Err(error) => {
@@ -463,6 +461,16 @@ impl App {
             }
         }
 
+        // Cosmetic only: the RPC above and the save below always take the
+        // canonical id, never this. A name learned for a different provider
+        // than the one just confirmed must not decorate this id, so the
+        // lookup is scoped to it exactly like every other resolution.
+        let label = self
+            .state
+            .model_labels
+            .resolve(self.connected_provider.as_deref(), model)
+            .to_string();
+
         // Persisted too, so the choice survives the next start — but only
         // where this client owns the file the engine reads. An engine this
         // client did not start reads its own host's settings, so writing them
@@ -470,7 +478,7 @@ impl App {
         if !self.owns_engine_settings() {
             self.close_browser();
             let note = self.not_saved_remotely();
-            self.notice(format!("Model set to {model} for this session.{note}"), NoticeLevel::Info);
+            self.notice(format!("Model set to {label} for this session.{note}"), NoticeLevel::Info);
             self.load_models().await;
             return;
         }
@@ -482,7 +490,7 @@ impl App {
         // on a list that no longer described the session, and the header
         // naming the previous model.
         self.close_browser();
-        self.notice(format!("Model set to {model}."), NoticeLevel::Info);
+        self.notice(format!("Model set to {label}."), NoticeLevel::Info);
         if let super::settings::Saved::Failed(error) = saved {
             self.notice(
                 format!("The model was not saved for the next start: {error}"),
