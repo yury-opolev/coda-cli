@@ -234,6 +234,12 @@ pub struct SetSystemPromptParams {
 }
 
 /// `session/scheduleCreate` — `prompt` is required on the wire.
+///
+/// The bound fields are deliberately typed loosely: `max_runs` arrives as raw
+/// JSON so that a negative, fractional or out-of-range value reaches the shared
+/// validator and is refused with exactly the same message the `schedule_create`
+/// tool produces, rather than being coerced by one deserializer and rejected by
+/// the other.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScheduleCreateParams {
@@ -248,6 +254,15 @@ pub struct ScheduleCreateParams {
     pub cron: Option<String>,
     #[serde(default)]
     pub time_zone: Option<String>,
+    /// Absolute ISO-8601 deadline. Mutually exclusive with `expires_in`.
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    /// Relative deadline (`30m`, `2h`, `7d`), resolved once at creation.
+    #[serde(default)]
+    pub expires_in: Option<String>,
+    /// Accepted launch attempts before the schedule stops itself.
+    #[serde(default)]
+    pub max_runs: Option<Value>,
 }
 
 #[derive(Debug, Deserialize, Default)]

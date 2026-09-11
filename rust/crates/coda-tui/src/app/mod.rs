@@ -1446,7 +1446,8 @@ impl App {
                 }
             }
             SurfaceAction::ExplainScheduleCreation => self.notice(
-                "Creating a schedule needs arguments; use /schedule from the composer.",
+                "Ask the agent to create a schedule — it can also bound one, e.g. \
+                 \"every hour for the next 7 days\" or \"daily, 7 times\".",
                 NoticeLevel::Info,
             ),
             SurfaceAction::ExplainSkillToggle => self.notice(

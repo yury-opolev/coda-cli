@@ -1,13 +1,19 @@
 //! `schedule_create` — create a new scheduled task definition.
+//!
+//! The tool owns policy (who may create a schedule) and argument extraction;
+//! every validation rule lives in [`crate::scheduling::limits::build_draft`],
+//! which `session/scheduleCreate` calls too. Two creation surfaces with two
+//! validators is how a bound ends up enforced on one path and ignored on the
+//! other.
 
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::scheduling::{CronExpression, ScheduleDefinitionDraft, ScheduleKind};
-use crate::tool::{Tool, ToolContext, ToolOutcome, ToolResult};
+use crate::scheduling::{build_draft, ScheduleCreateRequest};
 use crate::tool::ToolContextServiceExt as _;
+use crate::tool::{Tool, ToolContext, ToolOutcome, ToolResult};
 
 pub struct ScheduleCreateTool;
 
@@ -20,7 +26,10 @@ impl Tool for ScheduleCreateTool {
     fn description(&self) -> &str {
         "Create a new scheduled task definition. Supply exactly one of 'every' (recurring \
          interval like '30m', '2h', '1d'), 'at' (one-shot ISO-8601 timestamp), or 'cron' \
-         (five-field cron expression). Returns the new schedule id."
+         (five-field cron expression). Optionally bound it: 'maxRuns' stops the schedule \
+         after that many runs have been started, and 'expiresAt' (absolute ISO-8601) or \
+         'expiresIn' (relative, like '7d') stops it at a deadline. Without those the \
+         schedule runs until deleted. Returns the new schedule id."
     }
 
     fn input_schema_json(&self) -> &str {
@@ -32,7 +41,10 @@ impl Tool for ScheduleCreateTool {
             "every":{"type":"string","description":"Recurring interval: '30m', '2h', '1d'"},
             "at":{"type":"string","description":"One-shot ISO-8601 date-time"},
             "cron":{"type":"string","description":"Five-field cron expression"},
-            "timeZone":{"type":"string","description":"IANA timezone id (for cron; default UTC)"}
+            "timeZone":{"type":"string","description":"IANA timezone id (for cron; default UTC)"},
+            "maxRuns":{"type":"integer","minimum":1,"description":"Stop after this many runs have been started (a run that later fails still counts). Omit for unlimited."},
+            "expiresAt":{"type":"string","description":"Absolute ISO-8601 deadline; no run starts at or after it. Mutually exclusive with expiresIn."},
+            "expiresIn":{"type":"string","description":"Relative deadline from now: '30m', '2h', '7d'. Mutually exclusive with expiresAt."}
           },
           "required":["prompt"]
         }"#
@@ -45,165 +57,53 @@ impl Tool for ScheduleCreateTool {
     async fn execute(&self, input: &Value, ctx: &ToolContext, _cancel: CancellationToken) -> ToolOutcome {
         // POLICY: arbitrary schedule management is main-agent only. A trusted
         // scheduled-run origin does NOT grant create rights either — the only
-        // origin-scoped self-action is a future, targetless self-cancel.
+        // origin-scoped self-action is the targetless `schedule_cancel_self`.
+        // Keeping creation main-only is also what stops a bounded run from
+        // cloning itself into an unbounded watch to escape its own budget.
         // Reject before any lookup or mutation.
         if ctx.caller_task_id.is_some() {
             return ToolResult::error("schedule_create is only available to the main agent.");
         }
-
-        let prompt = match input.get("prompt").and_then(Value::as_str) {
-            Some(p) if !p.trim().is_empty() => p.trim().to_owned(),
-            _ => return ToolResult::error("Missing required 'prompt'."),
-        };
 
         let store = match ctx.get_schedule_store() {
             Some(s) => s,
             None => return ToolResult::error("Schedule store is not available."),
         };
 
-        let name = input
-            .get("name")
-            .and_then(Value::as_str)
-            .filter(|s| !s.trim().is_empty())
-            .map(str::to_owned);
-
-        let every = input.get("every").and_then(Value::as_str);
-        let at = input.get("at").and_then(Value::as_str);
-        let cron = input.get("cron").and_then(Value::as_str);
-        let time_zone = input
-            .get("timeZone")
-            .and_then(Value::as_str)
-            .unwrap_or("UTC");
-
-        let selector_count = [every.is_some(), at.is_some(), cron.is_some()]
-            .iter()
-            .filter(|&&b| b)
-            .count();
-        if selector_count != 1 {
-            return ToolResult::error(
-                "schedule_create requires exactly one of 'every', 'at', or 'cron'.",
-            );
-        }
+        let request = ScheduleCreateRequest {
+            prompt: input.get("prompt").and_then(Value::as_str),
+            name: input.get("name").and_then(Value::as_str),
+            every: input.get("every").and_then(Value::as_str),
+            at: input.get("at").and_then(Value::as_str),
+            cron: input.get("cron").and_then(Value::as_str),
+            time_zone: input.get("timeZone").and_then(Value::as_str),
+            expires_at: input.get("expiresAt").and_then(Value::as_str),
+            expires_in: input.get("expiresIn").and_then(Value::as_str),
+            max_runs: input.get("maxRuns"),
+        };
 
         let now = Utc::now();
-        let draft = if let Some(every) = every {
-            match parse_every(every, &prompt, name) {
-                Ok(d) => d,
-                Err(e) => return ToolResult::error(e),
-            }
-        } else if let Some(at_str) = at {
-            match parse_at(at_str, &prompt, name) {
-                Ok(d) => d,
-                Err(e) => return ToolResult::error(e),
-            }
-        } else {
-            let cron_str = cron.unwrap();
-            match parse_cron(cron_str, &prompt, name, time_zone, now) {
-                Ok(d) => d,
-                Err(e) => return ToolResult::error(e),
-            }
+        let draft = match build_draft(&request, now) {
+            Ok(draft) => draft,
+            Err(error) => return ToolResult::error(error),
         };
 
         let task = store.add(draft, now);
-        ToolResult::ok(format!(
-            "Schedule created: id={} kind={:?}",
-            task.id, task.kind
-        ))
+        let mut summary = format!("Schedule created: id={} kind={:?}", task.id, task.kind);
+        if let Some(max) = task.max_runs {
+            summary.push_str(&format!(" maxRuns={max}"));
+        }
+        if let Some(deadline) = task.expires_at_utc {
+            summary.push_str(&format!(
+                " expiresAt={}",
+                deadline.format("%Y-%m-%dT%H:%M:%SZ")
+            ));
+        }
+        if task.max_runs.is_none() && task.expires_at_utc.is_none() {
+            summary.push_str(" (unbounded: runs until deleted)");
+        }
+        ToolResult::ok(summary)
     }
-}
-
-fn parse_every(
-    every: &str,
-    prompt: &str,
-    name: Option<String>,
-) -> Result<ScheduleDefinitionDraft, String> {
-    // Parse format: <number><unit> where unit is m, h, or d.
-    let every = every.trim();
-    let (n_str, unit) = every
-        .char_indices()
-        .rev()
-        .find_map(|(i, c)| {
-            if matches!(c, 'm' | 'h' | 'd' | 'M' | 'H' | 'D') {
-                Some((&every[..i], c.to_ascii_lowercase()))
-            } else {
-                None
-            }
-        })
-        .unwrap_or(("", ' '));
-
-    let amount: u64 = n_str
-        .parse()
-        .ok()
-        .filter(|&n: &u64| n > 0)
-        .ok_or_else(|| "'every' must be an integer duration such as 30m, 2h, or 1d.".to_owned())?;
-
-    let interval = match unit {
-        'm' => std::time::Duration::from_secs(amount * 60),
-        'h' => std::time::Duration::from_secs(amount * 3600),
-        'd' => std::time::Duration::from_secs(amount * 86400),
-        _ => return Err("'every' must end with 'm' (minutes), 'h' (hours), or 'd' (days).".into()),
-    };
-
-    if interval.as_secs() < 60 {
-        return Err("'every' must be at least one minute.".into());
-    }
-
-    let now = Utc::now();
-    let next_run = now + chrono::Duration::seconds(interval.as_secs() as i64);
-    Ok(ScheduleDefinitionDraft {
-        name,
-        kind: ScheduleKind::Interval,
-        prompt: prompt.to_owned(),
-        interval: Some(interval),
-        at_utc: None,
-        cron: None,
-        time_zone_id: "UTC".into(),
-        next_run_utc: next_run,
-    })
-}
-
-fn parse_at(at: &str, prompt: &str, name: Option<String>) -> Result<ScheduleDefinitionDraft, String> {
-    let dt = chrono::DateTime::parse_from_rfc3339(at.trim())
-        .map_err(|_| format!("'at' must be a valid ISO-8601 date-time with timezone offset, e.g. '2024-12-25T09:00:00+00:00'."))?;
-    let utc = dt.with_timezone(&Utc);
-    Ok(ScheduleDefinitionDraft {
-        name,
-        kind: ScheduleKind::At,
-        prompt: prompt.to_owned(),
-        interval: None,
-        at_utc: Some(utc),
-        cron: None,
-        time_zone_id: "UTC".into(),
-        next_run_utc: utc,
-    })
-}
-
-fn parse_cron(
-    cron: &str,
-    prompt: &str,
-    name: Option<String>,
-    time_zone_id: &str,
-    now: chrono::DateTime<Utc>,
-) -> Result<ScheduleDefinitionDraft, String> {
-    let expr = CronExpression::parse(cron)?;
-
-    // Validate timezone.
-    let tz: chrono_tz::Tz = time_zone_id
-        .parse()
-        .map_err(|_| format!("Unknown timezone '{time_zone_id}'."))?;
-
-    let next_run = crate::scheduling::ScheduleRecurrence::next_cron_occurrence(&expr, now, tz)?;
-
-    Ok(ScheduleDefinitionDraft {
-        name,
-        kind: ScheduleKind::Cron,
-        prompt: prompt.to_owned(),
-        interval: None,
-        at_utc: None,
-        cron: Some(expr.expression),
-        time_zone_id: time_zone_id.to_owned(),
-        next_run_utc: next_run,
-    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -211,7 +111,7 @@ fn parse_cron(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheduling::ScheduledTaskStore;
+    use crate::scheduling::{ScheduleKind, ScheduledTaskStore};
     use std::sync::Arc;
 
     fn ctx(store: Arc<ScheduledTaskStore>) -> ToolContext {
@@ -224,16 +124,16 @@ mod tests {
             .with_caller_task_id(caller_id)
     }
 
+    async fn create(store: &Arc<ScheduledTaskStore>, input: Value) -> ToolOutcome {
+        ScheduleCreateTool
+            .execute(&input, &ctx(store.clone()), CancellationToken::new())
+            .await
+    }
+
     #[tokio::test]
     async fn create_interval_schedule() {
         let s = ScheduledTaskStore::new();
-        let result = ScheduleCreateTool
-            .execute(
-                &serde_json::json!({"prompt": "run this", "every": "30m"}),
-                &ctx(s.clone()),
-                CancellationToken::new(),
-            )
-            .await;
+        let result = create(&s, serde_json::json!({"prompt": "run this", "every": "30m"})).await;
         assert!(!result.is_error, "{}", result.content);
         assert_eq!(s.items().len(), 1);
         assert_eq!(s.items()[0].kind, ScheduleKind::Interval);
@@ -242,13 +142,11 @@ mod tests {
     #[tokio::test]
     async fn create_cron_schedule() {
         let s = ScheduledTaskStore::new();
-        let result = ScheduleCreateTool
-            .execute(
-                &serde_json::json!({"prompt": "run this", "cron": "0 9 * * *", "timeZone": "UTC"}),
-                &ctx(s.clone()),
-                CancellationToken::new(),
-            )
-            .await;
+        let result = create(
+            &s,
+            serde_json::json!({"prompt": "run this", "cron": "0 9 * * *", "timeZone": "UTC"}),
+        )
+        .await;
         assert!(!result.is_error, "{}", result.content);
         assert_eq!(s.items()[0].kind, ScheduleKind::Cron);
     }
@@ -256,41 +154,150 @@ mod tests {
     #[tokio::test]
     async fn reject_invalid_cron() {
         let s = ScheduledTaskStore::new();
-        let result = ScheduleCreateTool
-            .execute(
-                &serde_json::json!({"prompt": "x", "cron": "not-a-cron"}),
-                &ctx(s),
-                CancellationToken::new(),
-            )
-            .await;
+        let result = create(&s, serde_json::json!({"prompt": "x", "cron": "not-a-cron"})).await;
         assert!(result.is_error);
     }
 
     #[tokio::test]
     async fn reject_multiple_selectors() {
         let s = ScheduledTaskStore::new();
-        let result = ScheduleCreateTool
-            .execute(
-                &serde_json::json!({"prompt": "x", "every": "1h", "cron": "* * * * *"}),
-                &ctx(s),
-                CancellationToken::new(),
-            )
-            .await;
+        let result = create(
+            &s,
+            serde_json::json!({"prompt": "x", "every": "1h", "cron": "* * * * *"}),
+        )
+        .await;
         assert!(result.is_error);
-        assert!(result.content.contains("exactly one"), "{}", result.content);
+        assert!(result.content.contains("Exactly one"), "{}", result.content);
     }
 
     #[tokio::test]
     async fn reject_no_selector() {
         let s = ScheduledTaskStore::new();
-        let result = ScheduleCreateTool
-            .execute(
-                &serde_json::json!({"prompt": "x"}),
-                &ctx(s),
-                CancellationToken::new(),
+        let result = create(&s, serde_json::json!({"prompt": "x"})).await;
+        assert!(result.is_error);
+    }
+
+    // ── STAGE 1: bounds ──────────────────────────────────────────────────────
+
+    /// The user's example: "run this every hour, but only seven times".
+    #[tokio::test]
+    async fn max_runs_is_stored_on_the_definition() {
+        let s = ScheduledTaskStore::new();
+        let result = create(
+            &s,
+            serde_json::json!({"prompt": "monitor", "every": "1h", "maxRuns": 7}),
+        )
+        .await;
+        assert!(!result.is_error, "{}", result.content);
+        let item = &s.items()[0];
+        assert_eq!(item.max_runs, Some(7));
+        assert_eq!(item.runs_started, 0);
+        assert!(result.content.contains("maxRuns=7"), "{}", result.content);
+    }
+
+    /// A relative deadline is resolved to an absolute instant exactly once, at
+    /// creation, so it cannot drift with later evaluations.
+    #[tokio::test]
+    async fn expires_in_is_resolved_to_an_absolute_deadline_at_creation() {
+        let s = ScheduledTaskStore::new();
+        let before = Utc::now();
+        let result = create(
+            &s,
+            serde_json::json!({"prompt": "monitor", "every": "1h", "expiresIn": "7d"}),
+        )
+        .await;
+        assert!(!result.is_error, "{}", result.content);
+        let deadline = s.items()[0].expires_at_utc.expect("a deadline must be stored");
+        assert!(deadline >= before + chrono::Duration::days(7));
+        assert!(deadline <= Utc::now() + chrono::Duration::days(7));
+    }
+
+    #[tokio::test]
+    async fn expires_at_is_accepted_as_an_absolute_instant() {
+        let s = ScheduledTaskStore::new();
+        let deadline = Utc::now() + chrono::Duration::days(30);
+        let result = create(
+            &s,
+            serde_json::json!({
+                "prompt": "monitor",
+                "every": "1h",
+                "expiresAt": deadline.to_rfc3339(),
+            }),
+        )
+        .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(
+            s.items()[0].expires_at_utc.unwrap().timestamp(),
+            deadline.timestamp()
+        );
+    }
+
+    #[tokio::test]
+    async fn expires_at_and_expires_in_together_are_refused_and_nothing_is_created() {
+        let s = ScheduledTaskStore::new();
+        let result = create(
+            &s,
+            serde_json::json!({
+                "prompt": "monitor",
+                "every": "1h",
+                "expiresAt": (Utc::now() + chrono::Duration::days(3)).to_rfc3339(),
+                "expiresIn": "7d",
+            }),
+        )
+        .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("mutually exclusive"), "{}", result.content);
+        assert!(s.items().is_empty(), "a rejected request must create nothing");
+    }
+
+    #[tokio::test]
+    async fn a_past_deadline_is_refused_and_nothing_is_created() {
+        let s = ScheduledTaskStore::new();
+        let result = create(
+            &s,
+            serde_json::json!({
+                "prompt": "monitor",
+                "every": "1h",
+                "expiresAt": (Utc::now() - chrono::Duration::days(1)).to_rfc3339(),
+            }),
+        )
+        .await;
+        assert!(result.is_error);
+        assert!(s.items().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_bad_run_budget_is_refused_and_nothing_is_created() {
+        for bad in [
+            serde_json::json!(0),
+            serde_json::json!(-3),
+            serde_json::json!(2.5),
+            serde_json::json!("7"),
+            serde_json::json!(4294967296u64),
+        ] {
+            let s = ScheduledTaskStore::new();
+            let result = create(
+                &s,
+                serde_json::json!({"prompt": "monitor", "every": "1h", "maxRuns": bad}),
             )
             .await;
-        assert!(result.is_error);
+            assert!(result.is_error, "maxRuns={bad} must be refused");
+            assert!(result.content.contains("maxRuns"), "{}", result.content);
+            assert!(s.items().is_empty());
+        }
+    }
+
+    /// Absent bounds must keep behaving exactly as before this stage.
+    #[tokio::test]
+    async fn an_unbounded_schedule_keeps_its_previous_defaults() {
+        let s = ScheduledTaskStore::new();
+        let result = create(&s, serde_json::json!({"prompt": "x", "every": "30m"})).await;
+        assert!(!result.is_error, "{}", result.content);
+        let item = &s.items()[0];
+        assert_eq!(item.max_runs, None);
+        assert_eq!(item.expires_at_utc, None);
+        assert!(item.retirement.is_none());
+        assert!(result.content.contains("unbounded"), "{}", result.content);
     }
 
     // ── POLICY: schedule management is main-agent only ───────────────────────
@@ -316,7 +323,7 @@ mod tests {
 
     /// Even a run stamped with a trusted scheduled origin (a nested child of a
     /// scheduled job) must not be able to create new arbitrary schedules —
-    /// only a dedicated, targetless self-action (Stage 1) may use its origin.
+    /// only the dedicated, targetless self-cancel may use its origin.
     #[tokio::test]
     async fn child_caller_with_schedule_origin_still_cannot_create() {
         use crate::tool::ScheduleOrigin;

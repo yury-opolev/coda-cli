@@ -1541,8 +1541,247 @@ mod tests {
             );
         }
 
-        // ── Test 4: real child loop cannot probe a sibling task ──────────────
+        // ── Test 3b: real child loop self-cancel ─────────────────────────────
 
+        /// Builds a host whose child loops can reach the schedule store, plus a
+        /// scheduled root task and two definitions: the run's own, and a
+        /// foreign one that must never be affected.
+        fn self_cancel_fixture(
+            client: Arc<dyn coda_llm::LlmClient>,
+            mgr: Arc<TaskManager>,
+        ) -> (Arc<SubagentHost>, Arc<ScheduledTaskStore>, String, String) {
+            let store = ScheduledTaskStore::new();
+            let mut ids = Vec::new();
+            for prompt in ["OWN_JOB_PROMPT", "FOREIGN_JOB_PROMPT"] {
+                ids.push(
+                    store
+                        .add(
+                            crate::scheduling::ScheduleDefinitionDraft {
+                                name: Some("watcher".into()),
+                                kind: crate::scheduling::ScheduleKind::Interval,
+                                prompt: prompt.into(),
+                                interval: Some(std::time::Duration::from_secs(3600)),
+                                at_utc: None,
+                                cron: None,
+                                time_zone_id: "UTC".into(),
+                                next_run_utc: chrono::Utc::now() + chrono::Duration::hours(1),
+                                expires_at_utc: None,
+                                max_runs: None,
+                            },
+                            chrono::Utc::now(),
+                        )
+                        .id,
+                );
+            }
+            let host = host_with(
+                client,
+                vec![
+                    Arc::new(crate::tools::ScheduleCancelSelfTool) as Arc<dyn Tool>,
+                    Arc::new(crate::tools::TaskTool) as Arc<dyn Tool>,
+                ],
+                mgr,
+                8,
+            )
+            .with_schedule_store(Arc::clone(&store));
+            let own = ids[0].clone();
+            let foreign = ids[1].clone();
+            (host, store, own, foreign)
+        }
+
+        fn retired(store: &Arc<ScheduledTaskStore>, id: &str) -> bool {
+            store.items().iter().any(|t| t.id == id && t.is_retired())
+        }
+
+        /// The real thing: a scheduled run's own `AgentLoop` calls
+        /// `schedule_cancel_self`, its definition stops scheduling future work,
+        /// and — by default — the model is left to finish the turn it is in.
+        #[tokio::test]
+        async fn a_real_scheduled_run_cancels_only_its_own_future_runs() {
+            use crate::tool::ScheduleOrigin;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mgr = manager(&dir);
+            let client = ScriptedClient::new(vec![
+                tool_turn("c1", "schedule_cancel_self", "{}"),
+                text_turn("watcher finished its job"),
+            ]);
+            let (host, store, own, foreign) =
+                self_cancel_fixture(client, Arc::clone(&mgr));
+
+            let run = mgr
+                .register(
+                    TaskKind::Scheduled,
+                    "Scheduled: watcher",
+                    None,
+                    TaskExecutionMode::Background,
+                )
+                .unwrap();
+
+            let sink = Arc::new(CollectingSink::new());
+            let report = host
+                .spawn(
+                    SubagentRequest::foreground("general-purpose", "watch", &run.id, 1)
+                        .with_schedule_origin(Some(ScheduleOrigin::new(own.clone(), None))),
+                    sink.clone(),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+
+            let results = tool_results(&sink);
+            let (_, content, is_error) = results
+                .iter()
+                .find(|(name, _, _)| name == "schedule_cancel_self")
+                .expect("the tool must have run inside the real child loop");
+            assert!(!is_error, "{content}");
+
+            assert!(retired(&store, &own), "the run's own definition must be retired");
+            assert!(
+                !retired(&store, &foreign),
+                "no other definition may be touched"
+            );
+            assert!(
+                !run.cancel.is_cancelled(),
+                "the default must let the model finish its turn"
+            );
+            assert!(
+                report.contains("watcher finished its job"),
+                "the run must have produced its final answer: {report}"
+            );
+        }
+
+        /// `stopRunning: true` cancels the run's own `ManagedTask` token — the
+        /// same token the schedule runner hands to the loop — so the run really
+        /// ends instead of merely being reported as ended.
+        #[tokio::test]
+        async fn stop_running_cancels_the_runs_own_managed_task_token() {
+            use crate::tool::ScheduleOrigin;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mgr = manager(&dir);
+            let client = ScriptedClient::new(vec![
+                tool_turn("c1", "schedule_cancel_self", r#"{"stopRunning":true}"#),
+                text_turn("unreachable"),
+            ]);
+            let (host, store, own, _foreign) = self_cancel_fixture(client, Arc::clone(&mgr));
+
+            let run = mgr
+                .register(
+                    TaskKind::Scheduled,
+                    "Scheduled: watcher",
+                    None,
+                    TaskExecutionMode::Background,
+                )
+                .unwrap();
+
+            // The runner hands the task's own token to the loop.
+            let _ = host
+                .spawn(
+                    SubagentRequest::foreground("general-purpose", "watch", &run.id, 1)
+                        .with_schedule_origin(Some(ScheduleOrigin::new(own.clone(), None))),
+                    Arc::new(CollectingSink::new()),
+                    run.cancel.clone(),
+                )
+                .await;
+
+            assert!(
+                run.cancel.is_cancelled(),
+                "stopRunning must cancel the token the runner observes"
+            );
+            assert!(retired(&store, &own));
+        }
+
+        /// A nested subagent inside a scheduled run inherits the origin but is
+        /// not the run: it must be refused, must not retire the definition, and
+        /// must certainly not stop its parent's run.
+        #[tokio::test]
+        async fn a_nested_subagent_inside_a_real_scheduled_run_cannot_self_cancel() {
+            use crate::tool::ScheduleOrigin;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mgr = manager(&dir);
+            let client = ScriptedClient::new(vec![
+                tool_turn("n1", "schedule_cancel_self", r#"{"stopRunning":true}"#),
+                text_turn("nested done"),
+            ]);
+            let (host, store, own, _foreign) = self_cancel_fixture(client, Arc::clone(&mgr));
+
+            // The scheduled root run, and a nested child beneath it — exactly
+            // the shape `SubagentHost` produces when a scheduled run delegates.
+            let run = mgr
+                .register(
+                    TaskKind::Scheduled,
+                    "Scheduled: watcher",
+                    None,
+                    TaskExecutionMode::Background,
+                )
+                .unwrap();
+            let nested = mgr
+                .register(
+                    TaskKind::Subagent,
+                    "nested worker",
+                    Some(&run.id),
+                    TaskExecutionMode::Foreground,
+                )
+                .unwrap();
+
+            let sink = Arc::new(CollectingSink::new());
+            host.spawn(
+                // Depth 2, the child's own task id, and the origin it inherited
+                // from the run it is executing inside.
+                SubagentRequest::foreground("general-purpose", "decide", &nested.id, 2)
+                    .with_schedule_origin(Some(ScheduleOrigin::new(own.clone(), None))),
+                sink.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+            let results = tool_results(&sink);
+            let (_, content, is_error) = results
+                .iter()
+                .find(|(name, _, _)| name == "schedule_cancel_self")
+                .expect("the nested attempt must be visible");
+            assert!(is_error, "a nested subagent must be refused: {content}");
+            assert!(!retired(&store, &own), "the definition must survive the attempt");
+            assert!(
+                !run.cancel.is_cancelled(),
+                "a nested child must not be able to stop its parent's run"
+            );
+            assert!(
+                !nested.cancel.is_cancelled(),
+                "and the refusal must not stop anything at all"
+            );
+        }
+
+        /// Depth and read-only policy still apply: the tool mutates, so a
+        /// read-only definition never receives it, and a grandchild's inherited
+        /// origin buys it nothing because the authorization check is about
+        /// being the run, not about carrying an origin.
+        #[test]
+        fn self_cancel_is_stripped_from_read_only_children_like_any_mutating_tool() {
+            let registry = ToolRegistry::new(vec![
+                Arc::new(crate::tools::ScheduleCancelSelfTool) as Arc<dyn Tool>,
+                Arc::new(crate::tools::ScheduleListTool) as Arc<dyn Tool>,
+            ]);
+
+            let read_only = resolve_child_tools(&registry, true, 1);
+            let names: Vec<_> =
+                read_only.all().iter().map(|t| t.name().to_owned()).collect();
+            assert!(
+                !names.contains(&"schedule_cancel_self".to_owned()),
+                "a read-only definition must not receive a mutating tool"
+            );
+            assert!(names.contains(&"schedule_list".to_owned()));
+
+            // It is not a task-management tool, so depth alone does not strip
+            // it: a depth-limited *scheduled root* still needs it.
+            let deep = resolve_child_tools(&registry, false, MAX_SUBAGENT_DEPTH);
+            let deep_names: Vec<_> = deep.all().iter().map(|t| t.name().to_owned()).collect();
+            assert!(deep_names.contains(&"schedule_cancel_self".to_owned()));
+        }
+
+        // ── Test 4: real child loop cannot probe a sibling task ──────────────
         /// A depth-1 child gets the full task-management tool set (see
         /// `resolve_child_tools`), but it must still be unable to reach a
         /// SIBLING task's output or terminal status via `task_peek` /

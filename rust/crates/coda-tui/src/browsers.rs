@@ -101,7 +101,12 @@ pub fn models(models: &[WireModel], current: Option<&str>, source: &str) -> Brow
     browser
 }
 
-/// The scheduled-task browser. List only; the C# has no detail pane here.
+/// The scheduled-task browser.
+///
+/// The `runs` and `until` columns exist because a bounded schedule's remaining
+/// budget and deadline are the two things an operator actually needs to decide
+/// whether to intervene. An unbounded schedule leaves them blank rather than
+/// rendering a placeholder that would imply a limit it does not have.
 pub fn schedules(tasks: &[ScheduledTask]) -> Browser {
     let mut browser = Browser::new(
         format!("Schedules — {}", tasks.len()),
@@ -112,7 +117,9 @@ pub fn schedules(tasks: &[ScheduledTask]) -> Browser {
             Column::new("rule", 14),
             Column::new("tz", 8),
             Column::new("next run", 16),
-            Column::new("state", 12),
+            Column::new("state", 10),
+            Column::new("runs", 8),
+            Column::new("until", 20),
         ],
     )
     .with_footer("↑/↓ k/j move · d delete · n new · r reload · / filter · Esc q close")
@@ -125,7 +132,7 @@ pub fn schedules(tasks: &[ScheduledTask]) -> Browser {
             .map(|task| {
                 let status = match task.state.as_str() {
                     "running" => glyph::ACTIVE,
-                    "pending" => glyph::INACTIVE,
+                    "pending" | "retiring" => glyph::INACTIVE,
                     _ => glyph::OTHER,
                 };
                 Item::new(
@@ -138,12 +145,42 @@ pub fn schedules(tasks: &[ScheduledTask]) -> Browser {
                         task.time_zone.clone().unwrap_or_default(),
                         task.next_run_utc.clone().unwrap_or_default(),
                         task.state.clone(),
+                        schedule_run_budget(task),
+                        schedule_deadline_or_retirement(task),
                     ],
                 )
             })
             .collect(),
     );
     browser
+}
+
+/// `started/budget` for a bounded schedule, bare count once it has run at
+/// least once, and empty while an unbounded schedule has never run.
+fn schedule_run_budget(task: &ScheduledTask) -> String {
+    match task.max_runs {
+        Some(max) => format!("{}/{max}", task.runs_started),
+        None if task.runs_started > 0 => task.runs_started.to_string(),
+        None => String::new(),
+    }
+}
+
+/// The deadline or retirement time; the adjacent state column gives the reason.
+fn schedule_deadline_or_retirement(task: &ScheduledTask) -> String {
+    if task.retired_reason.is_some() {
+        return short_instant(task.retired_at_utc.as_deref());
+    }
+    match task.expires_at_utc.as_deref() {
+        Some(deadline) => short_instant(Some(deadline)),
+        None => String::new(),
+    }
+}
+
+/// `YYYY-MM-DDTHH:MM` — enough to act on, short enough for a column.
+fn short_instant(value: Option<&str>) -> String {
+    value
+        .map(|v| v.chars().take(16).collect::<String>())
+        .unwrap_or_default()
 }
 
 /// The skill browser.
@@ -850,7 +887,8 @@ mod tests {
         let tasks: Vec<ScheduledTask> = serde_json::from_value(json!([
             { "id": "s1", "state": "running", "rule": "every 5m" },
             { "id": "s2", "state": "pending", "rule": "cron" },
-            { "id": "s3", "state": "idle", "rule": "at" }
+            { "id": "s3", "state": "idle", "rule": "at" },
+            { "id": "s4", "state": "retiring", "rule": "every 1h" }
         ]))
         .expect("tasks");
 
@@ -859,6 +897,74 @@ mod tests {
         assert_eq!(rows[0].cells[0], glyph::ACTIVE);
         assert_eq!(rows[1].cells[0], glyph::INACTIVE);
         assert_eq!(rows[2].cells[0], glyph::OTHER);
+        assert_eq!(
+            rows[3].cells[0],
+            glyph::INACTIVE,
+            "a retiring schedule still has work in flight; it is not inert"
+        );
+    }
+
+    /// The run budget and the deadline are what an operator needs to decide
+    /// whether to intervene, so they are columns rather than buried detail.
+    #[test]
+    fn the_schedule_browser_shows_the_run_budget_and_deadline() {
+        let tasks: Vec<ScheduledTask> = serde_json::from_value(json!([
+            {
+                "id": "s1", "state": "running", "rule": "every 1h",
+                "maxRuns": 7, "runsStarted": 3,
+                "expiresAtUtc": "2087-03-08T00:00:00+00:00"
+            }
+        ]))
+        .expect("tasks");
+
+        let browser = schedules(&tasks);
+        let row = &browser.visible_items()[0];
+        assert_eq!(row.cells[6], "running");
+        assert_eq!(row.cells[7], "3/7");
+        assert_eq!(row.cells[8], "2087-03-08T00:00");
+    }
+
+    /// An unbounded schedule must not grow a fake limit: the budget column is
+    /// blank until it has actually run, and the deadline column stays empty.
+    #[test]
+    fn an_unbounded_schedule_shows_no_budget_or_deadline() {
+        let tasks: Vec<ScheduledTask> =
+            serde_json::from_value(json!([{ "id": "s1", "state": "idle", "rule": "every 1h" }]))
+                .expect("tasks");
+
+        let browser = schedules(&tasks);
+        let row = &browser.visible_items()[0];
+        assert_eq!(row.cells[7], "");
+        assert_eq!(row.cells[8], "");
+    }
+
+    /// Once a schedule is settled, why it stopped is more useful than a
+    /// deadline it will never reach again.
+    #[test]
+    fn a_retired_schedule_shows_its_state_and_full_retirement_minute() {
+        let tasks: Vec<ScheduledTask> = serde_json::from_value(json!([
+            {
+                "id": "s1", "state": "cancelled", "rule": "every 1h",
+                "expiresAtUtc": "2087-03-08T00:00:00+00:00",
+                "retiredReason": "cancelled",
+                "retiredAtUtc": "2087-03-02T11:30:00+00:00"
+            },
+            {
+                "id": "s2", "state": "completed", "rule": "cron",
+                "maxRuns": 7, "runsStarted": 7,
+                "retiredReason": "completed",
+                "retiredAtUtc": "2087-03-07T09:00:00+00:00"
+            }
+        ]))
+        .expect("tasks");
+
+        let browser = schedules(&tasks);
+        let rows = browser.visible_items();
+        assert_eq!(rows[0].cells[6], "cancelled");
+        assert_eq!(rows[0].cells[8], "2087-03-02T11:30");
+        assert_eq!(rows[1].cells[6], "completed");
+        assert_eq!(rows[1].cells[7], "7/7");
+        assert_eq!(rows[1].cells[8], "2087-03-07T09:00");
     }
 
     #[test]

@@ -18,6 +18,7 @@ mod list_dir;
 mod notebook_edit;
 mod read_file;
 mod run_command;
+mod schedule_cancel_self;
 mod schedule_create;
 mod schedule_tools;
 mod sleep_tool;
@@ -61,6 +62,7 @@ pub use list_dir::ListDirTool;
 pub use notebook_edit::NotebookEditTool;
 pub use read_file::ReadFileTool;
 pub use run_command::{RunCommandTool, DEFAULT_TIMEOUT_SECS, TIMEOUT_ENV};
+pub use schedule_cancel_self::ScheduleCancelSelfTool;
 pub use schedule_create::ScheduleCreateTool;
 pub use schedule_tools::{ScheduleDeleteTool, ScheduleListTool};
 pub use sleep_tool::{SleepTool, MAX_DURATION_MS};
@@ -138,6 +140,7 @@ pub fn built_in_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(ScheduleCreateTool),
         Arc::new(ScheduleListTool),
         Arc::new(ScheduleDeleteTool),
+        Arc::new(ScheduleCancelSelfTool),
     ]
 }
 

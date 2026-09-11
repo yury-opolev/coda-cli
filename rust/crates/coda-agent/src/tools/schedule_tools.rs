@@ -35,10 +35,11 @@ impl Tool for ScheduleListTool {
         };
 
         let items = store.items();
+        let now = chrono::Utc::now();
 
         // Main agent (no caller identity) sees every definition, unchanged.
         let Some(caller_id) = ctx.caller_task_id.as_deref() else {
-            return format_items(&items);
+            return format_items(&items, store, now);
         };
 
         // POLICY: a child never gets full visibility. It may see AT MOST the
@@ -73,7 +74,7 @@ impl Tool for ScheduleListTool {
         }
 
         match items.iter().find(|t| t.id == origin.definition_id) {
-            Some(t) => format_items(std::slice::from_ref(t)),
+            Some(t) => format_items(std::slice::from_ref(t), store, now),
             None => ToolResult::ok("No scheduled tasks accessible to this task."),
         }
     }
@@ -82,7 +83,16 @@ impl Tool for ScheduleListTool {
 /// Formats a list of scheduled definitions (or a single, origin-scoped one)
 /// into the tool's text response. Shared by the main-agent full listing and
 /// the child's own-origin-only listing so both paths render identically.
-fn format_items(items: &[crate::scheduling::ScheduledTask]) -> ToolOutcome {
+///
+/// The state column is derived, never assumed: a definition that is running,
+/// queued behind its own run, retiring on its last run, or already retired
+/// must say so. Reporting a retired schedule as "idle" would tell the model it
+/// still has a working automation when it has none.
+fn format_items(
+    items: &[crate::scheduling::ScheduledTask],
+    store: &std::sync::Arc<crate::scheduling::ScheduledTaskStore>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> ToolOutcome {
     if items.is_empty() {
         return ToolResult::ok("No scheduled tasks.");
     }
@@ -96,9 +106,11 @@ fn format_items(items: &[crate::scheduling::ScheduledTask]) -> ToolOutcome {
         };
         let label = t.name.as_deref().unwrap_or("(unnamed)");
         let next = t.next_run_utc.format("%Y-%m-%dT%H:%M:%SZ");
+        let state = crate::scheduling::reported_state(t, &store.live_state(&t.id), now);
         lines.push(format!(
-            "{} [{kind}] \"{label}\" next={next} — {}",
+            "{} [{kind}] \"{label}\" next={next} state={state}{} — {}",
             t.id,
+            format_bounds(t),
             t.prompt.chars().take(60).collect::<String>()
         ));
         if let Some(ref outcome) = t.last_terminal_outcome {
@@ -108,9 +120,41 @@ fn format_items(items: &[crate::scheduling::ScheduledTask]) -> ToolOutcome {
                 outcome.completed_at_utc.format("%Y-%m-%dT%H:%M:%SZ")
             ));
         }
+        if let Some(ref retirement) = t.retirement {
+            lines.push(format!(
+                "  retired: {} at {}{}",
+                retirement.reason.as_wire(),
+                retirement.retired_at_utc.format("%Y-%m-%dT%H:%M:%SZ"),
+                retirement
+                    .note
+                    .as_deref()
+                    .map(|n| format!(" ({n})"))
+                    .unwrap_or_default()
+            ));
+        }
     }
 
     ToolResult::ok(lines.join("\n"))
+}
+
+/// The run budget and deadline, rendered only when the definition actually has
+/// one. An unbounded schedule must not grow a "∞/∞" column that implies a
+/// limit exists.
+fn format_bounds(t: &crate::scheduling::ScheduledTask) -> String {
+    let mut parts = Vec::new();
+    if let Some(max) = t.max_runs {
+        parts.push(format!("runs={}/{max}", t.runs_started));
+    } else if t.runs_started > 0 {
+        parts.push(format!("runs={}", t.runs_started));
+    }
+    if let Some(deadline) = t.expires_at_utc {
+        parts.push(format!("expires={}", deadline.format("%Y-%m-%dT%H:%M:%SZ")));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", parts.join(" "))
+    }
 }
 
 /// `schedule_delete` — delete a scheduled task definition.
@@ -196,6 +240,8 @@ mod tests {
             cron: None,
             time_zone_id: "UTC".into(),
             next_run_utc: chrono::Utc::now() + chrono::Duration::hours(1),
+            expires_at_utc: None,
+            max_runs: None,
         };
         store.add(draft, chrono::Utc::now()).id
     }
@@ -252,6 +298,159 @@ mod tests {
             )
             .await;
         assert!(result.is_error);
+    }
+
+    // ── STAGE 1: truthful state reporting ────────────────────────────────────
+
+    /// An unbounded, idle definition still reports `idle` — bounds reporting
+    /// must not invent a limit where none was configured.
+    #[tokio::test]
+    async fn an_unbounded_schedule_lists_as_idle_with_no_bounds_noise() {
+        let s = ScheduledTaskStore::new();
+        add(&s);
+        let result = ScheduleListTool
+            .execute(&Value::Object(Default::default()), &ctx(s), CancellationToken::new())
+            .await;
+        assert!(result.content.contains("state=idle"), "{}", result.content);
+        assert!(!result.content.contains("runs="), "{}", result.content);
+        assert!(!result.content.contains("expires="), "{}", result.content);
+    }
+
+    /// A definition with a live run must not be reported as idle.
+    #[tokio::test]
+    async fn a_running_definition_lists_as_running_with_its_budget() {
+        use crate::scheduling::{ScheduleLiveState, ScheduleLiveStatus};
+
+        let s = ScheduledTaskStore::new();
+        let id = add(&s);
+        s.update(&id, |t| {
+            t.max_runs = Some(7);
+            t.runs_started = 3;
+        });
+        s.set_live_state(
+            &id,
+            ScheduleLiveState {
+                status: ScheduleLiveStatus::Running,
+                active_task_id: Some("task-0009".into()),
+            },
+        );
+
+        let result = ScheduleListTool
+            .execute(&Value::Object(Default::default()), &ctx(s), CancellationToken::new())
+            .await;
+        assert!(result.content.contains("state=running"), "{}", result.content);
+        assert!(result.content.contains("runs=3/7"), "{}", result.content);
+    }
+
+    /// The last allowed run, still executing: `retiring`, never `completed`.
+    /// The work is not done, and reporting it as done would be a lie the model
+    /// would act on.
+    #[tokio::test]
+    async fn the_last_allowed_run_lists_as_retiring_while_it_is_still_working() {
+        use crate::scheduling::{ScheduleLiveState, ScheduleLiveStatus};
+
+        let s = ScheduledTaskStore::new();
+        let id = add(&s);
+        s.update(&id, |t| {
+            t.max_runs = Some(7);
+            t.runs_started = 7;
+        });
+        s.set_live_state(
+            &id,
+            ScheduleLiveState {
+                status: ScheduleLiveStatus::Running,
+                active_task_id: Some("task-0009".into()),
+            },
+        );
+
+        let result = ScheduleListTool
+            .execute(&Value::Object(Default::default()), &ctx(s), CancellationToken::new())
+            .await;
+        assert!(result.content.contains("state=retiring"), "{}", result.content);
+        assert!(!result.content.contains("state=completed"), "{}", result.content);
+    }
+
+    #[tokio::test]
+    async fn a_spent_budget_with_no_live_run_lists_as_completed() {
+        let s = ScheduledTaskStore::new();
+        let id = add(&s);
+        s.update(&id, |t| {
+            t.max_runs = Some(7);
+            t.runs_started = 7;
+        });
+
+        let result = ScheduleListTool
+            .execute(&Value::Object(Default::default()), &ctx(s), CancellationToken::new())
+            .await;
+        assert!(result.content.contains("state=completed"), "{}", result.content);
+        assert!(result.content.contains("runs=7/7"), "{}", result.content);
+    }
+
+    #[tokio::test]
+    async fn a_passed_deadline_lists_as_expired_with_the_deadline_shown() {
+        let s = ScheduledTaskStore::new();
+        let id = add(&s);
+        s.update(&id, |t| {
+            t.expires_at_utc = Some(chrono::Utc::now() - chrono::Duration::minutes(1));
+        });
+
+        let result = ScheduleListTool
+            .execute(&Value::Object(Default::default()), &ctx(s), CancellationToken::new())
+            .await;
+        assert!(result.content.contains("state=expired"), "{}", result.content);
+        assert!(result.content.contains("expires="), "{}", result.content);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_definition_lists_as_cancelled_with_its_reason_line() {
+        use crate::scheduling::{ScheduleRetirement, ScheduleRetirementReason};
+
+        let s = ScheduledTaskStore::new();
+        let id = add(&s);
+        s.update(&id, |t| {
+            t.retirement = Some(ScheduleRetirement {
+                reason: ScheduleRetirementReason::Cancelled,
+                retired_at_utc: chrono::Utc::now(),
+                note: Some("nothing left to watch".into()),
+            });
+        });
+
+        let result = ScheduleListTool
+            .execute(&Value::Object(Default::default()), &ctx(s), CancellationToken::new())
+            .await;
+        assert!(result.content.contains("state=cancelled"), "{}", result.content);
+        assert!(result.content.contains("retired: cancelled"), "{}", result.content);
+        assert!(
+            result.content.contains("nothing left to watch"),
+            "{}",
+            result.content
+        );
+    }
+
+    /// The definition's retirement and the last run's outcome are separate
+    /// facts and must both be reportable at once: a budget can be spent by a
+    /// run that failed.
+    #[tokio::test]
+    async fn retirement_and_last_outcome_are_reported_separately() {
+        use crate::scheduling::{ScheduleTerminalMetadata, ScheduleTerminalOutcome};
+
+        let s = ScheduledTaskStore::new();
+        let id = add(&s);
+        s.update(&id, |t| {
+            t.max_runs = Some(1);
+            t.runs_started = 1;
+            t.last_terminal_outcome = Some(ScheduleTerminalMetadata {
+                outcome: ScheduleTerminalOutcome::Failed,
+                completed_at_utc: chrono::Utc::now(),
+                summary: Some("boom".into()),
+            });
+        });
+
+        let result = ScheduleListTool
+            .execute(&Value::Object(Default::default()), &ctx(s), CancellationToken::new())
+            .await;
+        assert!(result.content.contains("state=completed"), "{}", result.content);
+        assert!(result.content.contains("last: Failed"), "{}", result.content);
     }
 
     // ── POLICY: schedule management is main-agent only ───────────────────────

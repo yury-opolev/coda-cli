@@ -54,6 +54,16 @@ pub fn capability_catalog() -> HashMap<String, CapabilityEntry> {
     m.insert("config.describe".into(), CapabilityEntry::supported());
     m.insert("config.session".into(), CapabilityEntry::supported());
     m.insert("mcp.list".into(), CapabilityEntry::supported());
+    // Bounded schedules: `session/scheduleCreate` accepts `maxRuns` and
+    // `expiresAt`/`expiresIn`, and `session/scheduleList` reports
+    // `runsStarted`, the configured bounds and a truthful lifecycle `state`.
+    //
+    // This is advertised because an older engine would *accept* those fields
+    // and silently ignore them — a client that asked for "seven runs" would
+    // get an unbounded schedule with no error. Clients must check this
+    // capability before relying on a bound, and fall back to managing the
+    // limit themselves when it is absent.
+    m.insert("schedules.bounds".into(), CapabilityEntry::supported());
     // The reverse-request registry now makes this phase real: it is entered
     // when a permission/question/plan request goes outstanding and left when
     // the last one resolves, restoring the phase the turn was in.
@@ -228,10 +238,44 @@ mod tests {
             "config.session",
             "mcp.list",
             "state.awaitingUserInput",
+            "schedules.bounds",
         ] {
             assert!(catalog[name].supported, "{name} is implemented and must be advertised");
             assert!(catalog[name].reason.is_none(), "{name} is supported; no excuse needed");
         }
+    }
+
+    /// A bound the engine would silently drop is worse than no bound at all:
+    /// the client believes the schedule will stop itself. The capability is the
+    /// only way an older engine can be told apart from one that honours
+    /// `maxRuns`, so it must correspond to real wire fields.
+    #[test]
+    fn bounded_schedules_are_advertised_with_their_wire_fields_present() {
+        assert!(capability_catalog()["schedules.bounds"].supported);
+        let params = coda_proto::messages::ScheduleCreateParams {
+            prompt: "watch".into(),
+            every: Some("1h".into()),
+            max_runs: Some(7),
+            expires_in: Some("7d".into()),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(params).unwrap();
+        assert_eq!(value["maxRuns"], 7);
+        assert_eq!(value["expiresIn"], "7d");
+
+        let listed: coda_proto::messages::ScheduledTask = serde_json::from_value(
+            serde_json::json!({
+                "id": "s1",
+                "state": "retiring",
+                "maxRuns": 7,
+                "runsStarted": 7,
+                "retiredReason": "completed",
+            }),
+        )
+        .unwrap();
+        assert_eq!(listed.max_runs, Some(7));
+        assert_eq!(listed.runs_started, 7);
+        assert_eq!(listed.retired_reason.as_deref(), Some("completed"));
     }
 
     /// Every advertised capability must correspond to a routed method (or, for

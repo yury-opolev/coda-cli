@@ -108,6 +108,14 @@ mod tests {
     }
 
     #[test]
+    fn schedule_run_limits_require_at_least_one_run_in_the_schema() {
+        let schemas = documents();
+        for name in ["ScheduleCreateParams.json", "ScheduledTask.json"] {
+            assert_eq!(schemas[name]["properties"]["maxRuns"]["minimum"].as_f64(), Some(1.0), "{name}");
+        }
+    }
+
+    #[test]
     fn generated_files_match_wire_schemas() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors().nth(3).unwrap().join("docs").join("protocol").join("schemas");

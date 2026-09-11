@@ -759,13 +759,36 @@ pub struct ScheduledTask {
     pub time_zone: Option<String>,
     #[serde(default)]
     pub next_run_utc: Option<String>,
-    /// `"idle"`, `"running"` or `"pending"`.
+    /// `"idle"`, `"running"`, `"pending"`, `"retiring"`, `"completed"`,
+    /// `"expired"`, `"cancelled"` or `"failed"`.
+    ///
+    /// `"retiring"` means a run is still in flight for a schedule that will
+    /// not start another one: the work is not finished. Engines without the
+    /// `schedules.bounds` capability only ever send the first three.
     #[serde(default)]
     pub state: String,
     #[serde(default)]
     pub active_task_id: Option<String>,
     #[serde(default)]
     pub last_outcome: Option<String>,
+    /// Configured run budget; absent means unlimited.
+    #[serde(default)]
+    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
+    pub max_runs: Option<u32>,
+    /// Configured deadline; absent means the schedule never expires.
+    #[serde(default)]
+    pub expires_at_utc: Option<String>,
+    /// Accepted launch attempts so far, including runs that later failed.
+    /// Absent on an engine without the `schedules.bounds` capability, which
+    /// reads as `0` rather than as a claim that nothing ever ran.
+    #[serde(default)]
+    pub runs_started: u32,
+    /// Why the schedule will never run again: `"completed"` (run budget
+    /// spent), `"expired"`, `"cancelled"` or `"failed"`.
+    #[serde(default)]
+    pub retired_reason: Option<String>,
+    #[serde(default)]
+    pub retired_at_utc: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -784,6 +807,20 @@ pub struct ScheduleCreateParams {
     pub cron: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time_zone: Option<String>,
+    /// Stop after this many runs have been *started*. A run that later fails
+    /// still consumes one. Requires the `schedules.bounds` capability: an
+    /// engine without it accepts the field and ignores it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
+    pub max_runs: Option<u32>,
+    /// Absolute ISO-8601 deadline; no run starts at or after it. Mutually
+    /// exclusive with `expires_in`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    /// Relative deadline (`"30m"`, `"2h"`, `"7d"`), resolved to an absolute
+    /// instant once, at creation. Mutually exclusive with `expires_at`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_in: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1204,6 +1241,75 @@ mod tests {
         let task: ScheduledTask = serde_json::from_value(json!({ "id": "s1" })).expect("parse");
         assert_eq!(task.id, "s1");
         assert!(task.name.is_none());
+    }
+
+    /// An engine without the `schedules.bounds` capability omits every bound
+    /// field. The reader must present that as "unlimited", not as a schedule
+    /// with a zero budget that has already finished.
+    #[test]
+    fn a_schedule_without_bounds_reads_as_unlimited_and_never_started() {
+        let task: ScheduledTask =
+            serde_json::from_value(json!({ "id": "s1", "state": "idle" })).expect("parse");
+        assert_eq!(task.max_runs, None);
+        assert_eq!(task.expires_at_utc, None);
+        assert_eq!(task.runs_started, 0);
+        assert_eq!(task.retired_reason, None);
+    }
+
+    #[test]
+    fn a_bounded_schedule_round_trips_its_budget_deadline_and_retirement() {
+        let task: ScheduledTask = serde_json::from_value(json!({
+            "id": "s1",
+            "state": "completed",
+            "maxRuns": 7,
+            "runsStarted": 7,
+            "expiresAtUtc": "2087-03-08T00:00:00+00:00",
+            "retiredReason": "completed",
+            "retiredAtUtc": "2087-03-07T09:00:00+00:00",
+        }))
+        .expect("parse");
+        assert_eq!(task.max_runs, Some(7));
+        assert_eq!(task.runs_started, 7);
+        assert_eq!(task.state, "completed");
+        assert_eq!(task.retired_reason.as_deref(), Some("completed"));
+        assert_eq!(task.expires_at_utc.as_deref(), Some("2087-03-08T00:00:00+00:00"));
+    }
+
+    /// Bound fields are omitted entirely when unset, so an unbounded create
+    /// request is byte-for-byte what it was before bounds existed.
+    #[test]
+    fn an_unbounded_create_request_carries_no_bound_fields() {
+        let params = ScheduleCreateParams {
+            prompt: "watch".into(),
+            every: Some("1h".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(params).unwrap(),
+            json!({ "prompt": "watch", "every": "1h" })
+        );
+    }
+
+    #[test]
+    fn a_bounded_create_request_uses_camel_case_wire_names() {
+        let params = ScheduleCreateParams {
+            prompt: "watch".into(),
+            cron: Some("0 9 * * *".into()),
+            time_zone: Some("America/New_York".into()),
+            max_runs: Some(7),
+            expires_at: Some("2087-03-08T00:00:00Z".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(params).unwrap(),
+            json!({
+                "prompt": "watch",
+                "cron": "0 9 * * *",
+                "timeZone": "America/New_York",
+                "maxRuns": 7,
+                "expiresAt": "2087-03-08T00:00:00Z",
+            })
+        );
     }
 
     #[test]

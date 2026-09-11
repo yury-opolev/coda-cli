@@ -34,6 +34,29 @@
         "string",
         "null"
       ]
+    },
+    "maxRuns": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 1,
+      "description": "Stop after this many runs have been *started*. A run that later fails\nstill consumes one. Requires the `schedules.bounds` capability: an\nengine without it accepts the field and ignores it."
+    },
+    "expiresAt": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Absolute ISO-8601 deadline; no run starts at or after it. Mutually\nexclusive with `expires_in`."
+    },
+    "expiresIn": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Relative deadline (`\"30m\"`, `\"2h\"`, `\"7d\"`), resolved to an absolute\ninstant once, at creation. Mutually exclusive with `expires_at`."
     }
   },
   "required": [

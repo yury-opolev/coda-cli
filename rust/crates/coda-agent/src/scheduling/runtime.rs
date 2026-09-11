@@ -33,9 +33,11 @@ use chrono::{DateTime, Utc};
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio_util::sync::CancellationToken;
 
+use super::limits;
 use super::schedule_recurrence::ScheduleRecurrence;
 use super::scheduled_task::{
-    ScheduleKind, ScheduleTerminalMetadata, ScheduleTerminalOutcome, ScheduledTask,
+    ScheduleKind, ScheduleLiveState, ScheduleLiveStatus, ScheduleRetirement,
+    ScheduleRetirementReason, ScheduleTerminalMetadata, ScheduleTerminalOutcome, ScheduledTask,
 };
 use super::scheduled_task_store::ScheduledTaskStore;
 use crate::tasks::{TaskKind, TaskExecutionMode, TaskManager, TaskSnapshot};
@@ -254,6 +256,9 @@ struct Entry {
     /// Recurrence computation threw.  Quarantined until a new store revision
     /// appears for this definition.
     faulted: bool,
+    /// A `retired` lifecycle event has already been emitted for this entry, so
+    /// reconciliation and terminal processing cannot double-fire it.
+    retirement_announced: bool,
 }
 
 struct TerminalCommand {
@@ -397,7 +402,7 @@ async fn run_loop(
 
         // 1. Reconcile the store.
         let snapshot = store.get_snapshot();
-        reconcile(&mut entries, &snapshot, &view);
+        reconcile(&mut entries, &snapshot, &view, &store);
 
         // 2. Process queued terminal callbacks.
         while let Ok(cmd) = commands_rx.try_recv() {
@@ -414,7 +419,7 @@ async fn run_loop(
 
         // 4. Re-reconcile before parking (our own writes may have landed).
         let wait_snapshot = store.get_snapshot();
-        reconcile(&mut entries, &wait_snapshot, &view);
+        reconcile(&mut entries, &wait_snapshot, &view, &store);
 
         // 5. Wait for next event.
         let now = clock.now();
@@ -441,14 +446,22 @@ fn reconcile(
     entries: &mut HashMap<String, Entry>,
     snapshot: &crate::scheduling::ScheduledTaskStoreSnapshot,
     view: &Arc<RwLock<HashMap<String, ScheduleRuntimeState>>>,
+    store: &Arc<ScheduledTaskStore>,
 ) {
     let mut seen = std::collections::HashSet::new();
     for definition in &snapshot.items {
         seen.insert(definition.id.clone());
         if let Some(entry) = entries.get_mut(&definition.id) {
             if entry.definition != *definition {
+                // A retirement that arrived from outside (a self-cancelling
+                // run) must not be treated as "a new revision may fix the
+                // recurrence": clearing `faulted` there would put a quarantined
+                // definition back into rotation.
+                let newly_faultable = !definition.is_retired();
                 entry.definition = definition.clone();
-                entry.faulted = false; // new revision may fix recurrence
+                if newly_faultable {
+                    entry.faulted = false;
+                }
             }
         } else {
             entries.insert(definition.id.clone(), Entry {
@@ -456,7 +469,11 @@ fn reconcile(
                 status: RuntimeStatus::Idle,
                 active_task_id: None,
                 deleted: false,
+                // A definition that arrives already retired (self-cancelled
+                // between loop iterations) must never launch, so it is
+                // announced as retired rather than rediscovered as fresh work.
                 faulted: false,
+                retirement_announced: definition.is_retired(),
             });
         }
     }
@@ -472,7 +489,7 @@ fn reconcile(
         }
     }
 
-    publish_view(entries, view);
+    publish_view(entries, view, store);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -489,11 +506,11 @@ async fn evaluate_due(
     cancel: &CancellationToken,
     clock: &Arc<dyn ScheduleClock>,
 ) {
-    let now = clock.now();
     let ids: Vec<String> = entries.keys().cloned().collect();
 
     for id in ids {
         if cancel.is_cancelled() { return; }
+        let now = clock.now();
 
         let (status, next_run, deleted, faulted) = {
             let e = match entries.get(&id) {
@@ -504,6 +521,34 @@ async fn evaluate_due(
         };
 
         if deleted || faulted { continue; }
+
+        // Bounds are evaluated on their own schedule, not on the definition's.
+        // A deadline that passes while the next boundary is days away must
+        // retire the definition *at the deadline*; waiting for the next tick
+        // would leave a dead schedule advertising itself as live.
+        let admission = {
+            let e = entries.get(&id).unwrap();
+            limits::admit(&e.definition, now)
+        };
+        if let Some(reason) = admission.retirement() {
+            match status {
+                // Nothing is in flight: the definition retires now.
+                RuntimeStatus::Idle => {
+                    retire(entries, &id, reason, now, None, store, sink, view);
+                }
+                // Work is still running. The default is that already-running
+                // work finishes, so the definition is marked retiring and the
+                // record is settled when that run reaches its terminal state.
+                RuntimeStatus::Running | RuntimeStatus::Pending => {
+                    if let Some(entry) = entries.get_mut(&id) {
+                        // A queued replacement is no longer allowed to start.
+                        entry.status = RuntimeStatus::Running;
+                    }
+                    publish_view(entries, view, store);
+                }
+            }
+            continue;
+        }
 
         let due = next_run <= now;
         match status {
@@ -523,13 +568,86 @@ async fn evaluate_due(
         }
     }
 
-    publish_view(entries, view);
+    publish_view(entries, view, store);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Retirement
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Record that a definition will never launch again, and say so exactly once.
+///
+/// The write goes through `store.update` so it cannot clobber — or be clobbered
+/// by — a concurrent counter bump or a self-cancellation that landed first. The
+/// first recorded reason wins: a definition that cancelled itself is not
+/// relabelled "expired" a moment later because its deadline also passed.
+fn retire(
+    entries: &mut HashMap<String, Entry>,
+    id: &str,
+    reason: ScheduleRetirementReason,
+    now: DateTime<Utc>,
+    note: Option<String>,
+    store: &Arc<ScheduledTaskStore>,
+    sink: &Arc<dyn ScheduleLifecycleSink>,
+    view: &Arc<RwLock<HashMap<String, ScheduleRuntimeState>>>,
+) {
+    let recorded = store.update(id, |definition| {
+        if definition.retirement.is_none() {
+            definition.retirement = Some(ScheduleRetirement {
+                reason,
+                retired_at_utc: now,
+                note,
+            });
+            definition.updated_at_utc = now;
+        }
+        definition.clone()
+    });
+
+    let Some(definition) = recorded else {
+        // Deleted concurrently: there is nothing to retire and nothing to
+        // resurrect.
+        entries.remove(id);
+        publish_view(entries, view, store);
+        return;
+    };
+
+    let Some(entry) = entries.get_mut(id) else { return };
+    entry.definition = definition.clone();
+    entry.status = RuntimeStatus::Idle;
+    entry.active_task_id = None;
+
+    if !entry.retirement_announced {
+        entry.retirement_announced = true;
+        let effective = definition
+            .retirement
+            .as_ref()
+            .map(|r| r.reason)
+            .unwrap_or(reason);
+        emit(
+            sink,
+            &definition,
+            None,
+            "retired",
+            now,
+            Some(format!("retired: {}", effective.as_wire())),
+        );
+    }
+    publish_view(entries, view, store);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ClaimAndLaunch
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Claim the launch slot and start an occurrence.
+///
+/// The claim is a single atomic store mutation: it re-checks admission and
+/// advances the recurrence boundary under the store lock, so a cancellation or
+/// a deletion that lands between the due-evaluation and the launch is
+/// linearized — either it wins and no run starts, or the claim wins and the
+/// cancellation is observed on the next iteration. The runner is called
+/// *after* the lock is released; nothing awaits or calls back into a runner
+/// while the store is held.
 async fn claim_and_launch(
     entries: &mut HashMap<String, Entry>,
     id: &str,
@@ -542,41 +660,66 @@ async fn claim_and_launch(
 ) {
     let definition = entries.get(id).unwrap().definition.clone();
 
-    if is_recurring(&definition) {
-        let next = match ScheduleRecurrence::advance_recurring_past(&definition, now) {
-            Ok(n) => n,
+    // Compute the next boundary outside the lock: recurrence evaluation is the
+    // one part of this that can fail, and it must not fail with the store held.
+    let advanced_next_run = if is_recurring(&definition) {
+        match ScheduleRecurrence::advance_recurring_past(&definition, now) {
+            Ok(next) => Some(next),
             Err(e) => {
                 let entry = entries.get_mut(id).unwrap();
                 entry.faulted = true;
                 emit(sink, &definition, None, "failed", now, Some(format!("recurrence: {e}")));
                 return;
             }
-        };
+        }
+    } else {
+        None
+    };
 
-        let advanced = ScheduledTask {
-            next_run_utc: next,
-            updated_at_utc: now,
-            ..definition.clone()
-        };
+    let claim = store.update(id, |current| {
+        // Re-check under the lock. The definition may have been cancelled,
+        // expired or had its budget spent since the due evaluation.
+        if let Some(reason) = limits::admit(current, now).retirement() {
+            return Claim::Denied(reason);
+        }
+        if let Some(next) = advanced_next_run {
+            current.next_run_utc = next;
+            current.updated_at_utc = now;
+        }
+        Claim::Granted(current.clone())
+    });
 
-        if !store.replace(advanced.clone()) {
+    let claimed = match claim {
+        None => {
+            // Deleted between evaluation and claim: never resurrect it.
             entries.remove(id);
+            publish_view(entries, view, store);
             return;
         }
+        Some(Claim::Denied(reason)) => {
+            retire(entries, id, reason, now, None, store, sink, view);
+            return;
+        }
+        Some(Claim::Granted(definition)) => definition,
+    };
 
-        let entry = entries.get_mut(id).unwrap();
-        entry.definition = advanced;
-    }
-
-    let def = entries.get(id).unwrap().definition.clone();
-    launch(entries, id, &def, now, runner, sink, commands_tx, view);
+    entries.get_mut(id).unwrap().definition = claimed.clone();
+    launch(entries, id, &claimed, now, store, runner, sink, commands_tx, view);
 }
 
+/// Outcome of an atomic launch claim.
+enum Claim {
+    Granted(ScheduledTask),
+    Denied(ScheduleRetirementReason),
+}
+
+#[allow(clippy::too_many_arguments)]
 fn launch(
     entries: &mut HashMap<String, Entry>,
     id: &str,
     definition: &ScheduledTask,
     now: DateTime<Utc>,
+    store: &Arc<ScheduledTaskStore>,
     runner: &Arc<dyn ScheduledAgentRunner>,
     sink: &Arc<dyn ScheduleLifecycleSink>,
     commands_tx: &UnboundedSender<TerminalCommand>,
@@ -609,30 +752,60 @@ fn launch(
 
     match runner_clone.start(scheduled_run, on_terminal) {
         Ok(task_id) => {
-            let entry = entries.get_mut(id).unwrap();
+            // The attempt was accepted: a task exists for it. It counts against
+            // `maxRuns` from here on, even if the run later fails in the model,
+            // in a tool, or while waiting for a concurrency slot — otherwise an
+            // unreliable environment could retry a bounded job forever.
+            let committed = store.update(id, |current| {
+                current.runs_started = current.runs_started.saturating_add(1);
+                current.updated_at_utc = now;
+                current.clone()
+            });
+
+            let Some(entry) = entries.get_mut(id) else { return };
+            if let Some(committed) = committed {
+                entry.definition = committed;
+            } else {
+                // Deleted while the runner was accepting the launch. The run
+                // itself is allowed to finish, but there is no definition left
+                // to count against or to relaunch.
+                entry.deleted = true;
+            }
             entry.status = RuntimeStatus::Running;
             entry.active_task_id = Some(task_id.clone());
-            emit(sink, definition, Some(&task_id), "started", now, None);
-            publish_view(entries, view);
+            let announced = entry.definition.clone();
+            emit(sink, &announced, Some(&task_id), "started", now, None);
+            publish_view(entries, view, store);
         }
         Err(e) => {
+            // Refused outright: no task was registered, so nothing ran and the
+            // attempt does not count against the budget.
             emit(sink, definition, None, "failed", now, Some(format!("launch: {e}")));
             if definition.kind == ScheduleKind::At {
-                // One-shot launch failure: remove to prevent tight loop.
-                // The store remove is best-effort; we always remove the entry.
-                let _ = entries.remove(id); // remove before store.remove to avoid race
-                // Note: we don't have the store reference here, so the store
-                // entry will be cleaned up on next reconcile when it still fires.
-                // This is a minor imprecision; the tight loop is prevented
-                // because the entry is marked faulted.
+                // A one-shot whose launch was refused has no future boundary to
+                // advance to. Previously the entry was dropped from the map but
+                // left in the store, so the very next reconcile rediscovered it
+                // as fresh, overdue work and retried forever. Retire it in BOTH
+                // places, with an explicit reason, so the failure is visible and
+                // the loop cannot spin.
+                retire(
+                    entries,
+                    id,
+                    ScheduleRetirementReason::LaunchFailed,
+                    now,
+                    None,
+                    store,
+                    sink,
+                    view,
+                );
             } else {
                 if let Some(entry) = entries.get_mut(id) {
                     entry.faulted = true; // prevent tight loop
                     entry.status = RuntimeStatus::Idle;
                     entry.active_task_id = None;
                 }
+                publish_view(entries, view, store);
             }
-            publish_view(entries, view);
         }
     }
 }
@@ -659,23 +832,30 @@ fn advance_while_active(
         }
     };
 
-    let advanced = ScheduledTask {
-        next_run_utc: next,
-        updated_at_utc: now,
-        ..definition
-    };
+    // Advancing the boundary must never resurrect a retired definition or roll
+    // back a counter, so it is a targeted field update rather than a blind
+    // replace of a snapshot taken before the run started.
+    let advanced = store.update(id, |current| {
+        current.next_run_utc = next;
+        current.updated_at_utc = now;
+        current.clone()
+    });
 
-    if !store.replace(advanced.clone()) {
+    let Some(advanced) = advanced else {
         let entry = entries.get_mut(id).unwrap();
         entry.deleted = true;
         return;
-    }
+    };
 
     let entry = entries.get_mut(id).unwrap();
     entry.definition = advanced;
-    // Running → Pending; Pending stays Pending.
-    entry.status = RuntimeStatus::Pending;
-    publish_view(entries, view);
+    // Running → Pending; Pending stays Pending. A definition that has already
+    // exhausted its bounds never queues a replacement: it stays Running and is
+    // settled when the in-flight run finishes.
+    if limits::admit(&entry.definition, now).is_allowed() {
+        entry.status = RuntimeStatus::Pending;
+    }
+    publish_view(entries, view, store);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -702,7 +882,6 @@ async fn process_terminal(
     }
 
     let now = clock.now();
-    let definition = entry.definition.clone();
     let deleted = entry.deleted;
     let was_pending = entry.status == RuntimeStatus::Pending;
 
@@ -712,54 +891,77 @@ async fn process_terminal(
     if deleted {
         // Definition was removed while running: emit nothing, clean up.
         entries.remove(&command.definition_id);
-        publish_view(entries, view);
+        publish_view(entries, view, store);
         return;
     }
 
-    if definition.kind == ScheduleKind::At {
+    // Self-retirement can land after reconciliation but before the terminal
+    // callback. Consult the current store before removing a one-shot.
+    let Some(definition) = store.update(&command.definition_id, |current| current.clone()) else {
+        entries.remove(&command.definition_id);
+        publish_view(entries, view, store);
+        return;
+    };
+    if definition.kind == ScheduleKind::At && !definition.is_retired() {
         // One-shot: emit outcome, remove from store and entries.
         emit(sink, &definition, Some(&command.task_id), kind_str, now, summary.clone());
         store.remove(&definition.id);
         entries.remove(&command.definition_id);
-        publish_view(entries, view);
+        publish_view(entries, view, store);
         return;
     }
 
-    // Recurring: persist terminal metadata, keep definition.
-    let updated = ScheduledTask {
-        last_terminal_outcome: Some(ScheduleTerminalMetadata {
+    // Recurring: persist terminal metadata, keep definition. A targeted update
+    // rather than a blind replace, so a retirement or counter bump that landed
+    // while the run was in flight survives.
+    let updated = store.update(&command.definition_id, |current| {
+        current.last_terminal_outcome = Some(ScheduleTerminalMetadata {
             outcome,
             completed_at_utc: now,
             summary: summary.clone(),
-        }),
-        updated_at_utc: now,
-        ..definition.clone()
-    };
+        });
+        current.updated_at_utc = now;
+        current.clone()
+    });
 
-    if !store.replace(updated.clone()) {
+    let Some(updated) = updated else {
         // Deleted concurrently.
         entries.remove(&command.definition_id);
-        publish_view(entries, view);
+        publish_view(entries, view, store);
         return;
-    }
+    };
 
     let entry = entries.get_mut(&command.definition_id).unwrap();
     entry.definition = updated.clone();
+    entry.status = RuntimeStatus::Idle;
+    entry.active_task_id = None;
     emit(sink, &updated, Some(&command.task_id), kind_str, now, summary);
+
+    // The run's outcome and the definition's fate are separate questions. The
+    // run above may have succeeded while the definition is now out of budget,
+    // or failed while the definition still has runs left.
+    if let Some(reason) = limits::admit(&updated, now).retirement() {
+        retire(entries, &command.definition_id, reason, now, None, store, sink, view);
+        return;
+    }
 
     if was_pending {
         // Launch one coalesced replacement; next_run_utc is already future.
-        let def = entry.definition.clone();
-        entry.status = RuntimeStatus::Idle;
-        entry.active_task_id = None;
-        launch(entries, &command.definition_id, &def, now, runner, sink, commands_tx, view);
-    } else {
-        let entry = entries.get_mut(&command.definition_id).unwrap();
-        entry.status = RuntimeStatus::Idle;
-        entry.active_task_id = None;
+        let def = entries.get(&command.definition_id).unwrap().definition.clone();
+        launch(
+            entries,
+            &command.definition_id,
+            &def,
+            now,
+            store,
+            runner,
+            sink,
+            commands_tx,
+            view,
+        );
     }
 
-    publish_view(entries, view);
+    publish_view(entries, view, store);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -774,9 +976,19 @@ fn compute_delay(entries: &HashMap<String, Entry>, now: DateTime<Utc>) -> Durati
     let mut earliest = now + chrono::Duration::from_std(MAX_REEVALUATION).unwrap();
     for entry in entries.values() {
         if entry.deleted || entry.faulted { continue; }
-        if entry.status == RuntimeStatus::Idle {
-            if entry.definition.next_run_utc < earliest {
-                earliest = entry.definition.next_run_utc;
+        if entry.status == RuntimeStatus::Idle
+            && entry.definition.next_run_utc < earliest
+            && !entry.definition.is_retired()
+        {
+            earliest = entry.definition.next_run_utc;
+        }
+        // A deadline is a wake reason in its own right. Without this, a
+        // definition whose next boundary is a year out — or one with a run in
+        // flight, which contributes no due time at all — would keep advertising
+        // itself as live long after it expired.
+        if let Some(deadline) = limits::deadline_wake(&entry.definition, now) {
+            if deadline < earliest {
+                earliest = deadline;
             }
         }
     }
@@ -784,9 +996,17 @@ fn compute_delay(entries: &HashMap<String, Entry>, now: DateTime<Utc>) -> Durati
     delta.min(MAX_REEVALUATION)
 }
 
+/// Publish runtime state both to the in-process view and to the store's
+/// ephemeral live table.
+///
+/// The store copy is what makes `schedule_list` and `session/scheduleList`
+/// truthful: they can read a definition's real status without holding a handle
+/// to the runtime. It is deliberately a side table, never a serialized field,
+/// so a reload can never claim to own runs it does not have.
 fn publish_view(
     entries: &HashMap<String, Entry>,
     view: &Arc<RwLock<HashMap<String, ScheduleRuntimeState>>>,
+    store: &Arc<ScheduledTaskStore>,
 ) {
     let new_view: HashMap<String, ScheduleRuntimeState> = entries
         .iter()
@@ -804,7 +1024,38 @@ fn publish_view(
             )
         })
         .collect();
+
+    for (id, entry) in entries {
+        store.set_live_state(id, live_state_of(entry));
+    }
+    // A definition the runtime no longer tracks owns no live state.
+    for id in store.live_states().keys() {
+        if !entries.contains_key(id) {
+            store.set_live_state(id, ScheduleLiveState::default());
+        }
+    }
+
     *view.write().unwrap() = new_view;
+}
+
+/// The live status a reader should see for one entry.
+///
+/// `Retiring` is reported only while work is genuinely still in flight: a
+/// definition at its limit with a run executing has not completed its work, and
+/// calling it "completed" would be a lie a reader acts on.
+fn live_state_of(entry: &Entry) -> ScheduleLiveState {
+    let status = match entry.status {
+        _ if entry.faulted => ScheduleLiveStatus::Faulted,
+        RuntimeStatus::Idle => ScheduleLiveStatus::Idle,
+        RuntimeStatus::Running | RuntimeStatus::Pending
+            if entry.definition.is_retired() =>
+        {
+            ScheduleLiveStatus::Retiring
+        }
+        RuntimeStatus::Running => ScheduleLiveStatus::Running,
+        RuntimeStatus::Pending => ScheduleLiveStatus::Pending,
+    };
+    ScheduleLiveState { status, active_task_id: entry.active_task_id.clone() }
 }
 
 fn emit(
@@ -957,6 +1208,8 @@ pub(crate) mod tests {
             cron: None,
             time_zone_id: "UTC".into(),
             next_run_utc: now - chrono::Duration::seconds(1), // already due
+            expires_at_utc: None,
+            max_runs: None,
         }
     }
 
@@ -972,6 +1225,8 @@ pub(crate) mod tests {
             cron: None,
             time_zone_id: "UTC".into(),
             next_run_utc: when,
+            expires_at_utc: None,
+            max_runs: None,
         }
     }
 
@@ -1321,6 +1576,846 @@ pub(crate) mod tests {
         assert!(runs.iter().all(|r| r.prompt == "run me"));
 
         drop(runs);
+        runtime.shutdown().await;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // STAGE 1 — bounded schedules
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// A runner the test drives by hand: it decides whether a launch is
+    /// accepted, and decides *later* whether the accepted run succeeded.
+    ///
+    /// That separation is the whole point. `TaskManagerRunner` returns `Ok`
+    /// once the task is registered — *before* it acquires a concurrency slot
+    /// or talks to a model — so a run can be accepted and still fail. A mock
+    /// that only ever completed successfully would let a wrong counting rule
+    /// pass.
+    pub struct ControlledRunner {
+        accepted: std::sync::Mutex<Vec<(String, Arc<dyn Fn(TaskSnapshot) + Send + Sync>)>>,
+        launch_count: AtomicUsize,
+        refuse: std::sync::atomic::AtomicBool,
+    }
+
+    impl ControlledRunner {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                accepted: std::sync::Mutex::new(Vec::new()),
+                launch_count: AtomicUsize::new(0),
+                refuse: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+
+        fn refusing() -> Arc<Self> {
+            let runner = Self::new();
+            runner.refuse.store(true, Ordering::SeqCst);
+            runner
+        }
+
+        fn launches(&self) -> usize {
+            self.launch_count.load(Ordering::SeqCst)
+        }
+
+        fn in_flight(&self) -> usize {
+            self.accepted.lock().unwrap().len()
+        }
+
+        /// Finish every in-flight run with `status`.
+        fn finish_all(&self, status: crate::tasks::TaskRunStatus) {
+            let runs: Vec<_> = self.accepted.lock().unwrap().drain(..).collect();
+            for (task_id, on_terminal) in runs {
+                on_terminal(make_snapshot(&task_id, status));
+            }
+        }
+    }
+
+    impl ScheduledAgentRunner for ControlledRunner {
+        fn start(
+            &self,
+            _run: ScheduledRun,
+            on_terminal: Arc<dyn Fn(TaskSnapshot) + Send + Sync>,
+        ) -> Result<String, String> {
+            if self.refuse.load(Ordering::SeqCst) {
+                // Refused outright: no task is registered, nothing runs.
+                return Err("no capacity".into());
+            }
+            let n = self.launch_count.fetch_add(1, Ordering::SeqCst) + 1;
+            let task_id = format!("controlled-task-{n}");
+            self.accepted.lock().unwrap().push((task_id.clone(), on_terminal));
+            Ok(task_id)
+        }
+    }
+
+    /// Wake the schedule loop without clobbering anything.
+    ///
+    /// The loop parks on the store version, so a test that advances the fake
+    /// clock has to touch the store to force a re-evaluation. This is an
+    /// atomic field update, not a blind `replace` of a snapshot that may
+    /// already be stale — a blind poke could itself undo a retirement and make
+    /// the test prove the opposite of what it claims.
+    fn poke(store: &Arc<ScheduledTaskStore>, id: &str, now: DateTime<Utc>) {
+        store.update(id, |task| task.updated_at_utc = now);
+    }
+
+    async fn wait_until(label: &str, mut condition: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for: {label}"));
+    }
+
+    /// Settle the loop: give it enough iterations to have done anything it
+    /// was going to do, so an assertion of "nothing happened" means it.
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(80)).await;
+    }
+
+    fn bounded_draft(
+        secs: u64,
+        expires_at: Option<DateTime<Utc>>,
+        max_runs: Option<u32>,
+        start: DateTime<Utc>,
+    ) -> ScheduleDefinitionDraft {
+        ScheduleDefinitionDraft {
+            name: Some("bounded".into()),
+            kind: ScheduleKind::Interval,
+            prompt: "watch".into(),
+            interval: Some(Duration::from_secs(secs)),
+            at_utc: None,
+            cron: None,
+            time_zone_id: "UTC".into(),
+            next_run_utc: start - chrono::Duration::seconds(1), // due immediately
+            expires_at_utc: expires_at,
+            max_runs,
+        }
+    }
+
+    fn current(store: &Arc<ScheduledTaskStore>, id: &str) -> ScheduledTask {
+        store.items().into_iter().find(|t| t.id == id).expect("definition must still exist")
+    }
+
+    // ── deadlines ─────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn each_definition_uses_a_fresh_admission_time() {
+        struct AdvancingClock {
+            start: DateTime<Utc>,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl ScheduleClock for AdvancingClock {
+            fn now(&self) -> DateTime<Utc> {
+                let first = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                self.start + chrono::Duration::milliseconds(if first { 0 } else { 2 })
+            }
+        }
+        let start = fake_start();
+        let deadline = start + chrono::Duration::milliseconds(1);
+        let store = ScheduledTaskStore::new();
+        for _ in 0..2 {
+            store.add(bounded_draft(3600, Some(deadline), None, start), start);
+        }
+        let runner = ControlledRunner::new();
+        let runner_port: Arc<dyn ScheduledAgentRunner> = runner.clone();
+        let sink: Arc<dyn ScheduleLifecycleSink> = RecordingSink::new();
+        let clock: Arc<dyn ScheduleClock> = Arc::new(AdvancingClock {
+            start, calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let view = Arc::new(RwLock::new(HashMap::new()));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut entries = HashMap::new();
+        reconcile(&mut entries, &store.get_snapshot(), &view, &store);
+        evaluate_due(
+            &mut entries, &store, &runner_port, &sink, &tx, &view,
+            &CancellationToken::new(), &clock,
+        ).await;
+        assert_eq!(runner.launches(), 1, "the later admission occurred after expiry");
+    }
+
+    /// The deadline retires the definition when the clock *reaches* it — not
+    /// early because the next boundary would have fallen beyond it. An hourly
+    /// monitor with a Friday deadline stays live until Friday.
+    #[tokio::test]
+    async fn a_definition_expires_at_its_deadline_not_at_its_last_fitting_tick() {
+        let start = fake_start();
+        let clock = TestClock::new(start);
+        let store = ScheduledTaskStore::new();
+        let deadline = start + chrono::Duration::days(7);
+        let id = store
+            .add(bounded_draft(3600, Some(deadline), None, start), start)
+            .id;
+
+        let runner = ControlledRunner::new();
+        let sink = RecordingSink::new();
+        let runtime =
+            ScheduleRuntime::new_with_clock(store.clone(), runner.clone(), sink.clone(), clock.clone());
+
+        wait_until("the first run to start", || runner.launches() >= 1).await;
+        runner.finish_all(crate::tasks::TaskRunStatus::Completed);
+
+        // Six days in: still live, still unretired.
+        clock.advance(chrono::Duration::days(6));
+        poke(&store, &id, clock.now());
+        wait_until("the catch-up run", || runner.launches() >= 2).await;
+        assert!(
+            !current(&store, &id).is_retired(),
+            "a definition six days before its deadline must still be live"
+        );
+        // Let the run finish so the definition is idle when the deadline lands:
+        // the default is that in-flight work is never interrupted.
+        runner.finish_all(crate::tasks::TaskRunStatus::Completed);
+        settle().await;
+
+        // At the deadline: retired, and nothing launches at or after it.
+        clock.advance(chrono::Duration::days(1));
+        poke(&store, &id, clock.now());
+        wait_until("the deadline retirement", || current(&store, &id).is_retired()).await;
+
+        let retirement = current(&store, &id).retirement.unwrap();
+        assert_eq!(retirement.reason, ScheduleRetirementReason::Expired);
+        assert_eq!(retirement.retired_at_utc, clock.now());
+
+        let at_retirement = runner.launches();
+        clock.advance(chrono::Duration::days(30));
+        poke(&store, &id, clock.now());
+        settle().await;
+        assert_eq!(
+            runner.launches(),
+            at_retirement,
+            "no occurrence may start at or after the expiry"
+        );
+
+        assert!(
+            sink.events.lock().unwrap().iter().filter(|e| e.state == "retired").count() == 1,
+            "the retirement must be announced exactly once"
+        );
+
+        runtime.shutdown().await;
+    }
+
+    /// A definition whose next boundary is far in the future, with a run still
+    /// in flight, must still be revisited at its deadline. Without a
+    /// deadline-driven wake the loop would sleep past it entirely.
+    #[tokio::test]
+    async fn the_loop_wakes_at_the_deadline_even_with_a_distant_next_run_and_active_work() {
+        let start = fake_start();
+        let clock = TestClock::new(start);
+        let store = ScheduledTaskStore::new();
+        let deadline = start + chrono::Duration::hours(2);
+        // A daily interval: after the first launch the next boundary is ~24h
+        // away, well past the 2h deadline.
+        let id = store
+            .add(bounded_draft(86_400, Some(deadline), None, start), start)
+            .id;
+
+        let runner = ControlledRunner::new();
+        let sink = RecordingSink::new();
+        let runtime =
+            ScheduleRuntime::new_with_clock(store.clone(), runner.clone(), sink.clone(), clock.clone());
+
+        wait_until("the first run to start", || runner.launches() == 1).await;
+        assert!(current(&store, &id).next_run_utc > deadline, "next boundary is past the deadline");
+
+        // The run is still in flight when the deadline passes.
+        clock.advance(chrono::Duration::hours(2));
+        poke(&store, &id, clock.now());
+        settle().await;
+
+        // Default: running work is not interrupted, but the definition is
+        // already known to be retiring.
+        assert_eq!(runner.in_flight(), 1, "the active run must not be cancelled by expiry");
+        assert_eq!(
+            crate::scheduling::reported_state(
+                &current(&store, &id),
+                &store.live_state(&id),
+                clock.now()
+            ),
+            "retiring",
+            "a definition past its deadline with work in flight is retiring, not completed"
+        );
+
+        runner.finish_all(crate::tasks::TaskRunStatus::Completed);
+        wait_until("the retirement to settle", || current(&store, &id).is_retired()).await;
+        assert_eq!(
+            current(&store, &id).retirement.unwrap().reason,
+            ScheduleRetirementReason::Expired
+        );
+
+        runtime.shutdown().await;
+    }
+
+    // ── run budgets ───────────────────────────────────────────────────────────
+
+    /// "Daily, for a week" is seven accepted launches — and a run that fails
+    /// still consumed one of them.
+    #[tokio::test]
+    async fn exactly_seven_accepted_launches_are_made_including_failed_runs() {
+        let start = fake_start();
+        let clock = TestClock::new(start);
+        let store = ScheduledTaskStore::new();
+        let id = store.add(bounded_draft(86_400, None, Some(7), start), start).id;
+
+        let runner = ControlledRunner::new();
+        let sink = RecordingSink::new();
+        let runtime =
+            ScheduleRuntime::new_with_clock(store.clone(), runner.clone(), sink.clone(), clock.clone());
+
+        for day in 0..12 {
+            wait_until(&format!("day {day} to settle"), || {
+                runner.in_flight() > 0 || current(&store, &id).is_retired()
+            })
+            .await;
+            // Alternate success and failure: both consume budget.
+            let status = if day % 2 == 0 {
+                crate::tasks::TaskRunStatus::Completed
+            } else {
+                crate::tasks::TaskRunStatus::Failed
+            };
+            runner.finish_all(status);
+            clock.advance(chrono::Duration::days(1));
+            poke(&store, &id, clock.now());
+            settle().await;
+        }
+
+        assert_eq!(
+            runner.launches(),
+            7,
+            "a run that failed still consumed budget; the schedule must stop at seven"
+        );
+        let definition = current(&store, &id);
+        assert_eq!(definition.runs_started, 7);
+        assert_eq!(
+            definition.retirement.unwrap().reason,
+            ScheduleRetirementReason::RunLimit
+        );
+
+        runtime.shutdown().await;
+    }
+
+    /// The counter is monotonic: advancing the boundary while active, and
+    /// reconciling repeatedly, must never roll it back.
+    #[tokio::test]
+    async fn the_run_counter_is_never_reset_by_advancing_or_reconciling() {
+        let start = fake_start();
+        let clock = TestClock::new(start);
+        let store = ScheduledTaskStore::new();
+        let id = store.add(bounded_draft(3600, None, Some(5), start), start).id;
+
+        let runner = ControlledRunner::new();
+        let runtime = ScheduleRuntime::new_with_clock(
+            store.clone(),
+            runner.clone(),
+            RecordingSink::new(),
+            clock.clone(),
+        );
+
+        wait_until("the first run", || runner.launches() == 1).await;
+        assert_eq!(current(&store, &id).runs_started, 1);
+
+        // Several due ticks arrive while the run is still in flight: they only
+        // advance the boundary and queue at most one replacement.
+        for _ in 0..3 {
+            clock.advance(chrono::Duration::hours(1));
+            poke(&store, &id, clock.now());
+            settle().await;
+            assert_eq!(
+                current(&store, &id).runs_started,
+                1,
+                "advancing while active must not touch the counter"
+            );
+        }
+
+        runner.finish_all(crate::tasks::TaskRunStatus::Completed);
+        wait_until("the coalesced replacement", || runner.launches() == 2).await;
+        assert_eq!(current(&store, &id).runs_started, 2);
+
+        runtime.shutdown().await;
+    }
+
+    /// The queued replacement is gated too: a definition that spends its last
+    /// unit of budget on the *running* occurrence must not start the pending
+    /// one when that occurrence finishes.
+    #[tokio::test]
+    async fn a_pending_replacement_is_refused_once_the_budget_is_spent() {
+        let start = fake_start();
+        let clock = TestClock::new(start);
+        let store = ScheduledTaskStore::new();
+        let id = store.add(bounded_draft(3600, None, Some(1), start), start).id;
+
+        let runner = ControlledRunner::new();
+        let sink = RecordingSink::new();
+        let runtime =
+            ScheduleRuntime::new_with_clock(store.clone(), runner.clone(), sink.clone(), clock.clone());
+
+        wait_until("the only allowed run", || runner.launches() == 1).await;
+
+        // A due tick lands while it runs: with budget left this would queue a
+        // replacement.
+        clock.advance(chrono::Duration::hours(2));
+        poke(&store, &id, clock.now());
+        settle().await;
+
+        assert_eq!(
+            crate::scheduling::reported_state(
+                &current(&store, &id),
+                &store.live_state(&id),
+                clock.now()
+            ),
+            "retiring",
+            "the last allowed run must report retiring, not completed, while it works"
+        );
+
+        runner.finish_all(crate::tasks::TaskRunStatus::Completed);
+        wait_until("the retirement", || current(&store, &id).is_retired()).await;
+        settle().await;
+
+        assert_eq!(runner.launches(), 1, "the pending replacement must never start");
+        let definition = current(&store, &id);
+        assert_eq!(definition.runs_started, 1);
+        assert_eq!(
+            definition.retirement.unwrap().reason,
+            ScheduleRetirementReason::RunLimit
+        );
+        // The run's own outcome stays a separate, honest fact.
+        assert_eq!(
+            definition.last_terminal_outcome.unwrap().outcome,
+            ScheduleTerminalOutcome::Succeeded
+        );
+
+        runtime.shutdown().await;
+    }
+
+    // ── launch failures ───────────────────────────────────────────────────────
+
+    /// A launch the runner refuses outright registers no task, so nothing ran
+    /// and nothing may be charged to the budget.
+    #[tokio::test]
+    async fn a_refused_launch_does_not_consume_budget() {
+        let start = fake_start();
+        let clock = TestClock::new(start);
+        let store = ScheduledTaskStore::new();
+        let id = store.add(bounded_draft(3600, None, Some(3), start), start).id;
+
+        let runner = ControlledRunner::refusing();
+        let sink = RecordingSink::new();
+        let runtime =
+            ScheduleRuntime::new_with_clock(store.clone(), runner.clone(), sink.clone(), clock.clone());
+
+        wait_until("the refusal to be reported", || {
+            sink.events.lock().unwrap().iter().any(|e| e.state == "failed")
+        })
+        .await;
+        settle().await;
+
+        let definition = current(&store, &id);
+        assert_eq!(definition.runs_started, 0, "nothing ran, so nothing was charged");
+        assert!(!definition.is_retired(), "a refused launch is not a retirement for a recurring job");
+        assert_eq!(
+            limits::reported_state(&definition, &store.live_state(&id), clock.now()),
+            "failed",
+            "quarantined work must not be advertised as idle future work",
+        );
+
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_one_shot_retired_after_reconcile_keeps_its_reason_after_completion() {
+        let start = fake_start();
+        let store = ScheduledTaskStore::new();
+        let mut draft = bounded_draft(3600, None, None, start);
+        draft.kind = ScheduleKind::At;
+        draft.interval = None;
+        draft.at_utc = Some(start);
+        let id = store.add(draft, start).id;
+        let runner = ControlledRunner::new();
+        let runner_port: Arc<dyn ScheduledAgentRunner> = runner.clone();
+        let sink: Arc<dyn ScheduleLifecycleSink> = RecordingSink::new();
+        let clock: Arc<dyn ScheduleClock> = TestClock::new(start);
+        let view = Arc::new(RwLock::new(HashMap::new()));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut entries = HashMap::new();
+        reconcile(&mut entries, &store.get_snapshot(), &view, &store);
+        claim_and_launch(&mut entries, &id, start, &store, &runner_port, &sink, &tx, &view).await;
+
+        // Self-retirement can land after the loop's snapshot and before its
+        // terminal callback is drained. The store, not that snapshot, wins.
+        store.update(&id, |definition| {
+            definition.retirement = Some(ScheduleRetirement {
+                reason: ScheduleRetirementReason::Cancelled,
+                retired_at_utc: start,
+                note: None,
+            });
+        }).unwrap();
+        runner.finish_all(crate::tasks::TaskRunStatus::Completed);
+        let terminal = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.unwrap().unwrap();
+        process_terminal(&mut entries, terminal, &store, &runner_port, &sink, &tx, &view, &clock).await;
+        let definition = current(&store, &id);
+        assert_eq!(definition.retirement.unwrap().reason, ScheduleRetirementReason::Cancelled);
+        assert!(definition.last_terminal_outcome.is_some());
+    }
+
+    /// A one-shot whose launch is refused used to be dropped from the runtime
+    /// map but left in the store, so reconciliation rediscovered it as fresh,
+    /// overdue work and retried it forever. It must now retire in both places
+    /// with an explicit reason, and the loop must not spin.
+    #[tokio::test]
+    async fn a_refused_one_shot_retires_in_both_places_and_never_retries() {
+        let start = fake_start();
+        let clock = TestClock::new(start);
+        let store = ScheduledTaskStore::new();
+        let id = store
+            .add(
+                ScheduleDefinitionDraft {
+                    name: None,
+                    kind: ScheduleKind::At,
+                    prompt: "once".into(),
+                    interval: None,
+                    at_utc: Some(start - chrono::Duration::seconds(1)),
+                    cron: None,
+                    time_zone_id: "UTC".into(),
+                    next_run_utc: start - chrono::Duration::seconds(1),
+                    expires_at_utc: None,
+                    max_runs: None,
+                },
+                start,
+            )
+            .id;
+
+        let runner = ControlledRunner::refusing();
+        let sink = RecordingSink::new();
+        let runtime =
+            ScheduleRuntime::new_with_clock(store.clone(), runner.clone(), sink.clone(), clock.clone());
+
+        wait_until("the one-shot to retire", || {
+            store.items().iter().any(|t| t.id == id && t.is_retired())
+        })
+        .await;
+
+        // Several reconcile cycles later it must still be retired, with no
+        // retry storm.
+        for _ in 0..5 {
+            poke(&store, &id, clock.now());
+            settle().await;
+        }
+
+        let definition = current(&store, &id);
+        assert_eq!(
+            definition.retirement.unwrap().reason,
+            ScheduleRetirementReason::LaunchFailed,
+            "the failure must be an explicit, visible state"
+        );
+        let failures = sink.events.lock().unwrap().iter().filter(|e| e.state == "failed").count();
+        assert_eq!(failures, 1, "one refusal, one report — not a retry storm");
+        let retirements =
+            sink.events.lock().unwrap().iter().filter(|e| e.state == "retired").count();
+        assert_eq!(retirements, 1, "the retirement must not double-fire");
+
+        runtime.shutdown().await;
+    }
+
+    /// The same counting rule, proved against the **real** `TaskManagerRunner`
+    /// rather than an idealized mock.
+    ///
+    /// `TaskManagerRunner::start` registers the task and returns `Ok`
+    /// *before* the spawned worker acquires a concurrency slot or talks to a
+    /// model, so a run can be accepted and then fail for reasons the scheduler
+    /// never sees. Those runs must still consume budget: if they did not, a
+    /// broken provider or an exhausted subagent pool would let a bounded job
+    /// retry forever. A mock that reports `Err` for the same situation would
+    /// let that bug through, which is why this test uses the production runner.
+    #[tokio::test]
+    async fn the_real_task_manager_runner_charges_runs_that_fail_after_acceptance() {
+        /// Every spawn fails — exactly what an exhausted pool or a dead
+        /// provider looks like from inside the worker, *after* `start`
+        /// already returned `Ok`.
+        struct AlwaysFailingFactory;
+
+        #[async_trait::async_trait]
+        impl crate::subagents::SubagentFactory for AlwaysFailingFactory {
+            async fn spawn(
+                &self,
+                _request: crate::subagents::SubagentRequest,
+                _sink: Arc<dyn crate::events::AgentSink>,
+                _cancel: CancellationToken,
+            ) -> Result<String, String> {
+                Err("no capacity".into())
+            }
+        }
+
+        let start = fake_start();
+        let clock = TestClock::new(start);
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = crate::tasks::TaskManager::new(
+            "runner-counting",
+            Some(dir.path().to_owned()),
+            4096,
+            64,
+        );
+        let store = ScheduledTaskStore::new();
+        let id = store.add(bounded_draft(3600, None, Some(2), start), start).id;
+
+        let runner = TaskManagerRunner::new(Arc::clone(&mgr), Arc::new(AlwaysFailingFactory));
+        let sink = RecordingSink::new();
+        let runtime =
+            ScheduleRuntime::new_with_clock(store.clone(), runner, sink.clone(), clock.clone());
+
+        // Drive well past two boundaries: if failed runs were uncounted this
+        // would keep firing.
+        for _ in 0..6 {
+            clock.advance(chrono::Duration::hours(1));
+            poke(&store, &id, clock.now());
+            settle().await;
+        }
+
+        let definition = current(&store, &id);
+        assert_eq!(
+            definition.runs_started, 2,
+            "a run accepted by the runner counts even though it failed afterwards"
+        );
+        assert_eq!(
+            definition.retirement.expect("the budget is spent").reason,
+            ScheduleRetirementReason::RunLimit
+        );
+
+        // The task manager really did register (and fail) exactly two runs —
+        // the runner accepted them, which is what "accepted attempt" means.
+        let scheduled: Vec<_> = mgr
+            .list()
+            .into_iter()
+            .filter(|t| t.kind == crate::tasks::TaskKind::Scheduled)
+            .collect();
+        assert_eq!(scheduled.len(), 2, "two registered scheduled tasks, no more");
+        assert!(
+            scheduled
+                .iter()
+                .all(|t| t.status == crate::tasks::TaskRunStatus::Failed),
+            "both accepted runs failed after acceptance"
+        );
+
+        // And the honest record of the last run is a failure, separate from
+        // the definition's "run budget spent" retirement.
+        assert_eq!(
+            current(&store, &id).last_terminal_outcome.unwrap().outcome,
+            ScheduleTerminalOutcome::Failed
+        );
+
+        runtime.shutdown().await;
+    }
+
+    // ── cancellation races ────────────────────────────────────────────────────
+
+    /// A retirement recorded by someone else (the self-cancel tool) while the
+    /// runtime holds an in-flight run must survive every later write: the
+    /// terminal metadata update, the reconcile, and the boundary advance all
+    /// go through targeted field updates precisely so they cannot resurrect it.
+    #[tokio::test]
+    async fn a_cancellation_during_a_run_is_never_undone_by_the_terminal_write() {
+        let start = fake_start();
+        let clock = TestClock::new(start);
+        let store = ScheduledTaskStore::new();
+        let id = store.add(bounded_draft(3600, None, Some(9), start), start).id;
+
+        let runner = ControlledRunner::new();
+        let runtime = ScheduleRuntime::new_with_clock(
+            store.clone(),
+            runner.clone(),
+            RecordingSink::new(),
+            clock.clone(),
+        );
+
+        wait_until("the run to start", || runner.launches() == 1).await;
+
+        // Someone cancels the definition while the run is in flight.
+        store.update(&id, |task| {
+            task.retirement = Some(ScheduleRetirement {
+                reason: ScheduleRetirementReason::Cancelled,
+                retired_at_utc: clock.now(),
+                note: Some("no longer needed".into()),
+            });
+        });
+
+        runner.finish_all(crate::tasks::TaskRunStatus::Completed);
+        settle().await;
+
+        let definition = current(&store, &id);
+        assert_eq!(
+            definition.retirement.as_ref().unwrap().reason,
+            ScheduleRetirementReason::Cancelled,
+            "the terminal write must not overwrite or relabel the cancellation"
+        );
+        assert_eq!(
+            definition.runs_started, 1,
+            "the counter must not be rolled back by the terminal write"
+        );
+        assert!(
+            definition.last_terminal_outcome.is_some(),
+            "the run's own outcome is still recorded honestly"
+        );
+
+        // And it stays retired across further reconciles — no resurrection.
+        for _ in 0..5 {
+            clock.advance(chrono::Duration::hours(1));
+            poke(&store, &id, clock.now());
+            settle().await;
+        }
+        assert_eq!(runner.launches(), 1, "a cancelled definition must never launch again");
+        assert_eq!(
+            current(&store, &id).retirement.unwrap().reason,
+            ScheduleRetirementReason::Cancelled
+        );
+
+        runtime.shutdown().await;
+    }
+
+    /// A definition cancelled while idle must not start even though its
+    /// boundary is already overdue when the loop next looks at it.
+    #[tokio::test]
+    async fn a_definition_cancelled_before_its_due_tick_never_launches() {
+        let start = fake_start();
+        let clock = TestClock::new(start);
+        let store = ScheduledTaskStore::new();
+
+        // Not yet due, so the loop parks without launching.
+        let mut draft = bounded_draft(3600, None, None, start);
+        draft.next_run_utc = start + chrono::Duration::hours(1);
+        let id = store.add(draft, start).id;
+
+        let runner = ControlledRunner::new();
+        let sink = RecordingSink::new();
+        let runtime =
+            ScheduleRuntime::new_with_clock(store.clone(), runner.clone(), sink.clone(), clock.clone());
+        settle().await;
+        assert_eq!(runner.launches(), 0);
+
+        store.update(&id, |task| {
+            task.retirement = Some(ScheduleRetirement {
+                reason: ScheduleRetirementReason::Cancelled,
+                retired_at_utc: clock.now(),
+                note: None,
+            });
+        });
+
+        // The boundary passes; a cancelled definition must stay silent.
+        clock.advance(chrono::Duration::hours(2));
+        poke(&store, &id, clock.now());
+        settle().await;
+
+        assert_eq!(runner.launches(), 0, "a cancelled definition must never launch");
+        assert_eq!(
+            crate::scheduling::reported_state(
+                &current(&store, &id),
+                &store.live_state(&id),
+                clock.now()
+            ),
+            "cancelled"
+        );
+
+        runtime.shutdown().await;
+    }
+
+    /// Deleting a definition mid-launch must not resurrect it through the
+    /// counter commit that follows the runner's acceptance.
+    #[tokio::test]
+    async fn a_definition_deleted_while_launching_is_not_resurrected_by_the_counter_commit() {
+        let start = fake_start();
+        let clock = TestClock::new(start);
+        let store = ScheduledTaskStore::new();
+        let id = store.add(bounded_draft(3600, None, Some(9), start), start).id;
+
+        let runner = ControlledRunner::new();
+        let runtime = ScheduleRuntime::new_with_clock(
+            store.clone(),
+            runner.clone(),
+            RecordingSink::new(),
+            clock.clone(),
+        );
+
+        wait_until("the run to start", || runner.launches() == 1).await;
+        store.remove(&id);
+        runner.finish_all(crate::tasks::TaskRunStatus::Completed);
+        settle().await;
+
+        assert!(
+            store.items().iter().all(|t| t.id != id),
+            "a deleted definition must never come back through a counter or terminal write"
+        );
+        assert!(store.live_states().is_empty(), "and it owns no stale live state");
+
+        runtime.shutdown().await;
+    }
+
+    // ── unbounded definitions are unchanged ───────────────────────────────────
+
+    /// The whole point of optional bounds: a definition without them behaves
+    /// exactly as it did before this stage.
+    #[tokio::test]
+    async fn an_unbounded_definition_keeps_firing_and_never_retires() {
+        let start = fake_start();
+        let clock = TestClock::new(start);
+        let store = ScheduledTaskStore::new();
+        let id = store.add(bounded_draft(3600, None, None, start), start).id;
+
+        let runner = ControlledRunner::new();
+        let runtime = ScheduleRuntime::new_with_clock(
+            store.clone(),
+            runner.clone(),
+            RecordingSink::new(),
+            clock.clone(),
+        );
+
+        for _ in 0..4 {
+            wait_until("a run", || runner.in_flight() > 0).await;
+            runner.finish_all(crate::tasks::TaskRunStatus::Completed);
+            clock.advance(chrono::Duration::hours(1));
+            poke(&store, &id, clock.now());
+            settle().await;
+        }
+
+        assert!(runner.launches() >= 4, "an unbounded definition keeps firing");
+        let definition = current(&store, &id);
+        assert!(!definition.is_retired());
+        assert_eq!(definition.max_runs, None);
+        assert_eq!(definition.expires_at_utc, None);
+
+        runtime.shutdown().await;
+    }
+
+    /// A clock jump must not produce a catch-up storm: missed ticks stay
+    /// coalesced into a single run, and that run costs exactly one unit of
+    /// budget.
+    #[tokio::test]
+    async fn a_clock_jump_coalesces_into_one_run_and_one_unit_of_budget() {        let start = fake_start();
+        let clock = TestClock::new(start);
+        let store = ScheduledTaskStore::new();
+        let id = store.add(bounded_draft(3600, None, Some(20), start), start).id;
+
+        let runner = ControlledRunner::new();
+        let runtime = ScheduleRuntime::new_with_clock(
+            store.clone(),
+            runner.clone(),
+            RecordingSink::new(),
+            clock.clone(),
+        );
+
+        wait_until("the first run", || runner.launches() == 1).await;
+        runner.finish_all(crate::tasks::TaskRunStatus::Completed);
+        settle().await;
+
+        // Jump a year: dozens of hourly ticks were missed.
+        clock.advance(chrono::Duration::days(365));
+        poke(&store, &id, clock.now());
+        settle().await;
+
+        assert_eq!(
+            runner.launches(),
+            2,
+            "missed ticks must coalesce into one catch-up run, not a storm"
+        );
+        assert_eq!(current(&store, &id).runs_started, 2);
+
         runtime.shutdown().await;
     }
 }

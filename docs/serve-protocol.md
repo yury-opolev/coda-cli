@@ -535,10 +535,10 @@ the orchestrator may receive them at any time while the connection is open.
 
 ```jsonc
 event/scheduleLifecycle {
-  "definitionId":   "a1b2c3",           // persisted schedule id
+  "definitionId":   "a1b2c3",           // schedule id
   "definitionName": "nightly backup",   // optional label, omitted when null
   "taskId":         "task-9",           // the TaskKind.Scheduled task id, omitted for a pre-launch failure
-  "state":          "started",          // "started" | "completed" | "failed" | "stopped"
+  "state":          "started",          // "started" | "completed" | "failed" | "stopped" | "retired"
   "timestamp":      "2026-07-21T09:00:00Z",
   "summary":        "…"                 // optional short detail (result or error), omitted when null
 }
@@ -548,6 +548,21 @@ event/scheduleLifecycle {
 then exactly one terminal of `completed` / `failed` / `stopped`. Optional fields are
 omitted from the wire when null. The underlying `TaskKind.Scheduled` task is also
 visible through the normal `task_*` tools and logs.
+
+A **bounded** schedule additionally produces a `retired` transition — at most once
+per definition — when it will never launch again, with a `summary` naming the
+reason (`retired: completed` for a spent run budget, `expired`, `cancelled`, or
+`failed`). `retired` carries no `taskId`: it is a statement about the *definition*,
+not about a run, and it can arrive after the last run's own terminal transition. A
+definition at its limit with work still in flight is not retired yet;
+`session/scheduleList` reports it as `retiring` until that run finishes.
+
+> **Rust engine:** the schedule runtime's lifecycle sink is currently a null sink,
+> so `event/scheduleLifecycle` notifications (including `retired`) are **not
+> forwarded to the client** by `coda serve`. Poll `session/scheduleList`, whose
+> `state`, `runsStarted` and `retiredReason` fields are authoritative. See the
+> bounded-schedules section of [`docs/protocol/catalog.md`](protocol/catalog.md)
+> and the `schedules.bounds` capability.
 
 The runtime is authentication-gated: over **stdio** (no expected API key) it starts
 at session startup, so schedule events may arrive immediately; in **API-key** mode it

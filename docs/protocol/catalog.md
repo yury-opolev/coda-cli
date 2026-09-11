@@ -61,9 +61,9 @@ might infer from its name. Unsupported operations are listed separately.
 | `config/describe` | Reusable | Describe ownership, mutability, applicability and safe effective values. Available before initialize. |
 | `config/set` | Reusable | Delegate supported session settings to their validated setters. Refuse startup-only, file-owned and client-local settings. |
 | `mcp/list` | Reusable | Read-only, secret-free configuration/runtime inventory on the engine host. Available before initialize. |
-| `session/scheduleList` | Reusable | List this engine's scheduled-task definitions; not fleet inventory. |
-| `session/scheduleCreate` | Reusable | Create a scheduled-task definition in the engine's scope. |
-| `session/scheduleDelete` | Reusable | Delete a scheduled-task definition in the engine's scope. |
+| `session/scheduleList` | Reusable | List this engine's scheduled-task definitions; not fleet inventory. Reports live `state`, `runsStarted`, configured bounds and any retirement reason. |
+| `session/scheduleCreate` | Reusable | Create a scheduled-task definition in the engine's scope. Accepts the optional `maxRuns` / `expiresAt` / `expiresIn` bounds only when `schedules.bounds` is advertised. |
+| `session/scheduleDelete` | Reusable | Delete a scheduled-task definition in the engine's scope. Stops future runs; does not interrupt a run already executing. |
 | `hooks/list` | Reusable | List hook configuration with engine-side trust information. |
 | `hooks/info` | Reusable | Describe a hook selected by the method's parameters. |
 | `hooks/trust` | Reusable | Apply the engine's hook trust operation; caller authorization must be supplied by the external control plane. |
@@ -179,6 +179,41 @@ local instant using a remote wall clock.
 Queue outcomes are bounded. Preserve original editable drafts separately if
 recovery is needed; a message missing from both pending and retained outcomes
 has an unknown disposition. Never automatically submit it again.
+
+## Bounded schedules
+
+`schedules.bounds` is a capability, not a version check, and clients must read
+it before relying on a schedule bound: an engine without it accepts `maxRuns`,
+`expiresAt` and `expiresIn` on `session/scheduleCreate` and silently ignores
+them, turning "seven runs" into an unbounded schedule with no error. Manage the
+limit client-side when it is absent.
+
+When advertised, `session/scheduleCreate` validates bounds with the same code
+the engine's `schedule_create` tool uses: `maxRuns` must be an integer in
+`1..=4294967295`; `expiresAt` (absolute ISO-8601 with offset) and `expiresIn`
+(relative, `30m` / `2h` / `7d`) are mutually exclusive; a deadline at or before
+"now" is refused; and a definition whose first occurrence already falls outside
+its deadline is refused rather than created dead.
+
+`session/scheduleList` then reports `maxRuns`, `expiresAtUtc`, `runsStarted`,
+`retiredReason` and `retiredAtUtc`, plus a derived `state`. Read these
+literally:
+
+- `runsStarted` counts **accepted launch attempts**, including runs that later
+  failed. Only a launch refused outright, with nothing executed, is uncounted.
+- `expiresAtUtc` is **exclusive**: no run starts at or after it. Expiry does not
+  interrupt a run already executing.
+- `state` is one of `idle`, `running`, `pending`, `retiring`, `completed`,
+  `expired`, `cancelled`, `failed`. **`retiring` means work is still in
+  flight** for a schedule that will not start another run — it is not a
+  finished schedule, and `completed` specifically means the run budget was
+  spent, not that the last run succeeded. The last run's own outcome remains a
+  separate field (`lastOutcome`).
+- Absent bound fields mean *unlimited*, never zero.
+
+Schedules are engine-scoped and **in memory only** in the Rust engine: nothing
+survives an engine restart, and no schedule state is written to disk. Do not
+build resumption on top of `session/scheduleList`.
 
 ## Unsupported and client-local surfaces
 

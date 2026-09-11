@@ -24,7 +24,7 @@ use coda_agent::permission::{
     ModePermissionPrompt, PermissionMode, PermissionModeState, PermissionPrompt,
 };
 use coda_agent::scheduling::{
-    ScheduleDefinitionDraft, ScheduleKind, ScheduleTerminalOutcome, ScheduledTaskStore,
+    ScheduleKind, ScheduleTerminalOutcome, ScheduledTaskStore,
 };
 use coda_agent::subagents::{SubagentHost, MAX_CONCURRENT_SUBAGENTS};
 use coda_agent::tasks::TaskManager;
@@ -233,11 +233,25 @@ struct ScheduledTaskResponse {
     rule: String,
     time_zone: String,
     next_run_utc: String,
+    /// `idle` | `running` | `pending` | `retiring` | `completed` | `expired`
+    /// | `cancelled` | `failed`. Derived from the definition's bounds and its
+    /// live runtime status; never a placeholder.
     state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     active_task_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_outcome: Option<String>,
+    // ── Bounds (absent when the schedule is unbounded) ────────────────────
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_runs: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_at_utc: Option<String>,
+    /// Accepted launch attempts so far, including runs that later failed.
+    runs_started: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retired_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retired_at_utc: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3048,72 +3062,51 @@ impl ServeBackend for ServeHost {
     }
 
     async fn session_schedule_list(&self) -> Result<Value, RpcError> {
-        let schedules: Vec<ScheduledTaskResponse> =
-            self.schedule_store.items().iter().map(scheduled_task_to_wire).collect();
+        let now = Utc::now();
+        let live = self.schedule_store.live_states();
+        let default_live = coda_agent::scheduling::ScheduleLiveState::default();
+        let schedules: Vec<ScheduledTaskResponse> = self
+            .schedule_store
+            .items()
+            .iter()
+            .map(|t| {
+                scheduled_task_to_wire(t, live.get(&t.id).unwrap_or(&default_live), now)
+            })
+            .collect();
         serde_json::to_value(&schedules)
             .map(|v| json!({ "schedules": v }))
             .map_err(|e| RpcError::internal(e.to_string()))
     }
 
+    /// Create a schedule over the wire.
+    ///
+    /// Validation is the *same* code the `schedule_create` tool runs. Before
+    /// this stage the two surfaces had separate parsers that quietly disagreed
+    /// (this one accepted `"30s"` and rejected `"1d"`; the tool did the
+    /// opposite), which is precisely how a new bound ends up enforced on one
+    /// path only.
     async fn session_schedule_create(&self, p: ScheduleCreateParams) -> Result<Value, RpcError> {
-        let rc = [p.every.is_some(), p.at.is_some(), p.cron.is_some()]
-            .iter()
-            .filter(|&&b| b)
-            .count();
-        if rc != 1 {
-            return Err(RpcError::invalid_params(
-                "exactly one of every, at, or cron must be provided",
-            ));
-        }
-        let tz = p.time_zone.clone().unwrap_or_else(|| "UTC".into());
         let now = Utc::now();
-
-        let draft = if let Some(ref every) = p.every {
-            let interval = parse_duration(Some(every)).ok_or_else(|| {
-                RpcError::invalid_params(format!("invalid 'every' duration: {every:?}"))
-            })?;
-            let next_run_utc = now + chrono::Duration::seconds(interval.as_secs() as i64);
-            ScheduleDefinitionDraft {
-                name: p.name.clone(),
-                kind: ScheduleKind::Interval,
-                prompt: p.prompt.clone(),
-                interval: Some(interval),
-                at_utc: None,
-                cron: None,
-                time_zone_id: tz,
-                next_run_utc,
-            }
-        } else if let Some(ref at) = p.at {
-            let at_utc = chrono::DateTime::parse_from_rfc3339(at)
-                .map(|d| d.with_timezone(&Utc))
-                .map_err(|e| RpcError::invalid_params(format!("invalid 'at' datetime: {e}")))?;
-            ScheduleDefinitionDraft {
-                name: p.name.clone(),
-                kind: ScheduleKind::At,
-                prompt: p.prompt.clone(),
-                interval: None,
-                at_utc: Some(at_utc),
-                cron: None,
-                time_zone_id: tz,
-                next_run_utc: at_utc,
-            }
-        } else {
-            let cron_expr = p.cron.clone().unwrap();
-            // next_run_utc = now; the runtime will advance to the proper boundary.
-            ScheduleDefinitionDraft {
-                name: p.name.clone(),
-                kind: ScheduleKind::Cron,
-                prompt: p.prompt.clone(),
-                interval: None,
-                at_utc: None,
-                cron: Some(cron_expr),
-                time_zone_id: tz,
-                next_run_utc: now,
-            }
+        let request = coda_agent::scheduling::ScheduleCreateRequest {
+            prompt: Some(p.prompt.as_str()),
+            name: p.name.as_deref(),
+            every: p.every.as_deref(),
+            at: p.at.as_deref(),
+            cron: p.cron.as_deref(),
+            time_zone: p.time_zone.as_deref(),
+            expires_at: p.expires_at.as_deref(),
+            expires_in: p.expires_in.as_deref(),
+            max_runs: p.max_runs.as_ref(),
         };
+        let draft = coda_agent::scheduling::build_draft(&request, now)
+            .map_err(RpcError::invalid_params)?;
 
         let task = self.schedule_store.add(draft, now);
-        let resp = scheduled_task_to_wire(&task);
+        let resp = scheduled_task_to_wire(
+            &task,
+            &self.schedule_store.live_state(&task.id),
+            now,
+        );
         serde_json::to_value(&resp).map_err(|e| RpcError::internal(e.to_string()))
     }
 
@@ -5056,7 +5049,18 @@ fn catalog_models() -> Vec<WireModel> {
 // Schedule wire-format helper
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn scheduled_task_to_wire(t: &coda_agent::scheduling::ScheduledTask) -> ScheduledTaskResponse {
+/// Render one definition for the wire.
+///
+/// `live` is the runtime's ephemeral status for this definition. It is passed
+/// in rather than looked up here so the caller reads the store once, and so the
+/// reported state is always derived from a matching (definition, live) pair.
+/// The previous helper hardcoded `state: "idle"` and `activeTaskId: None` for
+/// every schedule, which told every client that a running job was idle.
+fn scheduled_task_to_wire(
+    t: &coda_agent::scheduling::ScheduledTask,
+    live: &coda_agent::scheduling::ScheduleLiveState,
+    now: chrono::DateTime<Utc>,
+) -> ScheduledTaskResponse {
     let (kind_str, rule) = match t.kind {
         ScheduleKind::Interval => {
             let secs = t.interval.unwrap_or(0.0);
@@ -5081,8 +5085,8 @@ fn scheduled_task_to_wire(t: &coda_agent::scheduling::ScheduledTask) -> Schedule
         rule,
         time_zone: t.time_zone_id.clone(),
         next_run_utc: t.next_run_utc.to_rfc3339(),
-        state: "idle".into(),
-        active_task_id: None,
+        state: coda_agent::scheduling::reported_state(t, live, now).to_owned(),
+        active_task_id: live.active_task_id.clone(),
         last_outcome: t.last_terminal_outcome.as_ref().map(|o| {
             match o.outcome {
                 ScheduleTerminalOutcome::Succeeded => "succeeded",
@@ -5091,6 +5095,11 @@ fn scheduled_task_to_wire(t: &coda_agent::scheduling::ScheduledTask) -> Schedule
             }
             .to_owned()
         }),
+        max_runs: t.max_runs,
+        expires_at_utc: t.expires_at_utc.map(|d| d.to_rfc3339()),
+        runs_started: t.runs_started,
+        retired_reason: t.retirement.as_ref().map(|r| r.reason.as_wire().to_owned()),
+        retired_at_utc: t.retirement.as_ref().map(|r| r.retired_at_utc.to_rfc3339()),
     }
 }
 
@@ -5119,6 +5128,214 @@ mod tests {
         let sink = Arc::new(ServeSink::new(tx.clone()));
         let ch = Arc::new(PromptChannel::new(tx));
         ServeHost::new(sink, ch, ".".into())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // STAGE 1 — bounded schedules over the wire
+    // ─────────────────────────────────────────────────────────────────────────
+
+    mod bounded_schedules {
+        use super::*;
+
+        fn params(value: Value) -> ScheduleCreateParams {
+            serde_json::from_value(value).expect("wire params must deserialize")
+        }
+
+        async fn create(host: &Arc<ServeHost>, value: Value) -> Result<Value, RpcError> {
+            host.session_schedule_create(params(value)).await
+        }
+
+        async fn list(host: &Arc<ServeHost>) -> Vec<Value> {
+            host.session_schedule_list()
+                .await
+                .unwrap()
+                .get("schedules")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default()
+        }
+
+        /// The RPC path accepts the same bounds the tool does and reports them
+        /// back, so a client can verify what it actually created.
+        #[tokio::test]
+        async fn create_accepts_bounds_and_echoes_them() {
+            let host = make_host();
+            let created = create(
+                &host,
+                json!({"prompt": "monitor", "every": "1h", "maxRuns": 7, "expiresIn": "7d"}),
+            )
+            .await
+            .expect("a bounded schedule must be accepted");
+
+            assert_eq!(created["maxRuns"], 7);
+            assert_eq!(created["runsStarted"], 0);
+            assert!(created["expiresAtUtc"].is_string());
+            assert_eq!(created["state"], "idle");
+            assert!(created.get("retiredReason").is_none());
+        }
+
+        /// The same validation as the tool, on the same code path: previously
+        /// this surface had its own parser that accepted `"30s"` and rejected
+        /// `"1d"`, so a rule could hold in one place and not the other.
+        #[tokio::test]
+        async fn create_rejects_exactly_what_the_tool_rejects() {
+            let host = make_host();
+            for bad in [
+                json!({"prompt": "x", "every": "1h", "maxRuns": 0}),
+                json!({"prompt": "x", "every": "1h", "maxRuns": -1}),
+                json!({"prompt": "x", "every": "1h", "maxRuns": 1.5}),
+                json!({"prompt": "x", "every": "1h", "maxRuns": "7"}),
+                json!({"prompt": "x", "every": "1h", "expiresAt": "2001-01-01T00:00:00Z"}),
+                json!({"prompt": "x", "every": "1h", "expiresAt": "not-a-date"}),
+                json!({"prompt": "x", "every": "1h", "expiresAt": "2087-01-01T00:00:00Z", "expiresIn": "7d"}),
+                json!({"prompt": "x", "every": "2d", "expiresIn": "1d"}),
+                json!({"prompt": "x"}),
+                json!({"prompt": "x", "every": "1h", "cron": "* * * * *"}),
+                json!({"prompt": "x", "cron": "not-a-cron"}),
+                json!({"prompt": "x", "cron": "0 9 * * *", "timeZone": "Mars/Olympus"}),
+            ] {
+                let error = create(&host, bad.clone()).await.err();
+                assert!(error.is_some(), "must be refused: {bad}");
+            }
+            assert!(list(&host).await.is_empty(), "a refused request creates nothing");
+        }
+
+        /// The unified parser is the point: `1d` works here now, and the
+        /// sub-minute spelling the tool always refused is refused here too.
+        #[tokio::test]
+        async fn create_uses_the_same_duration_vocabulary_as_the_tool() {
+            let host = make_host();
+            assert!(create(&host, json!({"prompt": "x", "every": "1d"})).await.is_ok());
+            assert!(create(&host, json!({"prompt": "x", "every": "30s"})).await.is_err());
+        }
+
+        /// An unbounded create is unchanged: no bounds appear in the response.
+        #[tokio::test]
+        async fn an_unbounded_schedule_reports_no_bounds() {
+            let host = make_host();
+            let created = create(&host, json!({"prompt": "x", "every": "30m"}))
+                .await
+                .unwrap();
+            assert!(created.get("maxRuns").is_none());
+            assert!(created.get("expiresAtUtc").is_none());
+            assert_eq!(created["runsStarted"], 0);
+            assert_eq!(created["state"], "idle");
+        }
+
+        /// `session/scheduleList` must report what is actually happening. It
+        /// used to hardcode `state: "idle"` and omit `activeTaskId` for every
+        /// schedule, so a client watching a running job saw an idle one.
+        #[tokio::test]
+        async fn list_reports_live_state_rather_than_a_hardcoded_idle() {
+            use coda_agent::scheduling::{ScheduleLiveState, ScheduleLiveStatus};
+
+            let host = make_host();
+            let created = create(&host, json!({"prompt": "x", "every": "1h", "maxRuns": 7}))
+                .await
+                .unwrap();
+            let id = created["id"].as_str().unwrap().to_owned();
+
+            host.schedule_store.set_live_state(
+                &id,
+                ScheduleLiveState {
+                    status: ScheduleLiveStatus::Running,
+                    active_task_id: Some("task-0042".into()),
+                },
+            );
+
+            let listed = list(&host).await;
+            assert_eq!(listed[0]["state"], "running");
+            assert_eq!(listed[0]["activeTaskId"], "task-0042");
+        }
+
+        /// The last allowed run, still executing, is `retiring` — not
+        /// `completed`, which would tell the client the automation is done
+        /// while its agent is still working.
+        #[tokio::test]
+        async fn list_distinguishes_retiring_from_completed() {
+            use coda_agent::scheduling::{ScheduleLiveState, ScheduleLiveStatus};
+
+            let host = make_host();
+            let created = create(&host, json!({"prompt": "x", "every": "1h", "maxRuns": 1}))
+                .await
+                .unwrap();
+            let id = created["id"].as_str().unwrap().to_owned();
+            host.schedule_store.update(&id, |t| t.runs_started = 1);
+            host.schedule_store.set_live_state(
+                &id,
+                ScheduleLiveState {
+                    status: ScheduleLiveStatus::Running,
+                    active_task_id: Some("task-0042".into()),
+                },
+            );
+            assert_eq!(list(&host).await[0]["state"], "retiring");
+
+            host.schedule_store
+                .set_live_state(&id, ScheduleLiveState::default());
+            let listed = list(&host).await;
+            assert_eq!(listed[0]["state"], "completed");
+            assert_eq!(listed[0]["runsStarted"], 1);
+        }
+
+        #[tokio::test]
+        async fn list_reports_a_cancellation_with_its_reason_and_timestamp() {
+            use coda_agent::scheduling::{ScheduleRetirement, ScheduleRetirementReason};
+
+            let host = make_host();
+            let created = create(&host, json!({"prompt": "x", "every": "1h"})).await.unwrap();
+            let id = created["id"].as_str().unwrap().to_owned();
+            host.schedule_store.update(&id, |t| {
+                t.retirement = Some(ScheduleRetirement {
+                    reason: ScheduleRetirementReason::Cancelled,
+                    retired_at_utc: Utc::now(),
+                    note: None,
+                });
+            });
+
+            let listed = list(&host).await;
+            assert_eq!(listed[0]["state"], "cancelled");
+            assert_eq!(listed[0]["retiredReason"], "cancelled");
+            assert!(listed[0]["retiredAtUtc"].is_string());
+        }
+
+        /// Stage 1 is RAM-only: a brand-new host owns no definitions and the
+        /// feature writes no files.
+        #[tokio::test]
+        async fn a_fresh_host_recovers_no_definitions() {
+            let host = make_host();
+            create(&host, json!({"prompt": "x", "every": "1h", "maxRuns": 7}))
+                .await
+                .unwrap();
+            assert_eq!(list(&host).await.len(), 1);
+
+            let restarted = make_host();
+            assert!(
+                list(&restarted).await.is_empty(),
+                "schedules are in-memory only; nothing survives a restart"
+            );
+        }
+
+        /// The server response and the client reader must agree field for
+        /// field, or a client silently loses the bounds it asked for.
+        #[tokio::test]
+        async fn the_server_response_parses_as_the_published_client_dto() {
+            let host = make_host();
+            create(
+                &host,
+                json!({"prompt": "x", "every": "1h", "maxRuns": 7, "expiresIn": "7d"}),
+            )
+            .await
+            .unwrap();
+
+            let result = host.session_schedule_list().await.unwrap();
+            let parsed: coda_proto::messages::ScheduleListResult =
+                serde_json::from_value(result).expect("the wire shape must match the client DTO");
+            let task = &parsed.schedules[0];
+            assert_eq!(task.max_runs, Some(7));
+            assert_eq!(task.runs_started, 0);
+            assert_eq!(task.state, "idle");
+            assert!(task.expires_at_utc.is_some());
+        }
     }
 
     /// The turn slot must survive a cancelled turn.
