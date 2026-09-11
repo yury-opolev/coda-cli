@@ -8,6 +8,7 @@ use coda_proto::events::ToolCallStatus;
 use coda_proto::{Correlation, Event};
 use coda_render::tool::{CallStatus, ToolActivity, ToolCall, ToolDisplayMode};
 
+use crate::coverage::HistoryCoverage;
 use crate::hint::HintQueue;
 use crate::progress::TurnProgress;
 use crate::transcript::{same_call, ActivityKey, Block, NoticeLevel, PermissionDecision, Transcript};
@@ -125,6 +126,22 @@ pub struct QueuedMessage {
     pub text: String,
     /// When this was queued, for display and for ordering recovery.
     pub queued_at: String,
+}
+
+/// Where in the conversation a delivered message is being put, relative to
+/// when it actually happened.
+///
+/// The distinction is the difference between an honest transcript and a
+/// plausible one: a follow-up delivered into the turn that is still running
+/// belongs exactly where it is appended, while one confirmed after its turn
+/// ended is being appended somewhere it never was, and that has to be said
+/// rather than implied by position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    /// Appended into the turn it was delivered into.
+    InTurn,
+    /// Appended after its turn was already over.
+    Late,
 }
 
 /// A prompt from the engine awaiting a user decision.
@@ -282,7 +299,17 @@ pub enum UiEvent {
     /// selection) is not.
     Snapshot(Box<coda_proto::state::StateSnapshot>),
     /// The conversation was rebuilt from `session/getHistory`.
-    Rehydrated { blocks: Vec<Block>, notices: Vec<String> },
+    ///
+    /// `coverage` is what *that* read proved about the committed prefix, from
+    /// the answer's own fences. `None` means the rebuild carries no provable
+    /// claim (a legacy engine, or a caller that is not a history read), and
+    /// any previous claim is dropped rather than left to describe a
+    /// conversation it no longer matches.
+    Rehydrated {
+        blocks: Vec<Block>,
+        notices: Vec<String>,
+        coverage: Option<HistoryCoverage>,
+    },
     /// No engine is answering any more — a sign-out, an engine that went
     /// away, or a replacement that did not start.
     ///
@@ -291,6 +318,42 @@ pub enum UiEvent {
     EngineDisconnected,
     /// A freshly started engine was adopted as this session's connection.
     EngineAdopted,
+}
+
+/// The clock behind a live reasoning row.
+///
+/// Base offset plus a local instant, never a backdated `Instant`: the offset
+/// can come from the engine (`TurnState.phase_elapsed_ms`), and a remote
+/// duration older than this process cannot be subtracted from `Instant::now()`
+/// at all.
+#[derive(Debug, Clone, Copy)]
+struct ThinkingClock {
+    origin: std::time::Instant,
+    offset_ms: i64,
+}
+
+impl ThinkingClock {
+    fn start(now: std::time::Instant, offset_ms: i64) -> Self {
+        Self { origin: now, offset_ms: offset_ms.max(0) }
+    }
+
+    fn elapsed_ms(&self, now: std::time::Instant) -> i64 {
+        let local = now
+            .saturating_duration_since(self.origin)
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        self.offset_ms.saturating_add(local)
+    }
+
+    /// Adopts the engine's own measure of this burst, but only when it is
+    /// ahead of ours: a refresh of the same turn must never rewind a clock
+    /// the user is watching.
+    fn adopt(&mut self, reported_ms: i64, now: std::time::Instant) {
+        let reported = reported_ms.max(0);
+        if reported > self.elapsed_ms(now) {
+            *self = Self::start(now, reported);
+        }
+    }
 }
 
 /// Everything the UI draws from.
@@ -323,6 +386,25 @@ pub struct UiState {
     /// still lands as one assistant block, with the delivered message
     /// appended right after in chronological order.
     pending_deliveries: Vec<Block>,
+    /// Text this client knows reached the model but which the engine's own
+    /// rebuilt conversation does not contain.
+    ///
+    /// One cause, and it is legitimate: the live projection of a running turn
+    /// is byte-budgeted, and a message that arrives with no room left is
+    /// omitted from it entirely (`coda-serve`'s `push_user_block` returns
+    /// without an entry when the remaining room is zero). Rebuilding from
+    /// such a read and dropping the local copy would destroy the only full
+    /// copy of what the operator typed.
+    ///
+    /// Deliberately *not* `unsent`: these did reach the model, so they are
+    /// never described as unsent and never resent. They are kept as the
+    /// operator's own text, recoverable with Up once the recovery list is
+    /// empty.
+    pub delivered_local: Vec<QueuedMessage>,
+    /// What the last applied `session/getHistory` proved about the committed
+    /// prefix, used to tell "already in the conversation I rebuilt" from
+    /// "genuinely not on screen yet". See [`crate::coverage`].
+    history_coverage: Option<HistoryCoverage>,
     /// The turn's own clock and phase, for the pinned activity row.
     ///
     /// `Some` from a successful local `Submitted` until the next one starts;
@@ -369,7 +451,8 @@ pub struct UiState {
     pub hints: HintQueue,
     /// Timestamp source, injected so tests are deterministic.
     clock: fn() -> String,
-    thinking_started_at: Option<std::time::Instant>,
+    /// The live reasoning clock, while a reasoning block is open.
+    thinking_clock: Option<ThinkingClock>,
     /// The engine's own lifecycle, once it has reported one.
     ///
     /// `None` on a legacy connection, where nothing publishes it and the
@@ -412,6 +495,8 @@ impl UiState {
             queued: Vec::new(),
             unsent: Vec::new(),
             pending_deliveries: Vec::new(),
+            delivered_local: Vec::new(),
+            history_coverage: None,
             turn_progress: None,
             turn_id: None,
             prompt: None,
@@ -423,7 +508,7 @@ impl UiState {
             hints: HintQueue::new(),
 
             clock: default_timestamp,
-            thinking_started_at: None,
+            thinking_clock: None,
             core_lifecycle: None,
             optimistic_submit: false,
             active_model: None,
@@ -472,8 +557,17 @@ impl UiState {
     /// LIFO: the last thing that failed to send is the most likely thing the
     /// user wants back. Returns `None` when nothing is recoverable, so the
     /// caller can fall back to ordinary history recall.
+    ///
+    /// Once the recovery list is empty this also hands back a *delivered*
+    /// message whose text the engine's rebuilt conversation could not show
+    /// (see [`Self::delivered_local`]). Recall is "give me my text back", not
+    /// a claim that it was never sent — and the alternative is the only full
+    /// copy of it existing nowhere at all.
     pub fn recall_unsent(&mut self) -> Option<String> {
-        self.unsent.pop().map(|m| m.text)
+        self.unsent
+            .pop()
+            .or_else(|| self.delivered_local.pop())
+            .map(|m| m.text)
     }
 
     /// Closes whatever block is open, then appends any transcript inserts
@@ -486,7 +580,22 @@ impl UiState {
     /// actually finishes.
     fn close_open_and_flush(&mut self) {
         self.transcript.close_open();
-        for block in self.pending_deliveries.drain(..) {
+        self.flush_pending_deliveries();
+    }
+
+    /// Appends the deliveries that were waiting for the open block to close.
+    ///
+    /// Separate from [`Self::close_open_and_flush`] because a block can also
+    /// be closed *in place* — `event/assistantTextComplete` and
+    /// `event/thinkingComplete` mark the tail complete where it stands rather
+    /// than closing it through the transcript. Those are precisely the
+    /// boundaries a parked delivery is waiting for, and without this the
+    /// messages sat in `pending_deliveries` after the reply they belonged
+    /// behind had visibly finished — an operator who queued a dozen
+    /// follow-ups watched the queue empty with nothing appearing in the
+    /// conversation, until some later boundary happened to flush them.
+    fn flush_pending_deliveries(&mut self) {
+        for block in std::mem::take(&mut self.pending_deliveries) {
             self.transcript.push(block);
         }
     }
@@ -501,22 +610,310 @@ impl UiState {
         }
     }
 
+    /// Whether the steering message `id` is already on screen — or already
+    /// waiting to be, behind an open block.
+    ///
+    /// Identity is the queue id and nothing else. Two follow-ups with the
+    /// same words are two follow-ups, so matching on text would silently
+    /// swallow the second; and the id is on both the block this client
+    /// materialised itself and the one a conversation rebuilt from the engine
+    /// carries, so this answers the same question in both directions.
+    fn delivery_is_shown(&self, id: &str) -> bool {
+        let is_match = |block: &Block| {
+            matches!(block, Block::User { queue_id: Some(queue_id), .. } if queue_id == id)
+        };
+        self.transcript.blocks().iter().any(is_match)
+            || self.pending_deliveries.iter().any(is_match)
+    }
+
+    /// The text the conversation currently shows for steering message `id`.
+    ///
+    /// Looked up by id, never by words: this answers "how much of that
+    /// message is on screen", which is a different question from "is this the
+    /// same message", and only the id can answer the second one.
+    fn shown_delivery_text(&self, id: &str) -> Option<&str> {
+        self.transcript.blocks().iter().find_map(|block| match block {
+            Block::User { text, queue_id: Some(queue_id), .. } if queue_id == id => {
+                Some(text.as_str())
+            }
+            _ => None,
+        })
+    }
+
+    /// Takes the local copies of every message in `message_ids` out of the
+    /// queue, wherever this client is holding them.
+    ///
+    /// `unsent` is searched too, deliberately: a turn that ends before the
+    /// delivery notification arrives strands the message there, and a
+    /// notification that only looked at `queued` would find nothing, leaving
+    /// a message the model *did* receive sitting in the recovery list
+    /// labelled as never sent.
+    fn take_delivered(&mut self, message_ids: &[String]) -> Vec<(QueuedMessage, Placement)> {
+        let mut taken: Vec<(QueuedMessage, Placement)> = Vec::new();
+        for (list, placement) in
+            [(&mut self.queued, Placement::InTurn), (&mut self.unsent, Placement::Late)]
+        {
+            list.retain(|message| {
+                let matched = message.id.as_ref().is_some_and(|id| message_ids.contains(id));
+                if matched {
+                    taken.push((message.clone(), placement));
+                }
+                !matched
+            });
+        }
+        taken
+    }
+
+    /// Puts a delivered message on screen as the user's own, once.
+    ///
+    /// The text is this client's copy — the whole thing, including anything
+    /// the engine's own queue preview had to cut — so what is shown is what
+    /// was typed. A message with no id cannot be recognised later and is
+    /// shown as it arrives; one whose id is already on screen is not shown
+    /// again.
+    ///
+    /// The timestamp is when the operator actually queued it, never "now":
+    /// a delivery confirmed after the fact still happened when it happened,
+    /// and stamping the current time would state a send time that is false.
+    fn materialize_delivered(&mut self, message: QueuedMessage) {
+        if message.id.as_deref().is_some_and(|id| self.delivery_is_shown(id)) {
+            return;
+        }
+        let timestamp = if message.queued_at.is_empty() {
+            (self.clock)()
+        } else {
+            message.queued_at
+        };
+        self.insert_delivered_user(Block::User {
+            text: message.text,
+            timestamp,
+            pending: false,
+            queue_id: message.id,
+        });
+    }
+
+    /// Shows every delivered message in `messages`, reporting how many of
+    /// them were actually placed later than they happened.
+    ///
+    /// The count is what the caller turns into a notice, and that notice is
+    /// the honest part. A message confirmed after its turn ended is appended
+    /// at the bottom of the transcript, which is *not* where it was said — so
+    /// rather than letting the position imply a chronology that is wrong, the
+    /// placement is named out loud, together with the fact that nothing was
+    /// sent a second time.
+    fn materialize_all(&mut self, messages: Vec<(QueuedMessage, Placement)>) -> usize {
+        let mut late = 0usize;
+        for (message, placement) in messages {
+            let already_shown =
+                message.id.as_deref().is_some_and(|id| self.delivery_is_shown(id));
+            if placement == Placement::Late && !already_shown {
+                late += 1;
+            }
+            self.materialize_delivered(message);
+        }
+        late
+    }
+
+    /// Says that `count` messages have been put on screen somewhere other
+    /// than where they were said.
+    ///
+    /// `corrected` when this client had already told the operator they were
+    /// not sent: that claim was wrong and is withdrawn here rather than being
+    /// left standing above a message that is now visibly in the conversation.
+    fn note_late_placement(&mut self, count: usize, corrected: bool) {
+        if count == 0 {
+            return;
+        }
+        let one = count == 1;
+        let subject = if one { "1 message".to_string() } else { format!("{count} messages") };
+        let lead = if corrected {
+            format!(
+                "{subject} reported as not sent did reach the model after all. \
+                 {} shown below",
+                if one { "It is" } else { "They are" },
+            )
+        } else {
+            format!(
+                "{subject}, delivered earlier and confirmed only now, {} shown below",
+                if one { "is" } else { "are" },
+            )
+        };
+        self.notice(
+            format!(
+                "{lead} — below the conversation rather than in the place it was said, \
+                 keeping the time {} sent — and {} not sent again.",
+                if one { "it was" } else { "they were" },
+                if one { "it was" } else { "they were" },
+            ),
+            NoticeLevel::Info,
+        );
+    }
+
+    /// Settles the deliveries parked behind an open block when the
+    /// conversation is rebuilt underneath them.
+    ///
+    /// The parked block is normally dropped, and that is safe for one
+    /// specific reason: this client only ever learns of a delivery *after*
+    /// the engine has recorded it, and the engine writes the text into the
+    /// running turn's projection in the same transaction. So any rebuild that
+    /// could contain a parked message does contain it — with its queue id,
+    /// which is how the two are recognised as the same message.
+    ///
+    /// There is exactly one legitimate exception, and dropping the copy there
+    /// destroys the operator's text: the live projection is byte-budgeted,
+    /// and a steering message that arrives with little or no room left is cut
+    /// short — or omitted from it entirely rather than shortened
+    /// (`coda-serve`'s `push_user_block` returns without an entry when the
+    /// room left is zero). The read says so — `liveTruncated` — so when a
+    /// rebuild that announced truncation shows less of a parked message than
+    /// this client is holding, the full text is kept rather than lost.
+    ///
+    /// It is kept *out* of the transcript on purpose. The rebuild is the
+    /// engine's account of the conversation; appending a block the engine did
+    /// not return would put this client's copy at the bottom of a
+    /// conversation that has moved on, and committed history carries no queue
+    /// id to recognise it by later. So it becomes recoverable text, never a
+    /// second message and never a resend.
+    fn retain_parked_deliveries(&mut self) {
+        let parked = std::mem::take(&mut self.pending_deliveries);
+        let truncated = self
+            .history_coverage
+            .as_ref()
+            .is_some_and(HistoryCoverage::live_was_truncated);
+        if !truncated {
+            return;
+        }
+        let mut kept = 0usize;
+        for block in parked {
+            let Block::User { text, timestamp, queue_id: Some(id), .. } = block else {
+                continue;
+            };
+            // Shown in full already: the rebuild is the better copy.
+            if self.shown_delivery_text(&id).is_some_and(|shown| shown.len() >= text.len()) {
+                continue;
+            }
+            kept += 1;
+            self.delivered_local.push(QueuedMessage {
+                id: Some(id),
+                text,
+                queued_at: timestamp,
+            });
+        }
+        if kept > 0 {
+            self.notice(
+                format!(
+                    "The engine's view of the running turn ran out of room, so {} not shown \
+                     above in full. {} delivered — nothing was sent again — and your own \
+                     full text is recoverable with Up.",
+                    if kept == 1 {
+                        "a delivered message is"
+                    } else {
+                        "some delivered messages are"
+                    },
+                    if kept == 1 { "It was" } else { "They were" },
+                ),
+                NoticeLevel::Warning,
+            );
+        }
+    }
+
     /// Updates live elapsed time; returns whether its displayed second changed.
     pub(crate) fn tick_thinking(&mut self, now: std::time::Instant) -> bool {
-        let Some(started) = self.thinking_started_at else {
+        let Some(clock) = self.thinking_clock else {
             return false;
         };
         let Some(Block::Thinking { elapsed_ms, .. }) = self.transcript.open_tail() else {
-            self.thinking_started_at = None;
+            self.thinking_clock = None;
             return false;
         };
-        let elapsed = now
-            .saturating_duration_since(started)
-            .as_millis()
-            .min(i64::MAX as u128) as i64;
+        let elapsed = clock.elapsed_ms(now);
         let changed = *elapsed_ms / 1000 != elapsed / 1000;
         *elapsed_ms = elapsed;
         changed
+    }
+
+    /// Puts a live reasoning row on screen for reasoning the engine says is
+    /// happening now, without inventing any of its text.
+    ///
+    /// The event that opens one can be lost legitimately: a frame at or below
+    /// a snapshot's cursor is dropped as already reflected, and a snapshot
+    /// carries no conversation content to reflect it with. The authoritative
+    /// `reasoning` phase is then the only thing left that says the model is
+    /// reasoning *right now*, so it opens the row the lost frame would have.
+    ///
+    /// `reported_ms` is `TurnState.phase_elapsed_ms` when the phase is
+    /// `Reasoning` — the engine's own measure of *this burst* — and `None`
+    /// from a bare `event/activity`, which carries no duration.
+    fn ensure_live_thinking(&mut self, now: std::time::Instant, reported_ms: Option<i64>) {
+        // Buffered (hook) turns suppress reasoning entirely; a row opened
+        // here would be the seam for the very text that must not be shown.
+        if self.assistant_buffer.is_some() {
+            return;
+        }
+        if matches!(self.transcript.open_tail(), Some(Block::Thinking { .. })) {
+            match (self.thinking_clock.as_mut(), reported_ms) {
+                (Some(clock), Some(reported)) => clock.adopt(reported, now),
+                // Live on screen with no clock behind it: a rebuilt
+                // conversation whose tail the engine is still streaming.
+                (None, reported) => {
+                    self.thinking_clock = Some(ThinkingClock::start(now, reported.unwrap_or(0)));
+                }
+                (Some(_), None) => {}
+            }
+            return;
+        }
+        // A finished burst is already on screen and the phase has not moved
+        // on yet: it describes *that* burst, so reopening it would show the
+        // same reasoning twice and restart a clock that is already frozen.
+        if matches!(self.transcript.blocks().last(), Some(Block::Thinking { .. })) {
+            return;
+        }
+        self.close_open_and_flush();
+        let clock = ThinkingClock::start(now, reported_ms.unwrap_or(0));
+        self.transcript.push(Block::Thinking {
+            text: String::new(),
+            elapsed_ms: clock.offset_ms,
+            tokens: None,
+            complete: false,
+            expanded: false,
+            done_at: None,
+        });
+        self.thinking_clock = Some(clock);
+    }
+
+    /// The live reasoning row's own state, taken before the conversation is
+    /// rebuilt so a rebuild that describes the same burst can restore it.
+    fn take_live_thinking(&mut self) -> Option<(ThinkingClock, bool)> {
+        let expanded = match self.transcript.open_tail() {
+            Some(Block::Thinking { expanded, .. }) => *expanded,
+            _ => return None,
+        };
+        self.thinking_clock.map(|clock| (clock, expanded))
+    }
+
+    /// Restores a live reasoning row across a rebuild of the conversation.
+    ///
+    /// Only a tail the engine itself reported as still open is live: a
+    /// committed reasoning summary is history and must never start ticking.
+    fn restore_live_thinking(
+        &mut self,
+        carried: Option<(ThinkingClock, bool)>,
+        now: std::time::Instant,
+    ) {
+        let Some(Block::Thinking { expanded, .. }) = self.transcript.open_tail() else {
+            self.thinking_clock = None;
+            return;
+        };
+        match carried {
+            Some((clock, was_expanded)) => {
+                *expanded = was_expanded;
+                self.thinking_clock = Some(clock);
+            }
+            // The burst began before this client was watching it. How long it
+            // has run is not knowable from a history read, so the clock starts
+            // at zero rather than claiming a duration.
+            None => self.thinking_clock = Some(ThinkingClock::start(now, 0)),
+        }
     }
 
     /// Advances the state by one event.
@@ -542,7 +939,7 @@ impl UiState {
                 self.optimistic_submit = false;
                 self.turn_progress = None;
                 self.turn_id = None;
-                self.thinking_started_at = None;
+                self.thinking_clock = None;
                 self.core_lifecycle = None;
             }
             UiEvent::EngineAdopted => {
@@ -701,6 +1098,10 @@ impl UiState {
                 self.queued.clear();
                 self.unsent.clear();
                 self.pending_deliveries.clear();
+                self.delivered_local.clear();
+                // The conversation that read described is not on screen any
+                // more, so it can no longer vouch for anything.
+                self.history_coverage = None;
                 self.turn_progress = None;
             }
             UiEvent::ModelChanged { id, context_limit } => {
@@ -724,24 +1125,35 @@ impl UiState {
                 }
             }
             UiEvent::CoreLifecycle(lifecycle) => self.apply_lifecycle(lifecycle, now),
-            UiEvent::CoreActivity(phase) => self.apply_activity_phase(phase, now),
+            UiEvent::CoreActivity(phase) => self.apply_activity_phase(phase, now, None),
             UiEvent::Snapshot(snapshot) => self.reconcile(&snapshot, now),
-            UiEvent::Rehydrated { blocks, notices } => {
+            UiEvent::Rehydrated { blocks, notices, coverage } => {
                 // The engine owns what the *conversation* is. Anything the UI
                 // had of it is a projection of an older answer to the same
                 // question, so it is replaced outright — but the banner, the
                 // launch notices, slash-command output and a rendered diff
                 // are this client's own and no history read can return them,
                 // so they are kept rather than swept away with it.
+                //
+                // A rebuild taken mid-burst still describes the burst that is
+                // running, so the live row's clock and fold survive it rather
+                // than the reasoning appearing to start over.
+                let carried = self.take_live_thinking();
                 self.transcript.replace_conversation(blocks);
-                self.pending_deliveries.clear();
+                self.restore_live_thinking(carried, now);
+                // The claim travels with the rebuild it came from: a read
+                // whose provenance is unknown replaces the previous claim
+                // with nothing rather than leaving it to describe a
+                // conversation it no longer matches.
+                self.history_coverage = coverage;
+                self.retain_parked_deliveries();
                 for notice in notices {
                     self.notice(notice, NoticeLevel::Warning);
                 }
             }
         }
         if !matches!(self.transcript.open_tail(), Some(Block::Thinking { .. })) {
-            self.thinking_started_at = None;
+            self.thinking_clock = None;
         }
     }
 
@@ -776,6 +1188,9 @@ impl UiState {
                 if self.assistant_buffer.is_none() {
                     if let Some(Block::Assistant { complete, .. }) = self.transcript.open_tail() {
                         *complete = true;
+                        // The reply is over, and that is exactly the boundary
+                        // a delivery parked behind it was waiting for.
+                        self.flush_pending_deliveries();
                     }
                 }
             }
@@ -804,7 +1219,7 @@ impl UiState {
                             expanded: false,
                             done_at: None,
                         });
-                        self.thinking_started_at = Some(now);
+                        self.thinking_clock = Some(ThinkingClock::start(now, 0));
                     }
                 }
             }
@@ -832,11 +1247,25 @@ impl UiState {
                     *tokens = thinking_tokens;
                     *complete = true;
                     *done_at_field = Some(done_at);
+                    // The burst is over: anything parked behind it lands now
+                    // rather than waiting for some later boundary.
+                    self.flush_pending_deliveries();
                 } else {
-                    // No block to finish, because none was ever started: a
+                    // No block to finish. Either none was ever started — a
                     // provider that encrypts its reasoning sends no deltas at
-                    // all, only a signed block at the end whose text is empty.
-                    // Without this the turn showed no sign of having reasoned.
+                    // all, only a signed block at the end whose text is empty
+                    // — or this completion is a duplicate of one already
+                    // shown. A real second burst announces itself with a
+                    // `Thinking` event first, so a completion landing on an
+                    // already-finished row is the latter and changes nothing:
+                    // adding a row for it invented a burst that never ran.
+                    if matches!(
+                        self.transcript.blocks().last(),
+                        Some(Block::Thinking { complete: true, .. })
+                    ) {
+                        self.activity = Activity::Working;
+                        return;
+                    }
                     self.close_open_and_flush();
                     self.transcript.push(Block::Thinking {
                         text: String::new(),
@@ -976,22 +1405,20 @@ impl UiState {
                 // duplicate notification finds nothing left to deliver and is
                 // a no-op, and delivering the middle of three queued messages
                 // promotes only that one.
-                let mut delivered: Vec<QueuedMessage> = Vec::new();
-                self.queued.retain(|m| {
-                    let matched = m.id.as_ref().is_some_and(|id| message_ids.contains(id));
-                    if matched {
-                        delivered.push(m.clone());
-                    }
-                    !matched
-                });
-                for message in delivered {
-                    self.insert_delivered_user(Block::User {
-                        text: message.text,
-                        timestamp: (self.clock)(),
-                        pending: false,
-                        queue_id: message.id,
-                    });
-                }
+                //
+                // The same id may already have been settled by a snapshot
+                // that overtook this event — the engine's state moves before
+                // the notification does — so the text is placed only if it is
+                // not on screen already.
+                //
+                // A message taken back out of the recovery list was stranded
+                // there by the turn ending first, so appending it now puts it
+                // after content that came later. That is said out loud rather
+                // than left for the position to imply.
+                let delivered = self.take_delivered(&message_ids);
+                let corrected = delivered.iter().any(|(_, p)| *p == Placement::Late);
+                let late = self.materialize_all(delivered);
+                self.note_late_placement(late, corrected);
             }
             Event::TaskCompleted {
                 description,
@@ -1204,6 +1631,7 @@ impl UiState {
         &mut self,
         phase: coda_proto::state::ActivityPhase,
         now: std::time::Instant,
+        phase_elapsed_ms: Option<i64>,
     ) {
         use coda_proto::state::ActivityPhase as P;
         use coda_proto::state::EngineLifecycle as L;
@@ -1216,6 +1644,12 @@ impl UiState {
         // free to claim ready while the engine still held it.
         if !matches!(self.core_lifecycle, Some(L::Stopping) | Some(L::Stopped)) {
             self.core_lifecycle = Some(L::Busy);
+        }
+        // Authoritative reasoning shows as reasoning at once, whether or not
+        // the frame that opened the burst survived the fence. Only a real
+        // `reasoning` phase does this — silence never infers it.
+        if phase == P::Reasoning {
+            self.ensure_live_thinking(now, phase_elapsed_ms);
         }
         let Some(progress) = self.turn_progress.as_mut() else {
             // A phase for a turn this client never saw start: adopt the
@@ -1299,7 +1733,7 @@ impl UiState {
             self.usage.output_tokens = session.output_tokens;
         }
 
-        self.reconcile_queue(&snapshot.steering);
+        self.reconcile_queue(snapshot);
 
         // The turn clock, seeded from the engine's own monotonic elapsed
         // time rather than re-derived from a remote wall clock.
@@ -1336,7 +1770,12 @@ impl UiState {
                 }
                 self.turn_progress = Some(progress);
                 self.turn_id = Some(turn.turn_id.clone());
-                self.apply_activity_phase(turn.phase, now);
+                // `phase_elapsed_ms` measures the phase, so it is this
+                // burst's own duration only while the phase *is* reasoning.
+                let reasoning_ms = (turn.phase == coda_proto::state::ActivityPhase::Reasoning)
+                    .then_some(turn.phase_elapsed_ms)
+                    .flatten();
+                self.apply_activity_phase(turn.phase, now, reasoning_ms);
             }
             None => {
                 if self.turn_progress.as_ref().is_some_and(|p| !p.is_finished()) {
@@ -1371,17 +1810,35 @@ impl UiState {
     /// message it stops holding, and that outcome is the only thing that says
     /// whether the text reached the model:
     ///
-    /// - `delivered` — it is part of the conversation now, so there is
-    ///   nothing to recover.
+    /// - `delivered` — it is part of the conversation now, so the message
+    ///   this client is holding becomes a real `User` block rather than being
+    ///   quietly discarded. Dropping the local copy on the strength of the
+    ///   outcome alone is what made a delivered follow-up vanish: the
+    ///   snapshot arrives before the `steeringDelivered` event, that event
+    ///   then searches a queue the snapshot has already emptied, and nothing
+    ///   ever puts the text on screen.
+    ///
+    ///   Unless the conversation on screen already contains it. The outcome
+    ///   ring is *retained*: the same `delivered` outcome is republished in
+    ///   every snapshot for as long as the ring holds it, so a client that
+    ///   materialised nothing (both delivery reports were lost across a
+    ///   reconnect) and then rebuilt the conversation from
+    ///   `session/getHistory` would append a second copy underneath the one
+    ///   the rebuild already showed — committed history carries no queue id,
+    ///   so the two cannot be told apart by identity. [`crate::coverage`]
+    ///   decides that by the read's own fences rather than by matching text,
+    ///   and when the read covers the committed prefix the snapshot describes
+    ///   the local receipt is simply cleared.
     /// - any other terminal outcome — it never reached the model, so the full
     ///   original draft moves to the recovery list, exactly as a turn ending
     ///   with a queue would have done.
     /// - **no outcome at all** — the outcome ring is bounded, so this is
     ///   genuinely unknown. The text is kept recoverable and the doubt is
     ///   stated; it is never resent, and it is never described as "not sent".
-    fn reconcile_queue(&mut self, steering: &coda_proto::state::SteeringQueueState) {
+    fn reconcile_queue(&mut self, snapshot: &coda_proto::state::StateSnapshot) {
         use coda_proto::state::SteeringOutcomeKind as Outcome;
 
+        let steering = &snapshot.steering;
         let mut reconciled = Vec::with_capacity(steering.pending.len());
         for entry in &steering.pending {
             let local = self
@@ -1401,7 +1858,45 @@ impl UiState {
             });
         }
 
+        // The last `delivered` outcome for `id`, if the engine reports one.
+        let delivery = |id: &str| {
+            steering
+                .outcomes
+                .iter()
+                .rev()
+                .find(|o| o.message_id == id)
+                .filter(|o| o.outcome == Outcome::Delivered)
+        };
+        // Whether the conversation currently on screen already accounts for
+        // that delivery, from the fences of the history read that built it.
+        let covered = |state: &Self, id: &str| {
+            delivery(id).is_some_and(|outcome| {
+                state
+                    .history_coverage
+                    .as_ref()
+                    .is_some_and(|coverage| coverage.covers_delivery(snapshot, outcome))
+            })
+        };
+        // Where a delivery would land if it is placed now: into the turn it
+        // was delivered into, or after that turn was already over.
+        let placement = |id: &str| match delivery(id) {
+            Some(outcome) if crate::coverage::delivery_turn_is_finished(snapshot, outcome) => {
+                Placement::Late
+            }
+            _ => Placement::InTurn,
+        };
+        // Positively: the engine names the turn running *now* as the one this
+        // message was delivered into. Anything less — a turn that has ended,
+        // an engine that names no turn at all — is not that claim.
+        let delivered_into_running_turn = |id: &str| {
+            matches!(
+                (delivery(id).and_then(|o| o.turn_id.as_deref()), snapshot.turn.as_ref()),
+                (Some(delivered_into), Some(running)) if running.turn_id == delivered_into
+            )
+        };
+
         // What happened to the entries the engine no longer lists.
+        let mut delivered: Vec<(QueuedMessage, Placement)> = Vec::new();
         let mut not_delivered: Vec<QueuedMessage> = Vec::new();
         let mut unexplained: Vec<QueuedMessage> = Vec::new();
         for local in &self.queued {
@@ -1410,11 +1905,36 @@ impl UiState {
                 continue;
             }
             match steering.outcomes.iter().rev().find(|o| o.message_id == id).map(|o| o.outcome) {
-                Some(Outcome::Delivered) => {}
+                // Already in the conversation the engine handed back: the
+                // receipt is settled by dropping it, not by showing the text
+                // a second time under a rebuild that already contains it.
+                Some(Outcome::Delivered) if covered(self, id) => {}
+                Some(Outcome::Delivered) => delivered.push((local.clone(), placement(id))),
                 Some(_) => not_delivered.push(local.clone()),
                 None => unexplained.push(local.clone()),
             }
         }
+
+        // A message the turn stranded in the recovery list, which the engine
+        // then reported as delivered after all. The notification and the turn
+        // ending race on the wire, and the loser must not leave a message the
+        // model received sitting under "not sent" — nor be resent.
+        //
+        // Unless the rebuilt conversation already accounts for it, in which
+        // case the receipt is cleared and nothing is appended: the operator
+        // can see it in the conversation, so there is no correction to make.
+        let mut late: Vec<QueuedMessage> = Vec::new();
+        for message in &self.unsent {
+            let Some(id) = message.id.as_deref() else { continue };
+            if delivery(id).is_none() || covered(self, id) {
+                continue;
+            }
+            late.push(message.clone());
+        }
+        self.unsent.retain(|message| {
+            let Some(id) = message.id.as_deref() else { return true };
+            delivery(id).is_none()
+        });
 
         // A local entry the engine has never acknowledged (no id yet) is
         // still the user's message and is kept: it is in flight, not gone.
@@ -1422,6 +1942,27 @@ impl UiState {
             self.queued.iter().filter(|q| q.id.is_none()).cloned().collect();
         reconciled.extend(unacknowledged);
         self.queued = reconciled;
+
+        let corrected = !late.is_empty();
+        let placed: Vec<(QueuedMessage, Placement)> = delivered
+            .into_iter()
+            .chain(late.into_iter().map(|message| {
+                // A message the turn end stranded is, by construction,
+                // confirmed after that turn ended. Only the engine naming the
+                // turn running *now* makes appending it chronologically true.
+                let placement = match message.id.as_deref() {
+                    Some(id) if delivered_into_running_turn(id) => Placement::InTurn,
+                    _ => Placement::Late,
+                };
+                (message, placement)
+            }))
+            .collect();
+        let shown_late = self.materialize_all(placed);
+        self.note_late_placement(shown_late, corrected);
+        // Nothing is said for a receipt the rebuilt conversation already
+        // accounts for: the message is on screen — or honestly announced as
+        // part of an earlier page that was not loaded — and a notice here
+        // would be describing a problem that does not exist.
 
         if !not_delivered.is_empty() {
             let n = not_delivered.len();
@@ -2786,6 +3327,11 @@ mod tests {
             }
             other => panic!("expected a thinking block: {other:?}"),
         }
+        assert_eq!(
+            state.transcript.len(),
+            1,
+            "the duplicate completion invented a second burst"
+        );
     }
 
     #[test]
@@ -3487,6 +4033,188 @@ mod tests {
         }
 
         #[test]
+        fn an_authoritative_reasoning_phase_opens_the_row_its_lost_event_would_have() {
+            // The frame that opens a burst can be dropped legitimately — a
+            // snapshot's cursor covers it, and the snapshot carries no
+            // content to replace it with. The phase is then the only thing
+            // that says reasoning is happening now.
+            let mut state = state();
+            let now = Instant::now();
+            state.apply_at(UiEvent::Submitted { text: "hi".into() }, now);
+            state.apply_at(UiEvent::CoreActivity(ActivityPhase::Reasoning), now);
+            match state.transcript.blocks().last() {
+                Some(Block::Thinking { text, complete, elapsed_ms, .. }) => {
+                    assert!(text.is_empty(), "no reasoning text may be invented");
+                    assert!(!complete);
+                    assert_eq!(*elapsed_ms, 0);
+                }
+                other => panic!("expected a live thinking block, got {other:?}"),
+            }
+            assert!(state.tick_thinking(now + Duration::from_secs(1)), "the clock must run");
+        }
+
+        #[test]
+        fn a_reasoning_snapshot_seeds_the_burst_clock_and_never_rewinds_it() {
+            let mut state = state();
+            let now = Instant::now();
+            state.apply_at(UiEvent::Submitted { text: "hi".into() }, now);
+            let mut first = snapshot(EngineLifecycle::Busy);
+            let mut running = turn(ActivityPhase::Reasoning, Some(30_000));
+            running.phase_elapsed_ms = Some(12_000);
+            first.turn = Some(running.clone());
+            state.apply_at(UiEvent::Snapshot(Box::new(first)), now);
+            assert!(matches!(
+                state.transcript.blocks().last(),
+                Some(Block::Thinking { elapsed_ms: 12_000, complete: false, .. })
+            ));
+
+            // A refresh of the same burst reporting *less* must not rewind a
+            // clock the user is watching.
+            let later = now + Duration::from_secs(5);
+            let mut stale = snapshot(EngineLifecycle::Busy);
+            running.phase_elapsed_ms = Some(1_000);
+            stale.turn = Some(running);
+            state.apply_at(UiEvent::Snapshot(Box::new(stale)), later);
+            state.tick_thinking(later);
+            match state.transcript.blocks().last() {
+                Some(Block::Thinking { elapsed_ms, .. }) => {
+                    assert_eq!(*elapsed_ms, 17_000, "the clock went backwards")
+                }
+                other => panic!("expected a live thinking block, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_reasoning_phase_that_has_not_caught_up_never_reopens_a_finished_burst() {
+            // `thinkingComplete` closes the burst; a snapshot taken before
+            // the engine's phase moves on still names `reasoning`. That is
+            // the burst already on screen, not a new one.
+            let mut state = state();
+            let now = Instant::now();
+            state.apply_at(UiEvent::Engine(Event::Thinking { delta: "hmm".into() }), now);
+            state.apply_at(
+                UiEvent::Engine(Event::ThinkingComplete { elapsed_ms: 2_000, thinking_tokens: None }),
+                now + Duration::from_secs(2),
+            );
+            state.apply_at(
+                UiEvent::CoreActivity(ActivityPhase::Reasoning),
+                now + Duration::from_secs(3),
+            );
+            let bursts = state
+                .transcript
+                .blocks()
+                .iter()
+                .filter(|block| matches!(block, Block::Thinking { .. }))
+                .count();
+            assert_eq!(bursts, 1, "a frozen burst was reopened");
+            assert!(!state.tick_thinking(now + Duration::from_secs(9)));
+        }
+
+        #[test]
+        fn a_second_burst_after_other_content_gets_its_own_row_from_the_phase_alone() {
+            let mut state = state();
+            let now = Instant::now();
+            state.apply_at(UiEvent::Engine(Event::Thinking { delta: "first".into() }), now);
+            state.apply_at(
+                UiEvent::Engine(Event::ThinkingComplete { elapsed_ms: 1_000, thinking_tokens: None }),
+                now + Duration::from_secs(1),
+            );
+            state.apply_at(
+                UiEvent::Engine(Event::AssistantText { delta: "partial".into() }),
+                now + Duration::from_secs(2),
+            );
+            state.apply_at(
+                UiEvent::CoreActivity(ActivityPhase::Reasoning),
+                now + Duration::from_secs(3),
+            );
+            let bursts: Vec<&Block> = state
+                .transcript
+                .blocks()
+                .iter()
+                .filter(|block| matches!(block, Block::Thinking { .. }))
+                .collect();
+            assert_eq!(bursts.len(), 2, "a distinct burst must get a distinct row");
+            assert!(matches!(bursts[0], Block::Thinking { complete: true, .. }));
+            assert!(matches!(bursts[1], Block::Thinking { complete: false, .. }));
+        }
+
+        #[test]
+        fn a_buffered_turn_shows_no_reasoning_row_even_from_an_authoritative_phase() {
+            // Hook buffering withholds the whole assistant response until a
+            // rewrite has had its say; a row opened here is the seam the
+            // withheld reasoning text would land in.
+            let mut state = state();
+            let now = Instant::now();
+            state.apply(UiEvent::EnableAssistantBuffering);
+            state.apply_at(UiEvent::CoreActivity(ActivityPhase::Reasoning), now);
+            assert!(
+                !state.transcript.blocks().iter().any(|b| matches!(b, Block::Thinking { .. })),
+                "a buffered turn must not show reasoning"
+            );
+        }
+
+        #[test]
+        fn a_rebuilt_conversation_keeps_a_live_burst_running_and_folded_as_it_was() {
+            let mut state = state();
+            let now = Instant::now();
+            state.apply_at(UiEvent::Engine(Event::Thinking { delta: "half".into() }), now);
+            state.apply(UiEvent::ThinkingFoldToggled { block: 0 });
+            state.tick_thinking(now + Duration::from_secs(4));
+
+            // The engine's own projection of the same, still-running burst.
+            state.apply_at(
+                UiEvent::Rehydrated {
+                    blocks: vec![Block::Thinking {
+                        text: "half".into(),
+                        elapsed_ms: 0,
+                        tokens: None,
+                        complete: false,
+                        expanded: false,
+                        done_at: None,
+                    }],
+                    notices: Vec::new(),
+                    coverage: None,
+                },
+                now + Duration::from_secs(4),
+            );
+            state.tick_thinking(now + Duration::from_secs(6));
+            match state.transcript.blocks().last() {
+                Some(Block::Thinking { complete, elapsed_ms, expanded, .. }) => {
+                    assert!(!complete, "the running burst was rebuilt as history");
+                    assert_eq!(*elapsed_ms, 6_000, "the clock restarted");
+                    assert!(*expanded, "the fold the user opened was lost");
+                }
+                other => panic!("expected a live thinking block, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_rebuilt_conversation_never_makes_historical_reasoning_tick() {
+            let mut state = state();
+            let now = Instant::now();
+            state.apply_at(
+                UiEvent::Rehydrated {
+                    blocks: vec![Block::Thinking {
+                        text: "old reasoning".into(),
+                        elapsed_ms: 0,
+                        tokens: None,
+                        complete: true,
+                        expanded: false,
+                        done_at: None,
+                    }],
+                    notices: Vec::new(),
+                    coverage: None,
+                },
+                now,
+            );
+            assert!(!state.tick_thinking(now + Duration::from_secs(30)));
+            assert!(matches!(
+                state.transcript.blocks().last(),
+                Some(Block::Thinking { complete: true, elapsed_ms: 0, .. })
+            ));
+        }
+
+        #[test]
         fn the_queue_comes_from_the_engine_and_keeps_the_users_own_full_text() {
             let mut state = state();
             state.apply(UiEvent::Queued { text: "one".into(), id: Some("m1".into()) });
@@ -3766,6 +4494,7 @@ mod tests {
                     Block::Assistant { text: "answered".into(), complete: true },
                 ],
                 notices: Vec::new(),
+                coverage: None,
             });
             assert_eq!(state.transcript.len(), 2);
             match &state.transcript.blocks()[0] {
@@ -3801,6 +4530,7 @@ mod tests {
                     Block::Assistant { text: "answered".into(), complete: true },
                 ],
                 notices: Vec::new(),
+                coverage: None,
             });
 
             let blocks = state.transcript.blocks();
@@ -3841,7 +4571,11 @@ mod tests {
             });
             state.apply(UiEvent::Submitted { text: "stale".into() });
 
-            state.apply(UiEvent::Rehydrated { blocks: Vec::new(), notices: Vec::new() });
+            state.apply(UiEvent::Rehydrated {
+                blocks: Vec::new(),
+                notices: Vec::new(),
+                coverage: None,
+            });
 
             assert!(!state.has_conversation(), "{:?}", state.transcript.blocks());
             assert!(matches!(state.transcript.blocks().first(), Some(Block::Banner { .. })));
@@ -3860,6 +4594,7 @@ mod tests {
             state.apply(UiEvent::Rehydrated {
                 blocks: vec![Block::Assistant { text: "from history".into(), complete: true }],
                 notices: Vec::new(),
+                coverage: None,
             });
 
             assert_eq!(state.queued.len(), 1, "the queued message was lost with the transcript");
@@ -3888,6 +4623,7 @@ mod tests {
             state.apply(UiEvent::Rehydrated {
                 blocks: vec![Block::Assistant { text: "from history".into(), complete: true }],
                 notices: Vec::new(),
+                coverage: None,
             });
 
             assert!(
@@ -3931,6 +4667,7 @@ mod tests {
                     }],
                 }],
                 notices: Vec::new(),
+                coverage: None,
             });
 
             let live = Correlation {

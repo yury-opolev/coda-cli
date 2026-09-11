@@ -968,7 +968,8 @@ impl ServeHost {
         )
     }
 
-    /// Test constructor — pre-built client is injected directly.
+    /// Test constructor — pre-built client with automatic initial effort,
+    /// independent of the developer's saved effort preference.
     pub fn new_with_client(
         client: Arc<dyn LlmClient>,
         sink: Arc<ServeSink>,
@@ -984,7 +985,7 @@ impl ServeHost {
             working_dir,
             Some(&provider_id),
             McpBundle::disabled(),
-            StartupOptions::default(),
+            StartupOptions { effort: StartupEffort::Auto, ..Default::default() },
             None,
             None,
         )
@@ -6956,6 +6957,163 @@ mod tests {
         assert!(host.session.steering.has_pending());
     }
 
+    /// A follow-up sent while the model is working must be visible in what
+    /// the engine reports *while the turn is still running*, not only once it
+    /// commits — and it must appear exactly once afterwards.
+    ///
+    /// The whole round trip, through the real agent loop: the operator steers
+    /// mid-turn, the agent drains the inbox before its next model request, and
+    /// a client polling `session/getState` / `session/getHistory` in the
+    /// window that follows is shown the message the model actually received.
+    /// Before this, that window reported a `delivered` outcome over a
+    /// conversation with no trace of the text in it.
+    #[tokio::test]
+    async fn a_delivered_steer_is_visible_mid_turn_and_committed_exactly_once() {
+        use coda_llm::anthropic::StreamEvent;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct PausingClient {
+            calls: AtomicUsize,
+            paused: [tokio::sync::Notify; 2],
+            release: [tokio::sync::Notify; 2],
+            script: Mutex<std::collections::VecDeque<Vec<StreamEvent>>>,
+        }
+        #[async_trait]
+        impl LlmClient for PausingClient {
+            fn provider_id(&self) -> &str {
+                "scripted"
+            }
+            async fn stream(
+                &self,
+                _: coda_llm::ChatRequest,
+            ) -> Result<coda_llm::ResponseStream, coda_llm::LlmError> {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                if call < 2 {
+                    self.paused[call].notify_one();
+                    self.release[call].notified().await;
+                }
+                let events = self.script.lock().unwrap().pop_front().expect("a scripted turn");
+                let (tx, rx) = mpsc::channel(64);
+                tokio::spawn(async move {
+                    for event in events {
+                        let _ = tx.send(Ok(event)).await;
+                    }
+                });
+                Ok(coda_llm::ResponseStream::new(rx))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = dir.path().join("fixture.txt");
+        std::fs::write(&fixture, "fixture contents").unwrap();
+        let client = Arc::new(PausingClient {
+            calls: AtomicUsize::new(0),
+            paused: [tokio::sync::Notify::new(), tokio::sync::Notify::new()],
+            release: [tokio::sync::Notify::new(), tokio::sync::Notify::new()],
+            script: Mutex::new(
+                vec![outside_read_turn(&fixture, "c1"), file_test_done()].into_iter().collect(),
+            ),
+        });
+        let host = make_host_in_dir(dir.path().to_str().unwrap(), client.clone());
+        host.engine_state.mark_initialized();
+
+        let run = {
+            let host = host.clone();
+            tokio::spawn(async move {
+                host.session_prompt(PromptParams { text: Some("start".into()), images: None }).await
+            })
+        };
+
+        // The first model request is held open, which is where a real
+        // operator would type the follow-up.
+        tokio::time::timeout(Duration::from_secs(5), client.paused[0].notified()).await.unwrap();
+        let steer = host
+            .session_steer(SteerParams { text: "operator correction".into() })
+            .await
+            .unwrap();
+        assert_eq!(steer["ok"], true, "{steer}");
+        let message_id = steer["messageId"].as_str().expect("an accepted steer is given an id");
+        client.release[0].notify_one();
+
+        // The agent drains the inbox before its *next* request, so by the
+        // time the second one is held open the message has reached the model.
+        tokio::time::timeout(Duration::from_secs(5), client.paused[1].notified()).await.unwrap();
+
+        let state = host.session_get_state(GetStateParams::default()).await.unwrap();
+        assert_eq!(state["steering"]["pendingCount"], 0);
+        assert!(
+            state["steering"]["outcomes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|o| o["messageId"] == message_id && o["outcome"] == "delivered"),
+            "the delivery is reported: {}",
+            state["steering"]
+        );
+        let live = state["turn"]["liveEntries"].as_array().expect("a turn is running");
+        let steered: Vec<&Value> = live
+            .iter()
+            .filter(|entry| entry["steeringMessageId"] == message_id)
+            .collect();
+        assert_eq!(
+            steered.len(),
+            1,
+            "the same snapshot that reports the delivery must contain the message: {live:#?}"
+        );
+        assert_eq!(steered[0]["blocks"][0]["text"], "operator correction");
+        assert_eq!(steered[0]["role"], "user");
+        assert_eq!(steered[0]["entryKind"], "userPrompt");
+
+        let history = host
+            .session_get_history(GetHistoryParams { include_live: Some(true), ..Default::default() })
+            .await
+            .unwrap();
+        assert_eq!(
+            history["liveEntries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["blocks"][0]["text"] == "operator correction")
+                .count(),
+            1,
+            "a client rebuilding the conversation mid-turn must see it too"
+        );
+        assert!(
+            !history["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["blocks"][0]["text"] == "operator correction"),
+            "it is not committed yet; the live projection is where it lives"
+        );
+
+        client.release[1].notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(5), run).await.unwrap().unwrap().unwrap();
+        assert_eq!(result["ok"], true);
+
+        // Committed exactly once, and the live projection that carried it is
+        // gone — so a client that appends `entries ++ liveEntries` cannot end
+        // up with the message twice.
+        let history = host
+            .session_get_history(GetHistoryParams { include_live: Some(true), ..Default::default() })
+            .await
+            .unwrap();
+        let committed = history["entries"].as_array().unwrap();
+        assert_eq!(
+            committed
+                .iter()
+                .flat_map(|e| e["blocks"].as_array().unwrap())
+                .filter(|b| b["text"] == "operator correction")
+                .count(),
+            1,
+            "the follow-up must be persisted once: {committed:#?}"
+        );
+        assert!(
+            history["liveEntries"].as_array().is_none_or(|live| live.is_empty()),
+            "the turn is over; nothing is still live"
+        );
+    }
+
     #[tokio::test]
     async fn claiming_a_turn_never_discards_a_message_already_queued() {
         let dir = tempfile::tempdir().unwrap();
@@ -12083,6 +12241,4 @@ mod tests {
         }
     }
 }
-
-
 

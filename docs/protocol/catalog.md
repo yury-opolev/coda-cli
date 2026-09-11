@@ -166,6 +166,10 @@ fence; do not combine pages from different histories. Append the live
 projection once, not once per page, and do not treat user-role tool-result
 entries as user prompts: use `entryKind`.
 
+A delivered steering message appears in the live projection tagged with `steeringMessageId`,
+in the same read that reports its `delivered` outcome. A client that queued it holds the
+original text and should match on that id rather than on the text, which is not an identity.
+
 Honor advertised bounds and omission metadata. Missing elapsed time,
 credentials resolution, provider identity or background counts means unknown,
 not zero or false. Server elapsed durations are authoritative baselines;

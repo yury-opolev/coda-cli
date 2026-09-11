@@ -299,7 +299,13 @@ async fn a_resumed_session_renders_the_old_conversation_not_a_count() {
 
     let hydrated = api::history::hydrate(&history.entries, &[], false);
     let mut state = UiState::new();
-    state.apply(UiEvent::Rehydrated { blocks: hydrated.blocks, notices: hydrated.notices });
+    state.apply(UiEvent::Rehydrated {
+        blocks: hydrated.blocks,
+        notices: hydrated.notices,
+        // What this very read proves about the committed prefix, exactly as
+        // the client records it in production.
+        coverage: Some(coda_tui::coverage::HistoryCoverage::of_read(&history)),
+    });
 
     let user: Vec<&str> = state
         .transcript

@@ -414,7 +414,14 @@ fn render_thinking(
     width: usize,
     mode: ToolDisplayMode,
 ) -> Vec<RenderLine> {
-    let content = width.saturating_sub(MARKER_CELLS).max(1);
+    // The body of a live block hangs under the header's inset — unless the
+    // terminal is narrower than the inset itself, where an indent would push
+    // every row past the right edge.
+    let (body_gutter, content) = if width > MARKER_CELLS {
+        (Gutter::Continuation, width - MARKER_CELLS)
+    } else {
+        (Gutter::None, width.max(1))
+    };
     // Round half away from zero: `{:.0}` would round 4.5 to 4, which reads as
     // a stopwatch running backwards when the elapsed time ticks past .5.
     let seconds = (elapsed_ms as f64 / 1000.0).round() as i64;
@@ -431,8 +438,9 @@ fn render_thinking(
     // Full is the "show me everything" mode, so it opens every block without
     // needing a click; otherwise the block's own state decides.
     let open = has_body && (expanded || mode == ToolDisplayMode::Full);
-    let fold = if !has_body {
-        // Same width as a marker, so headers stay aligned in a column of them.
+    let marker = if !has_body {
+        // Same width as a fold marker, so headers stay aligned in a column of
+        // them even when this one has nothing to open.
         " "
     } else if open {
         glyphs::FOLD_EXPANDED
@@ -440,7 +448,7 @@ fn render_thinking(
         glyphs::FOLD_COLLAPSED
     };
 
-    let status = if complete {
+    let headline = if complete {
         // A duration of zero means the clock never started, not that no time
         // passed: it only runs from the first delta, and encrypted reasoning
         // produces none. Claiming "0s" would be inventing a measurement.
@@ -452,23 +460,28 @@ fn render_thinking(
             .map(|at| format!(" · done {at}"))
             .unwrap_or_default();
         match seconds {
-            0 => format!("{fold} Thought{suffix}"),
-            seconds => format!("{fold} Thought for {}{suffix}", format_duration(seconds)),
+            0 => format!("Thought{suffix}"),
+            seconds => format!("Thought for {}{suffix}", format_duration(seconds)),
         }
     } else {
         let seconds = elapsed_ms.max(0) / 1000;
         let duration = format_duration(seconds);
         match tokens {
-            Some(tokens) => format!("{fold} Thinking... {duration} · {tokens} tok"),
-            None => format!("{fold} Thinking... {duration}"),
+            Some(tokens) => format!("Thinking... {duration} · {tokens} tok"),
+            None => format!("Thinking... {duration}"),
         }
     };
 
+    // The same disclosure header a tool summary draws: one inset marker, no
+    // second icon, and the marker column excluded from a copy.
+    let role = if complete {
+        Role::ThinkingHeader
+    } else {
+        Role::Notification
+    };
+    let mut out = coda_render::line::disclosure_header(&headline, marker, width, role);
+
     if complete {
-        let mut out: Vec<RenderLine> = text::wrap(&status, width)
-            .into_iter()
-            .map(|chunk| RenderLine::new(chunk, Role::ThinkingHeader))
-            .collect();
         if open {
             let gutter = if width > Gutter::ThinkingBody.cells() {
                 Gutter::ThinkingBody
@@ -485,21 +498,9 @@ fn render_thinking(
         return out;
     }
 
-    let mut out: Vec<RenderLine> = text::wrap(&status, content)
-        .into_iter()
-        .enumerate()
-        .map(|(i, chunk)| {
-            RenderLine::new(chunk, Role::Notification).with_gutter(if i == 0 {
-                Gutter::AgentActive
-            } else {
-                Gutter::Continuation
-            })
-        })
-        .collect();
-
     if open {
         for line in markdown::render(body, content) {
-            out.push(line.with_gutter(Gutter::Continuation));
+            out.push(line.with_gutter(body_gutter));
         }
         return out;
     }
@@ -509,7 +510,7 @@ fn render_thinking(
     // produces a dozen of these.
     if let Some(last) = body.lines().map(str::trim).filter(|l| !l.is_empty()).next_back() {
         for chunk in text::wrap(last, content) {
-            out.push(RenderLine::new(chunk, Role::Notification).with_gutter(Gutter::Continuation));
+            out.push(RenderLine::new(chunk, Role::Notification).with_gutter(body_gutter));
         }
     }
 
@@ -638,7 +639,13 @@ impl Transcript {
         // longer the transcript's last block, and a caller reaching for
         // `close_open` would finalise a banner instead of a tool batch.
         if let Some(last) = conversation.last_mut() {
-            close_block(last);
+            // A reasoning burst the engine is still streaming is the one
+            // thing a rebuild may hand over open: the read describes it as
+            // in-flight, and finalising it here would freeze a live row and
+            // stop its clock the moment the conversation was re-read.
+            if !matches!(last, Block::Thinking { complete: false, .. }) {
+                close_block(last);
+            }
         }
         let previous = std::mem::take(&mut self.blocks);
         let first_conversation = previous.iter().position(|block| !block.is_client_owned());
@@ -1491,7 +1498,7 @@ mod tests {
 
             assert_eq!(
                 rows,
-                vec![format!("{} Thought for 1s", glyphs::FOLD_COLLAPSED)]
+                vec![format!(" {} Thought for 1s", glyphs::FOLD_COLLAPSED)]
             );
         }
     }
@@ -1508,11 +1515,82 @@ mod tests {
         }
         .render(24, ToolDisplayMode::Summary);
 
-        assert_eq!(rows[0].text, format!("{} Thought for 1s", glyphs::FOLD_EXPANDED));
+        assert_eq!(rows[0].text, format!(" {} Thought for 1s", glyphs::FOLD_EXPANDED));
         assert!(rows.len() > 4, "expected wrapping and a paragraph break: {rows:?}");
         assert!(rows[1..].iter().all(|row| row.text.starts_with("\u{2502} ")));
         assert!(rows.iter().all(|row| text::width(&row.text) <= 24));
         assert!(rows.iter().any(|row| row.text.trim_end() == "\u{2502}"));
+    }
+
+    #[test]
+    fn thinking_headers_are_one_inset_marker_that_never_enters_a_copy() {
+        // The same disclosure header a tool summary draws: exactly one left
+        // space, one marker, no second icon, and the marker column excluded
+        // from what a copy takes.
+        for complete in [false, true] {
+            for (body, expected) in [("", " "), ("reasoning", glyphs::FOLD_COLLAPSED)] {
+                let rows = Block::Thinking {
+                    text: body.into(),
+                    elapsed_ms: 1000,
+                    tokens: None,
+                    complete,
+                    expanded: false,
+                    done_at: None,
+                }
+                .render(60, ToolDisplayMode::Summary);
+                assert_eq!(
+                    rows[0].text.chars().take(3).collect::<String>(),
+                    format!(" {expected} "),
+                    "{:?}",
+                    rows[0].text
+                );
+                assert_eq!(rows[0].content_start(), MARKER_CELLS);
+                assert!(
+                    !rows[0].text.contains(Gutter::AgentActive.prefix().trim()),
+                    "the header must not carry a second icon: {:?}",
+                    rows[0].text
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn copying_a_reasoning_block_takes_the_words_and_not_the_chevron() {
+        // The header's marker column is decoration: it draws with the row and
+        // pasting it into an editor is never what was meant.
+        for complete in [false, true] {
+            let rows = Block::Thinking {
+                text: "the reasoning body".into(),
+                elapsed_ms: 1000,
+                tokens: None,
+                complete,
+                expanded: true,
+                done_at: None,
+            }
+            .render(60, ToolDisplayMode::Summary);
+            let copied = crate::selection::copy_visible_text(&rows, 0..rows.len());
+            assert!(
+                !copied.contains(glyphs::FOLD_EXPANDED) && !copied.contains(glyphs::FOLD_COLLAPSED),
+                "the fold marker was pasted: {copied:?}"
+            );
+            assert!(copied.starts_with("Th"), "the headline was clipped: {copied:?}");
+            assert!(copied.contains("the reasoning body"), "{copied:?}");
+        }
+    }
+
+    #[test]
+    fn a_narrow_terminal_still_draws_a_thinking_header_it_can_fit() {        for width in [1, 2, 3, 4, 10] {
+            let rows = Block::Thinking {
+                text: "reasoning".into(),
+                elapsed_ms: 1000,
+                tokens: None,
+                complete: false,
+                expanded: false,
+                done_at: None,
+            }
+            .render(width, ToolDisplayMode::Summary);
+            assert!(rows.iter().all(|row| text::width(&row.text) <= width), "{rows:?}");
+        }
     }
 
     #[test]

@@ -76,8 +76,15 @@ pub fn hydrate(entries: &[HistoryEntry], live: &[HistoryEntry], live_truncated: 
     let mut out = Hydration::default();
     let mut registry: Vec<Registered> = Vec::new();
 
-    for entry in entries.iter().chain(live.iter()) {
-        push_entry(entry, &mut out, &mut registry);
+    for entry in entries {
+        push_entry(entry, &mut out, &mut registry, false);
+    }
+    // Only the *last* live entry can still be receiving content, and within
+    // it only the last block. Everything before is finished by the fact that
+    // something followed it.
+    let last_live = live.len().saturating_sub(1);
+    for (index, entry) in live.iter().enumerate() {
+        push_entry(entry, &mut out, &mut registry, index == last_live);
     }
 
     if live_truncated {
@@ -90,7 +97,12 @@ pub fn hydrate(entries: &[HistoryEntry], live: &[HistoryEntry], live_truncated: 
     out
 }
 
-fn push_entry(entry: &HistoryEntry, out: &mut Hydration, registry: &mut Vec<Registered>) {
+fn push_entry(
+    entry: &HistoryEntry,
+    out: &mut Hydration,
+    registry: &mut Vec<Registered>,
+    live_tail: bool,
+) {
     match entry.entry_kind {
         HistoryEntryKind::UserPrompt => push_user_entry(entry, out),
         // A user-role message carrying tool results is the *conversation
@@ -102,12 +114,14 @@ fn push_entry(entry: &HistoryEntry, out: &mut Hydration, registry: &mut Vec<Regi
             for block in &entry.blocks {
                 match block {
                     HistoryBlock::ToolResult { .. } => attach_result(block, out, registry),
-                    HistoryBlock::Text { .. } => push_user_entry_block(block, out),
+                    HistoryBlock::Text { .. } => {
+                        push_user_entry_block(block, entry.steering_message_id.as_deref(), out)
+                    }
                     _ => {}
                 }
             }
         }
-        HistoryEntryKind::Assistant => push_assistant_entry(entry, out, registry),
+        HistoryEntryKind::Assistant => push_assistant_entry(entry, out, registry, live_tail),
     }
 }
 
@@ -143,11 +157,14 @@ fn push_user_entry(entry: &HistoryEntry, out: &mut Hydration) {
         // would be a fabricated fact rather than a missing one.
         timestamp: String::new(),
         pending: false,
-        queue_id: None,
+        // Carried when the engine says this entry *is* a delivered steering
+        // message: a client still holding its own copy of that message can
+        // then recognise it here instead of appending it a second time.
+        queue_id: entry.steering_message_id.clone(),
     });
 }
 
-fn push_user_entry_block(block: &HistoryBlock, out: &mut Hydration) {
+fn push_user_entry_block(block: &HistoryBlock, steering_id: Option<&str>, out: &mut Hydration) {
     if let HistoryBlock::Text { text, omitted_reason, full_length } = block {
         if text.is_empty() {
             return;
@@ -160,13 +177,19 @@ fn push_user_entry_block(block: &HistoryBlock, out: &mut Hydration) {
             text: body,
             timestamp: String::new(),
             pending: false,
-            queue_id: None,
+            queue_id: steering_id.map(str::to_string),
         });
     }
 }
 
-fn push_assistant_entry(entry: &HistoryEntry, out: &mut Hydration, registry: &mut Vec<Registered>) {
-    for block in &entry.blocks {
+fn push_assistant_entry(
+    entry: &HistoryEntry,
+    out: &mut Hydration,
+    registry: &mut Vec<Registered>,
+    live_tail: bool,
+) {
+    let last_block = entry.blocks.len().saturating_sub(1);
+    for (index, block) in entry.blocks.iter().enumerate() {
         match block {
             HistoryBlock::Text { text, omitted_reason, full_length } => {
                 let mut body = text.clone();
@@ -183,6 +206,11 @@ fn push_assistant_entry(entry: &HistoryEntry, out: &mut Hydration, registry: &mu
                 if let Some(marker) = omission_marker(omitted_reason.as_deref(), *full_length) {
                     body.push_str(&marker);
                 }
+                // The trailing block of the in-flight turn is the burst the
+                // model is reasoning through *now*: marking it done froze a
+                // live row and stopped its clock on every re-read. Anything
+                // the engine has already moved past is history.
+                let live = live_tail && index == last_block && !*redacted;
                 out.blocks.push(Block::Thinking {
                     text: body,
                     // Zero means "the clock never ran", which the renderer
@@ -190,7 +218,7 @@ fn push_assistant_entry(entry: &HistoryEntry, out: &mut Hydration, registry: &mu
                     // carries no duration and inventing one would be a lie.
                     elapsed_ms: 0,
                     tokens: None,
-                    complete: true,
+                    complete: !live,
                     expanded: false,
                     done_at: None,
                 });
@@ -522,6 +550,55 @@ mod tests {
     }
 
     #[test]
+    fn the_running_turns_trailing_reasoning_stays_live_but_nothing_else_does() {
+        // The engine projects the in-flight turn's reasoning as it streams.
+        // Marking it done froze a live row and stopped its clock every time
+        // the conversation was re-read; anything the turn has moved past —
+        // and every committed entry — is history.
+        let reasoning = |text: &str| B::ReasoningSummary {
+            text: text.into(),
+            redacted: false,
+            omitted_reason: None,
+            full_length: None,
+        };
+        let committed = vec![HistoryEntry::new(0, "assistant", vec![reasoning("last turn")])];
+        let live = vec![
+            HistoryEntry::new(1, "assistant", vec![reasoning("earlier burst"), text("an answer")]),
+            HistoryEntry::new(2, "assistant", vec![reasoning("still thinking")]),
+        ];
+        let hydration = hydrate(&committed, &live, false);
+
+        let bursts: Vec<(&str, bool)> = hydration
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Thinking { text, complete, .. } => Some((text.as_str(), *complete)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            bursts,
+            vec![("last turn", true), ("earlier burst", true), ("still thinking", false)]
+        );
+    }
+
+    #[test]
+    fn redacted_reasoning_is_never_left_open_for_text_that_can_never_arrive() {
+        let live = vec![HistoryEntry::new(
+            0,
+            "assistant",
+            vec![B::ReasoningSummary {
+                text: String::new(),
+                redacted: true,
+                omitted_reason: None,
+                full_length: None,
+            }],
+        )];
+        let hydration = hydrate(&[], &live, false);
+        assert!(matches!(hydration.blocks[0], Block::Thinking { complete: true, .. }));
+    }
+
+    #[test]
     fn historical_reasoning_carries_no_invented_clock_or_token_count() {
         let entries = vec![HistoryEntry::new(
             0,
@@ -589,6 +666,53 @@ mod tests {
         let hydration = hydrate(&entries, &[], false);
         assert_eq!(tools(&hydration)[0].calls[0].result, None);
         assert!(hydration.notices.iter().any(|n| n.contains("c9")), "{:?}", hydration.notices);
+    }
+
+    #[test]
+    fn a_delivered_steering_message_is_rebuilt_carrying_the_queue_id_that_identifies_it() {
+        // A client that queued this message is holding its own copy and is
+        // told separately that it was delivered. Without the id here it
+        // cannot tell this block *is* that message, and has to choose between
+        // showing the text twice and not showing it at all.
+        let live = vec![
+            HistoryEntry::new(0, "user", vec![text("start")]),
+            HistoryEntry::new(1, "assistant", vec![text("half a reply")]),
+            HistoryEntry::new(2, "user", vec![text("operator correction")]).from_steering("m1"),
+        ];
+        let hydration = hydrate(&[], &live, false);
+        let ids: Vec<Option<&str>> = hydration
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::User { queue_id, .. } => Some(queue_id.as_deref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, [None, Some("m1")]);
+        assert_eq!(users(&hydration), ["start", "operator correction"]);
+    }
+
+    #[test]
+    fn steering_delivered_inside_a_tool_batch_keeps_its_queue_id_too() {
+        let live = vec![
+            HistoryEntry::new(0, "assistant", vec![call("c1", "read_file", Some("t1"), Some("b1"))]),
+            HistoryEntry::new(
+                1,
+                "user",
+                vec![result("c1", "contents", Some("t1"), Some("b1")), text("actually, stop")],
+            )
+            .from_steering("m2"),
+        ];
+        let hydration = hydrate(&[], &live, false);
+        let ids: Vec<Option<&str>> = hydration
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::User { queue_id, .. } => Some(queue_id.as_deref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, [Some("m2")]);
     }
 
     #[test]

@@ -207,6 +207,15 @@ provider conversation encodes tool results as **user-role** messages: rendering 
 as "something the operator typed" invents prompts that never happened, and `entryKind` is how
 you avoid that. `role` itself is always exactly the provider protocol role.
 
+`steeringMessageId` is present on a live entry that **is** a queued message the engine has
+delivered into the running turn, and absent everywhere else (a committed message carries no
+queue id). Delivered steering is added to the live projection in the same transaction that
+records the `delivered` outcome, so a read that reports the outcome always contains the text:
+`session/getState` and `session/getHistory` never say a message reached the model over a
+conversation with no trace of it. A client holding its own copy of a queued message should use
+that id — never the text, since two messages with identical text are two messages — to decide
+whether a re-read conversation already contains it.
+
 **Internal metadata is not exposed.** History, state, config and MCP projections do not expose a
 `Content::Thinking.signature`, `RedactedThinking` ciphertext, image base64, a provider
 credential, an MCP `env` value, a custom header value, a `coda-secret:` target, or a URL with

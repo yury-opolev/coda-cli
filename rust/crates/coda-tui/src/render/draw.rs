@@ -40,10 +40,11 @@ pub struct Regions {
     pub scrollbar: Option<Rect>,
     /// One line for transient status, above the composer.
     pub hint: Option<Rect>,
-    /// Bounded previews of pending/recoverable input, never transcript rows.
+    /// Bounded previews below live activity, with one blank row on each side.
+    /// These are never transcript rows.
     pub pending: Option<Rect>,
-    /// One line, directly above the composer, showing what a running turn
-    /// is doing right now.
+    /// One line above the pending queue and composer, showing what a running
+    /// turn is doing right now.
     ///
     /// Present only while a turn is busy. Outranks the decorative `header`
     /// and `hint` rows for the space it needs: a tiny terminal drops those
@@ -64,7 +65,7 @@ const MIN_ROWS_FOR_CHROME: u16 = 12;
 ///
 /// The composer grows with its content up to a cap, after which it scrolls
 /// internally rather than crowding out the transcript. `busy` reserves the
-/// pinned activity row directly above the composer; it is independent of
+/// pinned activity row above the pending queue and composer; it is independent of
 /// `MIN_ROWS_FOR_CHROME` so live progress still shows on a terminal too short
 /// for the decorative header and hint rows.
 pub fn layout(area: Rect, composer_lines: usize, scrollable: bool, busy: bool) -> Regions {
@@ -81,8 +82,13 @@ pub fn layout_with_pending(
         0
     } else {
         (pending_count.min(3) + usize::from(pending_count > 3)) as u16
-    }.min(area.height.saturating_sub(COMPOSER_MIN_ROWS + 5 + chrome_rows));
-    let extra = chrome_rows + pending_rows;
+    }.min(area.height.saturating_sub(COMPOSER_MIN_ROWS + 5 + chrome_rows + 2));
+    let pending_space = if pending_rows > 0 { pending_rows + 2 } else { 0 };
+    let extra = chrome_rows + pending_space;
+    // Keep transient hints above the activity when a queue is shown, so the
+    // queue has exactly one blank row before the composer, not a second empty
+    // hint row.
+    let hint_before_activity = chrome && pending_rows > 0;
 
     let composer_rows = (composer_lines as u16)
         .clamp(COMPOSER_MIN_ROWS, COMPOSER_MAX_ROWS)
@@ -101,13 +107,18 @@ pub fn layout_with_pending(
         constraints.push(Constraint::Length(1));
     }
     constraints.push(Constraint::Min(1));
-    if pending_rows > 0 {
-        constraints.push(Constraint::Length(pending_rows));
+    if hint_before_activity {
+        constraints.push(Constraint::Length(1));
     }
     if busy {
         constraints.push(Constraint::Length(1));
     }
-    if chrome {
+    if pending_rows > 0 {
+        constraints.push(Constraint::Length(1));
+        constraints.push(Constraint::Length(pending_rows));
+        constraints.push(Constraint::Length(1));
+    }
+    if chrome && !hint_before_activity {
         constraints.push(Constraint::Length(1));
     }
     // + the panel's top and bottom half-block edges
@@ -127,9 +138,19 @@ pub fn layout_with_pending(
     };
     let header = chrome.then(&mut take);
     let transcript_area = take();
-    let pending = (pending_rows > 0).then(&mut take);
+    let mut hint = hint_before_activity.then(&mut take);
     let activity = busy.then(&mut take);
-    let hint = chrome.then(&mut take);
+    let pending = if pending_rows > 0 {
+        let _above = take();
+        let pending = take();
+        let _below = take();
+        Some(pending)
+    } else {
+        None
+    };
+    if chrome && !hint_before_activity {
+        hint = Some(take());
+    }
     let composer = take();
     let status = take();
 
@@ -334,7 +355,7 @@ pub fn draw_with_pin(
 
 fn draw_pending(frame: &mut Frame, area: Rect, state: &UiState, theme: &Theme) {
     let entries: Vec<_> = state.queued.iter().map(|message| ("pending", &message.text))
-        .chain(state.unsent.iter().map(|message| ("not sent", &message.text)))
+        .chain(state.unsent.iter().map(|message| ("recoverable", &message.text)))
         .collect();
     let preview_count = if entries.len() > area.height as usize && area.height > 1 {
         area.height as usize - 1
@@ -429,7 +450,7 @@ pub fn header_id_rect(area: Rect, state: &UiState) -> Option<Rect> {
 }
 
 /// Draws the pinned activity row: what a running turn is doing, and for how
-/// long, directly above the composer.
+/// long, above the pending queue and composer.
 ///
 /// Composed fresh every frame from `state` and `now` rather than cached, so
 /// its elapsed time can advance on the existing spinner/timer wakeup without

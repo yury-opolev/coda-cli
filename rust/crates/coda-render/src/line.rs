@@ -6,6 +6,35 @@
 
 use crate::theme::Role;
 
+/// A foldable header with one inset marker, aligned continuation lines, and
+/// decorative columns excluded from transcript copy/selection.
+pub fn disclosure_header(
+    headline: &str,
+    marker: &str,
+    width: usize,
+    role: Role,
+) -> Vec<RenderLine> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let prefix = format!(" {marker} ");
+    let prefix_cells = crate::text::width(&prefix);
+    if width <= prefix_cells {
+        let visible = crate::text::truncate(&prefix, width);
+        let cells = crate::text::width(&visible);
+        return vec![RenderLine::new(visible, role).with_chrome_cells(cells)];
+    }
+    let continuation = " ".repeat(prefix_cells);
+    crate::text::wrap(headline, width - prefix_cells)
+        .into_iter()
+        .enumerate()
+        .map(|(index, chunk)| {
+            let indent = if index == 0 { &prefix } else { &continuation };
+            RenderLine::new(format!("{indent}{chunk}"), role).with_chrome_cells(prefix_cells)
+        })
+        .collect()
+}
+
 /// Cells reserved for a top-level marker gutter.
 pub const MARKER_CELLS: usize = 3;
 /// Cells reserved for a nested (tool child) gutter.
