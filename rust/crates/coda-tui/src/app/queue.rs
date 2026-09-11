@@ -2,6 +2,40 @@ use coda_proto::messages::{method, RecallSteeringResult, RecalledSteeringMessage
 
 use super::App;
 use crate::state::UiEvent;
+use crate::transcript::NoticeLevel;
+
+/// An outcome the engine never reported. The message may or may not have been
+/// queued, so it is neither claimed as sent nor sent again.
+const UNCONFIRMED: &str = "The engine did not confirm whether the message was queued, so it was \
+                           not sent again — it may already have reached the queue. Your text is \
+                           back in the message box.";
+
+/// What the engine's refusal actually means, in the operator's terms.
+///
+/// The classification is the engine's own (`noActiveTurn`, `turnEnding`,
+/// `emptyText`); dropping it left "could not queue the message" as the only
+/// explanation for three quite different situations, one of which is simply
+/// "there is no turn to steer — press Enter to send it as a new message".
+fn refusal_text(reason: Option<&str>) -> String {
+    let explanation = match reason {
+        Some("noActiveTurn") => {
+            "there is no turn running to steer. Press Enter to send it as a new message."
+        }
+        Some("turnEnding") => {
+            "the turn was already finishing, so the model would never have seen it. Send it once \
+             the next turn starts."
+        }
+        Some("emptyText") => "it had no text in it.",
+        Some(other) => {
+            return format!(
+                "The engine refused to queue the message ({other}); it was not sent. Your text \
+                 is back in the message box."
+            )
+        }
+        None => "the engine gave no reason.",
+    };
+    format!("The message was not queued: {explanation} Your text is back in the message box.")
+}
 
 impl App {
     pub(super) async fn steer(&mut self, text: String) {
@@ -18,19 +52,23 @@ impl App {
         let response = self
             .ask::<serde_json::Value>(method::STEER, Some(serde_json::json!({ "text": &text })))
             .await;
-        let hint = match response {
+        // Both outcomes below put the draft back and say what happened where
+        // it stays said. A transient hint was the wrong shape for either: the
+        // one thing that must not happen is the operator believing a message
+        // is on its way to the model when it is sitting in the composer.
+        let (message, level) = match response {
             Ok(value) => match serde_json::from_value::<SteerResult>(value) {
                 Ok(result) if result.ok => {
                     self.apply(UiEvent::Queued { text, id: result.message_id });
                     return;
                 }
-                Ok(_) => "The engine could not queue the message; your draft was restored.",
-                Err(_) => "Could not confirm queuing; draft restored. The engine may already have received it.",
+                Ok(result) => (refusal_text(result.rejected_reason.as_deref()), NoticeLevel::Warning),
+                Err(_) => (UNCONFIRMED.to_string(), NoticeLevel::Warning),
             },
-            Err(_) => "Could not confirm queuing; draft restored. The engine may already have received it.",
+            Err(_) => (UNCONFIRMED.to_string(), NoticeLevel::Warning),
         };
         self.composer.set_text(text);
-        self.hint(hint);
+        self.notice(message, level);
     }
 
     /// Recall is engine-owned: an acknowledged message must never be edited
@@ -91,6 +129,38 @@ fn recalled_draft(messages: Vec<RecalledSteeringMessage>) -> (String, Vec<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_refusal_says_what_actually_happened_and_keeps_the_draft() {
+        let no_turn = refusal_text(Some("noActiveTurn"));
+        assert!(no_turn.contains("no turn running"), "{no_turn}");
+        assert!(no_turn.contains("new message"), "{no_turn}");
+
+        let ending = refusal_text(Some("turnEnding"));
+        assert!(ending.contains("already finishing"), "{ending}");
+
+        let empty = refusal_text(Some("emptyText"));
+        assert!(empty.contains("no text"), "{empty}");
+
+        // A reason this client has never heard of is reported verbatim rather
+        // than flattened into a guess.
+        let unknown = refusal_text(Some("someFutureReason"));
+        assert!(unknown.contains("someFutureReason"), "{unknown}");
+
+        let silent = refusal_text(None);
+        assert!(silent.contains("no reason"), "{silent}");
+
+        for text in [no_turn, ending, empty, unknown, silent] {
+            assert!(text.contains("back in the message box"), "{text}");
+            assert!(!text.contains("resent") && !text.contains("again"), "{text}");
+        }
+    }
+
+    #[test]
+    fn an_unconfirmed_steer_states_the_doubt_and_never_claims_it_was_sent() {
+        assert!(UNCONFIRMED.contains("not sent again"));
+        assert!(UNCONFIRMED.contains("may already have reached the queue"));
+    }
 
     #[test]
     fn recalled_draft_keeps_fifo_order_whitespace_and_newlines() {

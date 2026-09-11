@@ -109,6 +109,13 @@
           "items": {
             "$ref": "#/$defs/HistoryBlock"
           }
+        },
+        "steeringMessageId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The steering queue id this entry *is*, when the engine delivered a\nqueued operator message into the running turn.\n\nLive projection only, and never invented: a committed message carries\nno queue id, because the queue that minted it is gone by then.\n\nIt exists because a client that queued the message holds its own copy\nof the text and is told separately — by a `delivered` outcome — that\nit reached the model. Without an identity on the projection, that\nclient cannot tell whether the user block in a conversation it just\nre-read *is* the message it is still holding, and has to choose\nbetween showing it twice and not showing it at all. Two messages with\nidentical text are genuinely two messages, so the text cannot serve as\nthat identity."
         }
       },
       "required": [

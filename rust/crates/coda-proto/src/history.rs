@@ -176,6 +176,22 @@ pub struct HistoryEntry {
     #[serde(default = "default_entry_kind")]
     pub entry_kind: HistoryEntryKind,
     pub blocks: Vec<HistoryBlock>,
+    /// The steering queue id this entry *is*, when the engine delivered a
+    /// queued operator message into the running turn.
+    ///
+    /// Live projection only, and never invented: a committed message carries
+    /// no queue id, because the queue that minted it is gone by then.
+    ///
+    /// It exists because a client that queued the message holds its own copy
+    /// of the text and is told separately — by a `delivered` outcome — that
+    /// it reached the model. Without an identity on the projection, that
+    /// client cannot tell whether the user block in a conversation it just
+    /// re-read *is* the message it is still holding, and has to choose
+    /// between showing it twice and not showing it at all. Two messages with
+    /// identical text are genuinely two messages, so the text cannot serve as
+    /// that identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steering_message_id: Option<String>,
 }
 
 fn default_entry_kind() -> HistoryEntryKind {
@@ -193,7 +209,16 @@ impl HistoryEntry {
         } else {
             HistoryEntryKind::UserPrompt
         };
-        Self { index, role: role.to_string(), entry_kind, blocks }
+        Self { index, role: role.to_string(), entry_kind, blocks, steering_message_id: None }
+    }
+
+    /// Tags this entry as the delivered steering message `message_id`.
+    ///
+    /// See [`HistoryEntry::steering_message_id`]; only the live projection of
+    /// a running turn may set it.
+    pub fn from_steering(mut self, message_id: impl Into<String>) -> Self {
+        self.steering_message_id = Some(message_id.into());
+        self
     }
 }
 
@@ -299,6 +324,24 @@ mod tests {
         assert_eq!(v["entryKind"], "assistant");
         let back: HistoryEntry = serde_json::from_value(v).unwrap();
         assert_eq!(back, entry);
+    }
+
+    #[test]
+    fn an_ordinary_entry_carries_no_steering_id_and_a_tagged_one_round_trips() {
+        let plain = HistoryEntry::new(0, "user", vec![HistoryBlock::text_capped("hi", 1024)]);
+        let v = serde_json::to_value(&plain).unwrap();
+        assert!(
+            v.get("steeringMessageId").is_none(),
+            "a queue id is never invented for a message that was not steered: {v}"
+        );
+
+        let steered = HistoryEntry::new(1, "user", vec![HistoryBlock::text_capped("go", 1024)])
+            .from_steering("m1");
+        let v = serde_json::to_value(&steered).unwrap();
+        assert_eq!(v["steeringMessageId"], "m1");
+        assert_eq!(v["entryKind"], "userPrompt", "steering is text the operator typed");
+        let back: HistoryEntry = serde_json::from_value(v).unwrap();
+        assert_eq!(back, steered);
     }
 
     // ── A user-role tool-result message is not an operator prompt ────────

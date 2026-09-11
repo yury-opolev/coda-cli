@@ -685,7 +685,11 @@ impl App {
         // just as thoroughly, and a selection kept across one copies whatever
         // text now sits at those coordinates.
         self.selection.clear();
-        self.apply(UiEvent::Rehydrated { blocks: hydrated.blocks, notices });
+        // The claim travels with the rebuild, built from *this* answer's own
+        // fences rather than from the view's current numbers: what it vouches
+        // for is the committed prefix this read actually returned.
+        let coverage = Some(crate::coverage::HistoryCoverage::of_read(&history));
+        self.apply(UiEvent::Rehydrated { blocks: hydrated.blocks, notices, coverage });
     }
 
     /// The window of the conversation this client asks for.
@@ -2164,7 +2168,11 @@ pub(in crate::app) mod tests {
 
     /// A `session/getState` answer, built from the real DTO so a field this
     /// client depends on cannot quietly stop being sent.
-    fn snapshot_value(cursor: i64, history_length: i64, max_history_page: i64) -> Value {
+    pub(in crate::app) fn snapshot_value(
+        cursor: i64,
+        history_length: i64,
+        max_history_page: i64,
+    ) -> Value {
         use coda_proto::state::*;
         let snapshot = StateSnapshot {
             contract_version: CONTRACT_VERSION.into(),
@@ -2280,6 +2288,266 @@ pub(in crate::app) mod tests {
             .filter(|frame| frame["method"].as_str() == Some(method))
             .map(|frame| &frame["params"])
             .collect()
+    }
+
+    // -- Live reasoning ------------------------------------------------------
+
+    /// A snapshot of a busy engine in `phase`, with the engine's own measure
+    /// of how long it has been in it.
+    fn snapshot_in_phase(
+        cursor: i64,
+        history_length: i64,
+        phase: coda_proto::state::ActivityPhase,
+        phase_elapsed_ms: Option<i64>,
+    ) -> Value {
+        use coda_proto::state::*;
+        let mut value = snapshot_value(cursor, history_length, 500);
+        let active = ActiveConfig {
+            provider_id: None,
+            model: "m".into(),
+            effort: None,
+            effort_is_auto: true,
+            permission_mode: "default".into(),
+            system_prompt_source: "default".into(),
+        };
+        let turn = TurnState {
+            turn_id: "t1".into(),
+            started_at: "2026-01-01T00:00:00Z".into(),
+            elapsed_ms: Some(9_000),
+            phase,
+            phase_since: "2026-01-01T00:00:00Z".into(),
+            phase_elapsed_ms,
+            model_request: None,
+            batches: Vec::new(),
+            live_entries: Vec::new(),
+            live_truncated: false,
+            live_omitted_bytes: 0,
+            active_config: active,
+            concurrent: ConcurrentCounters::default(),
+        };
+        value["lifecycle"] = json!("busy");
+        value["turn"] = serde_json::to_value(turn).expect("turn");
+        value
+    }
+
+    /// The rows the transcript actually draws.
+    fn rendered(app: &App) -> Vec<String> {
+        app.state
+            .transcript
+            .render(80, coda_render::tool::ToolDisplayMode::Summary)
+            .into_iter()
+            .map(|row| row.text)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn reasoning_the_snapshot_covers_is_shown_live_not_only_once_it_ends() {
+        // The reported failure, through the public API. The first
+        // `event/thinking` (a bodyless `ThinkingStarted`) arrives while a
+        // state read is in flight, so it is buffered; the snapshot's cursor
+        // then covers it and it is dropped as already reflected. A snapshot
+        // carries no conversation content, so nothing put a reasoning row on
+        // screen and the turn showed no sign of reasoning until
+        // `event/thinkingComplete` — "reasoning only appears after thinking".
+        const CURSOR: i64 = 12;
+        let mut harness = app_answering(crate::local::AccessMode::TrustedLocal, |method, _| {
+            match method {
+                "session/getState" => Ok(snapshot_in_phase(
+                    CURSOR,
+                    0,
+                    coda_proto::state::ActivityPhase::Reasoning,
+                    Some(4_000),
+                )),
+                _ => Ok(json!({})),
+            }
+        });
+        let app = &mut harness.app;
+        app.needs_rehydrate = false;
+        app.needs_resync = true;
+
+        // The engine streams the start of reasoning while the read is out.
+        app.view.begin_resync();
+        for frame in app.accept(
+            "event/thinking".into(),
+            Some(json!({ "delta": "", "seq": 11, "engineInstanceId": "e1" })),
+        ) {
+            app.dispatch_frame(frame);
+        }
+
+        let start = std::time::Instant::now();
+        app.settle_with_engine_at(start).await;
+
+        let rows = rendered(app);
+        assert!(
+            rows.iter().any(|row| row.contains("Thinking...")),
+            "the model is reasoning now and the screen does not say so: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("Thinking... 4s")),
+            "the engine's own measure of the burst was ignored: {rows:?}"
+        );
+        assert_eq!(app.state.activity, crate::state::Activity::Thinking);
+
+        // And it keeps time while the provider stays silent.
+        assert!(app.state.tick_thinking(start + std::time::Duration::from_millis(2_500)));
+        assert!(
+            rendered(app).iter().any(|row| row.contains("Thinking... 6s")),
+            "the live clock stopped: {:?}",
+            rendered(app)
+        );
+        // And the loop wakes itself to keep drawing it: an engine that says
+        // nothing more until the burst ends must still show a moving clock.
+        app.frame_deadline = None;
+        app.arm_spinner_wakeup();
+        assert!(
+            app.frame_deadline.is_some(),
+            "nothing would wake the loop, so the clock would freeze on screen"
+        );
+
+        // The completion the client *can* see freezes it, in place.
+        for frame in app.accept(
+            "event/thinkingComplete".into(),
+            Some(json!({ "elapsedMs": 7_000, "seq": 13, "engineInstanceId": "e1" })),
+        ) {
+            app.dispatch_frame(frame);
+        }
+        let thinking = app
+            .state
+            .transcript
+            .blocks()
+            .iter()
+            .filter(|block| matches!(block, Block::Thinking { .. }))
+            .count();
+        assert_eq!(thinking, 1, "the burst was shown twice");
+        assert!(rendered(app).iter().any(|row| row.contains("Thought for 7s")));
+        assert!(!app.state.tick_thinking(start + std::time::Duration::from_secs(30)));
+    }
+
+    #[tokio::test]
+    async fn a_conversation_reread_mid_burst_keeps_the_reasoning_live() {
+        // The other half of the same failure: the read returns the running
+        // turn's reasoning as a live entry, and hydrating it as *finished*
+        // replaced the live row with a completed one and stopped its clock.
+        const TOTAL: i64 = 2;
+        const CURSOR: i64 = 12;
+        let mut harness = app_answering(crate::local::AccessMode::TrustedLocal, |method, params| {
+            match method {
+                "session/getState" => Ok(snapshot_in_phase(
+                    CURSOR,
+                    TOTAL,
+                    coda_proto::state::ActivityPhase::Reasoning,
+                    None,
+                )),
+                "session/getHistory" => {
+                    let mut page = history_page(params, TOTAL, CURSOR, 500)?;
+                    page["liveEntries"] = json!([{
+                        "index": TOTAL,
+                        "role": "assistant",
+                        "entryKind": "assistant",
+                        "blocks": [{ "kind": "reasoningSummary", "text": "half a thought", "redacted": false }],
+                    }]);
+                    page["liveTruncated"] = json!(false);
+                    Ok(page)
+                }
+                _ => Ok(json!({})),
+            }
+        });
+        let app = &mut harness.app;
+        app.needs_resync = true;
+        app.needs_rehydrate = true;
+
+        let start = std::time::Instant::now();
+        app.settle_with_engine_at(start).await;
+
+        assert!(
+            matches!(
+                app.state.transcript.blocks().last(),
+                Some(Block::Thinking { complete: false, .. })
+            ),
+            "the running burst was rebuilt as history: {:?}",
+            app.state.transcript.blocks().last()
+        );
+        assert!(app.state.tick_thinking(start + std::time::Duration::from_millis(3_500)));
+        assert!(rendered(app).iter().any(|row| row.contains("Thinking... 3s")));
+
+        // The rest of the same burst still lands in the same row.
+        for frame in app.accept(
+            "event/thinking".into(),
+            Some(json!({ "delta": ", continued", "seq": 13, "engineInstanceId": "e1" })),
+        ) {
+            app.dispatch_frame(frame);
+        }
+        let bursts: Vec<&Block> = app
+            .state
+            .transcript
+            .blocks()
+            .iter()
+            .filter(|block| matches!(block, Block::Thinking { .. }))
+            .collect();
+        assert_eq!(bursts.len(), 1, "the burst was split in two: {bursts:?}");
+        assert!(matches!(bursts[0], Block::Thinking { text, .. } if text == "half a thought, continued"));
+    }
+
+    #[tokio::test]
+    async fn a_busy_engine_that_is_not_reasoning_never_shows_a_reasoning_row() {
+        // The guard on the fix: only an authoritative `reasoning` phase may
+        // put a row on screen. Waiting, responding and running tools must
+        // never be dressed up as reasoning the provider never reported.
+        use coda_proto::state::ActivityPhase as P;
+        for phase in [P::WaitingForModel, P::Preparing, P::Responding, P::RunningTools] {
+            let mut harness = app_answering(crate::local::AccessMode::TrustedLocal, move |m, _| {
+                match m {
+                    "session/getState" => Ok(snapshot_in_phase(12, 0, phase, Some(30_000))),
+                    _ => Ok(json!({})),
+                }
+            });
+            let app = &mut harness.app;
+            app.needs_rehydrate = false;
+            app.needs_resync = true;
+            app.settle_with_engine_at(std::time::Instant::now()).await;
+            assert!(
+                !app.state.transcript.blocks().iter().any(|b| matches!(b, Block::Thinking { .. })),
+                "{phase:?} invented a reasoning row"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_phase_that_has_not_caught_up_does_not_reopen_a_finished_burst() {
+        // A snapshot taken between `thinkingComplete` and whatever the model
+        // does next can still name the phase the burst ran in. That is not a
+        // second burst, and it must not restart a clock that is frozen.
+        let mut harness = app_answering(crate::local::AccessMode::TrustedLocal, |method, _| {
+            match method {
+                "session/getState" => Ok(snapshot_in_phase(
+                    12,
+                    0,
+                    coda_proto::state::ActivityPhase::Reasoning,
+                    Some(90_000),
+                )),
+                _ => Ok(json!({})),
+            }
+        });
+        let app = &mut harness.app;
+        app.needs_rehydrate = false;
+        app.apply(UiEvent::Engine(Event::Thinking { delta: "done thinking".into() }));
+        app.apply(UiEvent::Engine(Event::ThinkingComplete {
+            elapsed_ms: 2_000,
+            thinking_tokens: None,
+        }));
+
+        app.needs_resync = true;
+        app.settle_with_engine_at(std::time::Instant::now()).await;
+
+        let bursts: Vec<&Block> = app
+            .state
+            .transcript
+            .blocks()
+            .iter()
+            .filter(|block| matches!(block, Block::Thinking { .. }))
+            .collect();
+        assert_eq!(bursts.len(), 1, "a finished burst was reopened: {bursts:?}");
+        assert!(matches!(bursts[0], Block::Thinking { complete: true, elapsed_ms: 2_000, .. }));
     }
 
     #[tokio::test]
@@ -2617,16 +2885,568 @@ pub(in crate::app) mod tests {
         let mut harness = app_with(crate::local::AccessMode::TrustedLocal, |_, _| json!({}));
         let app = &mut harness.app;
         app.apply(UiEvent::Queued { text: "already delivered".into(), id: Some("queued-1".into()) });
-        app.apply(UiEvent::Rehydrated { blocks: vec![Block::User {
-            text: "already delivered".into(), timestamp: String::new(),
-            pending: false, queue_id: None,
-        }], notices: Vec::new() });
+        app.apply(UiEvent::Rehydrated {
+            blocks: vec![Block::User {
+                text: "already delivered".into(),
+                timestamp: String::new(),
+                pending: false,
+                queue_id: None,
+            }],
+            notices: Vec::new(),
+            coverage: None,
+        });
         app.view.note_history_read(10);
         app.dispatch_frame(Frame::new("event/steeringDelivered", Some(json!({
             "seq": 5, "messageIds": ["queued-1"],
         }))));
         assert!(app.state.queued.is_empty(), "known delivery must not remain pending");
         assert_eq!(user_texts(app), ["already delivered"]);
+        assert!(
+            app.state.unsent.is_empty(),
+            "a delivery the conversation already shows is not a draft to resend"
+        );
+        assert!(
+            !notices(app).iter().any(|n| n.contains("not sent")),
+            "nothing was lost, so nothing may be announced as lost: {:?}",
+            notices(app)
+        );
+    }
+
+    /// The same fence, for a message the turn end had already stranded.
+    ///
+    /// A legacy `event/steeringDelivered` that arrives *after* the
+    /// conversation was re-read carries a seq the read already covers, so its
+    /// content is on screen and the only thing left to do is settle the
+    /// receipt. Appending would double it; leaving it in the recovery list
+    /// would describe a delivered message as never sent.
+    #[tokio::test]
+    async fn a_reflected_delivery_settles_a_stranded_receipt_without_appending_it() {
+        let mut harness = app_with(crate::local::AccessMode::TrustedLocal, |_, _| json!({}));
+        let app = &mut harness.app;
+        app.apply(UiEvent::Queued {
+            text: "already delivered".into(),
+            id: Some("queued-1".into()),
+        });
+        app.apply(UiEvent::TurnFinished { interrupted: false, error: None });
+        assert_eq!(app.state.unsent.len(), 1, "with no news, it is kept recoverable");
+        app.apply(UiEvent::Rehydrated {
+            blocks: vec![Block::User {
+                text: "already delivered".into(),
+                timestamp: String::new(),
+                pending: false,
+                queue_id: None,
+            }],
+            notices: Vec::new(),
+            coverage: None,
+        });
+        app.view.note_history_read(10);
+
+        app.dispatch_frame(Frame::new(
+            "event/steeringDelivered",
+            Some(json!({ "seq": 5, "messageIds": ["queued-1"] })),
+        ));
+
+        assert_eq!(user_texts(app), ["already delivered"], "the covered content was re-applied");
+        assert!(app.state.unsent.is_empty(), "a delivered message is not a draft to resend");
+        assert!(app.state.queued.is_empty());
+    }
+
+    /// The delivery reports are lost, the conversation is re-read, and the
+    /// *retained* outcome then arrives on a snapshot.
+    ///
+    /// This is the postcommit gap, end to end and through the real RPC. The
+    /// engine publishes a delivery twice — the `steering` projection in
+    /// `session/getState` and the legacy `event/steeringDelivered` — and both
+    /// can be lost: a gap in the event stream takes the notification, and the
+    /// first state read this client manages is refused. What it does get is
+    /// the conversation, which by then already contains the delivered message
+    /// as an ordinary committed prompt with **no queue id** on it. The next
+    /// successful snapshot still carries the `delivered` outcome, because the
+    /// outcome ring is retained — and acting on that alone appends a second
+    /// copy underneath a conversation that already shows it.
+    #[tokio::test]
+    async fn a_retained_delivery_outcome_does_not_re_append_a_message_the_rebuilt_conversation_shows()
+    {
+        const FOLLOW_UP: &str = "operator correction";
+        // Four committed entries: the prompt, the reply, the steering message
+        // the engine committed into the same turn, and the rest of the reply.
+        // Committed history carries no steering id — only the *live*
+        // projection does — so identity cannot be recovered from the rebuild.
+        let committed = json!([
+            { "index": 0, "role": "user", "entryKind": "userPrompt",
+              "blocks": [{ "kind": "text", "text": "start" }] },
+            { "index": 1, "role": "assistant", "entryKind": "assistant",
+              "blocks": [{ "kind": "text", "text": "answer" }] },
+            { "index": 2, "role": "user", "entryKind": "userPrompt",
+              "blocks": [{ "kind": "text", "text": FOLLOW_UP }] },
+            { "index": 3, "role": "assistant", "entryKind": "assistant",
+              "blocks": [{ "kind": "text", "text": "done" }] },
+        ]);
+        let state_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&state_reads);
+        let mut harness = app_answering(crate::local::AccessMode::TrustedLocal, move |method, _| {
+            match method {
+                "session/getState" => {
+                    // The first read is refused. The two reads have
+                    // independent backoffs, so the conversation can be
+                    // rebuilt before any snapshot has ever been applied.
+                    if counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        return Err((-32000, "engine busy".into()));
+                    }
+                    let mut snapshot: coda_proto::state::StateSnapshot =
+                        serde_json::from_value(snapshot_value(20, 4, 500)).expect("snapshot");
+                    // The turn is over: `end_turn` committed the text and
+                    // cleared the turn in the same transaction.
+                    snapshot.turn = None;
+                    snapshot.steering = coda_proto::state::SteeringQueueState {
+                        outcomes: vec![coda_proto::state::SteeringOutcomeDto {
+                            message_id: "m1".into(),
+                            outcome: coda_proto::state::SteeringOutcomeKind::Delivered,
+                            at: "2026-01-01T00:00:01Z".into(),
+                            turn_id: Some("t1".into()),
+                        }],
+                        ..Default::default()
+                    };
+                    Ok(serde_json::to_value(snapshot).expect("snapshot"))
+                }
+                "session/getHistory" => Ok(json!({
+                    "sessionId": "s1",
+                    "engineInstanceId": "e1",
+                    "isLiveSession": true,
+                    "historyEpoch": 0,
+                    "cursor": 20,
+                    "historyLength": 4,
+                    "entries": committed,
+                    "nextIndex": 4,
+                    "totalKnown": 4,
+                    "truncated": false,
+                })),
+                _ => Ok(json!({})),
+            }
+        });
+        let app = &mut harness.app;
+
+        // The operator typed a follow-up while the turn was running, and the
+        // engine acknowledged it into its queue.
+        app.apply(UiEvent::Submitted { text: "start".into() });
+        app.apply(UiEvent::Engine(coda_proto::Event::AssistantText { delta: "answer".into() }));
+        app.apply(UiEvent::Queued { text: FOLLOW_UP.into(), id: Some("m1".into()) });
+
+        // The engine's events 5..9 never arrived — `event/steeringDelivered`
+        // was among them — so the notification is simply gone.
+        app.dispatch_frame(Frame::new(
+            "event/eventsDropped",
+            Some(json!({ "seq": 10, "engineInstanceId": "e1", "fromCursor": 5, "toCursor": 9 })),
+        ));
+        // The turn ends without this client ever having heard of the
+        // delivery, which strands the follow-up in the recovery list.
+        app.apply(UiEvent::TurnFinished { interrupted: false, error: None });
+        assert_eq!(app.state.unsent.len(), 1, "with no news, the message is kept recoverable");
+        // The fence moves with the turn's own state frame.
+        app.dispatch_frame(Frame::new(
+            "stateEvents/turnEnded",
+            Some(json!({
+                "seq": 11, "engineInstanceId": "e1", "turnId": "t1",
+                "endedAt": "2026-01-01T00:00:02Z", "stopReason": "endTurn",
+                "interrupted": false, "historyEpoch": 0, "historyLength": 4,
+            })),
+        ));
+
+        // First settle: the state read is refused, the conversation is read.
+        let now = std::time::Instant::now();
+        app.settle_with_engine_at(now).await;
+        assert_eq!(
+            user_texts(app).iter().filter(|t| *t == FOLLOW_UP).count(),
+            1,
+            "the rebuilt conversation shows it once: {:?}",
+            user_texts(app)
+        );
+
+        // Second settle: the snapshot lands, still carrying the retained
+        // `delivered` outcome for a message this client is still holding.
+        app.settle_with_engine_at(now + std::time::Duration::from_secs(60)).await;
+        assert!(
+            state_reads.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the snapshot under test was never read"
+        );
+
+        let shown = user_texts(app);
+        assert_eq!(
+            shown.iter().filter(|t| *t == FOLLOW_UP).count(),
+            1,
+            "the retained outcome appended a second copy: {shown:?}"
+        );
+        assert_eq!(
+            shown,
+            ["start", "answer", FOLLOW_UP, "done"],
+            "it must stay where the engine committed it, not move to the end: {shown:?}"
+        );
+        assert!(app.state.unsent.is_empty(), "a delivered message is never offered for resend");
+        assert!(app.state.queued.is_empty());
+        let said = notices(app);
+        assert!(
+            !said.iter().any(|n| n.contains("confirmed only now") || n.contains("did reach")),
+            "nothing was placed late, so nothing may claim it was: {said:?}"
+        );
+    }
+
+    /// The engine's state moves before its notification does: the steering
+    /// queue transaction publishes `event/steeringQueue`, this client
+    /// re-reads `session/getState`, and only afterwards does the agent's own
+    /// `event/steeringDelivered` reach it. Driven through the real RPC rather
+    /// than a hand-built reducer input, because the ordering *is* the bug.
+    #[tokio::test]
+    async fn a_snapshot_that_beats_the_delivery_event_still_puts_the_follow_up_on_screen() {
+        let mut harness = app_with(crate::local::AccessMode::TrustedLocal, |method, _| {
+            if method != "session/getState" {
+                return json!({});
+            }
+            let mut snapshot: coda_proto::state::StateSnapshot =
+                serde_json::from_value(snapshot_value(6, 0, 500)).expect("snapshot");
+            snapshot.lifecycle = coda_proto::state::EngineLifecycle::Busy;
+            snapshot.turn = Some(coda_proto::state::TurnState {
+                turn_id: "t1".into(),
+                started_at: "2026-01-01T00:00:00Z".into(),
+                elapsed_ms: Some(1_000),
+                phase: coda_proto::state::ActivityPhase::Responding,
+                phase_since: "2026-01-01T00:00:00Z".into(),
+                phase_elapsed_ms: Some(1_000),
+                model_request: None,
+                batches: Vec::new(),
+                live_entries: Vec::new(),
+                live_truncated: false,
+                live_omitted_bytes: 0,
+                active_config: snapshot.config.next.clone(),
+                concurrent: Default::default(),
+            });
+            snapshot.steering = coda_proto::state::SteeringQueueState {
+                outcomes: vec![coda_proto::state::SteeringOutcomeDto {
+                    message_id: "q1".into(),
+                    outcome: coda_proto::state::SteeringOutcomeKind::Delivered,
+                    at: "2026-01-01T00:00:01Z".into(),
+                    turn_id: Some("t1".into()),
+                }],
+                ..Default::default()
+            };
+            serde_json::to_value(snapshot).expect("snapshot")
+        });
+        let app = &mut harness.app;
+        app.needs_rehydrate = false;
+        app.apply(UiEvent::Submitted { text: "start".into() });
+        app.apply(UiEvent::Engine(coda_proto::events::Event::AssistantText {
+            delta: "half a reply".into(),
+        }));
+        app.apply(UiEvent::Queued {
+            text: "operator correction".into(),
+            id: Some("q1".into()),
+        });
+
+        // The engine announces that its queue moved; this client re-reads.
+        app.dispatch_frame(Frame::new(
+            "event/steeringQueue",
+            Some(json!({ "seq": 6, "pendingCount": 0, "pending": [], "outcomes": [] })),
+        ));
+        assert!(app.needs_resync, "a queue announcement owes a re-read");
+        app.settle_with_engine_at(std::time::Instant::now()).await;
+        assert!(
+            harness.calls.lock().unwrap().contains(&"session/getState".to_string()),
+            "the snapshot must come from the engine, not from a fixture"
+        );
+
+        // ... and only now does the agent's own notification arrive.
+        let app = &mut harness.app;
+        app.dispatch_frame(Frame::new(
+            "event/steeringDelivered",
+            Some(json!({ "seq": 7, "messageIds": ["q1"] })),
+        ));
+        app.apply(UiEvent::TurnFinished { interrupted: false, error: None });
+
+        assert_eq!(
+            user_texts(app),
+            ["start", "half a reply", "operator correction"],
+            "the delivered follow-up must be in the conversation, once, after the reply"
+        );
+        assert!(app.state.queued.is_empty());
+        assert!(app.state.unsent.is_empty(), "a delivered message is never offered for resend");
+    }
+
+    // -- A whole queue, not a single follow-up ------------------------------
+
+    const BATCH: usize = 16;
+    const REPEATS: usize = 4;
+
+    /// Twenty acknowledged follow-ups: sixteen distinct, and four that say
+    /// the same thing as each other. Saying the same thing twice is something
+    /// people do, and each one is its own message.
+    fn queue_ids() -> Vec<String> {
+        (0..BATCH)
+            .map(|i| format!("q{i:02}"))
+            .chain((0..REPEATS).map(|i| format!("same-{i}")))
+            .collect()
+    }
+
+    fn queue_text(id: &str) -> String {
+        if id.starts_with("same-") {
+            "say it again".to_string()
+        } else {
+            format!("follow-up {id}")
+        }
+    }
+
+    fn steering_value(pending: &[String], done: &[String]) -> Value {
+        json!({
+            "pendingCount": pending.len(),
+            "pending": pending.iter().map(|id| json!({
+                "messageId": id,
+                "enqueuedAt": "2026-01-01T00:00:00Z",
+                "text": queue_text(id),
+                "textLength": queue_text(id).len(),
+                "textTruncated": false,
+            })).collect::<Vec<_>>(),
+            "outcomes": done.iter().map(|id| json!({
+                "messageId": id,
+                "outcome": "delivered",
+                "at": "2026-01-01T00:00:01Z",
+                "turnId": "t1",
+            })).collect::<Vec<_>>(),
+            "outcomesTruncated": false,
+            "retainedOutcomes": 64,
+        })
+    }
+
+    /// A snapshot of the turn `t1` mid-flight, with the queue as the engine
+    /// publishes it.
+    fn running_with_queue(cursor: i64, history_length: i64, pending: &[String], done: &[String]) -> Value {
+        let mut value = snapshot_in_phase(
+            cursor,
+            history_length,
+            coda_proto::state::ActivityPhase::Responding,
+            Some(1_000),
+        );
+        value["steering"] = steering_value(pending, done);
+        value
+    }
+
+    /// A `session/getHistory` answer whose live turn projects the steering
+    /// messages the engine has already delivered — carrying the queue ids,
+    /// which is the only thing that identifies them.
+    fn history_with_live(cursor: i64, committed: &[&str], live_delivered: &[String]) -> Value {
+        let entries: Vec<Value> = committed
+            .iter()
+            .enumerate()
+            .map(|(index, text)| json!({
+                "index": index,
+                "role": if index % 2 == 1 { "assistant" } else { "user" },
+                "entryKind": if index % 2 == 1 { "assistant" } else { "userPrompt" },
+                "blocks": [{ "kind": "text", "text": text }],
+            }))
+            .collect();
+        let mut live: Vec<Value> = vec![json!({
+            "index": 0,
+            "role": "assistant",
+            "entryKind": "assistant",
+            "blocks": [{ "kind": "text", "text": "half a reply" }],
+        })];
+        live.extend(live_delivered.iter().enumerate().map(|(offset, id)| json!({
+            "index": offset + 1,
+            "role": "user",
+            "entryKind": "userPrompt",
+            "blocks": [{ "kind": "text", "text": queue_text(id) }],
+            "steeringMessageId": id,
+        })));
+        json!({
+            "sessionId": "s1",
+            "engineInstanceId": "e1",
+            "isLiveSession": true,
+            "historyEpoch": 0,
+            "cursor": cursor,
+            "historyLength": committed.len(),
+            "entries": entries,
+            "nextIndex": committed.len(),
+            "totalKnown": committed.len(),
+            "truncated": false,
+            "liveEntries": live,
+            "liveTruncated": false,
+            "liveOmittedBytes": 0,
+        })
+    }
+
+    /// How many times each queued message is on screen.
+    fn tally(app: &App, ids: &[String]) -> Vec<(String, usize)> {
+        let shown = user_texts(app);
+        ids.iter()
+            .map(|id| {
+                let text = queue_text(id);
+                let count = shown.iter().filter(|t| **t == text).count();
+                (id.clone(), count)
+            })
+            .collect()
+    }
+
+    fn assert_each_once(app: &App, ids: &[String], where_: &str) {
+        let shown = user_texts(app);
+        for (id, count) in tally(app, ids) {
+            let expected = if id.starts_with("same-") { REPEATS } else { 1 };
+            assert_eq!(
+                count, expected,
+                "{where_}: {id} ({:?}) is on screen {count} times, expected {expected}: {shown:?}",
+                queue_text(&id)
+            );
+        }
+    }
+
+    /// Twenty queued follow-ups, delivered in waves, with the two delivery
+    /// reports racing a different way round each time — and then the turn
+    /// committing and the conversation being rebuilt on top.
+    ///
+    /// The single-message tests cannot see what a queue does: a wave that is
+    /// settled by a snapshot the client already applied, a notification whose
+    /// content a history read already covers, and a rebuild that replaces the
+    /// lot are all *batch* behaviours. Every message reached the model, so
+    /// every one belongs in the conversation exactly once — none dropped,
+    /// none doubled, and none quietly moved to the recovery list as though it
+    /// had never been sent.
+    #[tokio::test]
+    async fn a_whole_queue_of_follow_ups_is_shown_once_each_through_the_real_pipeline() {
+        let ids = queue_ids();
+        let committed_after: Vec<String> = std::iter::once("start".to_string())
+            .chain(std::iter::once("half a reply".to_string()))
+            .chain(ids.iter().map(|id| queue_text(id)))
+            .chain(std::iter::once("the rest of the reply".to_string()))
+            .collect();
+
+        let state_answer = Arc::new(Mutex::new(running_with_queue(10, 0, &ids, &[])));
+        let history_answer = Arc::new(Mutex::new(history_with_live(10, &[], &[])));
+        let (states, histories) = (Arc::clone(&state_answer), Arc::clone(&history_answer));
+        let mut harness = app_answering(crate::local::AccessMode::TrustedLocal, move |method, _| {
+            match method {
+                "session/getState" => Ok(states.lock().expect("state").clone()),
+                "session/getHistory" => Ok(histories.lock().expect("history").clone()),
+                _ => Ok(json!({})),
+            }
+        });
+        let app = &mut harness.app;
+        app.needs_rehydrate = false;
+        app.needs_resync = false;
+
+        app.apply(UiEvent::Submitted { text: "start".into() });
+        app.apply(UiEvent::Engine(coda_proto::events::Event::AssistantText {
+            delta: "half a reply".into(),
+        }));
+        for id in &ids {
+            app.apply(UiEvent::Queued { text: queue_text(id), id: Some(id.clone()) });
+        }
+        assert_eq!(app.state.queued.len(), ids.len(), "every one was acknowledged");
+
+        // Wave one: the notification wins the race, the snapshot follows.
+        let wave_one = &ids[..5];
+        app.dispatch_frame(Frame::new(
+            "event/steeringDelivered",
+            Some(json!({ "seq": 11, "engineInstanceId": "e1", "messageIds": wave_one })),
+        ));
+        // A delivery reported mid-reply waits for a block boundary rather
+        // than splitting the reply in two; the reply ending is that boundary.
+        app.dispatch_frame(Frame::new(
+            "event/assistantTextComplete",
+            Some(json!({ "seq": 12, "engineInstanceId": "e1" })),
+        ));
+        *state_answer.lock().expect("state") = running_with_queue(12, 0, &ids[5..], wave_one);
+        harness.app.needs_resync = true;
+        harness.app.settle_with_engine_at(std::time::Instant::now()).await;
+        assert_each_once(&harness.app, wave_one, "after wave one");
+
+        // Wave two: the state read wins it, the notification arrives after.
+        let wave_two = &ids[5..10];
+        *state_answer.lock().expect("state") = running_with_queue(14, 0, &ids[10..], &ids[..10]);
+        harness.app.needs_resync = true;
+        harness.app.settle_with_engine_at(std::time::Instant::now()).await;
+        harness.app.dispatch_frame(Frame::new(
+            "event/steeringDelivered",
+            Some(json!({ "seq": 15, "engineInstanceId": "e1", "messageIds": wave_two })),
+        ));
+        assert_each_once(&harness.app, &ids[..10], "after wave two");
+
+        // Wave three: the conversation is re-read first — its live projection
+        // carries the delivered messages *and their queue ids* — and the
+        // notification that follows is one the read already covers, so its
+        // content must be settled rather than applied a second time.
+        let wave_three = &ids[10..];
+        *state_answer.lock().expect("state") = running_with_queue(20, 0, &[], &ids);
+        *history_answer.lock().expect("history") = history_with_live(20, &[], &ids);
+        harness.app.needs_resync = true;
+        harness.app.needs_rehydrate = true;
+        harness.app.settle_with_engine_at(std::time::Instant::now()).await;
+        harness.app.dispatch_frame(Frame::new(
+            "event/steeringDelivered",
+            Some(json!({ "seq": 18, "engineInstanceId": "e1", "messageIds": wave_three })),
+        ));
+        assert_each_once(&harness.app, &ids, "after wave three");
+        assert!(
+            harness.app.state.queued.is_empty(),
+            "the engine holds none of them: {:?}",
+            harness.app.state.queued
+        );
+        assert!(
+            harness.app.state.unsent.is_empty(),
+            "delivered messages must never be offered for resend: {:?}",
+            harness.app.state.unsent
+        );
+
+        // The turn commits. The conversation comes back with every follow-up
+        // as an ordinary committed prompt — no queue ids on any of them — and
+        // the snapshot keeps republishing all twenty retained outcomes.
+        let committed: Vec<&str> = committed_after.iter().map(String::as_str).collect();
+        let mut settled = running_with_queue(30, committed.len() as i64, &[], &ids);
+        settled["turn"] = Value::Null;
+        settled["lifecycle"] = json!("ready");
+        *state_answer.lock().expect("state") = settled;
+        *history_answer.lock().expect("history") = json!({
+            "sessionId": "s1",
+            "engineInstanceId": "e1",
+            "isLiveSession": true,
+            "historyEpoch": 0,
+            "cursor": 30,
+            "historyLength": committed.len(),
+            "entries": committed.iter().enumerate().map(|(index, text)| json!({
+                "index": index,
+                "role": if *text == "half a reply" || *text == "the rest of the reply" {
+                    "assistant"
+                } else {
+                    "user"
+                },
+                "entryKind": if *text == "half a reply" || *text == "the rest of the reply" {
+                    "assistant"
+                } else {
+                    "userPrompt"
+                },
+                "blocks": [{ "kind": "text", "text": text }],
+            })).collect::<Vec<_>>(),
+            "nextIndex": committed.len(),
+            "totalKnown": committed.len(),
+            "truncated": false,
+        });
+        harness.app.apply(UiEvent::TurnFinished { interrupted: false, error: None });
+        harness.app.needs_resync = true;
+        harness.app.needs_rehydrate = true;
+        harness.app.settle_with_engine_at(std::time::Instant::now()).await;
+        // And once more, because a retained outcome is republished on every
+        // read: the second one must add nothing either.
+        harness.app.needs_resync = true;
+        harness.app.settle_with_engine_at(std::time::Instant::now()).await;
+
+        assert_each_once(&harness.app, &ids, "after the conversation was rebuilt");
+        let shown = user_texts(&harness.app);
+        assert_eq!(
+            shown, committed_after,
+            "the rebuilt conversation must be exactly what the engine committed"
+        );
+        assert!(harness.app.state.unsent.is_empty(), "nothing may be offered for resend");
+        assert!(harness.app.state.queued.is_empty());
+        let said = notices(&harness.app);
+        assert!(
+            !said.iter().any(|n| n.contains("were not sent")),
+            "no delivered message may be announced as unsent: {said:?}"
+        );
     }
 
     // -- A peer that never answers ------------------------------------------

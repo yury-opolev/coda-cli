@@ -302,6 +302,14 @@ impl StateInner {
         if let Some(t) = self.turn.as_mut() {
             t.live.flush_thinking();
         }
+        // The burst ended, and the model request that produced it is still
+        // open. Leaving `reasoning` set made every snapshot taken through the
+        // silence that follows claim the model was still reasoning; the phase
+        // it started in is what is true again. Only `reasoning` is left —
+        // text or tools have already moved it on themselves.
+        if self.turn.as_ref().is_some_and(|t| t.phase == ActivityPhase::Reasoning) {
+            return self.set_phase(ActivityPhase::WaitingForModel);
+        }
         Vec::new()
     }
 
@@ -1019,9 +1027,20 @@ impl EngineState {
         });
     }
 
+    /// Delivery: the operator's message reached the model.
+    ///
+    /// The text is added to the running turn's **live projection** in the
+    /// same transaction that records the outcome, so no reader can ever see
+    /// "delivered" without also seeing what was delivered. Before this, a
+    /// client polling `session/getState` or `session/getHistory` mid-turn was
+    /// told the message had reached the model while the conversation it was
+    /// handed contained no trace of it — and a client that trusted the
+    /// coverage that read implies then dropped its own copy, which is how a
+    /// delivered follow-up disappeared from the screen entirely.
     pub fn steering_delivered(&self, message_ids: &[String], turn_id: Option<&str>) {
         let (ids, turn_id) = (message_ids.to_vec(), turn_id.map(|s| s.to_string()));
         self.transact(move |s| {
+            project_delivered_steering(s, &ids, turn_id.as_deref());
             record_outcomes(s, &ids, SteeringOutcomeKind::Delivered, turn_id.as_deref())
         });
     }
@@ -1286,8 +1305,54 @@ impl requests::RequestObserver for EngineState {
     }
 }
 
+/// Adds delivered steering text to the running turn's live projection.
+///
+/// Called from inside [`EngineState::steering_delivered`]'s transaction,
+/// immediately before the outcomes are recorded — while the entries it reads
+/// are still in `steering_pending` and while STATE is held, so the projection
+/// and the outcome become visible together or not at all.
+///
+/// Three things it deliberately does not do:
+///
+/// - it does not project into a turn the delivery does not belong to. A late
+///   notification whose `turn_id` is not the running turn would otherwise
+///   write the previous turn's message into this one's transcript.
+/// - it does not append an id that already has a `delivered` outcome, so a
+///   repeated notification cannot double the text.
+/// - it does not invent text. An id the queue is not holding contributes
+///   nothing rather than an empty or guessed message.
+fn project_delivered_steering(s: &mut StateInner, ids: &[String], turn_id: Option<&str>) {
+    if ids.is_empty() || turn_id.is_none() || s.current_turn_id() != turn_id {
+        return;
+    }
+    let mut deliver: Vec<(String, String, Option<i64>)> = Vec::new();
+    for id in ids {
+        let already = s
+            .steering_outcomes
+            .iter()
+            .any(|o| &o.message_id == id && o.outcome == SteeringOutcomeKind::Delivered);
+        if already {
+            continue;
+        }
+        let Some(entry) = s.steering_pending.iter().find(|p| &p.message_id == id) else {
+            continue;
+        };
+        // `text` is already capped at the wire-facing steering cap, and
+        // `text_length` is what the operator actually typed. Both travel
+        // together so the projection can say it is short rather than look
+        // complete.
+        let full_length = entry.text_truncated.then_some(entry.text_length);
+        deliver.push((entry.message_id.clone(), entry.text.clone(), full_length));
+    }
+    let Some(turn) = s.turn.as_mut() else { return };
+    for (id, text, full_length) in deliver {
+        turn.live.push_steering_text(&id, &text, full_length);
+    }
+}
+
 fn record_outcomes(
-    s: &mut StateInner,    message_ids: &[String],
+    s: &mut StateInner,
+    message_ids: &[String],
     outcome: SteeringOutcomeKind,
     turn_id: Option<&str>,
 ) -> Vec<PendingEvent> {
@@ -1326,6 +1391,7 @@ fn record_outcomes(
 pub(crate) mod tests {
     use super::*;
     use crate::bus::EventBus;
+    use coda_proto::history::HistoryBlock;
     use std::collections::HashMap;
 
     fn test_state() -> Arc<EngineState> {
@@ -1359,6 +1425,172 @@ pub(crate) mod tests {
 
     fn ended(turn_id: &str) -> TurnEnd {
         TurnEnd { turn_id: turn_id.into(), stop_reason: Some("end_turn".into()), ..Default::default() }
+    }
+
+    // ── Delivered steering must be part of what the turn shows ───────────
+    //
+    // A client polling mid-turn was told a message had reached the model
+    // while the conversation it was handed contained no trace of it. It had
+    // no way to place the text itself, and a client that trusted the read
+    // dropped its own copy — so the operator's follow-up was simply gone from
+    // the screen while the model was answering it.
+
+    /// The whole `(text, steeringMessageId)` pair of every user entry in the
+    /// live projection.
+    fn live_user_entries(state: &EngineState) -> Vec<(String, Option<String>)> {
+        state
+            .history_view()
+            .live
+            .map(|live| {
+                live.entries
+                    .iter()
+                    .filter(|e| e.role == "user")
+                    .flat_map(|e| {
+                        e.blocks.iter().filter_map(move |b| match b {
+                            HistoryBlock::Text { text, .. } => {
+                                Some((text.clone(), e.steering_message_id.clone()))
+                            }
+                            _ => None,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn delivered_steering_is_in_the_live_projection_the_same_outcome_appears_in() {
+        let state = test_state();
+        state.begin_turn("t1", "start", active_config(), ActivityPhase::Responding);
+        state.transact(|s| s.observed_text_delta("half a reply"));
+        state.steering_enqueued("m1", "operator correction");
+        state.steering_delivered(&["m1".into()], Some("t1"));
+
+        let snapshot = state.project("v1", limits());
+        assert_eq!(
+            snapshot.steering.outcomes.iter().filter(|o| o.message_id == "m1").count(),
+            1,
+            "the delivery is recorded"
+        );
+        let entries = live_user_entries(&state);
+        assert_eq!(
+            entries,
+            vec![
+                ("start".to_string(), None),
+                ("operator correction".to_string(), Some("m1".to_string())),
+            ],
+            "a turn that received steering must show it, tagged with the id it was queued under"
+        );
+        assert!(snapshot.steering.pending.is_empty());
+
+        // The delivered message lands *after* the reply it interrupted, not
+        // inside it: the model saw it at that boundary and nowhere else.
+        let live = state.history_view().live.expect("a turn is running");
+        let roles: Vec<&str> = live.entries.iter().map(|e| e.role.as_str()).collect();
+        assert_eq!(roles, vec!["user", "assistant", "user"]);
+    }
+
+    #[test]
+    fn a_repeated_delivery_notification_does_not_double_the_text() {
+        let state = test_state();
+        state.begin_turn("t1", "start", active_config(), ActivityPhase::Responding);
+        state.steering_enqueued("m1", "operator correction");
+        state.steering_delivered(&["m1".into()], Some("t1"));
+        state.steering_delivered(&["m1".into()], Some("t1"));
+
+        assert_eq!(
+            live_user_entries(&state)
+                .iter()
+                .filter(|(text, _)| text == "operator correction")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn two_messages_delivered_together_keep_their_order_and_their_own_ids() {
+        let state = test_state();
+        state.begin_turn("t1", "start", active_config(), ActivityPhase::Responding);
+        state.steering_enqueued("m1", "first");
+        state.steering_enqueued("m2", "first");
+        state.steering_delivered(&["m1".into(), "m2".into()], Some("t1"));
+
+        assert_eq!(
+            live_user_entries(&state),
+            vec![
+                ("start".to_string(), None),
+                ("first".to_string(), Some("m1".to_string())),
+                ("first".to_string(), Some("m2".to_string())),
+            ],
+            "identical text is two messages, in the order the model received them"
+        );
+    }
+
+    #[test]
+    fn a_delivery_reported_for_another_turn_never_lands_in_this_ones_projection() {
+        let state = test_state();
+        state.begin_turn("t1", "start", active_config(), ActivityPhase::Responding);
+        state.steering_enqueued("m1", "meant for the previous turn");
+        state.steering_delivered(&["m1".into()], Some("t0"));
+
+        assert_eq!(live_user_entries(&state), vec![("start".to_string(), None)]);
+        let snapshot = state.project("v1", limits());
+        assert_eq!(
+            snapshot.steering.outcomes[0].outcome,
+            SteeringOutcomeKind::Delivered,
+            "the outcome is still recorded truthfully"
+        );
+    }
+
+    #[test]
+    fn a_steering_message_the_queue_never_held_contributes_no_invented_text() {
+        let state = test_state();
+        state.begin_turn("t1", "start", active_config(), ActivityPhase::Responding);
+        state.steering_delivered(&["unknown".into()], Some("t1"));
+
+        assert_eq!(live_user_entries(&state), vec![("start".to_string(), None)]);
+    }
+
+    #[test]
+    fn steering_the_wire_cap_shortened_says_so_in_the_projection() {
+        let state = test_state();
+        state.begin_turn("t1", "start", active_config(), ActivityPhase::Responding);
+        let long = "x".repeat(DEFAULT_STEERING_TEXT_CAP + 512);
+        state.steering_enqueued("m1", &long);
+        state.steering_delivered(&["m1".into()], Some("t1"));
+
+        let live = state.history_view().live.expect("a turn is running");
+        let block = live
+            .entries
+            .iter()
+            .find(|e| e.steering_message_id.as_deref() == Some("m1"))
+            .map(|e| e.blocks[0].clone())
+            .expect("the delivered message is projected");
+        match block {
+            HistoryBlock::Text { text, omitted_reason, full_length } => {
+                assert!(text.len() <= DEFAULT_STEERING_TEXT_CAP);
+                assert_eq!(omitted_reason.as_deref(), Some("tooLarge"));
+                assert_eq!(
+                    full_length,
+                    Some(long.len() as i64),
+                    "a message that was cut must report what it originally said"
+                );
+            }
+            other => panic!("expected a text block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_delivery_after_the_turn_ended_is_recorded_without_reopening_a_projection() {
+        let state = test_state();
+        state.begin_turn("t1", "start", active_config(), ActivityPhase::Responding);
+        state.steering_enqueued("m1", "operator correction");
+        state.end_turn(ended("t1"));
+        state.steering_delivered(&["m1".into()], Some("t1"));
+
+        assert!(state.history_view().live.is_none(), "no turn is running to project into");
+        let snapshot = state.project("v1", limits());
+        assert_eq!(snapshot.steering.outcomes[0].outcome, SteeringOutcomeKind::Delivered);
     }
 
     // ── Pending reverse requests: phase + snapshot section (Stage D) ─────
@@ -1840,6 +2072,46 @@ pub(crate) mod tests {
         assert_eq!(turn.phase, ActivityPhase::Reasoning, "an empty Thinking delta is still real evidence");
         assert!(turn.model_request.unwrap().observed_reasoning);
         assert!(turn.live_entries.len() <= 1, "no phantom reasoning text may be invented");
+    }
+
+    #[test]
+    fn a_completed_burst_leaves_the_reasoning_phase_it_was_in() {
+        // The burst ended and the model request is still open. Staying in
+        // `reasoning` made every snapshot taken through the silence that
+        // follows claim the model was still reasoning, and a client driving
+        // its UI from the phase showed a reasoning row through it.
+        let state = test_state();
+        state.begin_turn("t1", "go", active_config(), ActivityPhase::Preparing);
+        state.model_request_started("req-1");
+        state.observed_thinking_delta("");
+        state.thinking_complete();
+        let snap = state.project("v1", limits());
+        let turn = snap.turn.expect("the turn is still running");
+        assert_eq!(turn.phase, ActivityPhase::WaitingForModel, "silence is not reasoning");
+        assert!(
+            turn.model_request.is_some(),
+            "the request is still open: the turn must not have been released"
+        );
+    }
+
+    #[test]
+    fn a_completed_burst_never_pulls_a_later_phase_back_to_waiting() {
+        // Tools or text have already moved the phase on; a late or duplicate
+        // completion must not rewind it.
+        for phase in [ActivityPhase::Responding, ActivityPhase::RunningTools] {
+            let state = test_state();
+            state.begin_turn("t1", "go", active_config(), ActivityPhase::Preparing);
+            state.observed_thinking_delta("considering");
+            match phase {
+                ActivityPhase::Responding => state.observed_text_delta("answer"),
+                _ => {
+                    state.tool_batch_started("b1", vec!["c1".to_string()]);
+                }
+            }
+            state.thinking_complete();
+            state.thinking_complete();
+            assert_eq!(state.project("v1", limits()).turn.unwrap().phase, phase);
+        }
     }
 
     #[test]

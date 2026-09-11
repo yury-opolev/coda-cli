@@ -49,7 +49,7 @@
 use std::sync::Arc;
 
 use coda_proto::history::{
-    truncate_text, HistoryBlock, HistoryEntry, OMITTED_LIVE_BUDGET,
+    truncate_text, HistoryBlock, HistoryEntry, OMITTED_LIVE_BUDGET, OMITTED_TOO_LARGE,
 };
 
 /// Default cap on the total bytes of live-turn content retained (§2.5).
@@ -140,18 +140,51 @@ impl LiveTurnAccumulator {
     /// it made a turn look like it had no operator prompt at all, and keeping
     /// it silently short made a truncated prompt look complete.
     pub fn push_user_text(&mut self, text: &str) {
+        self.push_user_block(text, None, None);
+    }
+
+    /// Operator steering the engine has just delivered into this turn.
+    ///
+    /// The model received it *here*, between the assistant content before it
+    /// and whatever the next request produces, so the open assistant entry is
+    /// closed first and the message becomes its own entry in arrival order —
+    /// exactly where the committed transcript will later show it.
+    ///
+    /// `upstream_full_length` is the queue's own `textLength` when the
+    /// wire-facing steering cap already shortened `text`; the marker is
+    /// carried through rather than re-derived, so a message that was cut once
+    /// is never reported as complete.
+    pub fn push_steering_text(
+        &mut self,
+        message_id: &str,
+        text: &str,
+        upstream_full_length: Option<i64>,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        self.flush_assistant();
+        self.push_user_block(text, upstream_full_length, Some(message_id));
+    }
+
+    fn push_user_block(
+        &mut self,
+        text: &str,
+        upstream_full_length: Option<i64>,
+        steering_id: Option<&str>,
+    ) {
         if text.is_empty() {
             return;
         }
         const OVERHEAD: usize = ENTRY_OVERHEAD + BLOCK_OVERHEAD;
         if self.charge(OVERHEAD + text.len()) {
-            self.push_entry(
-                "user",
-                vec![HistoryBlock::Text {
+            self.push_user_entry(
+                steering_id,
+                HistoryBlock::Text {
                     text: text.to_string(),
-                    omitted_reason: None,
-                    full_length: None,
-                }],
+                    omitted_reason: upstream_full_length.map(|_| OMITTED_TOO_LARGE.to_string()),
+                    full_length: upstream_full_length,
+                },
             );
             return;
         }
@@ -167,14 +200,27 @@ impl LiveTurnAccumulator {
         }
         self.bytes_used += OVERHEAD + capped.len();
         self.omitted_bytes -= (OVERHEAD + capped.len()) as i64;
-        self.push_entry(
-            "user",
-            vec![HistoryBlock::Text {
+        self.push_user_entry(
+            steering_id,
+            HistoryBlock::Text {
                 text: capped,
                 omitted_reason: Some(OMITTED_LIVE_BUDGET.to_string()),
-                full_length: Some(text.len() as i64),
-            }],
+                // What the *original* said, not what this projection was
+                // handed: a message the steering cap had already shortened
+                // must not have its length re-stated as the shortened one.
+                full_length: Some(upstream_full_length.unwrap_or(text.len() as i64)),
+            },
         );
+    }
+
+    fn push_user_entry(&mut self, steering_id: Option<&str>, block: HistoryBlock) {
+        let index = self.next_index;
+        self.next_index += 1;
+        let entry = HistoryEntry::new(index, "user", vec![block]);
+        self.entries.push(Arc::new(match steering_id {
+            Some(id) => entry.from_steering(id),
+            None => entry,
+        }));
     }
 
     /// An `AssistantText` delta — appended as its own chunk of the open

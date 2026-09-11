@@ -246,20 +246,13 @@ impl ToolSummary {
 
     pub fn render(&self, width: usize, fold: Option<&str>) -> Vec<RenderLine> {
         let headline = self.headline();
-        let headline = match fold {
-            Some(fold) => format!("{fold} {headline}"),
-            None => headline,
-        };
+        if let Some(fold) = fold {
+            return crate::line::disclosure_header(&headline, fold, width, self.role());
+        }
         text::wrap(&headline, width.saturating_sub(MARKER_CELLS).max(1))
             .into_iter().enumerate().map(|(index, chunk)| {
-                let mut row = RenderLine::new(chunk, self.role())
-                    .with_gutter(if index == 0 { Gutter::AgentComplete } else { Gutter::Continuation });
-                if index == 0 {
-                    if let Some(fold) = fold {
-                        row = row.with_chrome_cells(text::width(fold) + 1);
-                    }
-                }
-                row
+                RenderLine::new(chunk, self.role())
+                    .with_gutter(if index == 0 { Gutter::AgentComplete } else { Gutter::Continuation })
             }).collect()
     }
 }
@@ -474,16 +467,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn grouped_summary_uses_one_aligned_chevron_and_preserves_status_color() {
+        for status in [
+            CallStatus::Succeeded, CallStatus::Failed, CallStatus::Cancelled, CallStatus::Skipped,
+        ] {
+            let calls = [call("run_command", "{}", status)];
+            let summary = ToolSummary::from_calls(&calls);
+            for marker in ["\u{276f}", "\u{2304}"] {
+                let rows = summary.render(80, Some(marker));
+                assert!(rows[0].text.starts_with(&format!(" {marker} Ran 1 shell command")), "{}", rows[0].text);
+                assert!(!rows[0].text.contains(Gutter::AgentComplete.prefix().trim()));
+                assert_eq!(rows[0].content_start(), MARKER_CELLS);
+                assert_eq!(rows[0].role, summary.role());
+            }
+        }
+    }
+
+    #[test]
     fn grouped_summary_with_fold_marker_fits_narrow_widths() {
         let mut failed = ToolCall::new("read_file", "{}");
         failed.status = CallStatus::Failed;
         let mut skipped = ToolCall::new("edit", "{}");
         skipped.status = CallStatus::Skipped;
         let calls = [failed, skipped];
-        for width in [10, 20] {
+        for width in [0, 1, 2, 3, 4, 10, 20] {
             let rows = ToolSummary::from_calls(&calls).render(width, Some("\u{276f}"));
-            assert!(!rows.is_empty());
+            if width > 0 {
+                assert!(!rows.is_empty());
+            }
             assert!(rows.iter().all(|row| text::width(&row.text) <= width));
+            if width > MARKER_CELLS {
+                assert!(rows.iter().all(|row| row.content_start() == MARKER_CELLS));
+                assert!(rows.iter().skip(1).all(|row| row.text.starts_with("   ")));
+            }
         }
     }
 

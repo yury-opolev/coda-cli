@@ -1282,6 +1282,51 @@ fn pending_text_is_visible_without_splitting_streaming_reply() {
 }
 
 #[test]
+fn pending_queue_sits_below_activity_with_one_blank_line_above_and_below() {
+    for count in [1, 8] {
+        for (label, event) in [
+            ("Working", None),
+            ("Thinking", Some(Event::Thinking { delta: "considering".into() })),
+            ("Responding", Some(Event::AssistantText { delta: "answering".into() })),
+        ] {
+            let mut state = session();
+            state.apply(UiEvent::Submitted { text: "question".into() });
+            if let Some(event) = event {
+                state.apply(UiEvent::Engine(event));
+            }
+            for index in 0..count {
+                state.apply(UiEvent::Queued {
+                    text: format!("follow up {index}"),
+                    id: Some(format!("q{index}")),
+                });
+            }
+            let screen = render(&state, &Composer::new(), 80, 24);
+            let regions = draw::layout_with_pending(
+                ratatui::layout::Rect::new(0, 0, 80, 24), 1, false, true, count,
+            );
+            let activity = regions.activity.unwrap();
+            let pending = regions.pending.unwrap();
+            assert!(screen[activity.y as usize].contains(label));
+            assert_eq!(pending.y, activity.bottom() + 1);
+            assert!(screen[(pending.y - 1) as usize].trim().is_empty());
+            assert!(screen[pending.bottom() as usize].trim().is_empty());
+            assert_eq!(regions.composer.y, pending.bottom() + 1);
+            assert!(screen[pending.y as usize].contains("[pending] follow up 0"));
+        }
+    }
+}
+
+#[test]
+fn recovery_previews_do_not_claim_an_unknown_delivery_was_not_sent() {
+    let mut state = session();
+    state.apply(UiEvent::Submitted { text: "question".into() });
+    state.apply(UiEvent::Queued { text: "recover this".into(), id: Some("q1".into()) });
+    state.apply(UiEvent::TurnFinished { interrupted: true, error: None });
+    let screen = render(&state, &Composer::new(), 80, 24);
+    assert!(screen.iter().any(|line| line.contains("[recoverable] recover this")));
+}
+
+#[test]
 fn pending_previews_are_bounded_and_keep_activity_visible() {
     let mut state = session();
     state.apply(UiEvent::Submitted { text: "question".into() });

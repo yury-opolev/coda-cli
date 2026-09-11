@@ -8,6 +8,7 @@ pub mod cli;
 pub mod commands;
 pub mod composer;
 pub mod config;
+pub mod coverage;
 pub mod diagnostics;
 pub mod hint;
 pub mod keymap;
