@@ -622,6 +622,55 @@ mod tests {
         drop(p4);
     }
 
+    #[tokio::test]
+    async fn default_pool_allows_twenty_slots_and_refuses_the_twenty_first() {
+        struct UnusedClient;
+        #[async_trait]
+        impl coda_llm::LlmClient for UnusedClient {
+            fn provider_id(&self) -> &str { "fixture" }
+            async fn stream(
+                &self,
+                _: coda_llm::ChatRequest,
+            ) -> Result<coda_llm::ResponseStream, coda_llm::LlmError> {
+                panic!("a full pool must refuse before calling the model")
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let manager = TaskManager::new(
+            "default-limit", Some(directory.path().to_owned()), 4096, 256,
+        );
+        let host = SubagentHost::with_defaults(
+            Arc::new(UnusedClient),
+            Arc::new(crate::permission::prompts::ModePermissionPrompt::new(
+                crate::permission::PermissionMode::Default, None,
+            )),
+            Arc::new(PermissionModeState::new(crate::permission::PermissionMode::Default)),
+            Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0])),
+            manager.clone(),
+            ".",
+        );
+        let mut held: Vec<_> = (0..20)
+            .map(|_| host.try_acquire_slot().expect("all twenty default slots must be available"))
+            .collect();
+        for foreground in [true, false] {
+            let mut request = SubagentRequest::foreground("general-purpose", "work", "t1", 1);
+            request.foreground = foreground;
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                host.spawn(request, Arc::new(crate::events::NullSink), CancellationToken::new()),
+            ).await.expect("a full pool must refuse immediately");
+            assert!(result.unwrap_err().contains("slots are taken"));
+        }
+        assert!(manager.list().is_empty(), "refused work must not be registered");
+
+        let clone = host.clone_for_background();
+        assert!(clone.try_acquire_slot().is_err(), "clones must share the same limit");
+        drop(held.pop());
+        let _replacement = clone.try_acquire_slot().expect("a released slot must be reusable");
+        assert!(host.try_acquire_slot().is_err(), "the replacement counts against the original pool");
+    }
+
     /// Foreground subagent immediately refuses (error, not panic/hang) when
     /// every concurrency slot is taken and registers nothing.
     ///

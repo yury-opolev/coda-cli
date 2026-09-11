@@ -41,8 +41,8 @@ use crate::events::AgentSink;
 /// tools, preventing unbounded recursion.
 pub const MAX_SUBAGENT_DEPTH: u32 = 2;
 
-/// Maximum simultaneously running subagents (sessions-wide semaphore guard).
-pub const MAX_CONCURRENT_SUBAGENTS: usize = 10;
+/// Default maximum simultaneously running subagents per host pool.
+pub const MAX_CONCURRENT_SUBAGENTS: usize = 20;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SubagentDefinition
