@@ -55,13 +55,20 @@ fn effort_cell(model: &WireModel) -> String {
 }
 
 /// The model picker.
+///
+/// The provider's friendly name is what a person actually chooses by, so it
+/// leads; the canonical id is kept alongside it because two providers' rows
+/// can share a display name while meaning different models, and because it is
+/// what effort adjustments and the saved preference are keyed by. Both are
+/// filterable and both are shown — nothing here is inferred from the id when
+/// a name is missing, [`WireModel::label`] already falls back to it.
 pub fn models(models: &[WireModel], current: Option<&str>, source: &str) -> Browser {
     let mut browser = Browser::new(
         format!("Models — {} models — {source}", models.len()),
         vec![
             Column::new("", 9),
-            Column::new("id", 40),
-            Column::new("name", 30),
+            Column::new("name", 34),
+            Column::new("id", 30),
             Column::new("context", 7),
             Column::new("effort", 12),
         ],
@@ -79,8 +86,8 @@ pub fn models(models: &[WireModel], current: Option<&str>, source: &str) -> Brow
                     &model.id,
                     vec![
                         if is_current { format!("{} current", glyph::CURRENT) } else { " ".into() },
+                        crate::state::ModelLabelCache::display_label(model),
                         model.id.clone(),
-                        model.display_name.clone().unwrap_or_default(),
                         context_size(model.context_limit),
                         effort_cell(model),
                     ],
@@ -712,6 +719,91 @@ mod tests {
         assert_eq!(browser.len(), 2);
         assert!(browser.title().contains("2 models"));
         assert!(browser.title().contains("live"));
+    }
+
+    #[test]
+    fn model_display_labels_are_bounded_without_changing_the_canonical_id() {
+        let long_name = "\u{6f22}".repeat(100);
+        let entry = model("canonical-model-id", Some(&long_name), None);
+        let browser = models(&[entry], None, "live");
+        let item = &browser.items()[0];
+        assert_eq!(item.id, "canonical-model-id");
+        assert!(coda_render::text::width(&item.cells[1]) <= 128);
+        assert!(item.cells[1].ends_with('\u{2026}'));
+        assert_eq!(item.cells[2], "canonical-model-id");
+    }
+
+    #[test]
+    fn an_unprintable_model_name_falls_back_to_the_id() {
+        let entry = model("canonical-model-id", Some("\u{1b}[31m\u{1b}[0m"), None);
+        let browser = models(&[entry], None, "live");
+        assert_eq!(browser.items()[0].cells[1], "canonical-model-id");
+    }
+
+    #[test]
+    fn the_readable_name_leads_and_the_canonical_id_follows() {
+        // The user's own complaint: "name of model is its ID, not its
+        // readable/display name". The friendly name is what a person
+        // actually picks by, so it is column 1; the id — needed to tell two
+        // identically-named rows apart, and to key effort/preference saves —
+        // stays visible right behind it rather than disappearing.
+        let row = model("claude-opus-4-6", Some("Claude Opus 4.6"), None);
+        let browser = models(&[row], None, "live");
+
+        let cells = &browser.items()[0].cells;
+        assert_eq!(cells[1], "Claude Opus 4.6", "the friendly name must lead");
+        assert_eq!(cells[2], "claude-opus-4-6", "the canonical id must still be shown");
+    }
+
+    #[test]
+    fn a_model_with_no_display_name_shows_its_id_in_both_columns() {
+        let row = model("unnamed-model", None, None);
+        let browser = models(&[row], None, "live");
+
+        let cells = &browser.items()[0].cells;
+        assert_eq!(cells[1], "unnamed-model", "a missing name falls back to the id, not a blank cell");
+        assert_eq!(cells[2], "unnamed-model");
+    }
+
+    #[test]
+    fn duplicate_friendly_names_still_select_and_activate_the_right_model_by_id() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        // Two different providers' models can share a display name; the row
+        // identity — selection, activation, the saved preference — must stay
+        // the canonical id, never the (possibly ambiguous) name.
+        let models_list = [
+            model("provider-a/model", Some("Assistant"), None),
+            model("provider-b/model", Some("Assistant"), None),
+        ];
+        let mut browser = models(&models_list, Some("provider-b/model"), "live");
+
+        assert_eq!(browser.selected_id(), Some("provider-b/model"));
+        assert_eq!(browser.visible_items()[0].cells[1], "Assistant");
+        assert_eq!(browser.visible_items()[1].cells[1], "Assistant");
+
+        // Selecting the *first* row (by navigating up) and activating it must
+        // resolve to the first row's own id, not the second's — proving the
+        // shared label never gets confused for identity.
+        browser.handle(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        let intent = browser.handle(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(intent, crate::overlay::Intent::Activate("provider-a/model".into()));
+    }
+
+    #[test]
+    fn filtering_by_the_friendly_name_still_finds_duplicate_rows() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let models_list = [
+            model("provider-a/model", Some("Assistant"), None),
+            model("provider-b/model", Some("Assistant"), None),
+            model("provider-c/model", Some("Other"), None),
+        ];
+        let mut browser = models(&models_list, None, "live");
+        browser.handle(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        for c in "assistant".chars() {
+            browser.handle(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+
+        assert_eq!(browser.len(), 2, "both same-named rows must still match");
     }
 
     #[test]

@@ -154,7 +154,14 @@ impl App {
         };
 
         match self.ask::<Value>(rpc_method, params).await {
-            Ok(value) => self.output(format_result(spec.name, &value)),
+            Ok(value) => {
+                if rpc_method == method::MODELS {
+                    if let Ok(result) = serde_json::from_value::<messages::ModelsResult>(value.clone()) {
+                        self.ingest_models_result(&result);
+                    }
+                }
+                self.output(format_result(spec.name, &value));
+            }
             Err(error) => self.notice(
                 format!("/{} failed: {error}", spec.name),
                 NoticeLevel::Error,
@@ -171,11 +178,12 @@ pub(super) fn format_result(command: &str, value: &Value) -> String {
             Ok(result) => {
                 let mut out = format!("Models ({})\n", result.source);
                 for model in &result.models {
+                    let label = crate::state::ModelLabelCache::display_label(model);
                     match model.context_limit {
                         Some(limit) => {
-                            out.push_str(&format!("  {}  ({limit} tokens)\n", model.label()))
+                            out.push_str(&format!("  {label}  ({limit} tokens)\n"))
                         }
-                        None => out.push_str(&format!("  {}\n", model.label())),
+                        None => out.push_str(&format!("  {label}\n")),
                     }
                 }
                 out.trim_end().to_string()

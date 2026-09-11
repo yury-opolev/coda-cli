@@ -43,19 +43,21 @@ impl App {
             self.remember_effort(result.current.clone());
         }
         let label = result.current.clone().unwrap_or_else(|| "auto".into());
+        let model_label = self.state.model_labels
+            .resolve(Some(&result.provider_id), &result.model).to_owned();
         let saved = self
             .persist_engine_default(move |settings| {
                 set_effort_in(settings, &result.provider_id, &result.model, result.current.as_deref())
             })
             .await;
         let status = match saved {
-            super::settings::Saved::Ok => format!("{model}: effort {label} saved"),
+            super::settings::Saved::Ok => format!("{model_label}: effort {label} saved"),
             // The session change stands; only the durable half is impossible.
             super::settings::Saved::Refused => {
-                format!("{model}: effort {label} for this session (the engine's defaults live on its own host)")
+                format!("{model_label}: effort {label} for this session (the engine's defaults live on its own host)")
             }
             super::settings::Saved::Failed(error) => {
-                let status = format!("{model}: effort {label} is session-only; could not save: {error}");
+                let status = format!("{model_label}: effort {label} is session-only; could not save: {error}");
                 self.notice(status.clone(), NoticeLevel::Warning);
                 status
             }
@@ -174,9 +176,11 @@ impl App {
         } else {
             PickerCapability::Unsupported
         };
+        let display_label = self.state.model_labels
+            .resolve(Some(&for_model.0), &for_model.1).to_owned();
         let picker = EffortPickerSurface::new(
             capability.current.as_deref(), supported, capability.supports_auto, for_model,
-        );
+        ).with_display_label(display_label);
         if !self.surfaces.push(Box::new(picker)) {
             self.notice("Answer the open prompt first.", NoticeLevel::Warning);
         }

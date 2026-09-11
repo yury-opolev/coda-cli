@@ -23,6 +23,7 @@ pub struct EffortPickerSurface {
     capability: PickerCapability,
     supports_auto: bool,
     for_model: (String, String),
+    display_label: Option<String>,
 }
 
 impl EffortPickerSurface {
@@ -43,7 +44,12 @@ impl EffortPickerSurface {
             .collect();
         let selected = current.and_then(|value|
             levels.iter().position(|level| level.eq_ignore_ascii_case(value)));
-        Self { levels, selected, capability, supports_auto, for_model }
+        Self { levels, selected, capability, supports_auto, for_model, display_label: None }
+    }
+
+    pub fn with_display_label(mut self, label: String) -> Self {
+        self.display_label = Some(label);
+        self
     }
 
     fn emit(&self, persist: bool) -> SurfaceOutcome {
@@ -63,7 +69,7 @@ impl EffortPickerSurface {
 
 impl Surface for EffortPickerSurface {
     fn title(&self) -> String {
-        format!("Effort - {}", self.for_model.1)
+        format!("Effort - {}", self.display_label.as_deref().unwrap_or(&self.for_model.1))
     }
 
     fn hints(&self) -> String {

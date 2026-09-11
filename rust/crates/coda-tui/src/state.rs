@@ -356,6 +356,75 @@ impl ThinkingClock {
     }
 }
 
+/// Provider-scoped display names learned from a `session/models` read,
+/// keyed by the canonical model id.
+///
+/// A resync only ever reports the canonical `(providerId, model)` pair —
+/// [`coda_proto::state::StateSnapshot`] carries no name for it, that is what
+/// [`coda_proto::messages::ModelsResult`] is for. Caching what that read
+/// said lets [`UiState::reconcile`] keep showing a friendly name across a
+/// resync that cannot itself carry one, without ever inventing one: an id
+/// this cache does not know, or one learned under a different provider,
+/// resolves to itself.
+#[derive(Debug, Clone, Default)]
+pub struct ModelLabelCache {
+    provider_id: Option<String>,
+    labels: std::collections::HashMap<String, String>,
+}
+
+impl ModelLabelCache {
+    /// Names are display-only: keep them bounded and on one terminal line.
+    pub fn display_label(model: &coda_proto::messages::WireModel) -> String {
+        let clean = coda_render::text::sanitize(model.label())
+            .split_whitespace().collect::<Vec<_>>().join(" ");
+        let clean = if clean.is_empty() {
+            coda_render::text::sanitize(&model.id)
+                .split_whitespace().collect::<Vec<_>>().join(" ")
+        } else {
+            clean
+        };
+        coda_render::text::truncate_with_ellipsis(&clean, 128)
+    }
+
+    /// Replaces the cache with one provider's current model list.
+    ///
+    /// A full replacement, not a merge: a `session/models` read is the
+    /// engine's authoritative answer for that provider right now, so a name
+    /// that changed or a model that was removed from the list must not leave
+    /// a stale label behind under the old id.
+    pub fn replace(&mut self, provider_id: Option<String>, models: &[coda_proto::messages::WireModel]) {
+        self.provider_id = provider_id;
+        self.labels.clear();
+        for model in models {
+            let label = Self::display_label(model);
+            if label != model.id {
+                self.labels.insert(model.id.clone(), label);
+            }
+        }
+    }
+
+    /// Discards every learned label.
+    ///
+    /// Called when the engine identity changes: a new process's names are
+    /// not evidence about the previous one's, even for an id the two happen
+    /// to share.
+    pub fn clear(&mut self) {
+        self.provider_id = None;
+        self.labels.clear();
+    }
+
+    /// The friendly name for `id` under `provider_id`, or `id` itself when
+    /// the cache does not know it — including when it was filled for a
+    /// different provider, so one provider's names never decorate another
+    /// provider's id.
+    pub fn resolve<'a>(&'a self, provider_id: Option<&str>, id: &'a str) -> &'a str {
+        if self.provider_id.as_deref() != provider_id {
+            return id;
+        }
+        self.labels.get(id).map(String::as_str).unwrap_or(id)
+    }
+}
+
 /// Everything the UI draws from.
 #[derive(Debug)]
 pub struct UiState {
@@ -474,6 +543,13 @@ pub struct UiState {
     /// "in effect" distinguishable rather than the UI claiming a switch that
     /// the running turn is not using.
     pub active_model: Option<String>,
+    /// Friendly names learned from `session/models`, scoped to the provider
+    /// the engine connected with.
+    ///
+    /// [`Self::reconcile`] is the only reader that needs this: a resync
+    /// carries the canonical model id and nothing else, and this is how it
+    /// still shows a name instead of regressing to that id.
+    pub model_labels: ModelLabelCache,
 }
 
 impl Default for UiState {
@@ -512,6 +588,7 @@ impl UiState {
             core_lifecycle: None,
             optimistic_submit: false,
             active_model: None,
+            model_labels: ModelLabelCache::default(),
         }
     }
 
@@ -950,6 +1027,11 @@ impl UiState {
                 self.turn_progress = None;
                 self.turn_id = None;
                 self.core_lifecycle = None;
+                // Whatever this cache learned belonged to the process that
+                // is gone: a replacement can reuse the same provider id for
+                // a differently named model, and must re-earn its labels
+                // rather than inherit its predecessor's.
+                self.model_labels.clear();
             }
             UiEvent::Submitted { text } => {
                 self.close_open_and_flush();
@@ -1714,14 +1796,18 @@ impl UiState {
         // what the running turn actually captured. Reporting `next` as if the
         // running turn were using it is the specific dishonesty to avoid.
         let next = &snapshot.config.next;
-        self.model = Some(next.model.clone());
+        self.model =
+            Some(self.model_labels.resolve(next.provider_id.as_deref(), &next.model).to_string());
         self.effort = if next.effort_is_auto { None } else { next.effort.clone() };
         self.active_model = snapshot
             .config
             .active
             .as_ref()
-            .map(|active| active.model.clone())
-            .filter(|active| active != &next.model);
+            // Compared canonically, before either side is turned into a
+            // label: two different ids that happen to resolve to the same
+            // display name must still count as "the running turn differs".
+            .filter(|active| active.model != next.model)
+            .map(|active| self.model_labels.resolve(active.provider_id.as_deref(), &active.model).to_string());
 
         // Usage. `session` is the running total; `lastResponse` is one
         // response's cost and must never be presented as a total.
@@ -4305,6 +4391,114 @@ mod tests {
                 state.active_model.as_deref(),
                 Some("claude-haiku"),
                 "the running turn kept the model it captured"
+            );
+        }
+
+        /// A `session/models` result carries names a snapshot cannot: this
+        /// is the fixture for the model this file's fixtures return
+        /// (`active_config` always names provider `anthropic`).
+        fn wire_model(id: &str, display_name: &str) -> coda_proto::messages::WireModel {
+            serde_json::from_value(serde_json::json!({ "id": id, "displayName": display_name }))
+                .expect("wire model")
+        }
+
+        #[test]
+        fn a_resync_shows_the_friendly_name_a_model_list_already_taught_it() {
+            // This is the reported bug: `/model` (or startup) reads
+            // `session/models` and the header shows "Claude Sonnet 4.5" —
+            // then the very next resync overwrote it with the canonical
+            // "claude-sonnet", because `reconcile` assigned `next.model`
+            // verbatim instead of resolving it through what had just been
+            // learned.
+            let mut state = state();
+            state
+                .model_labels
+                .replace(Some("anthropic".into()), &[wire_model("claude-sonnet", "Claude Sonnet 4.5")]);
+
+            state.apply(UiEvent::Snapshot(Box::new(snapshot(EngineLifecycle::Ready))));
+
+            assert_eq!(
+                state.model.as_deref(),
+                Some("Claude Sonnet 4.5"),
+                "a resync must not regress a known model back to its raw id"
+            );
+        }
+
+        #[test]
+        fn both_the_running_and_the_next_model_resolve_through_the_cache() {
+            let mut state = state();
+            state.model_labels.replace(
+                Some("anthropic".into()),
+                &[
+                    wire_model("claude-sonnet", "Claude Sonnet 4.5"),
+                    wire_model("claude-haiku", "Claude Haiku 4.5"),
+                ],
+            );
+            let mut snapshot = snapshot(EngineLifecycle::Busy);
+            snapshot.config.active = Some(active_config("claude-haiku"));
+            snapshot.turn = Some(turn(ActivityPhase::Responding, Some(1_000)));
+
+            state.apply(UiEvent::Snapshot(Box::new(snapshot)));
+
+            assert_eq!(state.model.as_deref(), Some("Claude Sonnet 4.5"), "next turn's name");
+            assert_eq!(
+                state.active_model.as_deref(),
+                Some("Claude Haiku 4.5"),
+                "the running turn's own name"
+            );
+        }
+
+        #[test]
+        fn an_id_the_cache_does_not_know_falls_back_to_itself_not_the_first_cached_name() {
+            let mut state = state();
+            // Cached under a *different* id than the snapshot reports.
+            state
+                .model_labels
+                .replace(Some("anthropic".into()), &[wire_model("claude-opus-5", "Claude Opus 5")]);
+
+            state.apply(UiEvent::Snapshot(Box::new(snapshot(EngineLifecycle::Ready))));
+
+            assert_eq!(
+                state.model.as_deref(),
+                Some("claude-sonnet"),
+                "an unlisted id must show itself, never an unrelated cached name"
+            );
+        }
+
+        #[test]
+        fn a_name_learned_for_one_provider_never_decorates_another_providers_same_id() {
+            // Two providers can both use an id like "gpt-5" for different
+            // models; a label cached for one must not bleed onto the other's
+            // row just because the id string matches.
+            let mut state = state();
+            state
+                .model_labels
+                .replace(Some("openai".into()), &[wire_model("claude-sonnet", "OpenAI's Claude-Sonnet-Named-Thing")]);
+
+            // `active_config`/`snapshot` report provider "anthropic".
+            state.apply(UiEvent::Snapshot(Box::new(snapshot(EngineLifecycle::Ready))));
+
+            assert_eq!(
+                state.model.as_deref(),
+                Some("claude-sonnet"),
+                "a different provider's cached name must not apply"
+            );
+        }
+
+        #[test]
+        fn adopting_a_replacement_engine_drops_the_previous_ones_cached_names() {
+            let mut state = state();
+            state
+                .model_labels
+                .replace(Some("anthropic".into()), &[wire_model("claude-sonnet", "Claude Sonnet 4.5")]);
+            assert_eq!(state.model_labels.resolve(Some("anthropic"), "claude-sonnet"), "Claude Sonnet 4.5");
+
+            state.apply(UiEvent::EngineAdopted);
+
+            assert_eq!(
+                state.model_labels.resolve(Some("anthropic"), "claude-sonnet"),
+                "claude-sonnet",
+                "a replacement engine's names are not evidence about the previous one's"
             );
         }
 
