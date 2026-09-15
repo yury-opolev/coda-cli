@@ -14,7 +14,8 @@
 //!   `LiveBypassClassifierPermissionPrompt`, `ClassifierPermissionPrompt`),
 //!   plus the `ToolActionClassifier` trait and its LLM-backed implementation.
 //! - **`autonomy`**: `AutonomySupervisor`, `GoalBudget`, `GoalVerdict`, `GoalStatus`,
-//!   `GoalOutcome`, `CompletionJudgePrompt`, `GoalRetryPolicy`, `ForkedAgent`.
+//!   `GoalOutcome`, `CompletionJudgePrompt`, `GoalRetryPolicy`, `ForkedAgent`,
+//!   `AssumptionLedger`, `LedgerEntry`, `BlockerKind`, `Confidence`.
 //! - **`steering`**: `SteeringInbox`, `SteeringEntry`.
 //! - **`events`**: `AgentEvent`, `AgentSink`, `ProtoAdapter`, `NullSink`,
 //!   `CollectingSink`, `ToolCallStatus`.
@@ -38,9 +39,9 @@
 //! - **`output_styles`**: `OutputStyle`, `BuiltInOutputStyles`.
 
 pub mod agent;
+pub mod autonomy;
 pub mod compaction;
 pub mod events;
-pub mod autonomy;
 pub mod hooks;
 pub mod lsp;
 pub mod message;
@@ -60,8 +61,9 @@ pub use agent::{AgentError, AgentLoop, AgentLoopBuilder};
 pub use compaction::{CompactionPolicy, CompactionService, TokenEstimator, compaction_tail_start};
 pub use events::{AgentEvent, AgentSink, CollectingSink, NullSink, ToolCallStatus};
 pub use autonomy::{
-    ForkedAgent, GoalBudget, CompletionJudgePrompt, GoalOutcome, GoalRetryPolicy, GoalStatus,
-    AutonomySupervisor, GoalVerdict,
+    AssumptionLedger, AutonomySupervisor, BlockerKind, CompletionJudgePrompt, Confidence,
+    ForkedAgent, GoalBudget, GoalOutcome, GoalRetryPolicy, GoalStatus, GoalVerdict, LedgerEntry,
+    LedgerError, LedgerSnapshot, WorkItemRef,
 };
 pub use hooks::{
     HookContentHash, HookEventPolicy, HookMatcher, HookRunEntry, HookRunLog, HookRunner,

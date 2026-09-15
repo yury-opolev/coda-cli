@@ -17,10 +17,15 @@ use tokio_util::sync::CancellationToken;
 
 pub mod budget;
 pub mod completion;
+pub mod ledger;
 pub mod retry;
 pub mod verdict;
 
 pub use budget::GoalBudget;
+pub use ledger::{
+    AssumptionLedger, BlockerKind, Confidence, LedgerEntry, LedgerError, LedgerSnapshot,
+    WorkItemRef,
+};
 pub use retry::GoalRetryPolicy;
 pub use verdict::{GoalOutcome, GoalStatus, GoalVerdict};
 
