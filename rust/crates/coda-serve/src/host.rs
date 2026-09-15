@@ -5665,6 +5665,8 @@ fn wire_goal_status(gs: &GoalStatus) -> Option<Value> {
     let outcome = match gs.outcome {
         GoalOutcome::Met => "Met",
         GoalOutcome::Unmet => "Unmet",
+        GoalOutcome::GenuinelyBlocked => "GenuinelyBlocked",
+        GoalOutcome::Stalled => "Stalled",
         GoalOutcome::None => return None,
     };
     let mut m = serde_json::Map::new();

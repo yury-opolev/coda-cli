@@ -16,6 +16,9 @@ pub enum GoalVerdict {
     /// The run should end.  `met = true` when the judge confirmed completion;
     /// `met = false` when the budget was exhausted after the extension was spent.
     Stop { met: bool },
+    /// The run should end because stopping was *proved*, not because a budget
+    /// ran out. Carries the outcome the proof established.
+    StopProved { outcome: GoalOutcome, report: String },
     /// Budget exhausted and extension unused: ask the operator `question`.
     /// The caller resolves by granting an extension (continue) or marking
     /// the goal unmet (stop).
@@ -32,6 +35,28 @@ pub enum GoalOutcome {
     /// The budget (time or turns, including the one extension) was exhausted
     /// before the goal was confirmed complete.
     Unmet,
+    /// Every remaining piece of work is parked behind a recorded blocker.
+    ///
+    /// The provable form of "impossible to proceed": the report names each
+    /// blocker, what was tried, and what a human would need to supply.
+    GenuinelyBlocked,
+    /// The run was looping with nothing parked and nothing moving.
+    ///
+    /// Not blocked on anyone — it had simply stopped getting anywhere. This is
+    /// what guarantees termination when the operator set no budget.
+    Stalled,
+}
+
+impl GoalOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GoalOutcome::None => "none",
+            GoalOutcome::Met => "met",
+            GoalOutcome::Unmet => "unmet",
+            GoalOutcome::GenuinelyBlocked => "genuinelyBlocked",
+            GoalOutcome::Stalled => "stalled",
+        }
+    }
 }
 
 /// Snapshot of goal run metrics, surfaced to callers at run end.
@@ -62,7 +87,10 @@ impl GoalStatus {
 
     /// True when the goal was not active or was verified complete (i.e. not Unmet).
     pub fn is_successful(&self) -> bool {
-        self.outcome != GoalOutcome::Unmet
+        !matches!(
+            self.outcome,
+            GoalOutcome::Unmet | GoalOutcome::GenuinelyBlocked | GoalOutcome::Stalled
+        )
     }
 }
 
@@ -85,5 +113,28 @@ mod tests {
     fn unmet_outcome_is_not_successful() {
         let s = GoalStatus { outcome: GoalOutcome::Unmet, ..GoalStatus::none() };
         assert!(!s.is_successful());
+    }
+
+    /// The two proved terminal states are honest failures: the goal was not
+    /// met, and a caller must not read them as success.
+    #[test]
+    fn the_proved_terminal_outcomes_are_not_successful() {
+        for outcome in [GoalOutcome::GenuinelyBlocked, GoalOutcome::Stalled] {
+            let s = GoalStatus { outcome, ..GoalStatus::none() };
+            assert!(!s.is_successful(), "{outcome:?} is not success");
+        }
+    }
+
+    #[test]
+    fn every_outcome_has_a_stable_wire_name() {
+        for (outcome, name) in [
+            (GoalOutcome::None, "none"),
+            (GoalOutcome::Met, "met"),
+            (GoalOutcome::Unmet, "unmet"),
+            (GoalOutcome::GenuinelyBlocked, "genuinelyBlocked"),
+            (GoalOutcome::Stalled, "stalled"),
+        ] {
+            assert_eq!(outcome.as_str(), name);
+        }
     }
 }

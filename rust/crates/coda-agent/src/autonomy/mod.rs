@@ -26,6 +26,7 @@ pub mod permission;
 pub mod recovery;
 pub mod retry;
 pub mod stuck;
+pub mod termination;
 pub mod verdict;
 
 pub use answerer::{ProxyAnswer, ProxyAnswerer};
@@ -38,6 +39,9 @@ pub use permission::PermissionResolver;
 pub use recovery::{RecoveryExecutor, RecoveryGuard, RecoveryKind};
 pub use retry::GoalRetryPolicy;
 pub use stuck::{StuckDetector, StuckObservation, StuckPattern};
+pub use termination::{
+    ProgressSnapshot, ProgressTracker, TerminationInputs, TerminationProof, NO_PROGRESS_WINDOW,
+};
 pub use verdict::{GoalOutcome, GoalStatus, GoalVerdict};
 
 use completion::SYSTEM_PROMPT;
@@ -88,6 +92,14 @@ pub struct AutonomySupervisor {
     ledger: Arc<AssumptionLedger>,
     /// Shared with the loop's per-iteration observation.
     stuck: Arc<StuckDetector>,
+    /// Tracks whether the run is still getting anywhere.
+    progress: ProgressTracker,
+    /// Work items not yet done, refreshed by the loop each turn.
+    open_work_items: Vec<String>,
+    /// Work items finished, as a monotonically comparable count.
+    completed_work_items: usize,
+    /// Successful file mutations, as a monotonically comparable count.
+    files_changed: u64,
 }
 
 impl AutonomySupervisor {
@@ -109,6 +121,10 @@ impl AutonomySupervisor {
             escalated: false,
             ledger: Arc::new(AssumptionLedger::new()),
             stuck: Arc::new(StuckDetector::new()),
+            progress: ProgressTracker::new(),
+            open_work_items: Vec::new(),
+            completed_work_items: 0,
+            files_changed: 0,
         }
     }
 
@@ -140,6 +156,17 @@ impl AutonomySupervisor {
     }
 
     /// Decide what happens at a natural stop.
+    ///
+    /// The ladder, in order:
+    /// 1. The completion judge says the goal is met — stop, met.
+    /// 2. The termination proof establishes that nothing further is possible —
+    ///    stop with the proved outcome and a report.
+    /// 3. The budget is exhausted — escalate once, then stop unmet.
+    /// 4. Otherwise keep working.
+    ///
+    /// The proof sits *above* the budget deliberately. A run that is genuinely
+    /// blocked should say so while it still has budget left, rather than
+    /// burning hours to reach the same conclusion by timing out.
     ///
     /// When the result is `GoalVerdict::Escalate`, the caller MUST call
     /// `try_grant_extension` (then continue) or `mark_stopped_unmet` (then
@@ -198,7 +225,7 @@ impl AutonomySupervisor {
             Err(_) | Ok((false, _)) => {
                 // §8 item 19: judge failure fails open — never stops an unfinished run.
                 self.budget.record_continuation();
-                GoalVerdict::Continue { nudge: nudge_unavailable }
+                self.continue_or_prove(nudge_unavailable)
             }
             Ok((true, Some(response))) => {
                 if completion::is_complete(&response) {
@@ -208,21 +235,128 @@ impl AutonomySupervisor {
 
                 self.last_remaining = Some(completion::remaining(&response));
                 self.budget.record_continuation();
-                GoalVerdict::Continue {
-                    nudge: format!(
-                        "The goal is not yet complete. Still remaining: {}\n\
-                         Keep working toward the goal, then stop only when it is fully done:\n{}",
-                        self.last_remaining.as_deref().unwrap_or("unspecified"),
-                        self.goal
-                    ),
-                }
+                let nudge = format!(
+                    "The goal is not yet complete. Still remaining: {}\n\
+                     Keep working toward the goal, then stop only when it is fully done:\n{}",
+                    self.last_remaining.as_deref().unwrap_or("unspecified"),
+                    self.goal
+                );
+                self.continue_or_prove(nudge)
             }
             Ok((true, None)) => {
                 // Shouldn't happen (true + None) but fail-open.
                 self.budget.record_continuation();
-                GoalVerdict::Continue { nudge: nudge_unavailable }
+                self.continue_or_prove(nudge_unavailable)
             }
         }
+    }
+
+    /// Record this turn's progress, then either continue or stop on a proof.
+    ///
+    /// The nudge is threaded through rather than built here so the caller's
+    /// reason for continuing — judge unavailable, or work still remaining —
+    /// survives into the message the agent actually sees.
+    fn continue_or_prove(&mut self, nudge: String) -> GoalVerdict {
+        let ledger = self.ledger.snapshot();
+        self.progress.observe(ProgressSnapshot {
+            completed_work_items: self.completed_work_items,
+            files_changed: self.files_changed,
+            distinct_ledger_entries: ledger.distinct_entries(),
+        });
+
+        let proof = termination::prove(TerminationInputs {
+            open_work_items: &self.open_work_items,
+            ledger: &ledger,
+            stuck: self.stuck.is_stuck(),
+            without_progress: self.progress.without_progress(),
+        });
+
+        match proof {
+            TerminationProof::GenuinelyBlocked => {
+                self.outcome = GoalOutcome::GenuinelyBlocked;
+                GoalVerdict::StopProved {
+                    outcome: GoalOutcome::GenuinelyBlocked,
+                    report: self.build_report(),
+                }
+            }
+            TerminationProof::Stalled => {
+                self.outcome = GoalOutcome::Stalled;
+                GoalVerdict::StopProved {
+                    outcome: GoalOutcome::Stalled,
+                    report: self.build_report(),
+                }
+            }
+            // Before continuing, hand the agent the stuck detector's one-shot
+            // correction if it has one: a run that can fix itself should be
+            // given the chance before any of this matters.
+            TerminationProof::KeepGoing => match self.stuck.take_nudge() {
+                Some(correction) => GoalVerdict::Continue {
+                    nudge: format!("{correction}\n\n{nudge}"),
+                },
+                None => GoalVerdict::Continue { nudge },
+            },
+        }
+    }
+
+    /// Tell the supervisor what the run has achieved so far.
+    ///
+    /// Called by the loop each turn. Kept as explicit inputs rather than having
+    /// the supervisor reach into the todo store or the filesystem, so the
+    /// progress rule stays a pure comparison that tests can drive directly.
+    pub fn record_progress(
+        &mut self,
+        open_work_items: Vec<String>,
+        completed_work_items: usize,
+        files_changed: u64,
+    ) {
+        self.open_work_items = open_work_items;
+        self.completed_work_items = completed_work_items;
+        self.files_changed = files_changed;
+    }
+
+    /// The operator-facing account of why the run stopped.
+    ///
+    /// Read from the ledger rather than from the decision snapshot: this is
+    /// prose for a human, so the freshest entries are more useful than perfect
+    /// agreement with the moment the proof was taken.
+    pub fn build_report(&self) -> String {
+        let entries = self.ledger.entries();
+        let mut report = String::new();
+
+        let blockers: Vec<&LedgerEntry> = entries
+            .iter()
+            .filter(|e| matches!(e, LedgerEntry::ParkedBlocker { .. }))
+            .collect();
+
+        if blockers.is_empty() {
+            report.push_str(
+                "The run stopped making progress and no further action was available.\n",
+            );
+        } else {
+            report.push_str("The run stopped because everything remaining is blocked.\n\n");
+            for entry in blockers {
+                if let LedgerEntry::ParkedBlocker { kind, tried, needs, blocks } = entry {
+                    let what = blocks.as_ref().map(|b| b.display()).unwrap_or("the goal");
+                    report.push_str(&format!("- {what} ({})\n", kind.as_str()));
+                    report.push_str(&format!("  needs: {needs}\n"));
+                    for attempt in tried {
+                        report.push_str(&format!("  tried: {attempt}\n"));
+                    }
+                }
+            }
+        }
+
+        let unsure = self.ledger.low_confidence_assumptions();
+        if !unsure.is_empty() {
+            report.push_str("\nDecisions made on your behalf that are worth checking:\n");
+            for entry in unsure {
+                if let LedgerEntry::Assumption { question, chosen, rationale, .. } = entry {
+                    report.push_str(&format!("- {question} -> {chosen} ({rationale})\n"));
+                }
+            }
+        }
+
+        report
     }
 
     /// Called by the loop after an answered escalation: extend the budget.
@@ -487,5 +621,291 @@ mod tests {
             Some(GoalRetryPolicy::for_tests()),
         );
         assert_eq!(sup.goal(), "ship the feature");
+    }
+
+    // ── The termination proof, through the supervisor ────────────────────────
+
+    /// A run with plenty of budget left, nothing parked and nothing looping
+    /// must keep working however quiet it is. Quiet is not the same as done.
+    #[tokio::test]
+    async fn a_quiet_run_with_budget_left_keeps_working() {
+        let mut sup = AutonomySupervisor::new(
+            Box::new(ScriptedJudge::new(vec!["CONTINUE: more", "CONTINUE: more", "CONTINUE: more"])),
+            "finish the work",
+            budget_cont(100),
+            Some(GoalRetryPolicy::for_tests()),
+        );
+
+        for _ in 0..3 {
+            let verdict = sup.evaluate("still going", CancellationToken::new()).await;
+            assert!(matches!(verdict, GoalVerdict::Continue { .. }), "{verdict:?}");
+        }
+    }
+
+    /// The headline guarantee: a blocked run stops with a proof and a report,
+    /// while it still has budget, and without asking anyone anything.
+    #[tokio::test]
+    async fn a_fully_blocked_run_stops_with_a_report_and_never_escalates() {
+        let mut sup = AutonomySupervisor::new(
+            Box::new(ScriptedJudge::new(vec![
+                "CONTINUE: needs a key",
+                "CONTINUE: needs a key",
+                "CONTINUE: needs a key",
+                "CONTINUE: needs a key",
+            ])),
+            "wire up billing",
+            budget_cont(100),
+            Some(GoalRetryPolicy::for_tests()),
+        );
+
+        sup.ledger()
+            .park_blocker(
+                crate::autonomy::BlockerKind::MissingCredential,
+                &["looked for STRIPE_KEY in the environment".to_owned()],
+                "STRIPE_KEY",
+                None,
+            )
+            .expect("an attempt was recorded");
+
+        // The ledger stops changing, so from here nothing moves.
+        let mut last = GoalVerdict::Continue { nudge: String::new() };
+        for _ in 0..4 {
+            last = sup.evaluate("blocked", CancellationToken::new()).await;
+        }
+
+        match last {
+            GoalVerdict::StopProved { outcome, report } => {
+                assert_eq!(outcome, GoalOutcome::GenuinelyBlocked);
+                assert!(report.contains("STRIPE_KEY"), "the report must name what is needed: {report}");
+                assert!(report.contains("looked for"), "and what was tried: {report}");
+            }
+            other => panic!("a fully blocked run must stop with a proof, got {other:?}"),
+        }
+        assert_eq!(sup.status().outcome, GoalOutcome::GenuinelyBlocked);
+        assert!(!sup.status().is_successful());
+        assert!(!sup.status().escalated, "a proved stop must never escalate to a human");
+    }
+
+    /// The termination guarantee when the operator set no budget at all: a
+    /// looping run still stops, via the stuck detector rather than a ceiling.
+    #[tokio::test]
+    async fn a_looping_run_with_an_unlimited_budget_still_terminates() {
+        let judge = ScriptedJudge::new(vec![
+            "CONTINUE: x", "CONTINUE: x", "CONTINUE: x", "CONTINUE: x", "CONTINUE: x",
+        ]);
+        let mut sup = AutonomySupervisor::new(
+            Box::new(judge),
+            "impossible task",
+            // No ceiling on either dimension.
+            GoalBudget::new(None, None, 0.5, || Duration::ZERO),
+            Some(GoalRetryPolicy::for_tests()),
+        );
+
+        // The agent loops on one failing call until the detector gives up on it.
+        let stuck = sup.stuck();
+        for _ in 0..5 {
+            stuck.observe(StuckObservation::new("run_command", "{}", "E", true));
+        }
+        stuck.take_nudge().expect("the loop is nudged once");
+        stuck.observe(StuckObservation::new("run_command", "{}", "E", true));
+
+        let mut verdicts = Vec::new();
+        for _ in 0..5 {
+            verdicts.push(sup.evaluate("looping", CancellationToken::new()).await);
+        }
+
+        let stopped = verdicts.iter().any(|v| {
+            matches!(v, GoalVerdict::StopProved { outcome: GoalOutcome::Stalled, .. })
+        });
+        assert!(
+            stopped,
+            "an unlimited budget must not mean an unlimited run: {verdicts:?}"
+        );
+        assert_eq!(sup.status().outcome, GoalOutcome::Stalled);
+    }
+
+    /// A completed goal wins over every proof: finishing is not being stuck.
+    #[tokio::test]
+    async fn a_completed_goal_stops_as_met_even_while_quiet() {
+        let mut sup = AutonomySupervisor::new(
+            Box::new(ScriptedJudge::new(vec!["DONE"])),
+            "the work",
+            budget_cont(100),
+            Some(GoalRetryPolicy::for_tests()),
+        );
+        sup.ledger()
+            .park_blocker(
+                crate::autonomy::BlockerKind::MissingAccess,
+                &["tried".to_owned()],
+                "access",
+                None,
+            )
+            .unwrap();
+
+        let verdict = sup.evaluate("all done", CancellationToken::new()).await;
+        assert!(matches!(verdict, GoalVerdict::Stop { met: true }), "{verdict:?}");
+        assert_eq!(sup.status().outcome, GoalOutcome::Met);
+    }
+
+    /// Recorded work that is neither finished nor blocked is work still to do.
+    #[tokio::test]
+    async fn unblocked_work_items_keep_the_run_going() {
+        let mut sup = AutonomySupervisor::new(
+            Box::new(ScriptedJudge::new(vec![
+                "CONTINUE: x", "CONTINUE: x", "CONTINUE: x", "CONTINUE: x", "CONTINUE: x",
+            ])),
+            "the work",
+            budget_cont(100),
+            Some(GoalRetryPolicy::for_tests()),
+        );
+        sup.record_progress(vec!["unblocked item".to_owned()], 0, 0);
+        sup.ledger()
+            .park_blocker(
+                crate::autonomy::BlockerKind::MissingAccess,
+                &["tried".to_owned()],
+                "access",
+                Some("a different item"),
+            )
+            .unwrap();
+
+        for _ in 0..5 {
+            let verdict = sup.evaluate("working", CancellationToken::new()).await;
+            assert!(
+                matches!(verdict, GoalVerdict::Continue { .. }),
+                "unblocked work must keep the run alive: {verdict:?}"
+            );
+        }
+    }
+
+    /// Real movement resets the quiet counter, so a slow but productive run is
+    /// never mistaken for a stalled one.
+    #[tokio::test]
+    async fn movement_prevents_any_proof_from_firing() {
+        let mut sup = AutonomySupervisor::new(
+            Box::new(ScriptedJudge::new(vec![
+                "CONTINUE: x", "CONTINUE: x", "CONTINUE: x", "CONTINUE: x", "CONTINUE: x",
+            ])),
+            "the work",
+            budget_cont(100),
+            Some(GoalRetryPolicy::for_tests()),
+        );
+        sup.ledger()
+            .park_blocker(
+                crate::autonomy::BlockerKind::MissingAccess,
+                &["tried".to_owned()],
+                "access",
+                None,
+            )
+            .unwrap();
+
+        for turn in 0..5 {
+            sup.record_progress(Vec::new(), 0, turn + 1);
+            let verdict = sup.evaluate("progressing", CancellationToken::new()).await;
+            assert!(
+                matches!(verdict, GoalVerdict::Continue { .. }),
+                "a run that is changing files is making progress: {verdict:?}"
+            );
+        }
+    }
+
+    /// The stuck detector's correction must actually reach the agent, or it
+    /// never gets the chance to fix itself before being judged.
+    #[tokio::test]
+    async fn a_pending_correction_is_delivered_with_the_nudge() {
+        let mut sup = AutonomySupervisor::new(
+            Box::new(ScriptedJudge::new(vec!["CONTINUE: keep going"])),
+            "the work",
+            budget_cont(100),
+            Some(GoalRetryPolicy::for_tests()),
+        );
+
+        let stuck = sup.stuck();
+        for _ in 0..4 {
+            stuck.observe(StuckObservation::new("run_command", "{}", "E", true));
+        }
+
+        match sup.evaluate("looping", CancellationToken::new()).await {
+            GoalVerdict::Continue { nudge } => {
+                assert!(nudge.contains("run_command"), "the correction must be delivered: {nudge}");
+                assert!(nudge.contains("keep going"), "and the judge's nudge kept: {nudge}");
+            }
+            other => panic!("expected a correction, got {other:?}"),
+        }
+    }
+
+    /// REGRESSION: the completion judge's prose was once a progress signal.
+    /// Because it is regenerated from the agent's varying output it differed
+    /// nearly every turn, so the quiet counter reset continually and a blocked
+    /// run never reached its proof. A judge that says something different every
+    /// time must not keep a stalled run alive.
+    #[tokio::test]
+    async fn varying_judge_prose_does_not_keep_a_blocked_run_alive() {
+        let mut sup = AutonomySupervisor::new(
+            Box::new(ScriptedJudge::new(vec![
+                "CONTINUE: still needs the key",
+                "CONTINUE: the key is still missing",
+                "CONTINUE: waiting on a credential",
+                "CONTINUE: blocked on STRIPE_KEY",
+                "CONTINUE: no key yet",
+            ])),
+            "wire up billing",
+            GoalBudget::new(None, None, 0.5, || Duration::ZERO),
+            Some(GoalRetryPolicy::for_tests()),
+        );
+        sup.ledger()
+            .park_blocker(
+                crate::autonomy::BlockerKind::MissingCredential,
+                &["looked for STRIPE_KEY".to_owned()],
+                "STRIPE_KEY",
+                None,
+            )
+            .unwrap();
+
+        let mut verdicts = Vec::new();
+        for _ in 0..5 {
+            verdicts.push(sup.evaluate("varied narration each turn", CancellationToken::new()).await);
+        }
+
+        assert!(
+            verdicts.iter().any(|v| matches!(
+                v,
+                GoalVerdict::StopProved { outcome: GoalOutcome::GenuinelyBlocked, .. }
+            )),
+            "prose is not progress: {verdicts:?}"
+        );
+    }
+
+    /// REGRESSION: repeatedly hitting the same wall appends an identical ledger
+    /// entry each turn. Counting those as new would make failure read as
+    /// forward motion and postpone termination forever.
+    #[tokio::test]
+    async fn repeating_an_identical_denial_is_not_progress() {
+        let mut sup = AutonomySupervisor::new(
+            Box::new(ScriptedJudge::new(vec![
+                "CONTINUE: x", "CONTINUE: x", "CONTINUE: x", "CONTINUE: x", "CONTINUE: x",
+            ])),
+            "the work",
+            GoalBudget::new(None, None, 0.5, || Duration::ZERO),
+            Some(GoalRetryPolicy::for_tests()),
+        );
+
+        let stuck = sup.stuck();
+        for _ in 0..5 {
+            stuck.observe(StuckObservation::new("run_command", "{}", "denied", true));
+        }
+        stuck.take_nudge();
+        stuck.observe(StuckObservation::new("run_command", "{}", "denied", true));
+
+        let mut verdicts = Vec::new();
+        for _ in 0..5 {
+            // The agent retries the same forbidden action every turn.
+            sup.ledger().record_denial("run_command", "plan", "bypassPermissions");
+            verdicts.push(sup.evaluate("retrying", CancellationToken::new()).await);
+        }
+
+        assert!(
+            verdicts.iter().any(|v| matches!(v, GoalVerdict::StopProved { .. })),
+            "an identical repeated denial is not progress: {verdicts:?}"
+        );
     }
 }

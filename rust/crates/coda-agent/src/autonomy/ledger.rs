@@ -37,7 +37,7 @@ use crate::tasks::streaming_secret_redactor::StreamingSecretRedactor;
 /// "87%", and that false precision would then be rendered to an operator as
 /// though it meant something. Three buckets carry the only distinction the
 /// report actually draws: whether this decision deserves a second look.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Confidence {
     High,
     Medium,
@@ -65,7 +65,7 @@ impl Confidence {
 /// cannot do the thing, by any available means. Risk, ambiguity and "this
 /// looks scary" are deliberately absent: those are resolvable, and resolving
 /// them is the agent's job.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BlockerKind {
     /// A credential or secret that is not in the environment or the store.
     MissingCredential,
@@ -105,7 +105,7 @@ impl BlockerKind {
 /// So `display` carries the redacted prose and `key` carries a hash of the
 /// original. A hash cannot leak the secret it was derived from, and it is
 /// unaffected by redaction, so the join stays sound however the text reads.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct WorkItemRef {
     display: String,
     key: u64,
@@ -142,7 +142,7 @@ fn work_item_key(original: &str) -> u64 {
 }
 
 /// One recorded autonomous decision.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LedgerEntry {
     /// A question was answered on the operator's behalf.
     Assumption {
@@ -227,6 +227,7 @@ pub struct LedgerSnapshot {
     has_parked: bool,
     goal_level_blockers: usize,
     total: usize,
+    distinct: usize,
 }
 
 impl LedgerSnapshot {
@@ -243,6 +244,16 @@ impl LedgerSnapshot {
     /// Total entries of every kind.
     pub fn total_entries(&self) -> usize {
         self.total
+    }
+
+    /// Entries that differ from one another.
+    ///
+    /// The progress signal counts these rather than the total: an agent that
+    /// retries the same denied action every turn appends an identical `Denial`
+    /// every turn, and counting those would make hitting the same wall
+    /// repeatedly read as forward motion — postponing termination forever.
+    pub fn distinct_entries(&self) -> usize {
+        self.distinct
     }
 
     /// Whether `original` — the live, unredacted todo text — is parked.
@@ -379,8 +390,11 @@ impl AssumptionLedger {
         let mut parked_items = Vec::new();
         let mut has_parked = false;
         let mut goal_level_blockers = 0usize;
+        let mut distinct: std::collections::HashSet<&LedgerEntry> =
+            std::collections::HashSet::new();
 
         for entry in entries.iter() {
+            distinct.insert(entry);
             if let LedgerEntry::ParkedBlocker { blocks, .. } = entry {
                 has_parked = true;
                 match blocks {
@@ -390,7 +404,13 @@ impl AssumptionLedger {
             }
         }
 
-        LedgerSnapshot { parked_items, has_parked, goal_level_blockers, total: entries.len() }
+        LedgerSnapshot {
+            parked_items,
+            has_parked,
+            goal_level_blockers,
+            total: entries.len(),
+            distinct: distinct.len(),
+        }
     }
 
     /// Every entry, in the order recorded.

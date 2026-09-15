@@ -50,8 +50,16 @@ perform it.
 
 Commits and deployments are recoverable and receive no special handling.
 
-**Progress signal.** Any of: a todo reaching `done`; a file changing; the
-completion judge's `remaining` text changing; a new non-repeat ledger entry.
+**Progress signal.** Any of: a todo reaching `done`; a file changing; a new
+**distinct** ledger entry.
+
+Deliberately *not* the completion judge's "what remains" prose. That text is
+regenerated from the agent's own varying output, so it differs almost every
+turn, which reset the quiet counter continually and left both proofs unable to
+fire in any realistic run. Nor the *total* ledger count: an agent retrying the
+same denied action appends an identical entry every turn, and counting those
+would make hitting the same wall repeatedly read as forward motion. A progress
+signal that a flailing agent can produce by flailing is not a progress signal.
 
 **No-progress window (`N`).** Three consecutive continuations without a
 progress signal. Chosen to match the StuckDetector's own error/monologue
@@ -257,19 +265,25 @@ PermissionPrompt.request(tool, input)
 ```
 1. CompletionJudge -- DONE ----------------------> Stop{ Met }
 2. progress signal since last stop? -- yes ------> Continue{ nudge }
-3. terminal-state proof:
-     every open todo has a ParkedBlocker
-     AND no progress signal for N continuations
-     AND at least one parked blocker exists
-                                 -- holds ------> Stop{ GenuinelyBlocked, report }
-4. stall proof:
-     StuckDetector reports stuck
-     AND no progress signal for N continuations
-     AND no parked blockers exist
-                                 -- holds ------> Stop{ Stalled, report }
-5. budget exhausted -----------------------------> Stop{ Unmet }
-   otherwise --------------------------------------> Continue{ nudge }
+3. terminal-state proof, once quiet for N turns:
+     any blocker parked?
+       yes, and every open item parked ---------> Stop{ GenuinelyBlocked, report }
+       yes, some open item unparked, looping ---> Stop{ Stalled, report }
+       yes, some open item unparked, not looping > Continue{ nudge }
+       no, and looping -------------------------> Stop{ Stalled, report }
+       no, not looping -------------------------> Continue{ nudge }
+4. budget exhausted -----------------------------> Stop{ Unmet }
 ```
+
+A parked blocker must never disable termination for the rest of the run. An
+earlier form of this ladder returned "keep going" whenever *something* was
+parked but *something else* was not, on the grounds that a run with real
+blockers should report them rather than be dismissed as looping. That confused
+the label with the decision: it declined to call the state `Stalled` and then
+chose no terminal state at all, so one parked branch made the whole run
+immortal — the precise hang this design exists to remove. Which proof fires is
+a presentation question; terminating is not optional. The report lists every
+parked blocker either way.
 
 `todo_write`'s list is the work-item registry, so "every open item is parked" is
 a real query rather than an estimate. When no todos exist, the proof rests on

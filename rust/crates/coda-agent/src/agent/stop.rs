@@ -65,6 +65,18 @@ pub(crate) async fn decide_stop(
         match verdict {
             GoalVerdict::Continue { nudge } => return Ok(StopAction::Continue { nudge }),
 
+            // Stopping was proved, not merely timed out. The report is the
+            // whole point of the proof — it tells the operator what is blocked,
+            // what was tried, and what they would need to supply — so it is
+            // emitted rather than discarded, and the run ends without ever
+            // asking anyone anything.
+            GoalVerdict::StopProved { outcome, report } => {
+                sink.emit(AgentEvent::LimitReached {
+                    kind: format!("goal.{}", outcome.as_str()),
+                    message: report,
+                });
+            }
+
             GoalVerdict::Escalate { question, .. } => {
                 // Ask the operator — headless (user_question = None) → stop unmet.
                 let outcome = match user_question {
