@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::compaction::{CompactionPolicy, CompactionService, TokenEstimator};
 use crate::events::{AgentEvent, AgentSink};
-use crate::goal::{GoalStatus, GoalSupervisor, last_assistant_text};
+use crate::autonomy::{GoalStatus, AutonomySupervisor, last_assistant_text};
 use crate::lsp::LspServerManager;
 use crate::permission::{PermissionMode, PermissionModeState, PermissionPrompt};
 use crate::scheduling::ScheduledTaskStore;
@@ -33,7 +33,7 @@ use crate::steering::SteeringInbox;
 use crate::subagents::SubagentFactory;
 use crate::tasks::TaskManager;
 use crate::todos::TodoStore;
-use crate::tool::{PlanApprover, ToolQuarantine, ToolRegistry, UserQuestion};
+use crate::tool::{PlanApprover, ScheduleOrigin, ToolQuarantine, ToolRegistry, UserQuestion};
 
 pub mod stop;
 pub mod stream;
@@ -155,8 +155,14 @@ pub struct AgentLoop {
     schedule_store: Option<Arc<ScheduledTaskStore>>,
     /// Id of the owning task (set when this loop runs inside a subagent task).
     caller_task_id: Option<String>,
+    /// Scheduled provenance of this run, stamped by the trusted host/runner.
+    schedule_origin: Option<ScheduleOrigin>,
     /// Subagent factory for the `task` tool.
     subagent_factory: Option<Arc<dyn SubagentFactory>>,
+    /// Engine-owned user-notification bus for `notify_user` (Stage 2).
+    message_bus: Option<Arc<crate::message::MessageBus>>,
+    /// `true` only for the trusted top-level (main) conversation loop.
+    is_main_context: bool,
 
     // Configuration.
     model: String,
@@ -190,7 +196,7 @@ impl AgentLoop {
         &self,
         history: &mut Vec<Message>,
         sink: &dyn AgentSink,
-        goal: Option<GoalSupervisor>,
+        goal: Option<AutonomySupervisor>,
         cancel: CancellationToken,
     ) -> Result<GoalStatus, AgentError> {
         // Reopen the steering inbox so messages enqueued between runs (or
@@ -218,11 +224,14 @@ impl AgentLoop {
         &self,
         history: &mut Vec<Message>,
         sink: &dyn AgentSink,
-        mut goal: Option<GoalSupervisor>,
+        mut goal: Option<AutonomySupervisor>,
         cancel: CancellationToken,
         _pending_hook_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
     ) -> Result<GoalStatus, AgentError> {
         let mut stop_continuations: u32 = 0;
+        // Successful file mutations this run, the progress signal that tells a
+        // slow run apart from a stalled one.
+        let mut files_changed: u64 = 0;
         let mut activity = ToolActivity::new();
         let mut blocked_compaction_at: Option<usize> = None;
 
@@ -300,7 +309,23 @@ impl AgentLoop {
                 }
             }
 
-            // 4c. Task-completion injection (no-op seam; later phase).
+            // 4c. Main inbox injection (Stage 3 chunk A, `ask_main`).
+            // Only the trusted main context drains the shared main FIFO — a
+            // child/subagent shares the SAME `Arc<MessageBus>` (so its own
+            // `ask_main`/`notify_user` calls land on it) but must never
+            // consume the single main-context inbox itself; see
+            // `crate::message` module docs and `stop::decide_stop`, which
+            // enforces the matching half of this at the natural-stop check.
+            // No TaskManager completion drain here — that is a separate,
+            // later seam.
+            if self.is_main_context {
+                if let Some(bus) = &self.message_bus {
+                    let drained = bus.take_main_for_delivery();
+                    for item in &drained {
+                        history.push(Message::user(item.injected_text()));
+                    }
+                }
+            }
             // 4d. Deferred-tools reminder (no-op seam; later phase).
 
             // 5. Wire tool definitions.
@@ -520,12 +545,48 @@ impl AgentLoop {
                 // No tool calls → stop-decision ladder (§1.5).
                 let recent_text = last_assistant_text(history);
 
+                // A turn that called no tool is a monologue. The detector needs
+                // to see it: three in a row is an agent talking rather than
+                // working, and is one of the shapes that would otherwise loop
+                // forever without a budget to catch it.
+                if let Some(supervisor) = goal.as_ref() {
+                    supervisor.stuck().observe_monologue();
+                }
+
+                // Tell the supervisor what this turn achieved, before it
+                // decides anything. Progress is measured from work actually
+                // done — todos finished, files changed — so a turn that only
+                // produced prose is correctly seen as standing still.
+                if let Some(supervisor) = goal.as_mut() {
+                    let (open, completed) = match self.todos.as_deref() {
+                        Some(store) => {
+                            let items = store.items();
+                            let open: Vec<String> = items
+                                .iter()
+                                .filter(|t| t.status != crate::todos::TodoStatus::Completed)
+                                .map(|t| t.content.clone())
+                                .collect();
+                            let completed = items
+                                .iter()
+                                .filter(|t| t.status == crate::todos::TodoStatus::Completed)
+                                .count();
+                            (open, completed)
+                        }
+                        None => (Vec::new(), 0),
+                    };
+                    supervisor.record_progress(open, completed, files_changed);
+                }
+
                 let action = decide_stop(
                     acc.stop_reason.as_deref(),
                     &recent_text,
                     &mut goal,
                     &mut stop_continuations,
                     self.steering.as_deref(),
+                    // Stage 3 chunk A: only a MAIN-context run checks the
+                    // shared main inbox here — see `decide_stop`'s doc
+                    // comment for why a child must never receive it.
+                    if self.is_main_context { self.message_bus.as_deref() } else { None },
                     sink,
                     cancel.clone(),
                     self.user_question.as_deref(),
@@ -574,14 +635,77 @@ impl AgentLoop {
                     task_manager: self.task_manager.clone(),
                     schedule_store: self.schedule_store.clone(),
                     caller_task_id: self.caller_task_id.clone(),
+                    schedule_origin: self.schedule_origin.clone(),
                     subagent_factory: self.subagent_factory.clone(),
+                    message_bus: self.message_bus.clone(),
+                    is_main_context: self.is_main_context,
                 };
 
                 let ToolBatchResult { result_blocks, abort_reason, control_abort } =
                     run_tools(&tool_uses_in_history, &activity, sink, &batch_ctx, cancel.clone())
                         .await?;
 
+                // Feed the autonomy supervisor what just happened. The stuck
+                // detector needs each call paired with its result to recognise
+                // a loop, and the file counter is the progress signal that
+                // distinguishes a slow run from a stalled one.
+                if let Some(supervisor) = goal.as_ref() {
+                    let stuck = supervisor.stuck();
+                    // The reasoning that accompanied this batch. Part of the
+                    // detector's notion of "the same action": two calls made
+                    // for genuinely different reasons are not a repeat.
+                    let thought = last_assistant_text(history);
+                    for (use_block, result_block) in
+                        tool_uses_in_history.iter().zip(result_blocks.iter())
+                    {
+                        let (Content::ToolUse { name, input_json, .. },
+                             Content::ToolResult { content, is_error, .. }) =
+                            (use_block, result_block)
+                        else {
+                            continue;
+                        };
+                        if !*is_error && is_file_mutation(name) {
+                            files_changed = files_changed.saturating_add(1);
+                        }
+                        stuck.observe(
+                            crate::autonomy::StuckObservation::new(
+                                name,
+                                input_json,
+                                content,
+                                *is_error,
+                            )
+                            .with_thought(thought.clone()),
+                        );
+                    }
+                }
+
                 history.push(Message::new(Role::User, result_blocks));
+
+                // The autonomy gate, on the path that actually loops.
+                //
+                // Everything below `decide_stop` runs only when a turn calls no
+                // tools. An agent that calls a tool every turn never gets there,
+                // and `max_iterations` is disabled for goal runs, so without
+                // this check such a run is bounded by nothing at all — not the
+                // budget, not the stuck detector, not the corrective nudge.
+                if let Some(supervisor) = goal.as_mut() {
+                    match supervisor.check_mid_turn() {
+                        crate::autonomy::MidTurn::Continue => {}
+                        crate::autonomy::MidTurn::Nudge(correction) => {
+                            history.push(Message::user(correction));
+                        }
+                        crate::autonomy::MidTurn::Stop { outcome, report } => {
+                            sink.emit(AgentEvent::Stop {
+                                stop_reason: Some(outcome.as_str().to_owned()),
+                            });
+                            sink.emit(AgentEvent::LimitReached {
+                                kind: format!("goal.{}", outcome.as_str()),
+                                message: report,
+                            });
+                            return Ok(goal_status(&goal));
+                        }
+                    }
+                }
 
                 // §8 item 28: persist after tool results (seam; no-op here).
 
@@ -629,8 +753,16 @@ impl AgentLoop {
     }
 }
 
-fn goal_status(goal: &Option<GoalSupervisor>) -> GoalStatus {
-    goal.as_ref().map(|g| g.status()).unwrap_or_else(GoalStatus::none)
+/// Tools whose success means a file actually changed on disk.
+///
+/// Used only as a progress signal, so a conservative list is fine: a mutation
+/// this misses simply is not counted as progress, and the other signals still
+/// apply.
+fn is_file_mutation(tool_name: &str) -> bool {
+    matches!(tool_name, "edit_file" | "write_file" | "notebook_edit")
+}
+
+fn goal_status(goal: &Option<AutonomySupervisor>) -> GoalStatus {    goal.as_ref().map(|g| g.status()).unwrap_or_else(GoalStatus::none)
 }
 
 /// Replace the `Text` block in the last assistant message with `new_text`.
@@ -754,7 +886,10 @@ pub struct AgentLoopBuilder {
     task_manager: Option<Arc<TaskManager>>,
     schedule_store: Option<Arc<ScheduledTaskStore>>,
     caller_task_id: Option<String>,
+    schedule_origin: Option<ScheduleOrigin>,
     subagent_factory: Option<Arc<dyn SubagentFactory>>,
+    message_bus: Option<Arc<crate::message::MessageBus>>,
+    is_main_context: bool,
     model: String,
     system_prompt: Option<String>,
     max_tokens: u32,
@@ -794,7 +929,10 @@ impl AgentLoopBuilder {
             task_manager: None,
             schedule_store: None,
             caller_task_id: None,
+            schedule_origin: None,
             subagent_factory: None,
+            message_bus: None,
+            is_main_context: false,
             model: "claude-opus-4-5".into(),
             system_prompt: None,
             max_tokens: 4096,
@@ -935,8 +1073,35 @@ impl AgentLoopBuilder {
         self
     }
 
+    /// Stamp this run's scheduled provenance.
+    ///
+    /// Only the trusted subagent host / schedule runner call this; the value
+    /// reaches tools read-only through `ToolContext::schedule_origin` and is
+    /// never derived from model input.
+    pub fn with_schedule_origin(mut self, origin: ScheduleOrigin) -> Self {
+        self.schedule_origin = Some(origin);
+        self
+    }
+
     pub fn with_subagent_factory(mut self, factory: Arc<dyn SubagentFactory>) -> Self {
         self.subagent_factory = Some(factory);
+        self
+    }
+
+    /// Wire the engine-owned user-notification bus so `notify_user` is
+    /// available to this run. Shared clones (main loop, subagent host,
+    /// scheduled runs) must all receive the **same** `Arc` — see
+    /// `crate::message` module docs.
+    pub fn with_message_bus(mut self, bus: Arc<crate::message::MessageBus>) -> Self {
+        self.message_bus = Some(bus);
+        self
+    }
+
+    /// Mark this build as the trusted top-level (main) conversation loop.
+    /// Only the top-level agent-construction path may call this — a
+    /// subagent host or scheduled-run builder must never set it.
+    pub fn with_main_context(mut self) -> Self {
+        self.is_main_context = true;
         self
     }
 
@@ -960,7 +1125,10 @@ impl AgentLoopBuilder {
             task_manager: self.task_manager,
             schedule_store: self.schedule_store,
             caller_task_id: self.caller_task_id,
+            schedule_origin: self.schedule_origin,
             subagent_factory: self.subagent_factory,
+            message_bus: self.message_bus,
+            is_main_context: self.is_main_context,
             model: self.model,
             system_prompt: self.system_prompt,
             max_tokens: self.max_tokens,
@@ -1955,7 +2123,7 @@ mod tests {
     // Fix: fall through to the seal check for BOTH goal and no-goal stop paths.
     #[tokio::test]
     async fn goal_stop_with_racing_message_delivers_steering() {
-        use crate::goal::{ForkedAgent, GoalBudget, GoalRetryPolicy, GoalSupervisor};
+        use crate::autonomy::{ForkedAgent, GoalBudget, GoalRetryPolicy, AutonomySupervisor};
         use coda_llm::Message as LlmMessage;
 
         let steering = Arc::new(SteeringInbox::new());
@@ -1991,13 +2159,13 @@ mod tests {
             vec![Ok(StreamEvent::TextDelta("continuing after steering".into())), Ok(done())],
         ]);
 
-        let goal = GoalSupervisor::new(
+        let goal = AutonomySupervisor::new(
             Box::new(EnqueueOnDoneJudge {
                 inbox: steering.clone(),
                 enqueued: std::sync::atomic::AtomicBool::new(false),
             }),
             "test goal",
-            GoalBudget::new(Duration::MAX, 5, 0.5, || Duration::ZERO),
+            GoalBudget::new(None, Some(5), 0.5, || Duration::ZERO),
             Some(GoalRetryPolicy::for_tests()),
         );
 
@@ -2364,7 +2532,7 @@ mod tests {
     struct MockFork(String);
 
     #[async_trait]
-    impl crate::goal::ForkedAgent for MockFork {
+    impl crate::autonomy::ForkedAgent for MockFork {
         async fn run(
             &self,
             _system: &str,
@@ -2379,10 +2547,139 @@ mod tests {
     ///
     /// Mutation-verified: comment out step 3 compaction block and this test
     /// fails (history length doesn't decrease).
+    // ── The autonomy gate on the tool-calling path ──────────────────────────
+
+    /// REGRESSION (hang): every autonomy check used to live behind the stop
+    /// ladder, which is only reached when a turn calls NO tools. An agent that
+    /// called a tool every turn — `cargo test` failing, then failing again,
+    /// forever — reached none of them, and `max_iterations` is deliberately
+    /// disabled for goal runs, so nothing bounded it at all.
+    ///
+    /// Drives the real `AgentLoop` with a model that only ever emits tool
+    /// calls. Before the mid-turn gate this test did not terminate.
+    #[tokio::test]
+    async fn a_goal_run_that_only_calls_tools_still_terminates() {
+        use crate::autonomy::{AutonomySupervisor, ForkedAgent, GoalBudget, GoalRetryPolicy};
+
+        struct NeverDone;
+        #[async_trait]
+        impl ForkedAgent for NeverDone {
+            async fn run(
+                &self,
+                _: &str,
+                _: Vec<Message>,
+                _: CancellationToken,
+            ) -> anyhow::Result<String> {
+                Ok("CONTINUE: not yet".to_owned())
+            }
+        }
+
+        // The model asks for the identical failing call, over and over.
+        let responses: Vec<_> = (0..60)
+            .map(|_| vec![Ok(tool_use_event("t1", "tool_a")), Ok(done())])
+            .collect();
+        let client = MockLlmClient::new(responses);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let tools = Arc::new(ToolRegistry::new([dyn_tool(MockTool::new(
+            "tool_a", false, log,
+        ))]));
+        let sink = CollectingSink::new();
+
+        let goal = AutonomySupervisor::new(
+            Box::new(NeverDone),
+            "make the tests pass",
+            // No ceiling on either dimension: the stuck detector is the only
+            // thing that can stop this, which is exactly the claim under test.
+            GoalBudget::new(None, None, 0.5, || Duration::ZERO),
+            Some(GoalRetryPolicy::for_tests()),
+        );
+
+        let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
+            .with_tool_max_duration(None)
+            .build();
+
+        let mut history = vec![Message::user("go")];
+        let status = tokio::time::timeout(
+            Duration::from_secs(20),
+            agent.run(&mut history, &sink, Some(goal), CancellationToken::new()),
+        )
+        .await
+        .expect("a goal run that only calls tools must terminate, not hang")
+        .expect("the run itself must not error");
+
+        assert_eq!(
+            status.outcome,
+            crate::autonomy::GoalOutcome::Stalled,
+            "a run looping on one tool call is stalled"
+        );
+        assert!(
+            sink.take().iter().any(|e| matches!(
+                e,
+                AgentEvent::LimitReached { kind, .. } if kind == "goal.stalled"
+            )),
+            "the operator must be told why it stopped"
+        );
+    }
+
+    /// The mirror: a goal run making genuine progress through tool calls must
+    /// not be killed by the gate.
+    #[tokio::test]
+    async fn a_goal_run_making_progress_through_tools_is_not_stopped_early() {
+        use crate::autonomy::{AutonomySupervisor, ForkedAgent, GoalBudget, GoalRetryPolicy};
+
+        struct DoneAfterWork;
+        #[async_trait]
+        impl ForkedAgent for DoneAfterWork {
+            async fn run(
+                &self,
+                _: &str,
+                _: Vec<Message>,
+                _: CancellationToken,
+            ) -> anyhow::Result<String> {
+                Ok("DONE".to_owned())
+            }
+        }
+
+        // Three DISTINCT calls, then a text turn.
+        let mut responses: Vec<_> = (0..3)
+            .map(|i| vec![Ok(tool_use_event(&format!("t{i}"), "tool_a")), Ok(done())])
+            .collect();
+        responses.push(vec![Ok(StreamEvent::TextDelta("finished".into())), Ok(done())]);
+
+        let client = MockLlmClient::new(responses);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let tools = Arc::new(ToolRegistry::new([dyn_tool(MockTool::new(
+            "tool_a", true, log,
+        ))]));
+
+        let goal = AutonomySupervisor::new(
+            Box::new(DoneAfterWork),
+            "do the work",
+            GoalBudget::new(None, None, 0.5, || Duration::ZERO),
+            Some(GoalRetryPolicy::for_tests()),
+        );
+
+        let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
+            .with_tool_max_duration(None)
+            .build();
+
+        let mut history = vec![Message::user("go")];
+        let status = agent
+            .run(&mut history, &NullSink, Some(goal), CancellationToken::new())
+            .await
+            .expect("the run must succeed");
+
+        assert_eq!(
+            status.outcome,
+            crate::autonomy::GoalOutcome::Met,
+            "real work must be allowed to finish"
+        );
+    }
+
     #[tokio::test]
     async fn compaction_fires_proactively_when_over_threshold_in_goal_run() {
         use crate::compaction::CompactionService;
-        use crate::goal::{ForkedAgent, GoalBudget, GoalRetryPolicy, GoalSupervisor};
+        use crate::autonomy::{ForkedAgent, GoalBudget, GoalRetryPolicy, AutonomySupervisor};
 
         let svc = Arc::new(CompactionService::new(Arc::new(MockFork("summary text".into()))));
 
@@ -2405,10 +2702,10 @@ mod tests {
         let tools = Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
         let sink = CollectingSink::new();
 
-        let goal = GoalSupervisor::new(
+        let goal = AutonomySupervisor::new(
             Box::new(DoneJudge),
             "test goal",
-            GoalBudget::new(Duration::MAX, 3, 0.5, || Duration::ZERO),
+            GoalBudget::new(None, Some(3), 0.5, || Duration::ZERO),
             Some(GoalRetryPolicy::for_tests()),
         );
 
@@ -2444,7 +2741,7 @@ mod tests {
 
         struct CountingFork(Arc<AtomicUsize>);
         #[async_trait]
-        impl crate::goal::ForkedAgent for CountingFork {
+        impl crate::autonomy::ForkedAgent for CountingFork {
             async fn run(&self, _: &str, _: Vec<Message>, _: CancellationToken) -> anyhow::Result<String> {
                 self.0.fetch_add(1, Ordering::SeqCst);
                 Ok("summary".to_owned())
@@ -2454,7 +2751,7 @@ mod tests {
         let svc = Arc::new(CompactionService::new(Arc::new(CountingFork(cnt))));
         let policy = CompactionPolicy { token_threshold: 0, ..Default::default() }; // disabled
 
-        use crate::goal::{ForkedAgent, GoalBudget, GoalRetryPolicy, GoalSupervisor};
+        use crate::autonomy::{ForkedAgent, GoalBudget, GoalRetryPolicy, AutonomySupervisor};
         struct DoneJudge;
         #[async_trait]
         impl ForkedAgent for DoneJudge {
@@ -2468,10 +2765,10 @@ mod tests {
             Ok(done()),
         ]]);
         let tools = Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
-        let goal = GoalSupervisor::new(
+        let goal = AutonomySupervisor::new(
             Box::new(DoneJudge),
             "test",
-            GoalBudget::new(Duration::MAX, 3, 0.5, || Duration::ZERO),
+            GoalBudget::new(None, Some(3), 0.5, || Duration::ZERO),
             Some(GoalRetryPolicy::for_tests()),
         );
 
@@ -2503,7 +2800,7 @@ mod tests {
 
         struct EmptyFork;
         #[async_trait]
-        impl crate::goal::ForkedAgent for EmptyFork {
+        impl crate::autonomy::ForkedAgent for EmptyFork {
             async fn run(&self, _: &str, _: Vec<Message>, _: CancellationToken) -> anyhow::Result<String> {
                 Ok(String::new()) // empty → fail
             }
@@ -2722,6 +3019,278 @@ mod tests {
         let events = sink.take();
         let has_rr = events.iter().any(|e| matches!(e, AgentEvent::ResponseRewritten { .. }));
         assert!(!has_rr, "no ResponseRewritten event must be emitted when hook returns no change");
+    }
+
+    // ── Stage 3 chunk A: main inbox / `ask_main` integration ─────────────────
+
+    fn subagent_source(task_id: &str, label: &str) -> crate::message::MessageSource {
+        crate::message::MessageSource::Subagent { task_id: task_id.into(), label: label.into() }
+    }
+
+    fn main_agent_message_texts(history: &[Message]) -> Vec<String> {
+        history
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .map(|m| m.text())
+            .filter(|t| t.starts_with("[agent-message]"))
+            .collect()
+    }
+
+    /// The main context drains the shared main inbox exactly once, before
+    /// the model is called, appending one `Message::user` per FIFO item in
+    /// order — and the queue ends up empty.
+    #[tokio::test]
+    async fn main_context_drains_main_inbox_once_before_model_call() {
+        let bus = Arc::new(crate::message::MessageBus::new());
+        bus.publish_main(&subagent_source("t1", "worker-a"), "question one", None, None).unwrap();
+        bus.publish_main(&subagent_source("t2", "worker-b"), "question two", None, None).unwrap();
+
+        let client =
+            MockLlmClient::new(vec![vec![Ok(StreamEvent::TextDelta("final answer".into())), Ok(done())]]);
+        let tools = Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
+
+        let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
+            .with_message_bus(bus.clone())
+            .with_main_context()
+            .with_tool_max_duration(None)
+            .build();
+
+        let mut history = vec![Message::user("go")];
+        agent.run(&mut history, &NullSink, None, CancellationToken::new()).await.unwrap();
+
+        assert_eq!(bus.pending_main_len(), 0, "the main inbox must be fully drained");
+        let injected = main_agent_message_texts(&history);
+        assert_eq!(injected.len(), 2, "one Message::user per FIFO item: {injected:?}");
+        assert!(injected[0].contains("question one"));
+        assert!(injected[1].contains("question two"));
+
+        // The injected messages must precede the final assistant response.
+        let assistant_idx = history.iter().position(|m| m.role == Role::Assistant).unwrap();
+        let last_injected_idx = history
+            .iter()
+            .rposition(|m| m.role == Role::User && m.text().starts_with("[agent-message]"))
+            .unwrap();
+        assert!(last_injected_idx < assistant_idx, "main-inbox items must be injected before the model call");
+    }
+
+    /// A child/subagent run (`is_main_context = false`) shares the SAME bus
+    /// but must never drain the main inbox itself, and must still be able to
+    /// stop normally with the item left untouched for the real main loop.
+    #[tokio::test]
+    async fn child_context_never_drains_main_inbox_and_stops_normally() {
+        let bus = Arc::new(crate::message::MessageBus::new());
+        bus.publish_main(&subagent_source("other-task", "other worker"), "not for this child", None, None)
+            .unwrap();
+
+        let client = MockLlmClient::new(vec![vec![Ok(StreamEvent::TextDelta("child done".into())), Ok(done())]]);
+        let tools = Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
+
+        // NOTE: no `.with_main_context()` — this is a plain (child-shaped) loop.
+        let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
+            .with_message_bus(bus.clone())
+            .with_tool_max_duration(None)
+            .build();
+
+        let mut history = vec![Message::user("go")];
+        let result = agent.run(&mut history, &NullSink, None, CancellationToken::new()).await;
+
+        assert!(result.is_ok(), "a child must be able to stop normally: {result:?}");
+        assert_eq!(bus.pending_main_len(), 1, "a child must never drain the shared main inbox");
+        assert!(main_agent_message_texts(&history).is_empty(), "no main-inbox item may leak into a child's own history");
+    }
+
+    /// Calling `ask_main` from a batch must NOT preempt remaining tools in
+    /// that same batch (unlike steering) — it only queues onto the main
+    /// inbox. The queued item is then drained at the NEXT iteration boundary
+    /// when running in a main context.
+    #[tokio::test]
+    async fn ask_main_tool_call_does_not_skip_remaining_tools_in_batch() {
+        use crate::tasks::{TaskExecutionMode, TaskKind, TaskManager};
+        use crate::tools::AskMainTool;
+
+        let bus = Arc::new(crate::message::MessageBus::new());
+        let task_mgr = TaskManager::with_defaults("session");
+        let caller_task =
+            task_mgr.register(TaskKind::Subagent, "caller worker", None, TaskExecutionMode::Background).unwrap();
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+
+        let client = MockLlmClient::new(vec![
+            // Iteration 0: ask_main then tool_b, both in one batch.
+            vec![
+                Ok(StreamEvent::ToolUse(Content::ToolUse {
+                    id: "am1".into(),
+                    name: "ask_main".into(),
+                    input_json: r#"{"text":"please review this"}"#.into(),
+                    correlation: Correlation::default(),
+                })),
+                Ok(tool_use_event("t2", "tool_b")),
+                Ok(done()),
+            ],
+            // Iteration 1: main context drains the just-queued item, then
+            // the model produces its final text.
+            vec![Ok(StreamEvent::TextDelta("all done".into())), Ok(done())],
+        ]);
+
+        let tools = Arc::new(ToolRegistry::new([
+            Arc::new(AskMainTool) as Arc<dyn crate::tool::Tool>,
+            dyn_tool(MockTool::new("tool_b", true, log.clone())),
+        ]));
+
+        let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
+            .with_message_bus(bus.clone())
+            .with_task_manager(Arc::clone(&task_mgr))
+            .with_caller_task_id(caller_task.id.clone())
+            .with_main_context()
+            .with_tool_max_duration(None)
+            .build();
+
+        let mut history = vec![Message::user("go")];
+        agent.run(&mut history, &NullSink, None, CancellationToken::new()).await.unwrap();
+
+        // tool_b must have executed — ask_main must not have preempted it.
+        assert_eq!(log.lock().unwrap().clone(), vec!["tool_b".to_owned()]);
+        // The ask_main request must have been drained and injected by the
+        // NEXT iteration's step 4c.
+        assert_eq!(bus.pending_main_len(), 0);
+        let injected = main_agent_message_texts(&history);
+        assert_eq!(injected.len(), 1);
+        assert!(injected[0].contains("please review this"));
+    }
+
+    /// A message that lands AFTER this iteration's step-4c drain but BEFORE
+    /// the natural-stop decision (simulated here via a client that publishes
+    /// to the bus as a side effect of `stream()`, which runs after 4c) must
+    /// force one more iteration rather than being left to sit undelivered.
+    #[tokio::test]
+    async fn racing_main_publish_forces_continuation_instead_of_a_premature_stop() {
+        struct RacingClient {
+            bus: Arc<crate::message::MessageBus>,
+            sequences: Mutex<VecDeque<Vec<Result<StreamEvent, LlmError>>>>,
+        }
+        #[async_trait]
+        impl coda_llm::LlmClient for RacingClient {
+            fn provider_id(&self) -> &str {
+                "racing-mock"
+            }
+            async fn stream(&self, _: ChatRequest) -> Result<coda_llm::ResponseStream, LlmError> {
+                // Simulate: iteration 0's step 4c already ran (saw nothing
+                // pending) BEFORE this call; the background task's request
+                // "arrives" only now, while the model is "generating".
+                if self.bus.main_seq() == 0 {
+                    self.bus
+                        .publish_main(
+                            &crate::message::MessageSource::Subagent {
+                                task_id: "racer".into(),
+                                label: "racer".into(),
+                            },
+                            "landed mid-turn",
+                            None,
+                            None,
+                        )
+                        .unwrap();
+                }
+                let events = self.sequences.lock().unwrap().pop_front().expect("ran out of sequences");
+                let (tx, rx) = tokio::sync::mpsc::channel(64);
+                tokio::spawn(async move {
+                    for ev in events {
+                        let _ = tx.send(ev).await;
+                    }
+                });
+                Ok(coda_llm::ResponseStream::new(rx))
+            }
+        }
+
+        let bus = Arc::new(crate::message::MessageBus::new());
+        let client = Arc::new(RacingClient {
+            bus: bus.clone(),
+            sequences: Mutex::new(
+                vec![
+                    // Iteration 0: no tool calls — would naturally stop, EXCEPT
+                    // the racing publish above just landed a pending item.
+                    vec![Ok(StreamEvent::TextDelta("first pass".into())), Ok(done())],
+                    // Iteration 1: step 4c drains the racer's item; model
+                    // gives its real final answer.
+                    vec![Ok(StreamEvent::TextDelta("second pass".into())), Ok(done())],
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        });
+
+        let tools = Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
+        let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
+            .with_message_bus(bus.clone())
+            .with_main_context()
+            .with_tool_max_duration(None)
+            .build();
+
+        let mut history = vec![Message::user("go")];
+        let result = agent.run(&mut history, &NullSink, None, CancellationToken::new()).await;
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(bus.pending_main_len(), 0, "the racing item must have been drained");
+        let injected = main_agent_message_texts(&history);
+        assert_eq!(injected.len(), 1);
+        assert!(injected[0].contains("landed mid-turn"));
+        // Both assistant turns actually ran (proves a second iteration
+        // really happened rather than the run stopping after the first).
+        let assistant_texts: Vec<String> =
+            history.iter().filter(|m| m.role == Role::Assistant).map(|m| m.text()).collect();
+        assert_eq!(assistant_texts, vec!["first pass".to_owned(), "second pass".to_owned()]);
+    }
+
+    /// The iteration-limit backstop fires BEFORE step 4c: a pending main
+    /// item must be left untouched, not silently drained on a run that is
+    /// about to be abandoned.
+    #[tokio::test]
+    async fn iteration_cap_before_4c_leaves_pending_main_item_untouched() {
+        let bus = Arc::new(crate::message::MessageBus::new());
+        bus.publish_main(&subagent_source("t1", "worker"), "never drained", None, None).unwrap();
+
+        // Any client would do: max_iterations = 0 means the loop breaks at
+        // step 2, before the model is ever called.
+        let client = MockLlmClient::new(vec![]);
+        let tools = Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
+
+        let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
+            .with_message_bus(bus.clone())
+            .with_main_context()
+            .with_max_iterations(0)
+            .with_tool_max_duration(None)
+            .build();
+
+        let mut history = vec![Message::user("go")];
+        let result = agent.run(&mut history, &NullSink, None, CancellationToken::new()).await;
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(bus.pending_main_len(), 1, "the pending item must survive an iteration-cap stop");
+        assert!(main_agent_message_texts(&history).is_empty());
+    }
+
+    /// A caller cancel observed at the top of the loop (before step 4c) must
+    /// likewise leave a pending main item untouched.
+    #[tokio::test]
+    async fn pre_cancelled_token_before_4c_leaves_pending_main_item_untouched() {
+        let bus = Arc::new(crate::message::MessageBus::new());
+        bus.publish_main(&subagent_source("t1", "worker"), "never drained", None, None).unwrap();
+
+        let client = MockLlmClient::new(vec![]);
+        let tools = Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
+
+        let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
+            .with_message_bus(bus.clone())
+            .with_main_context()
+            .with_tool_max_duration(None)
+            .build();
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut history = vec![Message::user("go")];
+        let result = agent.run(&mut history, &NullSink, None, cancel).await;
+
+        assert!(matches!(result, Err(AgentError::Cancelled)));
+        assert_eq!(bus.pending_main_len(), 1, "a pre-cancelled run must never drain the main inbox");
     }
 }
 

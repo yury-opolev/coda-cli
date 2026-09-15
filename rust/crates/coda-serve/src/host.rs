@@ -10,21 +10,26 @@ use async_trait::async_trait;
 use chrono::Utc;
 use coda_agent::{
     AgentError, AgentLoopBuilder, CompactionService, GoalBudget, GoalOutcome, GoalStatus,
-    GoalSupervisor, HookContentHash, HookRunner, HookScope, HookTrustGuard, HookTrustStore,
+    AutonomySupervisor, HookContentHash, HookRunner, HookScope, HookTrustGuard, HookTrustStore,
     InMemoryHookTrustStore, NullScheduleLifecycleSink, ScheduleRuntime, SubagentFactory,
     TaskManagerRunner, TodoStore, TokenEstimator, ToolQuarantine, ToolRegistry, UserHook,
     SessionTranscriptStore, fork_session, rewind_session, session_id_is_valid,
 };
 use coda_agent::agent::stop::UserQuestionPrompt;
 use coda_agent::events::{AgentEvent, AgentSink};
-use coda_agent::goal::ForkedAgent;
+use coda_agent::autonomy::{
+    AutonomousPlanApprover, ForkedAgent, PermissionResolver, ProxyAnswerer, RecoveryExecutor,
+    RecoveryGuard,
+};
+use crate::recovery_executor::GitRecoveryExecutor;
 use coda_agent::hooks::runner::{HookExecutor, ShellHookExecutor};
 use coda_agent::lsp::{LspServerConfig, LspServerManager, LspServerMapBuilder};
 use coda_agent::permission::{
-    ModePermissionPrompt, PermissionMode, PermissionModeState, PermissionPrompt,
+    ForkedAgent as ClassifierForkedAgent, LlmToolActionClassifier, ModePermissionPrompt,
+    PermissionMode, PermissionModeState, PermissionPrompt, ToolActionClassifier,
 };
 use coda_agent::scheduling::{
-    ScheduleDefinitionDraft, ScheduleKind, ScheduleTerminalOutcome, ScheduledTaskStore,
+    ScheduleKind, ScheduleTerminalOutcome, ScheduledTaskStore,
 };
 use coda_agent::subagents::{SubagentHost, MAX_CONCURRENT_SUBAGENTS};
 use coda_agent::tasks::TaskManager;
@@ -59,9 +64,9 @@ use uuid::Uuid;
 use crate::dispatch::{
     CancelRequestParams, CompactParams, ConfigSetParams, ForkParams, GetEventsParams,
     GetHistoryParams, GetStateParams, HooksInfoParams, HooksTrustParams, InitParams,
-    ListSessionsParams, MessagesParams, ModelsParams, PromptParams, ResolveRequestParams,
-    RewindParams, RpcError, ScheduleCreateParams, ScheduleDeleteParams, ServeBackend,
-    SetEffortParams, SetGoalParams, SetModelParams, SetPermissionModeParams,
+    ListSessionsParams, MessagesParams, ModelsParams, PendingMessagesParams, PromptParams,
+    ResolveRequestParams, RewindParams, RpcError, ScheduleCreateParams, ScheduleDeleteParams,
+    ServeBackend, SetEffortParams, SetGoalParams, SetModelParams, SetPermissionModeParams,
     SetSystemPromptParams, SteerParams,
 };
 use crate::dispatch::AdjustEffortParams;
@@ -233,11 +238,25 @@ struct ScheduledTaskResponse {
     rule: String,
     time_zone: String,
     next_run_utc: String,
+    /// `idle` | `running` | `pending` | `retiring` | `completed` | `expired`
+    /// | `cancelled` | `failed`. Derived from the definition's bounds and its
+    /// live runtime status; never a placeholder.
     state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     active_task_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_outcome: Option<String>,
+    // ── Bounds (absent when the schedule is unbounded) ────────────────────
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_runs: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_at_utc: Option<String>,
+    /// Accepted launch attempts so far, including runs that later failed.
+    runs_started: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retired_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retired_at_utc: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -280,7 +299,10 @@ impl AgentSink for TurnSink {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// LlmForkedAgent — ForkedAgent for GoalSupervisor, uses the session client
+// LlmForkedAgent — the isolated single-turn LLM call used by the autonomy
+// supervisor's completion judge, the stand-in answerer, and the safety
+// classifier. All three want the same thing: one short, cancellable,
+// side-effect-free call on the session's own client.
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct LlmForkedAgent {
@@ -288,9 +310,8 @@ struct LlmForkedAgent {
     model: String,
 }
 
-#[async_trait]
-impl ForkedAgent for LlmForkedAgent {
-    async fn run(
+impl LlmForkedAgent {
+    async fn run_once(
         &self,
         system: &str,
         messages: Vec<Message>,
@@ -307,6 +328,33 @@ impl ForkedAgent for LlmForkedAgent {
     }
 }
 
+#[async_trait]
+impl ForkedAgent for LlmForkedAgent {
+    async fn run(
+        &self,
+        system: &str,
+        messages: Vec<Message>,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<String> {
+        self.run_once(system, messages, cancel).await
+    }
+}
+
+/// The permission classifier declares its own structurally identical seam, so
+/// the same implementation satisfies both rather than the caller having to
+/// build two objects that do exactly the same thing.
+#[async_trait]
+impl ClassifierForkedAgent for LlmForkedAgent {
+    async fn run(
+        &self,
+        system: &str,
+        messages: Vec<Message>,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<String> {
+        self.run_once(system, messages, cancel).await
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // SessionServices — built lazily on the first prompt when the client is known
 // ─────────────────────────────────────────────────────────────────────────────
@@ -314,6 +362,12 @@ impl ForkedAgent for LlmForkedAgent {
 struct SessionServices {
     hook_runner: Arc<HookRunner>,
     subagent_host: Arc<SubagentHost>,
+    /// The hook-free host handed to the `HookRunner` for agent-type hooks.
+    /// Test-only: retained so tests can assert it shares exactly the same
+    /// service handles as the hooked host. Production code reaches it
+    /// through the hook runner and never needs this field directly.
+    #[cfg(test)]
+    hook_free_subagent_host: Arc<SubagentHost>,
     schedule_runtime: Arc<ScheduleRuntime>,
 }
 
@@ -666,36 +720,86 @@ impl StartupOptions {
     }
 }
 
-/// Validates a goal budget: a present timeout must parse to a strictly positive
-/// duration, and a present continuation budget must not be negative. Shared by
+/// Tokens an operator may use, for either budget dimension, to mean
+/// "no ceiling at all". Defined in `coda-proto` so the CLI parsers that produce
+/// them and the engine that consumes them cannot drift apart.
+use coda_proto::goal_budget::{is_unlimited_token, UNLIMITED_CONTINUATIONS};
+
+/// Validates a goal budget: a present timeout must either be an unlimited token
+/// or parse to a strictly positive duration, and a present continuation budget
+/// must be non-negative or exactly [`UNLIMITED_CONTINUATIONS`]. Shared by
 /// startup parsing and the live `session/setGoal` path so both agree.
 fn validate_goal_budget(
     max_duration: Option<&str>,
     max_continuations: Option<i32>,
 ) -> Result<(), StartupError> {
     if let Some(dur) = max_duration {
-        match parse_duration(Some(dur)) {
-            Some(d) if d.is_zero() => {
-                return Err(StartupError(format!(
-                    "invalid goal timeout '{dur}': duration must be greater than zero"
-                )))
-            }
-            Some(_) => {}
-            None => {
-                return Err(StartupError(format!(
-                    "invalid goal timeout '{dur}' (expected e.g. \"30m\", \"2h\", \"90s\")"
-                )))
+        if !is_unlimited_token(dur) {
+            match parse_duration(Some(dur)) {
+                Some(d) if d.is_zero() => {
+                    return Err(StartupError(format!(
+                        "invalid goal timeout '{dur}': duration must be greater than zero"
+                    )))
+                }
+                Some(_) => {}
+                None => {
+                    return Err(StartupError(format!(
+                        "invalid goal timeout '{dur}' \
+                         (expected e.g. \"90s\", \"30m\", \"2h\", \"7d\", or \"none\")"
+                    )))
+                }
             }
         }
     }
     if let Some(n) = max_continuations {
-        if n < 0 {
+        if n < 0 && n != UNLIMITED_CONTINUATIONS {
             return Err(StartupError(format!(
-                "invalid goal max-continuations {n}: must not be negative"
+                "invalid goal max-continuations {n}: must not be negative \
+                 (use {UNLIMITED_CONTINUATIONS}, or \"none\" on the command line, for no limit)"
             )));
         }
     }
     Ok(())
+}
+
+/// Turn budget applied to a goal run when the operator did not ask for one.
+///
+/// A goal means "keep working until a judge says it is done". A default that
+/// trips early turns that promise into a silent stop hours into an unattended
+/// run, so the backstop is set where it only ever catches a true runaway.
+/// Inherited from the C# engine, which used the same 60000.
+const DEFAULT_GOAL_MAX_CONTINUATIONS: u32 = 60_000;
+
+/// Wall-clock budget applied to a goal run when the operator did not ask for
+/// one — 240 hours (10 days). Same reasoning as
+/// [`DEFAULT_GOAL_MAX_CONTINUATIONS`]: long enough that hitting it means
+/// something is genuinely wrong, not merely slow.
+const DEFAULT_GOAL_MAX_DURATION: Duration = Duration::from_secs(240 * 60 * 60);
+
+/// Resolves the effective goal budget from the operator's (optional) overrides.
+///
+/// `None` in either returned slot means that dimension is unlimited. Pure so the
+/// defaults can be asserted directly: `build_autonomy_supervisor` holds a lock and
+/// builds an LLM-backed judge, neither of which a test wants.
+///
+/// `max_duration` is expected to have already passed [`validate_goal_budget`];
+/// an unparseable value falls back to the default rather than silently
+/// producing a zero-length budget that would escalate on the first stop.
+fn resolve_goal_budget(
+    max_duration: Option<&str>,
+    max_continuations: Option<i32>,
+) -> (Option<Duration>, Option<u32>) {
+    let duration = match max_duration {
+        Some(raw) if is_unlimited_token(raw) => None,
+        Some(raw) => Some(parse_duration(Some(raw)).unwrap_or(DEFAULT_GOAL_MAX_DURATION)),
+        None => Some(DEFAULT_GOAL_MAX_DURATION),
+    };
+    let continuations = match max_continuations {
+        Some(UNLIMITED_CONTINUATIONS) => None,
+        Some(n) => Some(n.max(0) as u32),
+        None => Some(DEFAULT_GOAL_MAX_CONTINUATIONS),
+    };
+    (duration, continuations)
 }
 
 /// The scalar configuration a turn actually runs under, held behind one
@@ -870,6 +974,50 @@ pub struct ServeHost {
     // ── Session-scoped services ──────────────────────────────────────────────
     task_manager: Arc<TaskManager>,
     schedule_store: Arc<ScheduledTaskStore>,
+    /// Engine-owned in-memory user-notification bus (Stage 2). Created
+    /// eagerly here, next to `schedule_store`, so it exists before the lazy
+    /// `SessionServices` and can serve `session/pendingMessages` recovery
+    /// even before the first prompt/provider is wired. RAM-only: never
+    /// persisted, never continues across a restart.
+    message_bus: Arc<coda_agent::MessageBus>,
+    /// Signalled once per newly-accepted `ask_main` item
+    /// (`MessageBusEventBridge::on_main_accepted`, Stage 3 chunk B) **and**
+    /// on every transition that could unblock the idle main-inbox pump: the
+    /// release of the single-flight turn slot (`TurnGuard::drop`, including
+    /// the cancelled/panicking paths), the release of the initialization
+    /// slot (`InitializationGuard::release`) and a provider-wiring
+    /// transition ([`ServeHost::note_provider_wired`]).
+    ///
+    /// Deliberately NOT signalled by anything passive: a `notify_user`
+    /// publication (`on_published`) and an ordinary task completion never
+    /// wake the pump, because neither is a request addressed to the main
+    /// conversation.
+    pub(crate) main_wake: Arc<tokio::sync::Notify>,
+    /// Weak self-reference, set immediately after this host is placed in its
+    /// `Arc` (see [`ServeHost::build`]).
+    ///
+    /// The idle main-inbox pump task is spawned with *this* `Weak`, never a
+    /// strong `Arc`: the pump parks on `main_wake` indefinitely, and holding
+    /// a strong reference across that park would make the host and its task
+    /// a permanent reference cycle that no drop could ever break. The pump
+    /// upgrades only for the duration of one step and drops the `Arc` again
+    /// before waiting.
+    self_ref: std::sync::OnceLock<std::sync::Weak<ServeHost>>,
+    /// Cancels the idle main-inbox pump. Cancelled by `shutdown` and by this
+    /// host's own `Drop`, so an idle pump can never outlive its host.
+    main_pump_cancel: CancellationToken,
+    /// The pump's join handle, `Some` once started. Retained (rather than
+    /// detached) so `shutdown` can actually join it — a dropped handle
+    /// detaches a still-running task instead of stopping it.
+    main_pump: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Monotonic count of provider-wiring transitions on this host.
+    ///
+    /// The pump's blocked-generation gate: when the pump finds no provider
+    /// wired it records this value and refuses to retry until it moves.
+    /// Without such a gate the pump would retry on its own self-wake (a
+    /// failed attempt releases the turn slot, which signals `main_wake`) and
+    /// spin forever on a host that simply has no credentials.
+    provider_generation: std::sync::atomic::AtomicU64,
     lsp_manager: Arc<LspServerManager>,
     /// Trust decisions for project-scoped hooks; persists within the session.
     hook_trust_store: Arc<InMemoryHookTrustStore>,
@@ -937,6 +1085,25 @@ pub struct ServeHost {
     /// enter deterministically — a scheduling race would prove nothing.
     #[cfg(test)]
     after_agent_build_hook: Mutex<Option<Arc<dyn Fn(&ServeHost) + Send + Sync>>>,
+    /// Test seam: invoked inside `run_prompt_inner` after `agent.run` has
+    /// returned and **before** the turn slot is released.
+    ///
+    /// That window — after the agent loop has taken its last look at the
+    /// main inbox and sealed, but before `TurnGuard::drop` signals the idle
+    /// pump — is the one place a newly accepted `ask_main` item could be
+    /// lost to a race rather than merely deferred. It is unreachable from
+    /// any caller outside the turn, so a test cannot enter it by scheduling
+    /// luck; a real hook is the only deterministic way to prove the wake is
+    /// not dropped.
+    #[cfg(test)]
+    after_agent_run_hook: Mutex<Option<Arc<dyn Fn(&ServeHost) + Send + Sync>>>,
+    /// Test seam: how many times the idle pump got past its blocked-state
+    /// gate and actually attempted to act. A pump that spun on its own
+    /// self-wake would grow this without bound, which is exactly what a test
+    /// otherwise has no way to observe (a refused attempt leaves no trace in
+    /// the queue, the model, or the public state).
+    #[cfg(test)]
+    main_pump_attempts: std::sync::atomic::AtomicU64,
 }
 
 impl ServeHost {
@@ -1177,6 +1344,9 @@ impl ServeHost {
             system_prompt: initial_system_prompt.map(Arc::from),
             provider_id: client.as_ref().map(|c| c.provider_id().to_owned()),
         };
+        // `EngineState` is built before the message-bus bridge below (it
+        // needs it): the single authority for everything in `StateSnapshot`,
+        // sharing this same `EventBus` so cursors always agree.
         let engine_state = Arc::new(EngineState::new(
             Arc::clone(&bus),
             session_id.clone(),
@@ -1184,6 +1354,33 @@ impl ServeHost {
             capability_catalog(),
             startup_runtime.active_config(initial_permission_mode),
         ));
+        // Engine-owned notification bus, created here (eagerly, next to
+        // `schedule_store` above) — before `SessionServices` (which builds
+        // lazily on the first prompt) so `session/pendingMessages` recovery
+        // and `notify_user` are both available immediately, independent of
+        // whether a provider has ever been wired. The bridge publishes each
+        // Stage 2 `notify_user` acceptance directly onto the SAME
+        // authoritative `EventBus` every other `event/*` notification uses
+        // (via `engine_state.bus_ref()`); the bus's own cursor (carried in
+        // the event payload) is distinct from that `EventBus`'s seq. The
+        // `ask_main` delivery path instead goes through `engine_state`
+        // itself (`EngineState::main_messages_delivered`), which is why the
+        // bridge needs `engine_state`, not only its bus.
+        //
+        // `main_wake` is signalled once per newly-accepted `ask_main` item
+        // (`on_main_accepted`) and on every transition that can unblock the
+        // idle main-inbox pump; the pump itself (Stage 3 chunk C) is spawned
+        // lazily and idempotently from `initialize`, never from here — this
+        // constructor is synchronous and is reached from fixtures that have
+        // no Tokio runtime at all, where `tokio::spawn` would panic.
+        let main_wake = Arc::new(tokio::sync::Notify::new());
+        let message_bus_bridge = crate::state::message_bus_observer::MessageBusEventBridge::new(
+            Arc::clone(&engine_state),
+            Arc::clone(&main_wake),
+        );
+        let message_bus: Arc<coda_agent::MessageBus> = Arc::new(coda_agent::MessageBus::with_observer(Some(
+            message_bus_bridge as Arc<dyn coda_agent::message::MessageBusObserver>,
+        )));
         let steering_observer = SteeringStateObserver::new(Arc::clone(&engine_state));
         // The registry publishes pending/resolved transitions through
         // `EngineState`, which owns the transaction (and therefore the
@@ -1194,7 +1391,7 @@ impl ServeHost {
             .registry()
             .set_observer(Arc::clone(&engine_state) as Arc<dyn crate::state::requests::RequestObserver>);
 
-        Arc::new(Self {
+        let host = Arc::new(Self {
             session: Session::with_steering_observer(
                 session_id.clone(),
                 Some(Arc::clone(&steering_observer) as Arc<dyn coda_agent::steering::SteeringObserver>),
@@ -1223,6 +1420,12 @@ impl ServeHost {
             current_session_id: Mutex::new(session_id),
             task_manager,
             schedule_store,
+            message_bus,
+            main_wake,
+            self_ref: std::sync::OnceLock::new(),
+            main_pump_cancel: CancellationToken::new(),
+            main_pump: Mutex::new(None),
+            provider_generation: std::sync::atomic::AtomicU64::new(0),
             lsp_manager,
             hook_trust_store,
             user_hooks,
@@ -1239,7 +1442,37 @@ impl ServeHost {
             steering_observer,
             #[cfg(test)]
             after_agent_build_hook: Mutex::new(None),
-        })
+            #[cfg(test)]
+            after_agent_run_hook: Mutex::new(None),
+            #[cfg(test)]
+            main_pump_attempts: std::sync::atomic::AtomicU64::new(0),
+        });
+        // Set once, immediately: the idle main-inbox pump is spawned with
+        // this `Weak` so it can never keep its own host alive (see the
+        // field's documentation). Nothing is spawned here — `build` is
+        // synchronous and is reached from fixtures with no Tokio runtime.
+        let _ = host.self_ref.set(Arc::downgrade(&host));
+        host
+    }
+
+    /// The current provider-wiring generation (see the field's docs).
+    fn provider_generation(&self) -> u64 {
+        self.provider_generation.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Records that a provider client has just been installed, and wakes the
+    /// idle main-inbox pump so anything it refused to run for want of a
+    /// provider is retried now that one exists.
+    ///
+    /// The generation bump and the wake are both required: the bump is what
+    /// lets the pump distinguish "the world changed" from its own self-wake,
+    /// and the wake is what gets it to look at all. Called from every path
+    /// that installs a client — `initialize(apiKey)` and the lazy env
+    /// wiring — immediately *after* the client is actually in place, so a
+    /// woken pump that reaches for it always finds it.
+    fn note_provider_wired(&self) {
+        self.provider_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.main_wake.notify_one();
     }
 
     /// Give this host the profile it authenticates against.
@@ -1586,6 +1819,10 @@ impl ServeHost {
         // across the await.
         self.commit_wired_provider(&new_client).await?;
         *guard = Some(new_client);
+        // Same transition the explicit `initialize(apiKey)` path records:
+        // the idle main-inbox pump blocks on "no provider" by generation,
+        // and this is the generation moving.
+        self.note_provider_wired();
         Ok(())
     }
 
@@ -1651,8 +1888,25 @@ impl ServeHost {
         }
     }
 
-    /// The provider id of the wired client, or `None` when nothing is wired.
+    /// Test seam: wires `client` the way a real provider transition does.
     ///
+    /// Deliberately goes through the same `config_commit -> client -> commit
+    /// -> note_provider_wired` sequence the production paths use, so a test
+    /// exercising "a provider appeared" exercises the real transition — the
+    /// generation bump and the wake included — rather than a shortcut that
+    /// would prove nothing about how the idle pump unblocks.
+    #[cfg(test)]
+    async fn wire_client_for_test(&self, client: Arc<dyn LlmClient>) -> Result<(), RpcError> {
+        let _commit = self.config_commit.lock().await;
+        let mut guard = self.client.lock().await;
+        self.commit_wired_provider(&client).await?;
+        *guard = Some(client);
+        drop(guard);
+        self.note_provider_wired();
+        Ok(())
+    }
+
+    /// The provider id of the wired client, or `None` when nothing is wired.
     /// The synchronous counterpart of [`Self::connected_provider`], reading
     /// the mirror in the runtime record rather than the async client mutex,
     /// and reporting *unknown* as `None` instead of substituting a fallback
@@ -1751,14 +2005,13 @@ impl ServeHost {
         }
     }
 
-    fn build_goal_supervisor(&self, client: Arc<dyn LlmClient>) -> Option<GoalSupervisor> {
+    fn build_autonomy_supervisor(&self, client: Arc<dyn LlmClient>) -> Option<AutonomySupervisor> {
         let params = self.goal_params.lock().expect("goal poisoned").clone();
         let goal_text = params.goal.filter(|g| !g.trim().is_empty())?;
-        let max_cont = params.max_continuations.unwrap_or(5).max(0) as u32;
-        let max_dur = parse_duration(params.max_duration.as_deref())
-            .unwrap_or(Duration::from_secs(30 * 60));
+        let (max_dur, max_cont) =
+            resolve_goal_budget(params.max_duration.as_deref(), params.max_continuations);
         let judge = Box::new(LlmForkedAgent { client, model: self.current_model() });
-        Some(GoalSupervisor::new(judge, goal_text, GoalBudget::start_now(max_dur, max_cont, 0.5), None))
+        Some(AutonomySupervisor::new(judge, goal_text, GoalBudget::start_now(max_dur, max_cont, 0.5), None))
     }
 
     /// Get or initialise the per-session services (SubagentHost, HookRunner,
@@ -1794,6 +2047,9 @@ impl ServeHost {
             runtime.lock().expect("runtime config poisoned").model.clone()
         });
         // 1. Hook-free subagent (prevents hook re-entrancy for agent-type hooks).
+        //    It receives the SAME in-memory schedule store as the main agent
+        //    loop and the hooked host, so a definition created anywhere in the
+        //    session is visible everywhere (and to the schedule runtime).
         let hook_free_subagent = SubagentHost::with_defaults(
             Arc::clone(&client),
             Arc::clone(&self.permission_prompt),
@@ -1801,7 +2057,10 @@ impl ServeHost {
             Arc::clone(&self.tools),
             Arc::clone(&self.task_manager),
             self.working_dir.clone(),
-        ).with_model_source(Arc::clone(&model_source));
+        )
+        .with_model_source(Arc::clone(&model_source))
+        .with_schedule_store(Arc::clone(&self.schedule_store))
+        .with_message_bus(Arc::clone(&self.message_bus));
 
         // 2. Trust guard using the session-scoped trust store.
         let trust_guard = HookTrustGuard::new(
@@ -1818,7 +2077,7 @@ impl ServeHost {
             executor,
             Some(Arc::new(trust_guard)),
             None,
-            Some(hook_free_subagent as Arc<dyn SubagentFactory>),
+            Some(Arc::clone(&hook_free_subagent) as Arc<dyn SubagentFactory>),
             Vec::new(), // no HTTP allowlist; http hooks require explicit opt-in
         ));
 
@@ -1836,7 +2095,10 @@ impl ServeHost {
             self.working_dir.clone(),
             Some(Arc::clone(&hook_runner)),
             MAX_CONCURRENT_SUBAGENTS,
-        ).with_model_source(model_source);
+        )
+        .with_model_source(model_source)
+        .with_schedule_store(Arc::clone(&self.schedule_store))
+        .with_message_bus(Arc::clone(&self.message_bus));
 
         // 5. Schedule runtime — fires due scheduled tasks via the main subagent.
         let runner = TaskManagerRunner::new(
@@ -1852,6 +2114,8 @@ impl ServeHost {
         SessionServices {
             hook_runner,
             subagent_host: main_subagent,
+            #[cfg(test)]
+            hook_free_subagent_host: hook_free_subagent,
             schedule_runtime,
         }
     }
@@ -1868,6 +2132,7 @@ impl ServeHost {
         Ok(InitializationGuard {
             flag: &self.turn_active,
             state: &self.engine_state,
+            main_wake: &self.main_wake,
             released: false,
         })
     }
@@ -1913,9 +2178,42 @@ impl ServeHost {
         user_text: &str,
         kind: TurnKind,
     ) -> Result<TurnGuard<'_>, ClaimRefused> {
+        self.try_claim_turn_if(turn_id, user_text, kind, None)
+    }
+
+    /// [`Self::try_claim_turn`] with an optional last-instant admission
+    /// precondition, evaluated **after** TURN is held and **before** the
+    /// public turn is opened.
+    ///
+    /// The idle main-inbox pump needs exactly this and nothing more: it
+    /// decides to run because the main inbox has pending work, but a user
+    /// turn can claim the slot and drain that queue (step 4c) in the window
+    /// between the pump's look and its claim. Re-checking outside the lock
+    /// would only move the race; re-checking after `begin_turn` would mean
+    /// publishing — and then having to retract — a turn that never should
+    /// have opened. So the check happens here, where the refusal is still
+    /// completely unobservable: no slot taken, no steering transition, no
+    /// turn observer, nothing published.
+    ///
+    /// Lock order for the pump's precondition is TURN -> MSGBUS -> CONFIG ->
+    /// STATE. `MessageBus`'s gate is a leaf in that direction: its own
+    /// observer callbacks take STATE and the event bus, never TURN, so
+    /// MSGBUS -> TURN never happens and the two cannot invert.
+    fn try_claim_turn_if(
+        &self,
+        turn_id: &str,
+        user_text: &str,
+        kind: TurnKind,
+        precondition: Option<&dyn Fn() -> bool>,
+    ) -> Result<TurnGuard<'_>, ClaimRefused> {
         let mut busy = self.turn_active.lock().expect("turn_active poisoned");
         if *busy {
             return Err(ClaimRefused::Busy);
+        }
+        if let Some(check) = precondition {
+            if !check() {
+                return Err(ClaimRefused::NoWork);
+            }
         }
         // TURN -> CONFIG -> STATE -> BUS. CONFIG is held across `begin_turn`
         // so the configuration this turn captures is exactly the one the
@@ -1947,6 +2245,7 @@ impl ServeHost {
             steering: &self.session.steering,
             state: &self.engine_state,
             observer: &self.steering_observer,
+            main_wake: &self.main_wake,
             turn_id: turn_id.to_string(),
         })
     }
@@ -1964,6 +2263,11 @@ enum ClaimRefused {
     Busy,
     /// The engine is stopping or stopped; no new work is admitted.
     Stopped,
+    /// The caller's own admission precondition no longer holds (see
+    /// [`ServeHost::try_claim_turn_if`]). Only the idle main-inbox pump
+    /// supplies a precondition, so this is unreachable for `session/prompt`,
+    /// `session/compact` and the maintenance operations.
+    NoWork,
 }
 
 impl ClaimRefused {
@@ -1975,6 +2279,9 @@ impl ClaimRefused {
             ClaimRefused::Stopped => RpcError::internal(
                 "engine is shutting down; no new turn was started".to_owned(),
             ),
+            ClaimRefused::NoWork => RpcError::internal(
+                "the work this turn was claimed for no longer exists".to_owned(),
+            ),
         }
     }
 }
@@ -1984,6 +2291,10 @@ impl ClaimRefused {
 struct InitializationGuard<'a> {
     flag: &'a std::sync::Mutex<bool>,
     state: &'a EngineState,
+    /// Signalled when the slot is released: an `ask_main` accepted while
+    /// initialization held the slot would otherwise have been refused as
+    /// busy with nothing left to wake the pump afterwards.
+    main_wake: &'a tokio::sync::Notify,
     released: bool,
 }
 
@@ -1992,7 +2303,11 @@ impl InitializationGuard<'_> {
         let mut busy = self.flag.lock().unwrap_or_else(|p| p.into_inner());
         *busy = false;
         self.released = true;
-        self.state.finish_initialization(completed)
+        let admitted = self.state.finish_initialization(completed);
+        drop(busy);
+        // After TURN is released, never while holding it.
+        self.main_wake.notify_one();
+        admitted
     }
 
     fn finish(mut self) -> Result<(), RpcError> {
@@ -2099,13 +2414,223 @@ fn safe_engine_error(code: i64) -> coda_proto::state::TurnErrorSummary {
     }
 }
 
+/// Why a prompt turn is being run (Stage 3 chunk C).
+///
+/// An **explicit** discriminant, deliberately not inferred from the request
+/// payload: `session/prompt` with no text is a legitimate, long-standing user
+/// request (run the model against the existing history), and deducing "this
+/// must be the pump" from an empty `text` would silently change it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptOrigin {
+    /// A real `session/prompt` request from the connected client.
+    User,
+    /// The idle main-inbox pump: a turn claimed only so the main agent
+    /// loop's own iteration boundary (step 4c) can drain the `ask_main`
+    /// queue into the model's history. Carries no user text of its own.
+    MainInbox,
+}
+
+/// Typed failure of [`ServeHost::run_prompt_with_origin`].
+///
+/// The pump has to tell "the slot was busy" (retry when it frees), "the
+/// engine is stopping" (never retry), "someone else already did the work"
+/// (nothing to retry) and "this attempt genuinely failed" (retry only on a
+/// real external change) apart from one another. Doing that by inspecting
+/// `RpcError` messages would be a string match on human-facing text; this
+/// keeps it a type.
+#[derive(Debug)]
+enum PromptRunFailure {
+    /// The single-flight slot was held by another writer.
+    Busy,
+    /// The engine is stopping or stopped; no new turn is admitted.
+    Stopped,
+    /// Main-inbox origin only: the admission precondition no longer held at
+    /// the instant of the claim — a racing user turn had already drained the
+    /// queue. Nothing was claimed, opened or published.
+    NoWork,
+    /// Anything else: preflight validation, a missing provider, or a failure
+    /// raised by the run itself. Carries the error the RPC would report.
+    Failed(RpcError),
+}
+
+impl From<ClaimRefused> for PromptRunFailure {
+    fn from(refused: ClaimRefused) -> Self {
+        match refused {
+            ClaimRefused::Busy => PromptRunFailure::Busy,
+            ClaimRefused::Stopped => PromptRunFailure::Stopped,
+            ClaimRefused::NoWork => PromptRunFailure::NoWork,
+        }
+    }
+}
+
+impl PromptRunFailure {
+    fn into_rpc_error(self) -> RpcError {
+        match self {
+            PromptRunFailure::Busy => {
+                ClaimRefused::Busy.into_error("another prompt is already in progress; busy")
+            }
+            PromptRunFailure::Stopped => ClaimRefused::Stopped.into_error(""),
+            PromptRunFailure::NoWork => ClaimRefused::NoWork.into_error(""),
+            PromptRunFailure::Failed(e) => e,
+        }
+    }
+
+    /// The diagnostics category this failure is recorded under. A claim
+    /// refusal carries an internal-coded `RpcError`, which is exactly what
+    /// the previous single-path implementation classified as `preflight`;
+    /// keeping that mapping here is what makes this refactor invisible to
+    /// the operational log.
+    fn diagnostic_category(&self) -> &'static str {
+        match self {
+            PromptRunFailure::Failed(e) => match e.code {
+                -32001 => "unauthorized",
+                -32602 => "invalid_params",
+                _ => "preflight",
+            },
+            PromptRunFailure::Busy
+            | PromptRunFailure::Stopped
+            | PromptRunFailure::NoWork => "preflight",
+        }
+    }
+}
+
+/// Why the idle main-inbox pump is not acting, and exactly what external
+/// transition clears it.
+///
+/// This is the anti-spin gate. Every failed pump attempt that claimed the
+/// turn slot releases it again, and that release signals `main_wake` — the
+/// pump's own wake. A pump that retried on any wake would therefore loop on
+/// itself forever (burning a model request or a log line each time) for as
+/// long as the underlying condition held. So a refusal is recorded here with
+/// the state it was refused *against*, and the pump only tries again when
+/// that state has genuinely moved.
+///
+/// Deliberately **not** a retry counter and deliberately not "give up and
+/// discard": the queued requests stay queued either way, and an engine that
+/// silently stopped trying after N attempts would strand them with no way
+/// back. "Busy" is not represented here at all — a busy slot is a condition
+/// that resolves by itself, and its release always wakes the pump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MainPumpBlock {
+    /// No provider is wired, so no turn can run at all. Cleared only by a
+    /// provider-wiring transition (`ServeHost::note_provider_wired`), which
+    /// both moves the generation and signals the wake.
+    ProviderUnavailable { provider_generation: u64 },
+    /// An attempt ran (or failed in preflight) without anything leaving the
+    /// main queue. Cleared by a provider transition **or** by genuinely new
+    /// accepted work — never by the pump's own self-wake.
+    NoProgress { provider_generation: u64, accepted_seq: u64 },
+}
+
+impl MainPumpBlock {
+    fn no_progress(host: &ServeHost) -> Self {
+        MainPumpBlock::NoProgress {
+            provider_generation: host.provider_generation(),
+            accepted_seq: host.message_bus.main_seq(),
+        }
+    }
+
+    /// Whether the world has moved enough to justify another attempt.
+    fn is_cleared_by(&self, host: &ServeHost) -> bool {
+        match *self {
+            MainPumpBlock::ProviderUnavailable { provider_generation } => {
+                provider_generation != host.provider_generation()
+            }
+            MainPumpBlock::NoProgress { provider_generation, accepted_seq } => {
+                provider_generation != host.provider_generation()
+                    || accepted_seq != host.message_bus.main_seq()
+            }
+        }
+    }
+}
+
+/// What the pump loop should do after one step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MainPumpStep {
+    /// Something was delivered: look again immediately, without waiting,
+    /// because more may have been queued while the turn ran.
+    Progressed,
+    /// Park until the next wake (or cancellation).
+    Wait,
+    /// The engine is stopping; the pump is done for good.
+    Stop,
+}
+
+/// The idle main-inbox pump task (Stage 3 chunk C).
+///
+/// Holds a `Weak<ServeHost>`, never a strong `Arc`: it parks indefinitely,
+/// and a strong reference held across that park would be a permanent cycle
+/// keeping the host alive forever. The upgrade lives only for the duration of
+/// one step.
+///
+/// The wake is armed **before** the queue is re-examined. `Notified::enable`
+/// registers the waiter (consuming any permit stored since the last wait), so
+/// a message accepted at any point after that — including one that lands
+/// after a turn's last step-4c drain but before its slot is released — is
+/// either seen by the check that follows or wakes the wait that follows it.
+/// There is no window in between for it to fall into.
+async fn main_inbox_pump(
+    host: std::sync::Weak<ServeHost>,
+    wake: Arc<tokio::sync::Notify>,
+    cancel: CancellationToken,
+) {
+    let mut block: Option<MainPumpBlock> = None;
+    loop {
+        let mut notified = Box::pin(wake.notified());
+        notified.as_mut().enable();
+
+        if cancel.is_cancelled() {
+            return;
+        }
+
+        let step = {
+            // Upgraded for this step only; dropped before the wait below.
+            let Some(host) = host.upgrade() else { return };
+            let step = host.main_pump_step(&mut block).await;
+            drop(host);
+            step
+        };
+
+        match step {
+            MainPumpStep::Stop => return,
+            MainPumpStep::Progressed => continue,
+            MainPumpStep::Wait => {
+                tokio::select! {
+                    _ = notified.as_mut() => {}
+                    _ = cancel.cancelled() => return,
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ServeHost {
+    /// Cancels the idle main-inbox pump.
+    ///
+    /// A host that is simply dropped (every fixture that never calls
+    /// `shutdown`) must not leave a task parked on its `main_wake` forever:
+    /// the pump holds only a `Weak`, so the host itself is already free, but
+    /// the task would linger for the life of the runtime. This is the only
+    /// thing this `Drop` does — no I/O, no blocking, no join (there is no
+    /// runtime guaranteed here to join on).
+    fn drop(&mut self) {
+        self.main_pump_cancel.cancel();
+        self.main_wake.notify_waiters();
+    }
+}
+
 /// Releases the turn slot when dropped, including on cancellation or panic,
 /// and finalises the public turn state idempotently (C6).
 struct TurnGuard<'a> {
-    flag: &'a std::sync::Mutex<bool>,
-    steering: &'a coda_agent::SteeringInbox,
+    flag: &'a std::sync::Mutex<bool>,    steering: &'a coda_agent::SteeringInbox,
     state: &'a EngineState,
     observer: &'a SteeringStateObserver,
+    /// Signalled once the slot is genuinely free again, on **every** exit
+    /// path — normal completion, early preflight failure, cancellation and
+    /// panic alike. This is the only thing that gets the idle main-inbox
+    /// pump moving after a busy refusal, so it must not be conditional on
+    /// how the turn ended.
+    main_wake: &'a tokio::sync::Notify,
     turn_id: String,
 }
 
@@ -2148,6 +2673,12 @@ impl Drop for TurnGuard<'_> {
         // safe direction: it only ever under-promises.
         *busy = false;
         self.state.release_turn();
+        // TURN is dropped *before* the wake so a pump woken on another task
+        // can claim the slot immediately rather than finding it still held
+        // by the guard that just told it to look (lock order TURN -> ...,
+        // never a notify under TURN).
+        drop(busy);
+        self.main_wake.notify_one();
     }
 }
 
@@ -2250,6 +2781,9 @@ impl ServeBackend for ServeHost {
                 // client being wired (see `commit_wired_provider`).
                 self.commit_wired_provider(&c).await?;
                 *client = Some(c);
+                // The provider transition is what unblocks a pump that
+                // refused to run for want of one (see `note_provider_wired`).
+                self.note_provider_wired();
             }
         }
         self.apply_pending_startup_effort().await?;
@@ -2257,6 +2791,16 @@ impl ServeBackend for ServeHost {
         // (§2.1, S4): absent `clientCapabilities` means legacy behaviour — no
         // gated `event/*` method is ever written to the connection.
         initialization.finish()?;
+        // The idle main-inbox pump starts here and only here: this is the
+        // first point at which the host is known to be running inside a
+        // Tokio runtime *and* to have completed initialization, and it is
+        // after the initialization slot was released (so a pump that
+        // immediately wants a turn is not refused as busy by the very call
+        // that started it). Idempotent — a second `initialize` does not
+        // start a second pump. Anything queued onto the main inbox *before*
+        // this point is not lost: the pump's first act is to look at the
+        // queue, not to wait for a wake.
+        self.ensure_main_pump_started();
         let telemetry_log_path = self
             .diagnostics
             .as_ref()
@@ -2295,9 +2839,22 @@ impl ServeBackend for ServeHost {
         // never observe a shutdown it was told to expect. They are published
         // for real now, around the work that actually stops the engine.
         self.engine_state.shutdown_started();
+        // Cover the token-publication race explicitly: a turn that has
+        // already claimed the slot but has not yet published its cancel
+        // token would otherwise see neither the cancellation below (there is
+        // no token to take) nor a refusal (it was admitted before
+        // `shutdown_started`). Setting the pending flag makes it cancel
+        // itself the instant it publishes, which is the same mechanism
+        // `session/interrupt` uses for that window.
+        *self.pending_interrupt.lock().expect("pending_interrupt poisoned") = true;
         if let Some(c) = self.current_cancel.lock().expect("cancel poisoned").take() {
             c.cancel();
         }
+        // Stop the idle main-inbox pump before the services below: it is the
+        // one thing that could otherwise claim a fresh turn slot while the
+        // rest of the engine is being torn down. `stop_main_pump` cancels
+        // and then *joins* (bounded); it never leaves a detached task.
+        self.stop_main_pump().await;
         // Shut down the schedule runtime if it was ever started.
         let services = self.session_services.lock().await.clone();
         if let Some(svc) = services {
@@ -2307,90 +2864,20 @@ impl ServeBackend for ServeHost {
         if let Some(manager) = &self.mcp_manager {
             manager.shutdown().await;
         }
+        // Close the engine-owned notification bus: no further `notify_user`
+        // publication is meaningful once the engine itself has begun
+        // shutting down, and closing it makes that refusal explicit rather
+        // than leaving a background task's publish silently succeed into a
+        // bus nothing will ever read from again.
+        self.message_bus.close();
         self.engine_state.shutdown_completed();
         Ok(json!({ "ok": true }))
     }
 
     async fn session_prompt(&self, p: PromptParams) -> Result<Value, RpcError> {
-        let provider = self.connected_provider().await;
-        // Mint the canonical turnId unconditionally, before any preflight
-        // check (image validation, turn-slot claim): every prompt gets a
-        // stable id regardless of whether it is ultimately accepted, so
-        // diagnostics and the wire identity model never disagree about which
-        // attempt failed preflight.
-        let turn_id = uuid::Uuid::new_v4().to_string();
-        let turn_ctx = self.diagnostics.as_ref().map(|ctx| {
-            ctx.with_session(self.active_session_id())
-                .with_turn(turn_id.clone())
-                .with_provider_model(Some(provider), Some(self.current_model()))
-        });
-        let run = async {
-        self.apply_pending_startup_effort().await?;
-        // Validate images BEFORE claiming the turn slot so a bad image
-        // never leaves the host stuck in "busy" state.
-        if let Some(images) = p.images.as_deref() {
-            for img in images {
-                let media_type = img["mediaType"].as_str().unwrap_or("");
-                match media_type {
-                    "image/png" | "image/jpeg" | "image/gif" | "image/webp" => {}
-                    other => {
-                        return Err(RpcError::invalid_params(format!(
-                            "unsupported image media type: {other}"
-                        )));
-                    }
-                }
-                let b64 = img["base64"].as_str().unwrap_or("");
-                if let Err(e) = validate_base64(b64) {
-                    return Err(RpcError::invalid_params(format!(
-                        "invalid base64 encoding: {e}"
-                    )));
-                }
-            }
-        }
-
-        // Claim the turn slot; the guard releases it on every exit path,
-        // including cancellation, and finalises the public turn with it.
-        let _turn = self
-            .try_claim_turn(&turn_id, &p.text.clone().unwrap_or_default(), TurnKind::Prompt)
-            .map_err(|refused| {
-                refused.into_error("another prompt is already in progress; busy")
-            })?;
-
-        let result = self.run_prompt_inner(p, turn_id.clone()).await;
-        if let Err(e) = &result {
-            // The turn was public from the moment the slot was claimed, so a
-            // failure after that point has to be published as a real outcome
-            // rather than left for the guard's generic fallback. Only a
-            // classification is retained — never the message (S3).
-            self.engine_state.end_turn(TurnEnd {
-                turn_id: turn_id.clone(),
-                stop_reason: None,
-                interrupted: false,
-                error: Some(safe_engine_error(e.code)),
-                history_length: None,
-                wire: None,
-            });
-        }
-        result
-        };
-        match turn_ctx {
-            Some(ctx) => {
-                ctx.record(coda_diagnostics::Event::TurnStart);
-                let result = coda_diagnostics::scope(ctx.clone(), run).await;
-                if let Err(error) = &result {
-                    ctx.record(coda_diagnostics::Event::TurnFailed {
-                        category: match error.code {
-                            -32001 => "unauthorized",
-                            -32602 => "invalid_params",
-                            _ => "preflight",
-                        },
-                        status: None,
-                    });
-                }
-                result
-            }
-            None => run.await,
-        }
+        self.run_prompt_with_origin(p, PromptOrigin::User)
+            .await
+            .map_err(PromptRunFailure::into_rpc_error)
     }
 
     async fn session_interrupt(&self) -> Result<Value, RpcError> {
@@ -3033,72 +3520,51 @@ impl ServeBackend for ServeHost {
     }
 
     async fn session_schedule_list(&self) -> Result<Value, RpcError> {
-        let schedules: Vec<ScheduledTaskResponse> =
-            self.schedule_store.items().iter().map(scheduled_task_to_wire).collect();
+        let now = Utc::now();
+        let live = self.schedule_store.live_states();
+        let default_live = coda_agent::scheduling::ScheduleLiveState::default();
+        let schedules: Vec<ScheduledTaskResponse> = self
+            .schedule_store
+            .items()
+            .iter()
+            .map(|t| {
+                scheduled_task_to_wire(t, live.get(&t.id).unwrap_or(&default_live), now)
+            })
+            .collect();
         serde_json::to_value(&schedules)
             .map(|v| json!({ "schedules": v }))
             .map_err(|e| RpcError::internal(e.to_string()))
     }
 
+    /// Create a schedule over the wire.
+    ///
+    /// Validation is the *same* code the `schedule_create` tool runs. Before
+    /// this stage the two surfaces had separate parsers that quietly disagreed
+    /// (this one accepted `"30s"` and rejected `"1d"`; the tool did the
+    /// opposite), which is precisely how a new bound ends up enforced on one
+    /// path only.
     async fn session_schedule_create(&self, p: ScheduleCreateParams) -> Result<Value, RpcError> {
-        let rc = [p.every.is_some(), p.at.is_some(), p.cron.is_some()]
-            .iter()
-            .filter(|&&b| b)
-            .count();
-        if rc != 1 {
-            return Err(RpcError::invalid_params(
-                "exactly one of every, at, or cron must be provided",
-            ));
-        }
-        let tz = p.time_zone.clone().unwrap_or_else(|| "UTC".into());
         let now = Utc::now();
-
-        let draft = if let Some(ref every) = p.every {
-            let interval = parse_duration(Some(every)).ok_or_else(|| {
-                RpcError::invalid_params(format!("invalid 'every' duration: {every:?}"))
-            })?;
-            let next_run_utc = now + chrono::Duration::seconds(interval.as_secs() as i64);
-            ScheduleDefinitionDraft {
-                name: p.name.clone(),
-                kind: ScheduleKind::Interval,
-                prompt: p.prompt.clone(),
-                interval: Some(interval),
-                at_utc: None,
-                cron: None,
-                time_zone_id: tz,
-                next_run_utc,
-            }
-        } else if let Some(ref at) = p.at {
-            let at_utc = chrono::DateTime::parse_from_rfc3339(at)
-                .map(|d| d.with_timezone(&Utc))
-                .map_err(|e| RpcError::invalid_params(format!("invalid 'at' datetime: {e}")))?;
-            ScheduleDefinitionDraft {
-                name: p.name.clone(),
-                kind: ScheduleKind::At,
-                prompt: p.prompt.clone(),
-                interval: None,
-                at_utc: Some(at_utc),
-                cron: None,
-                time_zone_id: tz,
-                next_run_utc: at_utc,
-            }
-        } else {
-            let cron_expr = p.cron.clone().unwrap();
-            // next_run_utc = now; the runtime will advance to the proper boundary.
-            ScheduleDefinitionDraft {
-                name: p.name.clone(),
-                kind: ScheduleKind::Cron,
-                prompt: p.prompt.clone(),
-                interval: None,
-                at_utc: None,
-                cron: Some(cron_expr),
-                time_zone_id: tz,
-                next_run_utc: now,
-            }
+        let request = coda_agent::scheduling::ScheduleCreateRequest {
+            prompt: Some(p.prompt.as_str()),
+            name: p.name.as_deref(),
+            every: p.every.as_deref(),
+            at: p.at.as_deref(),
+            cron: p.cron.as_deref(),
+            time_zone: p.time_zone.as_deref(),
+            expires_at: p.expires_at.as_deref(),
+            expires_in: p.expires_in.as_deref(),
+            max_runs: p.max_runs.as_ref(),
         };
+        let draft = coda_agent::scheduling::build_draft(&request, now)
+            .map_err(RpcError::invalid_params)?;
 
         let task = self.schedule_store.add(draft, now);
-        let resp = scheduled_task_to_wire(&task);
+        let resp = scheduled_task_to_wire(
+            &task,
+            &self.schedule_store.live_state(&task.id),
+            now,
+        );
         serde_json::to_value(&resp).map_err(|e| RpcError::internal(e.to_string()))
     }
 
@@ -3421,6 +3887,55 @@ impl ServeBackend for ServeHost {
         let result = self.mcp_inventory().await;
         serde_json::to_value(&result).map_err(|e| RpcError::internal(e.to_string()))
     }
+
+    /// Non-destructive recovery of engine-owned user notifications.
+    /// `afterCursor` addresses the message bus's own cursor, never the
+    /// `EventBus` seq — see `coda_agent::message` module docs.
+    ///
+    /// `engineInstanceId`, when supplied, fences this read the same way
+    /// `session/getHistory` fences its own: the bus is scoped to this engine
+    /// process, so a cursor minted by a different process is refused rather
+    /// than silently read against the wrong ring.
+    async fn session_pending_messages(&self, p: PendingMessagesParams) -> Result<Value, RpcError> {
+        let current_instance = self.engine_state.bus_ref().engine_instance_id();
+        if let Some(expected) = &p.engine_instance_id {
+            if expected != current_instance {
+                return Err(RpcError::instance_changed(format!(
+                    "this engine is instance {current_instance}; a cursor from another process \
+                     is not a position in this bus — re-read from cursor 0"
+                )));
+            }
+        }
+        let since =
+            self.message_bus.user_since(p.after_cursor, p.limit.map(|n| n.max(0) as usize));
+        let messages: Vec<coda_proto::responses::AgentMessageDto> = since
+            .messages
+            .into_iter()
+            .map(|m| coda_proto::responses::AgentMessageDto {
+                id: m.id,
+                cursor: m.cursor as i64,
+                label: m.label,
+                text: m.body,
+                context: m.context,
+                source: m.source_kind.to_owned(),
+                task_id: m.task_id,
+                schedule_definition_id: m.schedule_definition_id,
+            })
+            .collect();
+        let dropped = since.dropped.map(|d| coda_proto::responses::DroppedRangeDto {
+            from: d.from as i64,
+            to: d.to as i64,
+            count: d.count as i64,
+        });
+        let result = coda_proto::responses::PendingMessagesResult {
+            messages,
+            next_cursor: since.next_cursor as i64,
+            gap: since.gap,
+            dropped,
+            truncated: since.truncated,
+        };
+        serde_json::to_value(&result).map_err(|e| RpcError::internal(e.to_string()))
+    }
 }
 
 /// Maps a registry refusal onto a typed JSON-RPC error.
@@ -3708,6 +4223,353 @@ impl ServeHost {
         serde_json::to_value(&resp).map_err(|e| RpcError::internal(e.to_string()))
     }
 
+    // ── Idle main-inbox pump (Stage 3 chunk C, `ask_main`) ────────────────
+    //
+    // Lifecycle, in full:
+    //
+    // * **Start** — `ensure_main_pump_started`, called exactly once per host
+    //   from a *successful* `initialize`, after the initialization slot is
+    //   released. Idempotent. Never from `build`/`new`/`new_with_client`,
+    //   which are synchronous and reached from fixtures with no Tokio
+    //   runtime where `tokio::spawn` would panic.
+    // * **Ownership** — the task holds a `Weak<ServeHost>`, never a strong
+    //   `Arc`, and upgrades only for the duration of one step. An idle host
+    //   therefore drops normally, and its `Drop` cancels the pump.
+    // * **Wake** — `main_wake`, signalled by: a newly accepted `ask_main`
+    //   item (`on_main_accepted`), every release of the turn slot
+    //   (`TurnGuard::drop`, including cancelled/panicking turns), the
+    //   release of the initialization slot, and every provider-wiring
+    //   transition (`note_provider_wired`). Never by a passive `notify_user`
+    //   publication and never by an ordinary task completion.
+    // * **Retry policy** — see `MainPumpBlock`: a refusal is never retried
+    //   just because the pump's own failed attempt released the slot and
+    //   thereby woke it. Each blocked state names the external transition
+    //   that clears it.
+    // * **Stop** — `stop_main_pump`, from `shutdown` (after `stopping` is
+    //   published, so no further turn is admitted) and by cancellation from
+    //   `Drop`. Bounded graceful join, then abort *and* join.
+
+    /// How long `shutdown` waits for the pump to notice cancellation before
+    /// aborting it. Generous enough that an in-flight turn whose model
+    /// honours cancellation finishes its own teardown, short enough that a
+    /// client that ignores cancellation cannot hold shutdown open.
+    const MAIN_PUMP_JOIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// Starts the idle main-inbox pump if it is not already running.
+    ///
+    /// Idempotent and cheap: a second call (a second `initialize`, or a test
+    /// fixture starting it explicitly) does nothing. Must be called from
+    /// inside a Tokio runtime.
+    pub(crate) fn ensure_main_pump_started(&self) {
+        if self.main_pump_cancel.is_cancelled() {
+            // Already shutting down (or shut down): starting a pump now
+            // would be an orphan nothing will ever join.
+            return;
+        }
+        let mut slot = self.main_pump.lock().expect("main pump poisoned");
+        if slot.is_some() {
+            return;
+        }
+        let Some(weak) = self.self_ref.get().cloned() else {
+            // Unreachable in practice: `build` sets this before the `Arc` is
+            // ever handed out. Refusing rather than unwrapping keeps a
+            // hypothetical hand-constructed host from panicking here.
+            tracing::warn!("main-inbox pump not started: host self-reference was never set");
+            return;
+        };
+        let wake = Arc::clone(&self.main_wake);
+        let cancel = self.main_pump_cancel.clone();
+        *slot = Some(tokio::spawn(main_inbox_pump(weak, wake, cancel)));
+    }
+
+    /// Cancels the pump and **joins** it, with a bounded grace period.
+    ///
+    /// The handle is taken by value but awaited **by reference**: a
+    /// `timeout(handle)` that expires would drop the handle, which *detaches*
+    /// the still-running task rather than stopping it — precisely the leak
+    /// this is meant to prevent. On expiry the task is aborted and then
+    /// joined, so this never returns while the pump is still running.
+    async fn stop_main_pump(&self) {
+        self.main_pump_cancel.cancel();
+        // Wake it so a parked pump notices the cancellation immediately
+        // rather than after the grace period.
+        self.main_wake.notify_one();
+        let handle = self.main_pump.lock().expect("main pump poisoned").take();
+        let Some(mut handle) = handle else { return };
+        match tokio::time::timeout(Self::MAIN_PUMP_JOIN_GRACE, &mut handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(join_err)) => {
+                // Metadata only — never a message body.
+                tracing::warn!(
+                    panicked = join_err.is_panic(),
+                    cancelled = join_err.is_cancelled(),
+                    "main-inbox pump task ended abnormally"
+                );
+            }
+            Err(_elapsed) => {
+                handle.abort();
+                match handle.await {
+                    Ok(()) => {}
+                    Err(join_err) => tracing::warn!(
+                        panicked = join_err.is_panic(),
+                        cancelled = join_err.is_cancelled(),
+                        "main-inbox pump task aborted after exceeding the shutdown grace period"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// One step of the pump. Never drains the main inbox itself — draining is
+    /// the main `AgentLoop`'s own step 4c, and a second consumer would make
+    /// "delivered" mean two different things.
+    async fn main_pump_step(&self, block: &mut Option<MainPumpBlock>) -> MainPumpStep {
+        if !self.message_bus.has_pending_main() {
+            // Nothing queued. Any recorded block described a queue state
+            // that no longer exists, so it is discarded rather than left to
+            // suppress the next genuinely new request.
+            *block = None;
+            return MainPumpStep::Wait;
+        }
+
+        if let Some(recorded) = block.as_ref() {
+            if !recorded.is_cleared_by(self) {
+                return MainPumpStep::Wait;
+            }
+            *block = None;
+        }
+
+        // Counts only attempts that actually got past the blocked-state gate
+        // — the number a spinning pump would grow without bound.
+        #[cfg(test)]
+        self.main_pump_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        // Preflight the provider BEFORE claiming anything. Running the turn
+        // without one would fail inside `run_prompt_inner`, and the failed
+        // turn's guard would signal `main_wake` — the pump's OWN wake — so an
+        // unconditional retry would spin forever on a host that simply has no
+        // credentials. This is the same lazy wiring a user prompt performs.
+        let _ = self.wire_client_from_env_if_missing().await;
+        // Read AFTER the wiring attempt but BEFORE the check: a provider
+        // wired by anyone else from here on moves the generation, which is
+        // what clears the block. Reading it after the check could miss that
+        // transition and leave the pump blocked forever.
+        let generation = self.provider_generation();
+        if self.client.lock().await.is_none() {
+            self.announce_main_inbox_blocked();
+            *block = Some(MainPumpBlock::ProviderUnavailable { provider_generation: generation });
+            tracing::debug!(
+                pending = self.message_bus.pending_main_len(),
+                "main-inbox pump blocked: no provider is wired"
+            );
+            return MainPumpStep::Wait;
+        }
+
+        // Delivery progress, not acceptance: `main_seq` does not move when
+        // items are consumed, so it cannot answer "did this run actually
+        // deliver anything".
+        let delivered_before = self.message_bus.main_delivered_seq();
+        let outcome = self
+            .run_prompt_with_origin(
+                PromptParams { text: None, images: None },
+                PromptOrigin::MainInbox,
+            )
+            .await;
+        let delivered_after = self.message_bus.main_delivered_seq();
+
+        match outcome {
+            Ok(_) if delivered_after > delivered_before => {
+                tracing::debug!(
+                    delivered_through = delivered_after,
+                    still_pending = self.message_bus.pending_main_len(),
+                    "main-inbox pump delivered"
+                );
+                MainPumpStep::Progressed
+            }
+            // A turn ran but nothing left the queue (the run was interrupted
+            // before step 4c, or failed before reaching it). Honest outcome:
+            // the items are still pending and will be retried, but only when
+            // something external changes — never on the pump's own self-wake.
+            Ok(_) => {
+                *block = Some(MainPumpBlock::no_progress(self));
+                tracing::debug!(
+                    pending = self.message_bus.pending_main_len(),
+                    "main-inbox pump made no delivery progress; waiting for new work or a provider change"
+                );
+                MainPumpStep::Wait
+            }
+            // Someone else already did the work between the look and the
+            // claim, or the slot was held. Neither is a failure and neither
+            // is blocked: the queue state or the slot release will wake this
+            // again.
+            Err(PromptRunFailure::NoWork) | Err(PromptRunFailure::Busy) => MainPumpStep::Wait,
+            Err(PromptRunFailure::Stopped) => MainPumpStep::Stop,
+            Err(PromptRunFailure::Failed(e)) if delivered_after > delivered_before => {
+                // The items were injected and the model run then failed. The
+                // transcript already holds them (`run_prompt_inner` persists
+                // and commits history on the error path too), so this is
+                // real progress, not a retryable loss.
+                tracing::debug!(
+                    code = e.code,
+                    delivered_through = delivered_after,
+                    "main-inbox pump delivered, then the turn failed"
+                );
+                MainPumpStep::Progressed
+            }
+            Err(PromptRunFailure::Failed(e)) => {
+                *block = Some(MainPumpBlock::no_progress(self));
+                // Code only — never the message, which can carry provider
+                // text.
+                tracing::debug!(
+                    code = e.code,
+                    pending = self.message_bus.pending_main_len(),
+                    "main-inbox pump attempt failed with no delivery progress"
+                );
+                MainPumpStep::Wait
+            }
+        }
+    }
+
+    /// Publishes the single, constant "there is queued background work this
+    /// engine cannot act on" notice.
+    ///
+    /// Passive and honest: it says only that delivery is blocked and why, in
+    /// fixed wording. It never carries the queued request's body, its
+    /// context or anything else the requester wrote — a blocked delivery is
+    /// not a licence to show the user text the main conversation has not
+    /// accepted.
+    ///
+    /// The idempotency key is scoped to the *reason*, never to a message, so
+    /// every repeat of this blocked state deduplicates onto the one notice:
+    /// `publish_user` returns the original receipt for an identical replay
+    /// and does not re-announce it on the wire. (The key's lifetime is the
+    /// notification ring's own retention window — documented bus behaviour,
+    /// see `MessageBus`; once the notice itself has scrolled away, a still
+    /// blocked engine may honestly say so again.)
+    fn announce_main_inbox_blocked(&self) {
+        const BLOCKED_NOTICE: &str = "Background work is waiting for this conversation, but no \
+             model provider is connected, so it cannot be delivered. The requests are still \
+             queued and will be delivered once a provider is connected.";
+        let _ = self.message_bus.publish_user(
+            &coda_agent::message::MessageSource::Main,
+            BLOCKED_NOTICE,
+            None,
+            Some("mainInbox.blocked.providerUnavailable".to_owned()),
+        );
+    }
+
+    /// The whole `session/prompt` execution path, shared verbatim by the
+    /// public RPC and by the idle main-inbox pump (Stage 3 chunk C).
+    ///
+    /// There is exactly ONE execution slot and ONE history writer, and this
+    /// is it: the pump does not get a second one. Diagnostics scoping, the
+    /// startup-effort application, image validation, the single-flight
+    /// claim, `run_prompt_inner` (which owns the model run, the transcript
+    /// write and the terminal outcome) and the failure publication are all
+    /// the same code for both origins.
+    ///
+    /// `origin` is an **explicit discriminant**, never inferred from the
+    /// shape of `p`. An empty `session/prompt` is a legitimate user request
+    /// with its own long-standing behaviour (run the model against the
+    /// existing history), and treating "no text" as "this must be the pump"
+    /// would silently change it.
+    ///
+    /// The only difference between the two origins is the admission
+    /// precondition (see [`Self::try_claim_turn_if`]): a main-inbox turn
+    /// exists solely so the main agent loop's own step 4c can drain the
+    /// `ask_main` queue, so if a racing user turn already drained it there is
+    /// nothing left to run and the claim is refused — never drained here,
+    /// and never turned into an empty model request.
+    async fn run_prompt_with_origin(
+        &self,
+        p: PromptParams,
+        origin: PromptOrigin,
+    ) -> Result<Value, PromptRunFailure> {
+        let provider = self.connected_provider().await;
+        // Mint the canonical turnId unconditionally, before any preflight
+        // check (image validation, turn-slot claim): every prompt gets a
+        // stable id regardless of whether it is ultimately accepted, so
+        // diagnostics and the wire identity model never disagree about which
+        // attempt failed preflight.
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let turn_ctx = self.diagnostics.as_ref().map(|ctx| {
+            ctx.with_session(self.active_session_id())
+                .with_turn(turn_id.clone())
+                .with_provider_model(Some(provider), Some(self.current_model()))
+        });
+        let run = async {
+        self.apply_pending_startup_effort().await.map_err(PromptRunFailure::Failed)?;
+        // Validate images BEFORE claiming the turn slot so a bad image
+        // never leaves the host stuck in "busy" state.
+        if let Some(images) = p.images.as_deref() {
+            for img in images {
+                let media_type = img["mediaType"].as_str().unwrap_or("");
+                match media_type {
+                    "image/png" | "image/jpeg" | "image/gif" | "image/webp" => {}
+                    other => {
+                        return Err(PromptRunFailure::Failed(RpcError::invalid_params(format!(
+                            "unsupported image media type: {other}"
+                        ))));
+                    }
+                }
+                let b64 = img["base64"].as_str().unwrap_or("");
+                if let Err(e) = validate_base64(b64) {
+                    return Err(PromptRunFailure::Failed(RpcError::invalid_params(format!(
+                        "invalid base64 encoding: {e}"
+                    ))));
+                }
+            }
+        }
+
+        // Claim the turn slot; the guard releases it on every exit path,
+        // including cancellation, and finalises the public turn with it.
+        let still_has_work = || self.message_bus.has_pending_main();
+        let precondition: Option<&dyn Fn() -> bool> = match origin {
+            PromptOrigin::User => None,
+            PromptOrigin::MainInbox => Some(&still_has_work),
+        };
+        let _turn = self
+            .try_claim_turn_if(
+                &turn_id,
+                &p.text.clone().unwrap_or_default(),
+                TurnKind::Prompt,
+                precondition,
+            )
+            .map_err(PromptRunFailure::from)?;
+
+        let result = self.run_prompt_inner(p, turn_id.clone()).await;
+        if let Err(e) = &result {
+            // The turn was public from the moment the slot was claimed, so a
+            // failure after that point has to be published as a real outcome
+            // rather than left for the guard's generic fallback. Only a
+            // classification is retained — never the message (S3).
+            self.engine_state.end_turn(TurnEnd {
+                turn_id: turn_id.clone(),
+                stop_reason: None,
+                interrupted: false,
+                error: Some(safe_engine_error(e.code)),
+                history_length: None,
+                wire: None,
+            });
+        }
+        result.map_err(PromptRunFailure::Failed)
+        };
+        match turn_ctx {
+            Some(ctx) => {
+                ctx.record(coda_diagnostics::Event::TurnStart);
+                let result = coda_diagnostics::scope(ctx.clone(), run).await;
+                if let Err(failure) = &result {
+                    ctx.record(coda_diagnostics::Event::TurnFailed {
+                        category: failure.diagnostic_category(),
+                        status: None,
+                    });
+                }
+                result
+            }
+            None => run.await,
+        }
+    }
+
     /// Inner implementation of the prompt turn — called after the turn slot is claimed
     /// and image validation has passed. `turn_id` was already minted in
     /// `session_prompt`, unconditionally, before any preflight check.
@@ -3746,15 +4608,94 @@ impl ServeHost {
         }
 
         // Optional goal supervisor.
-        let goal = self.build_goal_supervisor(Arc::clone(&client));
+        let goal = self.build_autonomy_supervisor(Arc::clone(&client));
 
         // Initialise session-scoped services lazily (Finding 1: first turn only).
         let services = self.get_or_init_services(Arc::clone(&client)).await;
 
         // Build the agent loop with all services wired (Finding 1).
-        let uq_goal = Arc::clone(&self.user_question) as Arc<dyn UserQuestionPrompt>;
-        let uq_tool = Arc::clone(&self.user_question) as Arc<dyn UserQuestion>;
-        let pa = Arc::clone(&self.plan_approver) as Arc<dyn PlanApprover>;
+        //
+        // The goal-escalation seam is deliberately NOT installed under a goal.
+        // Its only job is to ask the operator whether to extend an exhausted
+        // budget, and that question waits without a timeout — so in an attended
+        // session whose operator has walked away, which is the exact case this
+        // feature exists for, it would park the run forever. With no seam the
+        // supervisor resolves exhaustion itself and stops with an honest
+        // `Unmet` and a report, which is what the terminal-state table promises.
+        let uq_goal: Option<Arc<dyn UserQuestionPrompt>> = match &goal {
+            Some(_) => None,
+            None => Some(Arc::clone(&self.user_question) as Arc<dyn UserQuestionPrompt>),
+        };
+
+        // The plan-approval seam. `exit_plan_mode` waits on the operator with
+        // no timeout, so under a goal it is resolved from the active mode just
+        // like the permission seam.
+        let pa: Arc<dyn PlanApprover> = match &goal {
+            Some(supervisor) => Arc::new(AutonomousPlanApprover::new(
+                Arc::clone(&self.permission_mode),
+                supervisor.ledger(),
+            )),
+            None => Arc::clone(&self.plan_approver) as Arc<dyn PlanApprover>,
+        };
+
+        // The question seam is the one place autonomy changes what the agent
+        // can do to the operator. With a goal active, `ask_user_question` is
+        // answered by a stand-in that records its reasoning, rather than
+        // suspending the run against a terminal nobody is watching. With no
+        // goal, this is untouched and the interactive prompt is used exactly as
+        // before — which is what keeps ordinary sessions unchanged.
+        //
+        // The ledger handed to the stand-in MUST be the supervisor's own, or
+        // its assumptions would be invisible to both the end-of-run report and
+        // the termination proof.
+        let uq_tool: Arc<dyn UserQuestion> = match &goal {
+            Some(supervisor) => {
+                let judge: Arc<dyn ForkedAgent> = Arc::new(LlmForkedAgent {
+                    client: Arc::clone(&client),
+                    model: self.current_model(),
+                });
+                let answerer = ProxyAnswerer::new(
+                    judge,
+                    supervisor.ledger(),
+                    supervisor.goal().to_owned(),
+                );
+                // Seed the stand-in with what the conversation has established
+                // so far. Deciding "which database?" without knowing that one
+                // was already chosen an hour ago is how a proxy contradicts
+                // its own earlier answers.
+                answerer.set_transcript(recent_transcript(&history));
+                Arc::new(answerer)
+            }
+            None => Arc::clone(&self.user_question) as Arc<dyn UserQuestion>,
+        };
+
+        // The permission seam. With a goal active it is resolved from the
+        // active mode's policy instead of being sent to an absent operator: an
+        // allowed action proceeds (after an undo is manufactured for the few
+        // genuinely unrecoverable ones), and a disallowed one is recorded as a
+        // capability blocker so the run continues elsewhere. The mode is still
+        // the envelope — a goal does NOT widen permissions — so a goal run
+        // under `plan` ends quickly with an honest list of what it could not do
+        // rather than stalling on the first prompt.
+        let permission_prompt: Arc<dyn PermissionPrompt> = match &goal {
+            Some(supervisor) => {
+                let classifier: Arc<dyn ToolActionClassifier> =
+                    Arc::new(LlmToolActionClassifier::new(Arc::new(LlmForkedAgent {
+                        client: Arc::clone(&client),
+                        model: self.current_model(),
+                    })));
+                let executor: Arc<dyn RecoveryExecutor> =
+                    Arc::new(GitRecoveryExecutor::new(self.working_dir.clone()));
+                let recovery = RecoveryGuard::new(executor, supervisor.ledger());
+                Arc::new(PermissionResolver::new(
+                    Arc::clone(&self.permission_mode),
+                    classifier,
+                    supervisor.ledger(),
+                    recovery,
+                ))
+            }
+            None => Arc::clone(&self.permission_prompt),
+        };
 
         // ONE coherent read of the configuration this turn runs under, taken
         // after every await that precedes the build. Everything below — the
@@ -3767,7 +4708,7 @@ impl ServeHost {
 
         let agent = AgentLoopBuilder::new(
             Arc::clone(&client),
-            Arc::clone(&self.permission_prompt),
+            permission_prompt,
             Arc::clone(&self.tools),
         )
         .with_permission_mode_state(Arc::clone(&self.permission_mode))
@@ -3775,7 +4716,6 @@ impl ServeHost {
         .with_working_directory(&self.working_dir)
         .with_effort(captured.config.effort)
         .with_steering(Arc::clone(&self.session.steering))
-        .with_user_question(uq_goal)
         .with_tool_user_question(uq_tool)
         .with_plan_approver(pa)
         .with_todos(Arc::clone(&self.todos))
@@ -3783,6 +4723,8 @@ impl ServeHost {
         .with_schedule_store(Arc::clone(&self.schedule_store))
         .with_lsp_manager(Arc::clone(&self.lsp_manager))
         .with_subagent_factory(Arc::clone(&services.subagent_host) as Arc<dyn SubagentFactory>)
+        .with_message_bus(Arc::clone(&self.message_bus))
+        .with_main_context()
         .with_hook_runner(Arc::clone(&services.hook_runner));
 
         // Apply the session-only system prompt override the captured record
@@ -3790,6 +4732,13 @@ impl ServeHost {
         // the builder needs to own it.
         let agent = match captured.config.system_prompt.as_deref() {
             Some(prompt) => agent.with_system_prompt(prompt.to_owned()),
+            None => agent,
+        };
+
+        // Installed only for a goal-less run — see the comment where `uq_goal`
+        // is built.
+        let agent = match uq_goal {
+            Some(seam) => agent.with_user_question(seam),
             None => agent,
         };
 
@@ -3849,6 +4798,16 @@ impl ServeHost {
         // Seal before announcing completion, closing the enqueue race even
         // while history persistence and final notifications are still running.
         self.session.steering.close_for_turn();
+        // Test seam (see the field's documentation): the window between the
+        // agent loop's last look at the main inbox and the release of the
+        // turn slot.
+        #[cfg(test)]
+        {
+            let hook = self.after_agent_run_hook.lock().expect("hook poisoned").clone();
+            if let Some(hook) = hook {
+                hook(self);
+            }
+        }
         let stop_reason = turn_sink.take_stop_reason();
 
         // Clear cancel token.
@@ -4818,6 +5777,43 @@ fn build_user_message(p: &PromptParams) -> Message {
     Message::new(Role::User, content)
 }
 
+/// Render the tail of a conversation for the stand-in answerer.
+///
+/// Only the text of recent turns: tool payloads are large, mostly mechanical,
+/// and would crowd out the decisions the stand-in actually needs to be
+/// consistent with. Bounded on both message count and characters so a long
+/// conversation cannot turn one question into an enormous request.
+fn recent_transcript(history: &[Message]) -> String {
+    const MAX_MESSAGES: usize = 12;
+    const MAX_CHARS: usize = 4000;
+
+    let start = history.len().saturating_sub(MAX_MESSAGES);
+    let mut lines: Vec<String> = Vec::new();
+    for message in &history[start..] {
+        let text = message.text();
+        if text.trim().is_empty() {
+            continue;
+        }
+        let who = match message.role {
+            Role::User => "operator",
+            Role::Assistant => "agent",
+        };
+        lines.push(format!("{who}: {}", text.trim()));
+    }
+
+    let mut rendered = lines.join("\n");
+    if rendered.len() > MAX_CHARS {
+        // Keep the most recent text: the latest decisions are the ones a new
+        // answer has to stay consistent with.
+        let cut = rendered.len() - MAX_CHARS;
+        let boundary = (cut..rendered.len())
+            .find(|i| rendered.is_char_boundary(*i))
+            .unwrap_or(rendered.len());
+        rendered = format!("(earlier turns omitted)\n{}", &rendered[boundary..]);
+    }
+    rendered
+}
+
 fn wire_goal_status(gs: &GoalStatus) -> Option<Value> {
     if gs.outcome == GoalOutcome::None {
         return None;
@@ -4825,6 +5821,8 @@ fn wire_goal_status(gs: &GoalStatus) -> Option<Value> {
     let outcome = match gs.outcome {
         GoalOutcome::Met => "Met",
         GoalOutcome::Unmet => "Unmet",
+        GoalOutcome::GenuinelyBlocked => "GenuinelyBlocked",
+        GoalOutcome::Stalled => "Stalled",
         GoalOutcome::None => return None,
     };
     let mut m = serde_json::Map::new();
@@ -4839,16 +5837,17 @@ fn wire_goal_status(gs: &GoalStatus) -> Option<Value> {
     Some(Value::Object(m))
 }
 
+/// Parses a duration in suffix form: `90s`, `30m`, `2h`, `7d`.
+///
+/// Multiplication is checked so an absurd literal (`99999999999999999999d`)
+/// yields `None` — an invalid duration — rather than panicking on overflow in a
+/// debug build or silently wrapping in release.
 fn parse_duration(s: Option<&str>) -> Option<Duration> {
-    let s = s?;
-    if let Some(n) = s.strip_suffix('m').and_then(|n| n.trim().parse::<u64>().ok()) {
-        return Some(Duration::from_secs(n * 60));
-    }
-    if let Some(n) = s.strip_suffix('h').and_then(|n| n.trim().parse::<u64>().ok()) {
-        return Some(Duration::from_secs(n * 3600));
-    }
-    if let Some(n) = s.strip_suffix('s').and_then(|n| n.trim().parse::<u64>().ok()) {
-        return Some(Duration::from_secs(n));
+    let s = s?.trim();
+    for (suffix, secs_per_unit) in [('d', 86_400u64), ('h', 3_600), ('m', 60), ('s', 1)] {
+        if let Some(n) = s.strip_suffix(suffix).and_then(|n| n.trim().parse::<u64>().ok()) {
+            return n.checked_mul(secs_per_unit).map(Duration::from_secs);
+        }
     }
     None
 }
@@ -5041,7 +6040,18 @@ fn catalog_models() -> Vec<WireModel> {
 // Schedule wire-format helper
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn scheduled_task_to_wire(t: &coda_agent::scheduling::ScheduledTask) -> ScheduledTaskResponse {
+/// Render one definition for the wire.
+///
+/// `live` is the runtime's ephemeral status for this definition. It is passed
+/// in rather than looked up here so the caller reads the store once, and so the
+/// reported state is always derived from a matching (definition, live) pair.
+/// The previous helper hardcoded `state: "idle"` and `activeTaskId: None` for
+/// every schedule, which told every client that a running job was idle.
+fn scheduled_task_to_wire(
+    t: &coda_agent::scheduling::ScheduledTask,
+    live: &coda_agent::scheduling::ScheduleLiveState,
+    now: chrono::DateTime<Utc>,
+) -> ScheduledTaskResponse {
     let (kind_str, rule) = match t.kind {
         ScheduleKind::Interval => {
             let secs = t.interval.unwrap_or(0.0);
@@ -5066,8 +6076,8 @@ fn scheduled_task_to_wire(t: &coda_agent::scheduling::ScheduledTask) -> Schedule
         rule,
         time_zone: t.time_zone_id.clone(),
         next_run_utc: t.next_run_utc.to_rfc3339(),
-        state: "idle".into(),
-        active_task_id: None,
+        state: coda_agent::scheduling::reported_state(t, live, now).to_owned(),
+        active_task_id: live.active_task_id.clone(),
         last_outcome: t.last_terminal_outcome.as_ref().map(|o| {
             match o.outcome {
                 ScheduleTerminalOutcome::Succeeded => "succeeded",
@@ -5076,6 +6086,11 @@ fn scheduled_task_to_wire(t: &coda_agent::scheduling::ScheduledTask) -> Schedule
             }
             .to_owned()
         }),
+        max_runs: t.max_runs,
+        expires_at_utc: t.expires_at_utc.map(|d| d.to_rfc3339()),
+        runs_started: t.runs_started,
+        retired_reason: t.retirement.as_ref().map(|r| r.reason.as_wire().to_owned()),
+        retired_at_utc: t.retirement.as_ref().map(|r| r.retired_at_utc.to_rfc3339()),
     }
 }
 
@@ -5104,6 +6119,214 @@ mod tests {
         let sink = Arc::new(ServeSink::new(tx.clone()));
         let ch = Arc::new(PromptChannel::new(tx));
         ServeHost::new(sink, ch, ".".into())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // STAGE 1 — bounded schedules over the wire
+    // ─────────────────────────────────────────────────────────────────────────
+
+    mod bounded_schedules {
+        use super::*;
+
+        fn params(value: Value) -> ScheduleCreateParams {
+            serde_json::from_value(value).expect("wire params must deserialize")
+        }
+
+        async fn create(host: &Arc<ServeHost>, value: Value) -> Result<Value, RpcError> {
+            host.session_schedule_create(params(value)).await
+        }
+
+        async fn list(host: &Arc<ServeHost>) -> Vec<Value> {
+            host.session_schedule_list()
+                .await
+                .unwrap()
+                .get("schedules")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default()
+        }
+
+        /// The RPC path accepts the same bounds the tool does and reports them
+        /// back, so a client can verify what it actually created.
+        #[tokio::test]
+        async fn create_accepts_bounds_and_echoes_them() {
+            let host = make_host();
+            let created = create(
+                &host,
+                json!({"prompt": "monitor", "every": "1h", "maxRuns": 7, "expiresIn": "7d"}),
+            )
+            .await
+            .expect("a bounded schedule must be accepted");
+
+            assert_eq!(created["maxRuns"], 7);
+            assert_eq!(created["runsStarted"], 0);
+            assert!(created["expiresAtUtc"].is_string());
+            assert_eq!(created["state"], "idle");
+            assert!(created.get("retiredReason").is_none());
+        }
+
+        /// The same validation as the tool, on the same code path: previously
+        /// this surface had its own parser that accepted `"30s"` and rejected
+        /// `"1d"`, so a rule could hold in one place and not the other.
+        #[tokio::test]
+        async fn create_rejects_exactly_what_the_tool_rejects() {
+            let host = make_host();
+            for bad in [
+                json!({"prompt": "x", "every": "1h", "maxRuns": 0}),
+                json!({"prompt": "x", "every": "1h", "maxRuns": -1}),
+                json!({"prompt": "x", "every": "1h", "maxRuns": 1.5}),
+                json!({"prompt": "x", "every": "1h", "maxRuns": "7"}),
+                json!({"prompt": "x", "every": "1h", "expiresAt": "2001-01-01T00:00:00Z"}),
+                json!({"prompt": "x", "every": "1h", "expiresAt": "not-a-date"}),
+                json!({"prompt": "x", "every": "1h", "expiresAt": "2087-01-01T00:00:00Z", "expiresIn": "7d"}),
+                json!({"prompt": "x", "every": "2d", "expiresIn": "1d"}),
+                json!({"prompt": "x"}),
+                json!({"prompt": "x", "every": "1h", "cron": "* * * * *"}),
+                json!({"prompt": "x", "cron": "not-a-cron"}),
+                json!({"prompt": "x", "cron": "0 9 * * *", "timeZone": "Mars/Olympus"}),
+            ] {
+                let error = create(&host, bad.clone()).await.err();
+                assert!(error.is_some(), "must be refused: {bad}");
+            }
+            assert!(list(&host).await.is_empty(), "a refused request creates nothing");
+        }
+
+        /// The unified parser is the point: `1d` works here now, and the
+        /// sub-minute spelling the tool always refused is refused here too.
+        #[tokio::test]
+        async fn create_uses_the_same_duration_vocabulary_as_the_tool() {
+            let host = make_host();
+            assert!(create(&host, json!({"prompt": "x", "every": "1d"})).await.is_ok());
+            assert!(create(&host, json!({"prompt": "x", "every": "30s"})).await.is_err());
+        }
+
+        /// An unbounded create is unchanged: no bounds appear in the response.
+        #[tokio::test]
+        async fn an_unbounded_schedule_reports_no_bounds() {
+            let host = make_host();
+            let created = create(&host, json!({"prompt": "x", "every": "30m"}))
+                .await
+                .unwrap();
+            assert!(created.get("maxRuns").is_none());
+            assert!(created.get("expiresAtUtc").is_none());
+            assert_eq!(created["runsStarted"], 0);
+            assert_eq!(created["state"], "idle");
+        }
+
+        /// `session/scheduleList` must report what is actually happening. It
+        /// used to hardcode `state: "idle"` and omit `activeTaskId` for every
+        /// schedule, so a client watching a running job saw an idle one.
+        #[tokio::test]
+        async fn list_reports_live_state_rather_than_a_hardcoded_idle() {
+            use coda_agent::scheduling::{ScheduleLiveState, ScheduleLiveStatus};
+
+            let host = make_host();
+            let created = create(&host, json!({"prompt": "x", "every": "1h", "maxRuns": 7}))
+                .await
+                .unwrap();
+            let id = created["id"].as_str().unwrap().to_owned();
+
+            host.schedule_store.set_live_state(
+                &id,
+                ScheduleLiveState {
+                    status: ScheduleLiveStatus::Running,
+                    active_task_id: Some("task-0042".into()),
+                },
+            );
+
+            let listed = list(&host).await;
+            assert_eq!(listed[0]["state"], "running");
+            assert_eq!(listed[0]["activeTaskId"], "task-0042");
+        }
+
+        /// The last allowed run, still executing, is `retiring` — not
+        /// `completed`, which would tell the client the automation is done
+        /// while its agent is still working.
+        #[tokio::test]
+        async fn list_distinguishes_retiring_from_completed() {
+            use coda_agent::scheduling::{ScheduleLiveState, ScheduleLiveStatus};
+
+            let host = make_host();
+            let created = create(&host, json!({"prompt": "x", "every": "1h", "maxRuns": 1}))
+                .await
+                .unwrap();
+            let id = created["id"].as_str().unwrap().to_owned();
+            host.schedule_store.update(&id, |t| t.runs_started = 1);
+            host.schedule_store.set_live_state(
+                &id,
+                ScheduleLiveState {
+                    status: ScheduleLiveStatus::Running,
+                    active_task_id: Some("task-0042".into()),
+                },
+            );
+            assert_eq!(list(&host).await[0]["state"], "retiring");
+
+            host.schedule_store
+                .set_live_state(&id, ScheduleLiveState::default());
+            let listed = list(&host).await;
+            assert_eq!(listed[0]["state"], "completed");
+            assert_eq!(listed[0]["runsStarted"], 1);
+        }
+
+        #[tokio::test]
+        async fn list_reports_a_cancellation_with_its_reason_and_timestamp() {
+            use coda_agent::scheduling::{ScheduleRetirement, ScheduleRetirementReason};
+
+            let host = make_host();
+            let created = create(&host, json!({"prompt": "x", "every": "1h"})).await.unwrap();
+            let id = created["id"].as_str().unwrap().to_owned();
+            host.schedule_store.update(&id, |t| {
+                t.retirement = Some(ScheduleRetirement {
+                    reason: ScheduleRetirementReason::Cancelled,
+                    retired_at_utc: Utc::now(),
+                    note: None,
+                });
+            });
+
+            let listed = list(&host).await;
+            assert_eq!(listed[0]["state"], "cancelled");
+            assert_eq!(listed[0]["retiredReason"], "cancelled");
+            assert!(listed[0]["retiredAtUtc"].is_string());
+        }
+
+        /// Stage 1 is RAM-only: a brand-new host owns no definitions and the
+        /// feature writes no files.
+        #[tokio::test]
+        async fn a_fresh_host_recovers_no_definitions() {
+            let host = make_host();
+            create(&host, json!({"prompt": "x", "every": "1h", "maxRuns": 7}))
+                .await
+                .unwrap();
+            assert_eq!(list(&host).await.len(), 1);
+
+            let restarted = make_host();
+            assert!(
+                list(&restarted).await.is_empty(),
+                "schedules are in-memory only; nothing survives a restart"
+            );
+        }
+
+        /// The server response and the client reader must agree field for
+        /// field, or a client silently loses the bounds it asked for.
+        #[tokio::test]
+        async fn the_server_response_parses_as_the_published_client_dto() {
+            let host = make_host();
+            create(
+                &host,
+                json!({"prompt": "x", "every": "1h", "maxRuns": 7, "expiresIn": "7d"}),
+            )
+            .await
+            .unwrap();
+
+            let result = host.session_schedule_list().await.unwrap();
+            let parsed: coda_proto::messages::ScheduleListResult =
+                serde_json::from_value(result).expect("the wire shape must match the client DTO");
+            let task = &parsed.schedules[0];
+            assert_eq!(task.max_runs, Some(7));
+            assert_eq!(task.runs_started, 0);
+            assert_eq!(task.state, "idle");
+            assert!(task.expires_at_utc.is_some());
+        }
     }
 
     /// The turn slot must survive a cancelled turn.
@@ -5324,6 +6547,104 @@ mod tests {
         assert_eq!(start["turn_id"], end["turn_id"], "start/end share the same turn id");
         assert_eq!(end["stop_reason"], "end_turn");
         assert_eq!(start["provider"], "scripted");
+    }
+
+    /// Poison canary: a real turn in which the model calls `notify_user` with
+    /// a distinctive, secret-shaped body must never leak that body into the
+    /// operational diagnostics log — at any of the three verbosity levels a
+    /// user can select. This crate's `Event` enum structurally carries no
+    /// tool-call content today (see `coda_diagnostics::event`/`detail`
+    /// module docs), so this is a regression lock: if a future change ever
+    /// added tool-call logging without redaction, this test would catch the
+    /// poison string appearing in the log file, rather than the safety
+    /// resting on an assumption about `Debug` derives or the diagnostics
+    /// event shape staying exactly as it is today.
+    #[tokio::test]
+    async fn notify_user_body_never_reaches_the_diagnostics_log_at_any_verbosity() {
+        use coda_llm::anthropic::StreamEvent;
+        use coda_llm::{Content, Correlation, Usage};
+
+        const POISON: &str = "PoisonCanary-secret-shaped-token-sk-live-do-not-log-me";
+
+        for verbosity in
+            [coda_diagnostics::Verbosity::Normal, coda_diagnostics::Verbosity::Debug, coda_diagnostics::Verbosity::Trace]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let logger = coda_diagnostics::Logger::open(
+                coda_diagnostics::Options {
+                    directory: dir.path().to_path_buf(),
+                    file: None,
+                    role: coda_diagnostics::ProcessRole::Serve,
+                    version: "test".into(),
+                    verbosity,
+                },
+                coda_diagnostics::Limits::default(),
+            )
+            .expect("logger opens");
+            let ctx = coda_diagnostics::DiagnosticContext::root(Arc::new(logger), "run-1");
+
+            let client = ScriptedClient::new(vec![
+                vec![
+                    StreamEvent::ToolUse(Content::ToolUse {
+                        id: "call-1".into(),
+                        name: "notify_user".into(),
+                        input_json: format!(r#"{{"text":"{POISON}"}}"#),
+                        correlation: Correlation::default(),
+                    }),
+                    StreamEvent::Done {
+                        stop_reason: Some("tool_use".into()),
+                        usage: Usage { input_tokens: 10, output_tokens: 5, ..Usage::ZERO },
+                    },
+                ],
+                vec![
+                    StreamEvent::TextDelta("done".into()),
+                    StreamEvent::Done { stop_reason: Some("end_turn".into()), usage: Usage::ZERO },
+                ],
+            ]);
+
+            let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            let sink = Arc::new(ServeSink::new(tx.clone()));
+            let ch = Arc::new(PromptChannel::new(tx));
+            let host = ServeHost::new_with_optional_client_and_mcp(
+                Some(client),
+                sink,
+                ch,
+                ".".into(),
+                crate::mcp::McpBundle::disabled(),
+                StartupOptions::default(),
+                None,
+                Some(ctx.clone()),
+            );
+            host.initialize(InitParams::default()).await.unwrap();
+            let result = host
+                .session_prompt(PromptParams { text: Some("send the report".into()), images: None })
+                .await
+                .expect("prompt succeeds");
+            assert!(result["ok"].as_bool().unwrap_or(false));
+
+            // The notification really was published (proves the tool ran,
+            // not that it was silently skipped) — recovered independently of
+            // diagnostics, through the documented public API.
+            let pending = host
+                .session_pending_messages(PendingMessagesParams {
+                    after_cursor: 0,
+                    limit: None,
+                    engine_instance_id: None,
+                })
+                .await
+                .unwrap();
+            assert_eq!(pending["messages"][0]["text"], POISON);
+
+            // The diagnostics log — the actual writer path, not a
+            // hypothetical one — must never contain it, at this verbosity.
+            let raw_log = std::fs::read_to_string(ctx.logger().status().path.expect("a log path"))
+                .unwrap();
+            assert!(
+                !raw_log.contains(POISON),
+                "the poison string leaked into the {:?} diagnostics log:\n{raw_log}",
+                verbosity
+            );
+        }
     }
 
     #[tokio::test]
@@ -7266,6 +8587,19 @@ mod tests {
         );
     }
 
+    /// The engine-owned message bus is closed as part of shutdown, so a
+    /// `notify_user` call racing the teardown gets an explicit refusal
+    /// rather than silently publishing into a bus nobody will ever read from
+    /// again.
+    #[tokio::test]
+    async fn shutdown_closes_the_message_bus() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, _rx) = host_with_events(dir.path());
+        assert!(!host.message_bus.is_closed());
+        host.shutdown().await.unwrap();
+        assert!(host.message_bus.is_closed());
+    }
+
     /// Diagnostic: does the engine find a usable provider on this machine?
     ///
     /// Touches the credential store and may perform a token exchange, so it is
@@ -8452,6 +9786,104 @@ mod tests {
         assert!(parse_duration(None).is_none());
     }
 
+    /// `d` was documented in `docs/serve-protocol.md` long before it parsed;
+    /// a goal budget measured in days is the whole point of an unattended run.
+    #[test]
+    fn parse_duration_accepts_days() {
+        assert_eq!(parse_duration(Some("1d")), Some(Duration::from_secs(86_400)));
+        assert_eq!(parse_duration(Some("7d")), Some(Duration::from_secs(604_800)));
+        assert_eq!(parse_duration(Some("240h")), Some(Duration::from_secs(864_000)));
+    }
+
+    /// `"bad"` ends in `d`; stripping the suffix must not make it parse.
+    #[test]
+    fn parse_duration_rejects_words_ending_in_a_unit_letter() {
+        for word in ["bad", "seconds", "h", "d", "m", "s"] {
+            assert!(parse_duration(Some(word)).is_none(), "{word} must not parse");
+        }
+    }
+
+    /// An absurd literal must read as invalid rather than panicking on overflow
+    /// in a debug build or silently wrapping in release.
+    #[test]
+    fn parse_duration_overflow_is_invalid_not_a_panic() {
+        assert!(parse_duration(Some("99999999999999999999999d")).is_none());
+        assert!(parse_duration(Some(&format!("{}d", u64::MAX))).is_none());
+    }
+
+    // ── resolve_goal_budget ──────────────────────────────────────────────────
+
+    /// A goal is a promise to keep working until the judge says it is done.
+    /// An operator who never asked for a budget must not be silently given a
+    /// tight one that stops an unattended run part-way through.
+    #[test]
+    fn an_unspecified_goal_budget_uses_the_generous_defaults() {
+        let (duration, continuations) = resolve_goal_budget(None, None);
+        assert_eq!(duration, Some(Duration::from_secs(240 * 60 * 60)), "240h");
+        assert_eq!(continuations, Some(60_000));
+    }
+
+    #[test]
+    fn an_explicit_goal_budget_overrides_both_defaults() {
+        let (duration, continuations) = resolve_goal_budget(Some("90m"), Some(7));
+        assert_eq!(duration, Some(Duration::from_secs(5_400)));
+        assert_eq!(continuations, Some(7));
+    }
+
+    /// Each dimension is independent: naming one must not reset the other.
+    #[test]
+    fn one_explicit_dimension_leaves_the_other_at_its_default() {
+        let (duration, continuations) = resolve_goal_budget(Some("5m"), None);
+        assert_eq!(duration, Some(Duration::from_secs(300)));
+        assert_eq!(continuations, Some(60_000));
+
+        let (duration, continuations) = resolve_goal_budget(None, Some(3));
+        assert_eq!(duration, Some(Duration::from_secs(240 * 60 * 60)));
+        assert_eq!(continuations, Some(3));
+    }
+
+    /// "No limit" must mean no ceiling at all, not a large one.
+    #[test]
+    fn every_unlimited_token_resolves_to_no_duration_ceiling() {
+        for token in coda_proto::UNLIMITED_TOKENS {
+            let (duration, _) = resolve_goal_budget(Some(token), None);
+            assert_eq!(duration, None, "{token} must mean no wall-clock ceiling");
+        }
+        let (duration, _) = resolve_goal_budget(Some("  NONE  "), None);
+        assert_eq!(duration, None, "the token is case- and space-insensitive");
+    }
+
+    #[test]
+    fn the_unlimited_sentinel_resolves_to_no_continuation_ceiling() {
+        let (_, continuations) = resolve_goal_budget(None, Some(UNLIMITED_CONTINUATIONS));
+        assert_eq!(continuations, None);
+    }
+
+    #[test]
+    fn both_dimensions_can_be_unlimited_at_once() {
+        let (duration, continuations) =
+            resolve_goal_budget(Some("none"), Some(UNLIMITED_CONTINUATIONS));
+        assert_eq!(duration, None);
+        assert_eq!(continuations, None);
+    }
+
+    /// Defence in depth: `validate_goal_budget` rejects this first, but if a
+    /// bad value ever reached the resolver it must fall back to the default
+    /// rather than produce a zero-length budget that escalates immediately.
+    #[test]
+    fn an_unparseable_duration_falls_back_to_the_default_not_to_zero() {
+        let (duration, _) = resolve_goal_budget(Some("banana"), None);
+        assert_eq!(duration, Some(Duration::from_secs(240 * 60 * 60)));
+    }
+
+    /// Zero is a real, if aggressive, choice — escalate at the first natural
+    /// stop — and must not be confused with "unlimited".
+    #[test]
+    fn zero_continuations_stays_zero_rather_than_becoming_unlimited() {
+        let (_, continuations) = resolve_goal_budget(None, Some(0));
+        assert_eq!(continuations, Some(0));
+    }
+
     // ── Bug-fix: set_goal with invalid maxDuration returns -32602 ────────────
 
     #[tokio::test]
@@ -9202,11 +10634,19 @@ mod tests {
         let runner = TaskManagerRunner::new(host.task_manager.clone(), services.subagent_host.clone());
         let (done, completed) = tokio::sync::oneshot::channel();
         let done = Mutex::new(Some(done));
-        runner.start("scheduled reply".into(), "scheduled".into(), Arc::new(move |_| {
-            if let Some(done) = done.lock().unwrap().take() {
-                let _ = done.send(());
-            }
-        })).unwrap();
+        runner.start(
+            coda_agent::scheduling::ScheduledRun {
+                definition_id: "sched-1".into(),
+                definition_name: Some("scheduled".into()),
+                prompt: "scheduled reply".into(),
+                description: "scheduled".into(),
+            },
+            Arc::new(move |_| {
+                if let Some(done) = done.lock().unwrap().take() {
+                    let _ = done.send(());
+                }
+            }),
+        ).unwrap();
         tokio::time::timeout(Duration::from_secs(5), completed).await.unwrap().unwrap();
 
         let mut background = request();
@@ -9221,6 +10661,233 @@ mod tests {
         let models: Vec<_> = client.requests.lock().unwrap().iter()
             .map(|request| request.model.clone()).collect();
         assert_eq!(models, ["model-a", "model-b", "explicit-model", "model-b", "model-b"]);
+    }
+
+    // ── STAGE 0: one in-memory schedule store for the whole session ──────────
+
+    /// Both the hooked and the hook-free subagent host must write into the
+    /// SAME session schedule store the main agent loop and the schedule
+    /// runtime use.  A per-host store would make a schedule created inside a
+    /// subagent invisible to everything that can actually fire it.
+    ///
+    /// STAGE0 made `schedule_create`/`schedule_delete`/`schedule_list`
+    /// (mostly) main-agent-only, so this can no longer be proven by spawning
+    /// a child to call a schedule tool (that call is now correctly refused).
+    /// Instead this asserts the wiring directly: every host must hold the
+    /// exact same `Arc<ScheduledTaskStore>` as the session.
+    #[tokio::test]
+    async fn session_schedule_store_is_shared_by_main_and_hook_free_subagent_hosts() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = ScriptedClient::new(vec![]);
+        let host = make_host_in_dir(dir.path().to_str().unwrap(), client.clone());
+        let services = host.build_session_services(client);
+
+        for (host_under_test, label) in [
+            (&services.subagent_host, "main"),
+            (&services.hook_free_subagent_host, "hook-free"),
+        ] {
+            let wired = host_under_test
+                .schedule_store()
+                .unwrap_or_else(|| panic!("{label} host must have a schedule store wired"));
+            assert!(
+                Arc::ptr_eq(wired, &host.schedule_store),
+                "the {label} host must share the SAME schedule store instance as the session"
+            );
+        }
+    }
+
+    /// Same invariant as the schedule-store test above, but for the Stage 2
+    /// engine-owned message bus: every host must share the SAME
+    /// `Arc<coda_agent::MessageBus>` as the session, never a per-host or
+    /// lazily-created one.
+    #[tokio::test]
+    async fn message_bus_is_shared_by_main_and_hook_free_subagent_hosts() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = ScriptedClient::new(vec![]);
+        let host = make_host_in_dir(dir.path().to_str().unwrap(), client.clone());
+        let services = host.build_session_services(client);
+
+        for (host_under_test, label) in [
+            (&services.subagent_host, "main"),
+            (&services.hook_free_subagent_host, "hook-free"),
+        ] {
+            let wired = host_under_test
+                .message_bus()
+                .unwrap_or_else(|| panic!("{label} host must have a message bus wired"));
+            assert!(
+                Arc::ptr_eq(wired, &host.message_bus),
+                "the {label} host must share the SAME message bus instance as the session"
+            );
+        }
+    }
+
+    /// End-to-end: a notification published via the `notify_user` tool
+    /// (using the session's own message bus and task manager) is recovered
+    /// through `session/pendingMessages`, independent of any prompt/provider.
+    #[tokio::test]
+    async fn notify_user_publication_is_recovered_via_pending_messages() {
+        use coda_agent::tool::{ToolContext, ToolContextServiceExt as _};
+        use coda_agent::tools::NotifyUserTool;
+        use coda_agent::Tool as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let client = ScriptedClient::new(vec![]);
+        let host = make_host_in_dir(dir.path().to_str().unwrap(), client);
+
+        let ctx = ToolContext::new(host.working_dir.clone())
+            .with_message_bus(Arc::clone(&host.message_bus))
+            .with_main_context();
+
+        let out = NotifyUserTool
+            .execute(
+                &serde_json::json!({"text": "background work is done"}),
+                &ctx,
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+
+        let result = host
+            .session_pending_messages(PendingMessagesParams {
+                after_cursor: 0,
+                limit: None,
+                engine_instance_id: None,
+            })
+            .await
+            .unwrap();
+        let messages = result["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["text"], "background work is done");
+        assert_eq!(messages[0]["source"], "main");
+        assert_eq!(result["gap"], false);
+        // No task at all for `main` — never a fabricated id.
+        assert!(messages[0]["taskId"].is_null());
+        assert!(messages[0]["scheduleDefinitionId"].is_null());
+    }
+
+    /// A scheduled/subagent notification's trusted `taskId` is recovered
+    /// through `session/pendingMessages`, not just its (non-unique) label —
+    /// an external client needs a stable id to correlate against
+    /// `TaskManager` state.
+    #[tokio::test]
+    async fn notify_user_publication_carries_its_trusted_task_id_through_pending_messages() {
+        use coda_agent::tasks::{TaskExecutionMode, TaskKind, TaskManager};
+        use coda_agent::tool::{ToolContext, ToolContextServiceExt as _};
+        use coda_agent::tools::NotifyUserTool;
+        use coda_agent::Tool as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let client = ScriptedClient::new(vec![]);
+        let host = make_host_in_dir(dir.path().to_str().unwrap(), client);
+        let manager = TaskManager::with_defaults("session");
+        let task = manager
+            .register(TaskKind::Subagent, "background audit", None, TaskExecutionMode::Background)
+            .unwrap();
+
+        let ctx = ToolContext::new(host.working_dir.clone())
+            .with_message_bus(Arc::clone(&host.message_bus))
+            .with_task_manager(manager)
+            .with_caller_task_id(task.id.clone());
+
+        let out = NotifyUserTool
+            .execute(&serde_json::json!({"text": "audit finished"}), &ctx, CancellationToken::new())
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+
+        let result = host
+            .session_pending_messages(PendingMessagesParams {
+                after_cursor: 0,
+                limit: None,
+                engine_instance_id: None,
+            })
+            .await
+            .unwrap();
+        let messages = result["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["taskId"], task.id);
+        assert!(messages[0]["scheduleDefinitionId"].is_null());
+    }
+
+    /// `engineInstanceId` fences `session/pendingMessages` exactly like
+    /// `session/getHistory`: a stale id from another process is refused
+    /// rather than silently read against this process's bus.
+    #[tokio::test]
+    async fn pending_messages_refuses_a_stale_engine_instance_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = ScriptedClient::new(vec![]);
+        let host = make_host_in_dir(dir.path().to_str().unwrap(), client);
+
+        let err = host
+            .session_pending_messages(PendingMessagesParams {
+                after_cursor: 0,
+                limit: None,
+                engine_instance_id: Some("a-different-process".into()),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, crate::dispatch::error_code::INSTANCE_CHANGED);
+    }
+
+    /// The matching (current) engine instance id is accepted, proving the
+    /// fence checks identity rather than merely presence.
+    #[tokio::test]
+    async fn pending_messages_accepts_the_current_engine_instance_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = ScriptedClient::new(vec![]);
+        let host = make_host_in_dir(dir.path().to_str().unwrap(), client);
+        let current = host.engine_state.bus_ref().engine_instance_id().to_owned();
+
+        let result = host
+            .session_pending_messages(PendingMessagesParams {
+                after_cursor: 0,
+                limit: None,
+                engine_instance_id: Some(current),
+            })
+            .await
+            .unwrap();
+        assert!(result["messages"].as_array().unwrap().is_empty());
+    }
+
+    /// Reviewer follow-up (Stage 2 re-review): a TUI-side fixture proved a
+    /// recovery read that asks from an already-advanced cursor never reports
+    /// a spurious gap, but only against a fake engine — never against the
+    /// real `MessageBus` and its actual ring-eviction accounting. Proven here
+    /// end to end: publish well past `DEFAULT_RING_CAPACITY` through the real
+    /// bus, then read from its own latest cursor (exactly where "this client
+    /// received every notification live" would leave it) and confirm no gap
+    /// is reported — the eviction that genuinely happened is irrelevant to a
+    /// caller who was never behind it.
+    #[tokio::test]
+    async fn pending_messages_read_from_the_latest_cursor_reports_no_gap_after_ring_overflow() {
+        use coda_agent::message::DEFAULT_RING_CAPACITY;
+        use coda_agent::MessageSource;
+
+        let dir = tempfile::tempdir().unwrap();
+        let client = ScriptedClient::new(vec![]);
+        let host = make_host_in_dir(dir.path().to_str().unwrap(), client);
+
+        let total = DEFAULT_RING_CAPACITY + 50;
+        for i in 0..total {
+            host.message_bus
+                .publish_user(&MessageSource::Main, format!("note {i}"), None, None)
+                .unwrap();
+        }
+        let latest = host.message_bus.cursor();
+
+        let result = host
+            .session_pending_messages(PendingMessagesParams {
+                after_cursor: latest,
+                limit: None,
+                engine_instance_id: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result["gap"], false, "a client already caught up must never see a gap: {result}");
+        assert!(
+            result["dropped"].is_null(),
+            "no dropped range is reported when nothing was actually lost: {result}"
+        );
+        assert!(result["messages"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -10019,6 +11686,71 @@ mod tests {
     }
 
     /// `session/setGoal` stores goal text and budget; validated before prompt.
+    /// The stand-in must be told what the conversation already established, or
+    /// it will contradict decisions it made earlier in the same run.
+    #[test]
+    fn the_transcript_carries_recent_turns_in_order() {
+        let history = vec![
+            Message::user("use sqlite"),
+            Message::assistant("understood, sqlite it is"),
+        ];
+        let rendered = recent_transcript(&history);
+        assert!(rendered.contains("operator: use sqlite"), "{rendered}");
+        assert!(rendered.contains("agent: understood, sqlite it is"), "{rendered}");
+        assert!(
+            rendered.find("operator:") < rendered.find("agent:"),
+            "order must be preserved: {rendered}"
+        );
+    }
+
+    /// One question must not turn into an enormous request just because the
+    /// conversation is long.
+    #[test]
+    fn the_transcript_is_bounded_and_keeps_the_most_recent_turns() {
+        let history: Vec<Message> =
+            (0..200).map(|i| Message::user(format!("message number {i}"))).collect();
+        let rendered = recent_transcript(&history);
+
+        assert!(rendered.len() < 5_000, "bounded: {} chars", rendered.len());
+        assert!(rendered.contains("message number 199"), "the latest turn must survive");
+        assert!(!rendered.contains("message number 0"), "the oldest must be dropped");
+    }
+
+    /// A long single message must be cut on a character boundary, not panic.
+    #[test]
+    fn an_oversized_transcript_is_cut_safely() {
+        let history = vec![Message::user("é".repeat(8_000))];
+        let rendered = recent_transcript(&history);
+        assert!(rendered.len() <= 4_100, "{} chars", rendered.len());
+    }
+
+    #[test]
+    fn an_empty_history_renders_nothing() {
+        assert!(recent_transcript(&[]).is_empty());
+    }
+
+    /// The two proved outcomes must reach the wire, or an operator returning to
+    /// a finished run has no way to tell "blocked, here is why" from "gave up".
+    #[test]
+    fn the_proved_outcomes_serialise_to_the_wire() {
+        for (outcome, expected) in [
+            (GoalOutcome::GenuinelyBlocked, "GenuinelyBlocked"),
+            (GoalOutcome::Stalled, "Stalled"),
+            (GoalOutcome::Met, "Met"),
+            (GoalOutcome::Unmet, "Unmet"),
+        ] {
+            let gs = GoalStatus { outcome, ..GoalStatus::none() };
+            let wire = wire_goal_status(&gs).expect("a non-None outcome is reported");
+            assert_eq!(wire["outcome"], expected);
+        }
+    }
+
+    /// No goal, no goalStatus — an ordinary interactive turn is unchanged.
+    #[test]
+    fn a_run_without_a_goal_reports_no_goal_status() {
+        assert!(wire_goal_status(&GoalStatus::none()).is_none());
+    }
+
     #[tokio::test]
     async fn set_goal_stores_all_params() {
         let host = make_host();
@@ -10030,8 +11762,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(r["ok"], true);
-        assert_eq!(r["goal"], "Implement feature X");
+        assert_eq!(r["ok"], true);        assert_eq!(r["goal"], "Implement feature X");
         assert_eq!(r["maxDuration"], "1h");
         assert_eq!(r["maxContinuations"], 10);
         // Verify the state is actually stored.
@@ -10286,10 +12017,29 @@ mod tests {
         assert!(zero.validate().is_err(), "zero-length timeout must be rejected");
 
         let neg = StartupOptions {
-            goal_max_continuations: Some(-1),
+            goal_max_continuations: Some(-2),
             ..StartupOptions::default()
         };
         assert!(neg.validate().is_err(), "negative continuations must be rejected");
+
+        // -1 is the wire spelling of "no limit", not a negative count.
+        let unlimited = StartupOptions {
+            goal_max_continuations: Some(UNLIMITED_CONTINUATIONS),
+            ..StartupOptions::default()
+        };
+        assert!(
+            unlimited.validate().is_ok(),
+            "the unlimited sentinel must be accepted, not read as a negative count"
+        );
+
+        let unlimited_duration = StartupOptions {
+            goal_max_duration: Some("none".into()),
+            ..StartupOptions::default()
+        };
+        assert!(
+            unlimited_duration.validate().is_ok(),
+            "an unlimited timeout token must be accepted"
+        );
 
         let bad = StartupOptions {
             goal_max_duration: Some("banana".into()),
@@ -12238,6 +13988,844 @@ mod tests {
                 host_clean.startup_provider_diagnostic.is_none(),
                 "a successfully-built host must not carry a stale diagnostic from another host"
             );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // STAGE 3 chunk C — idle main-inbox execution / lifecycle
+    // ─────────────────────────────────────────────────────────────────────
+    //
+    // Every test here drives the REAL `ServeHost`: a real `MessageBus`, the
+    // real single-flight turn slot, the real `run_prompt_inner` (model run,
+    // transcript write, terminal outcome) and the real pump task. Nothing is
+    // simulated except the LLM client itself.
+    mod main_inbox {
+        use super::*;
+        use coda_agent::message::{AskStatus, MessageSource};
+        use coda_llm::anthropic::StreamEvent;
+        use coda_llm::Usage;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        // ── Test tooling ─────────────────────────────────────────────────
+
+        /// A scripted client that records every request, can be gated (so a
+        /// test can hold a turn open deterministically), and reports an
+        /// ordinary provider error rather than panicking when its script runs
+        /// out — a panic inside a spawned pump task would be swallowed and
+        /// would turn "the pump ran an extra turn" into a silent pass.
+        struct PumpClient {
+            sequences: Mutex<std::collections::VecDeque<Vec<StreamEvent>>>,
+            requests: Mutex<Vec<coda_llm::ChatRequest>>,
+            /// Signalled once per `stream()` entry, before any gating.
+            entered: Arc<tokio::sync::Notify>,
+            /// When set, `stream()` waits on it before answering.
+            gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
+            /// When true, `stream()` never returns (until the future is
+            /// dropped): a client that ignores cancellation entirely.
+            hang: AtomicBool,
+            /// When true, `stream()` returns a stream that never yields an
+            /// event: a provider that has accepted the request and then gone
+            /// quiet. Unlike `hang`, the agent loop observes cancellation
+            /// here, so this is the shape an interrupt can actually act on.
+            stall: AtomicBool,
+            /// Senders for stalled streams, retained so the channel stays
+            /// open rather than closing and ending the stream.
+            stalled: Mutex<Vec<tokio::sync::mpsc::Sender<Result<StreamEvent, coda_llm::LlmError>>>>,
+        }
+
+        impl PumpClient {
+            fn new(sequences: Vec<Vec<StreamEvent>>) -> Arc<Self> {
+                Arc::new(Self {
+                    sequences: Mutex::new(sequences.into_iter().collect()),
+                    requests: Mutex::new(Vec::new()),
+                    entered: Arc::new(tokio::sync::Notify::new()),
+                    gate: Mutex::new(None),
+                    hang: AtomicBool::new(false),
+                    stall: AtomicBool::new(false),
+                    stalled: Mutex::new(Vec::new()),
+                })
+            }
+
+            fn hanging() -> Arc<Self> {
+                let c = Self::new(vec![]);
+                c.hang.store(true, Ordering::SeqCst);
+                c
+            }
+
+            fn stalling() -> Arc<Self> {
+                let c = Self::new(vec![]);
+                c.stall.store(true, Ordering::SeqCst);
+                c
+            }
+
+            fn gated(sequences: Vec<Vec<StreamEvent>>) -> (Arc<Self>, Arc<tokio::sync::Notify>) {
+                let c = Self::new(sequences);
+                let gate = Arc::new(tokio::sync::Notify::new());
+                *c.gate.lock().unwrap() = Some(Arc::clone(&gate));
+                (c, gate)
+            }
+
+            fn request_count(&self) -> usize {
+                self.requests.lock().unwrap().len()
+            }
+
+            fn requests(&self) -> Vec<coda_llm::ChatRequest> {
+                self.requests.lock().unwrap().clone()
+            }
+        }
+
+        #[async_trait]
+        impl LlmClient for PumpClient {
+            fn provider_id(&self) -> &str {
+                "pump-mock"
+            }
+            async fn stream(
+                &self,
+                request: coda_llm::ChatRequest,
+            ) -> Result<coda_llm::ResponseStream, coda_llm::LlmError> {
+                self.requests.lock().unwrap().push(request);
+                self.entered.notify_waiters();
+                if self.hang.load(Ordering::SeqCst) {
+                    // Never completes; only dropping this future ends it.
+                    std::future::pending::<()>().await;
+                }
+                if self.stall.load(Ordering::SeqCst) {
+                    let (tx, rx) = tokio::sync::mpsc::channel(4);
+                    self.stalled.lock().unwrap().push(tx);
+                    return Ok(coda_llm::ResponseStream::new(rx));
+                }
+                let gate = self.gate.lock().unwrap().clone();
+                if let Some(gate) = gate {
+                    gate.notified().await;
+                }
+                let events = self.sequences.lock().unwrap().pop_front();
+                let Some(events) = events else {
+                    return Err(coda_llm::LlmError::Protocol(
+                        "PumpClient: unscripted request (the engine ran a turn this test did not \
+                         expect)"
+                            .into(),
+                    ));
+                };
+                let (tx, rx) = tokio::sync::mpsc::channel(64);
+                tokio::spawn(async move {
+                    for ev in events {
+                        let _ = tx.send(Ok(ev)).await;
+                    }
+                });
+                Ok(coda_llm::ResponseStream::new(rx))
+            }
+        }
+
+        fn answer(text: &str) -> Vec<StreamEvent> {
+            vec![
+                StreamEvent::TextDelta(text.into()),
+                StreamEvent::Done { stop_reason: Some("end_turn".into()), usage: Usage::ZERO },
+            ]
+        }
+
+        fn host_with(
+            client: Option<Arc<dyn LlmClient>>,
+            dir: &std::path::Path,
+        ) -> Arc<ServeHost> {
+            let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            let sink = Arc::new(ServeSink::new(tx.clone()));
+            let ch = Arc::new(PromptChannel::new(tx));
+            ServeHost::new_with_optional_client_and_mcp(
+                client,
+                sink,
+                ch,
+                dir.display().to_string(),
+                crate::mcp::McpBundle::disabled(),
+                StartupOptions::default(),
+                None,
+                None,
+            )
+        }
+
+        fn ask(host: &ServeHost, task_id: &str, body: &str) -> coda_agent::message::AskReceipt {
+            host.message_bus
+                .publish_main(
+                    &MessageSource::Subagent { task_id: task_id.into(), label: "worker".into() },
+                    body,
+                    None,
+                    None,
+                )
+                .expect("the main inbox accepts this request")
+        }
+
+        /// Bounded, runtime-friendly wait. Bounded by an iteration count
+        /// rather than a wall clock so it terminates under paused time too.
+        async fn wait_for(label: &str, mut cond: impl FnMut() -> bool) {
+            for _ in 0..4000 {
+                if cond() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            panic!("timed out waiting for: {label}");
+        }
+
+        /// Gives the engine a bounded, generous opportunity to do something
+        /// it must NOT do. Used only for negative assertions.
+        async fn settle() {
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+
+        fn committed(host: &ServeHost) -> Vec<coda_llm::Message> {
+            host.session.history.lock().unwrap().clone()
+        }
+
+        /// `false` while any turn holds the single-flight slot.
+        ///
+        /// `run_prompt_inner` persists the transcript and commits history
+        /// *before* the guard releases this flag, so "idle" is also the point
+        /// at which the committed history of the turn that just ran is
+        /// readable.
+        fn idle(host: &ServeHost) -> bool {
+            !*host.turn_active.lock().unwrap()
+        }
+
+        fn injected_texts(messages: &[coda_llm::Message]) -> Vec<String> {
+            messages
+                .iter()
+                .filter(|m| m.role == coda_llm::Role::User)
+                .map(|m| m.text())
+                .filter(|t| t.starts_with("[agent-message]"))
+                .collect()
+        }
+
+        fn last_outcome(host: &ServeHost) -> Option<coda_proto::state::LastTurnOutcome> {
+            host.engine_state
+                .project(coda_proto::messages::CONTRACT_VERSION, test_limits())
+                .last_turn_outcome
+        }
+
+        fn test_limits() -> coda_proto::state::Limits {
+            coda_proto::state::Limits {
+                ring_envelopes: 0,
+                ring_bytes: 0,
+                live_bytes_cap: 0,
+                outcomes_retained: 0,
+                history_block_bytes_cap: 0,
+                max_history_page: 0,
+                max_session_page: 0,
+            }
+        }
+
+        // ── 1. The happy path ────────────────────────────────────────────
+
+        /// An `ask_main` accepted while the engine is idle produces exactly
+        /// ONE turn on the existing execution slot, the model actually
+        /// receives the `[agent-message]`-framed question, the turn ends with
+        /// the model's own genuine stop reason (never a fabricated one), and
+        /// the transcript keeps the framed provenance.
+        #[tokio::test]
+        async fn main_inbox_idle_request_runs_one_real_turn_the_model_can_see() {
+            let dir = tempfile::tempdir().unwrap();
+            let client = PumpClient::new(vec![answer("looked at it")]);
+            let host = host_with(Some(Arc::clone(&client) as Arc<dyn LlmClient>), dir.path());
+            host.initialize(InitParams::default()).await.unwrap();
+
+            let receipt = ask(&host, "t1", "please review the failing test");
+            assert_eq!(
+                receipt.status,
+                AskStatus::Queued,
+                "acceptance is a receipt, never 'the main conversation processed it'"
+            );
+
+            wait_for("the pump to deliver", || client.request_count() == 1).await;
+            wait_for("the turn to finish", || last_outcome(&host).is_some()).await;
+
+            let requests = client.requests();
+            assert_eq!(requests.len(), 1, "exactly one turn, on the one execution slot");
+            let seen = requests[0].messages.last().expect("the model sees a prompt").text();
+            assert!(
+                seen.starts_with("[agent-message]")
+                    && seen.contains("please review the failing test"),
+                "the model must receive the framed question verbatim: {seen:?}"
+            );
+            // Normal main context and configuration — the same model this
+            // host would use for a user prompt, not a special one.
+            assert_eq!(requests[0].model, host.current_model());
+
+            let outcome = last_outcome(&host).expect("the turn published an outcome");
+            assert_eq!(
+                outcome.stop_reason.as_deref(),
+                Some("end_turn"),
+                "the stop reason is the model's own; nothing fabricates an 'agentMessage' reason"
+            );
+            assert!(!outcome.interrupted);
+            assert!(outcome.error.is_none(), "{:?}", outcome.error);
+
+            assert_eq!(host.message_bus.pending_main_len(), 0);
+            let history = committed(&host);
+            assert_eq!(
+                injected_texts(&history).len(),
+                1,
+                "the framed provenance is persisted in the ordinary transcript"
+            );
+            assert!(
+                history.iter().any(|m| m.role == coda_llm::Role::Assistant
+                    && m.text().contains("looked at it")),
+                "the model's answer is committed by the same history writer as any turn"
+            );
+        }
+
+        // ── 2. Busy foreground ───────────────────────────────────────────
+
+        /// While a user turn holds the slot, an `ask_main` is accepted
+        /// immediately (the caller never waits and never holds a permit) and
+        /// is consumed EXACTLY ONCE — by the running turn's own iteration
+        /// boundary. The pump never opens a second, competing turn.
+        #[tokio::test]
+        async fn main_inbox_busy_foreground_turn_consumes_it_once_with_no_second_writer() {
+            let dir = tempfile::tempdir().unwrap();
+            let (client, gate) = PumpClient::gated(vec![
+                answer("first pass"),
+                answer("second pass"),
+            ]);
+            let host = host_with(Some(Arc::clone(&client) as Arc<dyn LlmClient>), dir.path());
+            host.initialize(InitParams::default()).await.unwrap();
+
+            let entered = Arc::clone(&client.entered);
+            let notified = entered.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            let prompt_host = Arc::clone(&host);
+            let prompt = tokio::spawn(async move {
+                prompt_host.session_prompt(PromptParams { text: Some("go".into()), images: None }).await
+            });
+
+            // The user turn is genuinely mid-flight (inside `stream`).
+            notified.await;
+
+            let before = std::time::Instant::now();
+            let receipt = ask(&host, "t1", "landed while busy");
+            assert_eq!(receipt.status, AskStatus::Queued);
+            assert!(
+                before.elapsed() < Duration::from_secs(1),
+                "acceptance must never block on the busy main conversation"
+            );
+
+            gate.notify_waiters();
+            // The second stream call is gated too; release it as it arrives.
+            let gate2 = Arc::clone(&gate);
+            tokio::spawn(async move {
+                for _ in 0..200 {
+                    gate2.notify_waiters();
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            });
+
+            let result = prompt.await.expect("the prompt task completes").expect("prompt ok");
+            assert!(result["ok"].as_bool().unwrap_or(false));
+
+            settle().await;
+            assert_eq!(
+                client.request_count(),
+                2,
+                "one turn, two iterations: the running turn's own boundary delivered it — a \
+                 third request would mean the pump opened a competing turn"
+            );
+            assert_eq!(host.message_bus.pending_main_len(), 0);
+            assert_eq!(
+                injected_texts(&committed(&host)).len(),
+                1,
+                "delivered exactly once"
+            );
+        }
+
+        // ── 3. The wake that must not be lost ────────────────────────────
+
+        /// A request accepted AFTER the agent loop's last look at the inbox
+        /// but BEFORE the turn slot is released must not be stranded: the
+        /// slot release is itself a wake, so a later turn picks it up. Driven
+        /// through a real hook in that exact window, not by scheduling luck.
+        #[tokio::test]
+        async fn main_inbox_request_accepted_after_the_final_drain_is_not_lost() {
+            let dir = tempfile::tempdir().unwrap();
+            let client = PumpClient::new(vec![answer("user answer"), answer("inbox answer")]);
+            let host = host_with(Some(Arc::clone(&client) as Arc<dyn LlmClient>), dir.path());
+            host.initialize(InitParams::default()).await.unwrap();
+
+            // Fires once, inside the window between `agent.run` returning
+            // (the loop has sealed and will not look again) and the guard's
+            // release of the slot.
+            let fired = Arc::new(AtomicBool::new(false));
+            {
+                let fired = Arc::clone(&fired);
+                *host.after_agent_run_hook.lock().unwrap() = Some(Arc::new(move |h: &ServeHost| {
+                    if !fired.swap(true, Ordering::SeqCst) {
+                        h.message_bus
+                            .publish_main(
+                                &MessageSource::Subagent {
+                                    task_id: "late".into(),
+                                    label: "worker".into(),
+                                },
+                                "arrived in the seam",
+                                None,
+                                None,
+                            )
+                            .expect("accepted");
+                    }
+                }));
+            }
+
+            host.session_prompt(PromptParams { text: Some("go".into()), images: None })
+                .await
+                .expect("the user turn succeeds");
+
+            wait_for("the stranded request to be delivered by a later turn", || {
+                host.message_bus.pending_main_len() == 0
+                    && client.request_count() == 2
+                    && idle(&host)
+            })
+            .await;
+
+            let seen = client.requests()[1].messages.last().unwrap().text();
+            assert!(
+                seen.contains("arrived in the seam"),
+                "the second turn must be the one that delivers it: {seen:?}"
+            );
+            assert_eq!(injected_texts(&committed(&host)).len(), 1);
+        }
+
+        // ── 4. No accidental empty model call ────────────────────────────
+
+        /// When the queue is already empty at the instant the pump would
+        /// claim the slot (a racing user turn drained it), the claim is
+        /// refused outright: no turn is opened, nothing is published, and no
+        /// model request is made.
+        #[tokio::test]
+        async fn main_inbox_origin_with_an_empty_queue_never_claims_a_turn_or_calls_the_model() {
+            let dir = tempfile::tempdir().unwrap();
+            let client = PumpClient::new(vec![]);
+            let host = host_with(Some(Arc::clone(&client) as Arc<dyn LlmClient>), dir.path());
+            host.initialize(InitParams::default()).await.unwrap();
+
+            let outcome = host
+                .run_prompt_with_origin(
+                    PromptParams { text: None, images: None },
+                    PromptOrigin::MainInbox,
+                )
+                .await;
+
+            assert!(
+                matches!(outcome, Err(PromptRunFailure::NoWork)),
+                "an empty queue must refuse the claim, not run an empty turn: {outcome:?}"
+            );
+            assert_eq!(client.request_count(), 0, "no model request may be made");
+            assert!(last_outcome(&host).is_none(), "no turn may have been opened at all");
+        }
+
+        /// The ordinary empty-text `session/prompt` is untouched: it is a
+        /// legitimate user request and still runs the model. The pump's
+        /// origin is an explicit discriminant, never inferred from "no text".
+        #[tokio::test]
+        async fn main_inbox_work_does_not_change_ordinary_empty_user_prompt_behaviour() {
+            let dir = tempfile::tempdir().unwrap();
+            let client = PumpClient::new(vec![answer("answered anyway")]);
+            let host = host_with(Some(Arc::clone(&client) as Arc<dyn LlmClient>), dir.path());
+            host.initialize(InitParams::default()).await.unwrap();
+
+            let result = host
+                .session_prompt(PromptParams { text: None, images: None })
+                .await
+                .expect("an empty user prompt is still accepted");
+            assert!(result["ok"].as_bool().unwrap_or(false));
+            assert_eq!(
+                client.request_count(),
+                1,
+                "an empty USER prompt still calls the model, exactly as before"
+            );
+        }
+
+        // ── 5. No provider ───────────────────────────────────────────────
+
+        /// With no provider wired the request stays pending, the user is told
+        /// once in constant wording that never quotes the request, the engine
+        /// stays quiet (no turns, no retries on its own self-wakes) — and a
+        /// real provider transition then delivers it with nobody poking the
+        /// pump.
+        #[tokio::test]
+        async fn main_inbox_without_a_provider_stays_pending_notifies_once_then_delivers() {
+            let dir = tempfile::tempdir().unwrap();
+            let host = host_with(None, dir.path());
+            host.initialize(InitParams::default()).await.unwrap();
+
+            ask(&host, "t1", "SECRET-REQUEST-BODY-must-not-be-quoted");
+
+            wait_for("the blocked notice", || {
+                !host.message_bus.user_since(0, None).messages.is_empty()
+            })
+            .await;
+
+            // More accepted work (each acceptance is another wake) must not
+            // produce more notices, more turns or any retry storm.
+            for i in 0..5 {
+                ask(&host, &format!("t{i}"), &format!("another request {i}"));
+            }
+            settle().await;
+
+            let notices = host.message_bus.user_since(0, None).messages;
+            assert_eq!(
+                notices.len(),
+                1,
+                "exactly one constant notice for the blocked state, not one per attempt"
+            );
+            assert!(
+                !notices[0].body.contains("SECRET-REQUEST-BODY-must-not-be-quoted"),
+                "the notice must never quote the queued request: {:?}",
+                notices[0].body
+            );
+            assert_eq!(host.message_bus.pending_main_len(), 6, "nothing may be consumed");
+            assert!(
+                last_outcome(&host).is_none(),
+                "no turn may have run at all while no provider exists"
+            );
+            assert_eq!(
+                host.main_pump_attempts.load(Ordering::SeqCst),
+                1,
+                "the pump must attempt once and then stay blocked on the provider generation — \
+                 six further acceptances are six further wakes, and none of them is a reason to \
+                 retry a state that has not changed"
+            );
+
+            // A real provider transition — the same commit + wake sequence
+            // production uses. Nothing here touches the pump directly.
+            let client = PumpClient::new(vec![answer("caught up")]);
+            host.wire_client_for_test(Arc::clone(&client) as Arc<dyn LlmClient>)
+                .await
+                .expect("wiring succeeds");
+
+            wait_for("delivery after the provider appears", || {
+                host.message_bus.pending_main_len() == 0 && idle(&host)
+            })
+            .await;
+            wait_for("the catch-up turn to finish", || last_outcome(&host).is_some()).await;
+            assert_eq!(client.request_count(), 1, "one turn drains the whole FIFO");
+            assert_eq!(injected_texts(&committed(&host)).len(), 6);
+        }
+
+        // ── 6. No self-spin on a no-progress failure ─────────────────────
+
+        /// A turn that ends before the inbox is ever drained (here: an
+        /// interrupt that lands before injection) leaves the request pending
+        /// — and the pump does NOT retry merely because its own failed turn
+        /// released the slot and woke it. Genuinely new accepted work is what
+        /// lets it try again.
+        #[tokio::test]
+        async fn main_inbox_no_progress_does_not_self_spin_and_retries_only_on_new_work() {
+            let dir = tempfile::tempdir().unwrap();
+            let client = PumpClient::new(vec![answer("caught up")]);
+            let host = host_with(Some(Arc::clone(&client) as Arc<dyn LlmClient>), dir.path());
+            host.initialize(InitParams::default()).await.unwrap();
+
+            // An interrupt already pending when the turn publishes its token
+            // cancels it at the top of the agent loop — before step 4c.
+            *host.pending_interrupt.lock().unwrap() = true;
+            ask(&host, "t1", "first request");
+
+            wait_for("the cancelled attempt to finish", || last_outcome(&host).is_some()).await;
+            settle().await;
+
+            assert_eq!(
+                host.message_bus.pending_main_len(),
+                1,
+                "an interrupt before injection must leave the request pending"
+            );
+            assert_eq!(
+                client.request_count(),
+                0,
+                "the turn never reached the model, and the pump must not spin retrying it"
+            );
+            let outcome = last_outcome(&host).expect("the cancelled turn published an outcome");
+            assert!(outcome.interrupted);
+            assert_eq!(
+                host.main_pump_attempts.load(Ordering::SeqCst),
+                1,
+                "exactly one attempt: the failed turn's own slot release woke the pump, and that \
+                 self-wake must not be a reason to try again"
+            );
+
+            // New accepted work moves the acceptance seq, which is the
+            // documented way out of this block.
+            ask(&host, "t2", "second request");
+            wait_for("the retry after new work", || {
+                host.message_bus.pending_main_len() == 0 && idle(&host)
+            })
+            .await;
+            assert_eq!(client.request_count(), 1);
+            assert_eq!(
+                injected_texts(&committed(&host)).len(),
+                2,
+                "both the stranded request and the new one are delivered"
+            );
+        }
+
+        /// An interrupt that lands AFTER injection keeps the framed history
+        /// (the ordinary transcript writer runs on the cancelled path too)
+        /// and releases the slot.
+        #[tokio::test]
+        async fn main_inbox_interrupt_after_injection_persists_history_and_frees_the_slot() {
+            let dir = tempfile::tempdir().unwrap();
+            let client = PumpClient::stalling();
+            let host = host_with(Some(Arc::clone(&client) as Arc<dyn LlmClient>), dir.path());
+            host.initialize(InitParams::default()).await.unwrap();
+
+            let entered = Arc::clone(&client.entered);
+            let notified = entered.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            ask(&host, "t1", "injected before the interrupt");
+            // The model request is in flight, so step 4c has already run.
+            notified.await;
+
+            host.session_interrupt().await.expect("interrupt accepted");
+
+            wait_for("the interrupted turn to finish", || last_outcome(&host).is_some()).await;
+            let outcome = last_outcome(&host).unwrap();
+            assert!(outcome.interrupted, "{outcome:?}");
+
+            assert_eq!(
+                injected_texts(&committed(&host)).len(),
+                1,
+                "once injected, the framed request is part of the transcript even though the \
+                 provider call was cancelled"
+            );
+            // The slot is genuinely free again.
+            assert!(!*host.turn_active.lock().unwrap());
+            assert!(host.try_claim_turn("next", "", TurnKind::Prompt).is_ok());
+        }
+
+        // ── 7. Shutdown ──────────────────────────────────────────────────
+
+        /// Shutdown with a client that ignores cancellation entirely returns
+        /// within its bounded grace period, and the pump is genuinely gone —
+        /// aborted and joined, never detached — with the bus closed behind
+        /// it so nothing can publish afterwards.
+        #[tokio::test]
+        async fn main_inbox_shutdown_with_a_hung_client_is_bounded_and_joins_the_pump() {
+            let dir = tempfile::tempdir().unwrap();
+            let client = PumpClient::hanging();
+            let host = host_with(Some(Arc::clone(&client) as Arc<dyn LlmClient>), dir.path());
+            host.initialize(InitParams::default()).await.unwrap();
+
+            ask(&host, "t1", "will hang");
+            wait_for("the hung turn to start", || client.request_count() == 1).await;
+
+            host.shutdown().await.expect("shutdown returns");
+
+            assert!(
+                host.main_pump.lock().unwrap().is_none(),
+                "the pump handle must be taken and joined, never dropped (which would detach it)"
+            );
+            assert!(host.message_bus.is_closed());
+            assert!(
+                host.message_bus
+                    .publish_main(&MessageSource::Main, "after close", None, None)
+                    .is_err(),
+                "no publication may be accepted after the bus is closed"
+            );
+            // The slot was released by the aborted turn's own guard.
+            assert!(!*host.turn_active.lock().unwrap());
+        }
+
+        /// Shutdown while nothing is running also joins the parked pump, and
+        /// no new pump can be started afterwards.
+        #[tokio::test]
+        async fn main_inbox_shutdown_while_idle_joins_the_pump_and_refuses_a_restart() {
+            let dir = tempfile::tempdir().unwrap();
+            let host = host_with(None, dir.path());
+            host.initialize(InitParams::default()).await.unwrap();
+            assert!(host.main_pump.lock().unwrap().is_some(), "initialize starts the pump");
+
+            host.shutdown().await.expect("shutdown returns");
+            assert!(host.main_pump.lock().unwrap().is_none());
+
+            host.ensure_main_pump_started();
+            assert!(
+                host.main_pump.lock().unwrap().is_none(),
+                "a stopped engine must never start an orphan pump"
+            );
+        }
+
+        // ── 8. Construction and ownership ────────────────────────────────
+
+        /// The synchronous constructors must not need a Tokio runtime: they
+        /// are reached from fixtures that have none, and `tokio::spawn`
+        /// there would panic.
+        #[test]
+        fn main_inbox_sync_constructors_start_no_pump_and_need_no_runtime() {
+            let host = make_host();
+            assert!(
+                host.main_pump.lock().unwrap().is_none(),
+                "no pump may be spawned from a synchronous constructor"
+            );
+        }
+
+        /// `initialize` starts the pump, idempotently, and work queued before
+        /// initialization is not lost — the pump's first act is to look at
+        /// the queue, not to wait for a wake it already missed.
+        #[tokio::test]
+        async fn main_inbox_initialize_starts_the_pump_and_picks_up_work_queued_before_it() {
+            let dir = tempfile::tempdir().unwrap();
+            let client = PumpClient::new(vec![answer("done")]);
+            let host = host_with(Some(Arc::clone(&client) as Arc<dyn LlmClient>), dir.path());
+
+            ask(&host, "t1", "queued before initialize");
+            settle().await;
+            assert_eq!(client.request_count(), 0, "nothing runs before initialize");
+
+            host.initialize(InitParams::default()).await.unwrap();
+            wait_for("delivery of the pre-initialize request", || {
+                host.message_bus.pending_main_len() == 0 && idle(&host)
+            })
+            .await;
+            assert_eq!(client.request_count(), 1);
+
+            // Idempotent: a second initialize does not start a second pump.
+            let before = host.main_pump.lock().unwrap().as_ref().map(|h| h.id());
+            host.ensure_main_pump_started();
+            let after = host.main_pump.lock().unwrap().as_ref().map(|h| h.id());
+            assert_eq!(before, after, "the pump must be started at most once");
+        }
+
+        /// An idle host with a running pump still drops: the pump holds only
+        /// a `Weak`, so it can never keep its own host alive.
+        #[tokio::test]
+        async fn main_inbox_idle_host_drop_leaves_no_strong_reference() {
+            let dir = tempfile::tempdir().unwrap();
+            let host = host_with(None, dir.path());
+            host.initialize(InitParams::default()).await.unwrap();
+            assert!(host.main_pump.lock().unwrap().is_some());
+
+            let weak = Arc::downgrade(&host);
+            drop(host);
+            settle().await;
+            assert_eq!(
+                weak.strong_count(),
+                0,
+                "the pump must never hold a strong reference to its own host"
+            );
+        }
+
+        // ── 9. Nothing passive wakes the main conversation ───────────────
+
+        /// A passive `notify_user` publication and an ordinary task
+        /// completion are not requests addressed to the main conversation and
+        /// must never cause a model call.
+        #[tokio::test]
+        async fn main_inbox_passive_notifications_never_cause_a_model_call() {
+            let dir = tempfile::tempdir().unwrap();
+            let client = PumpClient::new(vec![]);
+            let host = host_with(Some(Arc::clone(&client) as Arc<dyn LlmClient>), dir.path());
+            host.initialize(InitParams::default()).await.unwrap();
+
+            host.message_bus
+                .publish_user(
+                    &MessageSource::Subagent { task_id: "t1".into(), label: "worker".into() },
+                    "finished the background job",
+                    None,
+                    None,
+                )
+                .expect("accepted");
+            settle().await;
+
+            assert_eq!(
+                client.request_count(),
+                0,
+                "a passive notification must never wake the main conversation"
+            );
+            assert!(last_outcome(&host).is_none(), "no turn may have been opened");
+        }
+
+        // ── 10. Diagnostics canary ───────────────────────────────────────
+
+        /// Poison canary: the question the main conversation is asked, and
+        /// its context, must never reach the operational diagnostics log at
+        /// any verbosity a user can select — while the model's own history
+        /// demonstrably does receive it.
+        #[tokio::test]
+        async fn main_inbox_question_body_never_reaches_the_diagnostics_log_at_any_verbosity() {
+            const POISON: &str = "PoisonCanary-ask-main-body-sk-live-do-not-log-me";
+            const POISON_CTX: &str = "PoisonCanary-ask-main-context-do-not-log-me";
+
+            for verbosity in [
+                coda_diagnostics::Verbosity::Normal,
+                coda_diagnostics::Verbosity::Debug,
+                coda_diagnostics::Verbosity::Trace,
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let log_dir = tempfile::tempdir().unwrap();
+                let logger = coda_diagnostics::Logger::open(
+                    coda_diagnostics::Options {
+                        directory: log_dir.path().to_path_buf(),
+                        file: None,
+                        role: coda_diagnostics::ProcessRole::Serve,
+                        version: "test".into(),
+                        verbosity,
+                    },
+                    coda_diagnostics::Limits::default(),
+                )
+                .expect("logger opens");
+                let ctx = coda_diagnostics::DiagnosticContext::root(Arc::new(logger), "run-1");
+
+                let client = PumpClient::new(vec![answer("ok")]);
+                let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                let sink = Arc::new(ServeSink::new(tx.clone()));
+                let ch = Arc::new(PromptChannel::new(tx));
+                let host = ServeHost::new_with_optional_client_and_mcp(
+                    Some(Arc::clone(&client) as Arc<dyn LlmClient>),
+                    sink,
+                    ch,
+                    dir.path().display().to_string(),
+                    crate::mcp::McpBundle::disabled(),
+                    StartupOptions::default(),
+                    None,
+                    Some(ctx.clone()),
+                );
+                host.initialize(InitParams::default()).await.unwrap();
+
+                host.message_bus
+                    .publish_main(
+                        &MessageSource::Subagent {
+                            task_id: "t1".into(),
+                            label: "worker".into(),
+                        },
+                        POISON,
+                        Some(POISON_CTX.to_owned()),
+                        None,
+                    )
+                    .expect("accepted");
+
+                wait_for("the pump to deliver", || client.request_count() == 1).await;
+                wait_for("the turn to finish", || last_outcome(&host).is_some()).await;
+
+                // The model genuinely received it...
+                let seen = client.requests()[0].messages.last().unwrap().text();
+                assert!(seen.contains(POISON) && seen.contains(POISON_CTX), "{seen:?}");
+
+                // ...and the operational log did not.
+                let path = ctx.logger().status().path.expect("a log path");
+                let log = std::fs::read_to_string(&path).unwrap();
+                assert!(
+                    !log.contains(POISON) && !log.contains(POISON_CTX),
+                    "the question body/context leaked into the {verbosity:?} diagnostics log"
+                );
+                // It is a real log with real operational metadata, not an
+                // empty file that would pass vacuously.
+                assert!(
+                    log.contains("turn_start") && log.contains("turn_end"),
+                    "the canary must run against a log that actually recorded this turn"
+                );
+            }
         }
     }
 }

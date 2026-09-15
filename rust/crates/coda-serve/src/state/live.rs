@@ -92,6 +92,15 @@ pub struct LiveTurnAccumulator {
     bytes_cap: usize,
     pub truncated: bool,
     pub omitted_bytes: i64,
+    /// Stable `MainMessage` ids already projected into this live turn (Stage
+    /// 3 chunk B, `ask_main`). Scoped to *this* accumulator instance, which
+    /// is exactly the running turn's own live state — a fresh turn (a new
+    /// `LiveTurnAccumulator`, see `EngineState::begin_turn`) starts with an
+    /// empty set, never carrying a previous turn's delivered ids forward.
+    /// Dedup is by this id alone, deliberately never by matching the
+    /// projected *text*: two distinct delivered items could legitimately
+    /// carry identical body text.
+    delivered_main_ids: std::collections::HashSet<String>,
 }
 
 impl LiveTurnAccumulator {
@@ -165,6 +174,29 @@ impl LiveTurnAccumulator {
         }
         self.flush_assistant();
         self.push_user_block(text, upstream_full_length, Some(message_id));
+    }
+
+    /// Projects a delivered `ask_main` item's already-formatted
+    /// `MainMessage::injected_text()` into this live turn (Stage 3 chunk B).
+    ///
+    /// Deduplicated by `id` alone — the message's own stable id — never by
+    /// matching the projected text, so a duplicate delivery callback (an
+    /// externally/test-constructed stale re-delivery; the real bus's
+    /// `take_main_for_delivery` drains each item at most once) cannot
+    /// double the projection. Returns `true` when this call actually
+    /// projected a new block, `false` when `id` was already projected
+    /// earlier in this same live turn (a no-op).
+    ///
+    /// Unlike [`Self::push_steering_text`], this never closes an open
+    /// assistant entry first: an `ask_main` delivery is not a mid-stream
+    /// preemption the model observed — it is appended as the running turn's
+    /// own next inbox item, exactly like [`Self::push_user_text`].
+    pub fn push_main_message_text(&mut self, id: &str, text: &str) -> bool {
+        if !self.delivered_main_ids.insert(id.to_string()) {
+            return false;
+        }
+        self.push_user_block(text, None, None);
+        true
     }
 
     fn push_user_block(

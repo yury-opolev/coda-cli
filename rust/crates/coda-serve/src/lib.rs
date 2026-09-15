@@ -26,6 +26,7 @@ pub mod host;
 mod mcp;
 pub mod mcp_list;
 pub mod prompts;
+pub mod recovery_executor;
 pub mod session;
 pub mod settings;
 pub mod sink;

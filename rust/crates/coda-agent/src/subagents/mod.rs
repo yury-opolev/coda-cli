@@ -32,6 +32,7 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use crate::events::AgentSink;
+use crate::tool::ScheduleOrigin;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Maximum nesting depth
@@ -135,6 +136,13 @@ impl BuiltInAgents {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Everything needed to launch a subagent.
+///
+/// # Trust boundary
+/// Every field is set by Rust callers inside the engine (the `task` tool, the
+/// subagent host's background path, the schedule runner).  Tool *arguments*
+/// are untrusted and only ever contribute `prompt`, `agent_type` and `model`;
+/// `task_id`, `depth`, `caller_task_id` and `schedule_origin` are derived from
+/// the trusted `ToolContext` and the `TaskManager`, never from model output.
 #[derive(Debug, Clone)]
 pub struct SubagentRequest {
     pub agent_type: String,
@@ -148,6 +156,10 @@ pub struct SubagentRequest {
     /// For background spawns: used as `parent_task_id` when registering the task
     /// so the authorization tree is correct. Null means the main agent is the parent.
     pub caller_task_id: Option<String>,
+    /// Set when this run belongs to a scheduled definition, either because the
+    /// schedule runner started it or because it is a nested child of such a
+    /// run.  `None` for ordinary main-agent work.
+    pub schedule_origin: Option<ScheduleOrigin>,
 }
 
 impl SubagentRequest {
@@ -160,7 +172,14 @@ impl SubagentRequest {
             model: None,
             foreground: true,
             caller_task_id: None,
+            schedule_origin: None,
         }
+    }
+
+    /// Stamp the scheduled provenance of this request (trusted callers only).
+    pub fn with_schedule_origin(mut self, origin: Option<ScheduleOrigin>) -> Self {
+        self.schedule_origin = origin;
+        self
     }
 }
 

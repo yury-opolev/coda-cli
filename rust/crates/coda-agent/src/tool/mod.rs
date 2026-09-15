@@ -12,7 +12,7 @@ pub mod registry;
 // ── Re-exports from coda-tool ─────────────────────────────────────────────────
 pub use coda_tool::{AnswerOutcome, NoAnswerReason, Tool, ToolControl, ToolOutcome, ToolResult};
 pub use context::{
-    OpaqueServiceHandle, PlanApprover, TodoItem, TodoStatus, TodoStore, ToolContext,
+    OpaqueServiceHandle, PlanApprover, ScheduleOrigin, TodoItem, TodoStatus, TodoStore, ToolContext,
     ToolContextServiceExt, ToolDescriptor, UserQuestion,
     is_within_root, resolve_path, try_resolve_within_root,
 };

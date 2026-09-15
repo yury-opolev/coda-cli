@@ -52,6 +52,14 @@ impl Tool for TaskSendTool {
             None => return ToolResult::error("Task manager is not available."),
         };
 
+        // Authorization is checked BEFORE any target lookup/status check so an
+        // unauthorized caller cannot distinguish "unknown" from "exists but not
+        // mine, running, or without an inbox" — all collapse to the same
+        // "not found" wording (mirrors task_get/task_stop).
+        if !mgr.is_authorized_caller(task_id, ctx.caller_task_id.as_deref()) {
+            return ToolResult::error(format!("Task '{task_id}' not found."));
+        }
+
         let task = match mgr.find_task(task_id) {
             Some(t) => t,
             None => return ToolResult::error(format!("Task '{task_id}' not found.")),
@@ -82,8 +90,18 @@ mod tests {
     use crate::tasks::{TaskExecutionMode, TaskKind, TaskManager};
     use std::sync::Arc;
 
+    /// Marker string a denied caller must never see reflected in a response
+    /// (and must never manage to enqueue into a sibling's inbox).
+    const SIBLING_CANARY: &str = "SIBLING_CANARY_STEERING_MESSAGE";
+
     fn ctx(mgr: Arc<TaskManager>) -> ToolContext {
         ToolContext::new(".").with_task_manager(mgr)
+    }
+
+    fn ctx_with_caller(mgr: Arc<TaskManager>, caller_id: &str) -> ToolContext {
+        ToolContext::new(".")
+            .with_task_manager(mgr)
+            .with_caller_task_id(caller_id)
     }
 
     #[tokio::test]
@@ -101,5 +119,134 @@ mod tests {
             .await;
         // No steering inbox attached, so this should fail.
         assert!(result.is_error, "{}", result.content);
+    }
+
+    // ── SECURITY: authorization gate ─────────────────────────────────────────
+
+    /// A sibling must not be able to send a steering message to another
+    /// sibling's running task. The denial must look identical to "not found",
+    /// gating before the tool ever reaches the running/inbox checks that
+    /// would otherwise confirm the target's existence.
+    #[tokio::test]
+    async fn send_denied_for_sibling_looks_like_not_found() {
+        let m = TaskManager::with_defaults("session");
+        let a = m
+            .register(TaskKind::Subagent, "a", None, TaskExecutionMode::Background)
+            .unwrap();
+        let b = m
+            .register(TaskKind::Subagent, "b", None, TaskExecutionMode::Background)
+            .unwrap();
+
+        let result = TaskSendTool
+            .execute(
+                &serde_json::json!({"taskId": b.id, "message": SIBLING_CANARY}),
+                &ctx_with_caller(m, &a.id),
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(result.is_error);
+        assert_eq!(
+            result.content,
+            format!("Task '{}' not found.", b.id),
+            "denied send must use not-found wording, not leak running/no-inbox state"
+        );
+    }
+
+    /// A child must not be able to send a steering message to its own ancestor.
+    #[tokio::test]
+    async fn send_denied_for_ancestor_looks_like_not_found() {
+        let m = TaskManager::with_defaults("session");
+        let parent = m
+            .register(TaskKind::Subagent, "parent", None, TaskExecutionMode::Background)
+            .unwrap();
+        let child = m
+            .register(TaskKind::Subagent, "child", Some(&parent.id), TaskExecutionMode::Background)
+            .unwrap();
+
+        let result = TaskSendTool
+            .execute(
+                &serde_json::json!({"taskId": parent.id, "message": SIBLING_CANARY}),
+                &ctx_with_caller(m, &child.id),
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(result.is_error);
+        assert_eq!(result.content, format!("Task '{}' not found.", parent.id));
+    }
+
+    /// A task must not be authorized to send a steering message to itself.
+    #[tokio::test]
+    async fn send_denied_for_self_looks_like_not_found() {
+        let m = TaskManager::with_defaults("session");
+        let t = m
+            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .unwrap();
+
+        let result = TaskSendTool
+            .execute(
+                &serde_json::json!({"taskId": t.id, "message": SIBLING_CANARY}),
+                &ctx_with_caller(m, &t.id),
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(result.is_error);
+        assert_eq!(result.content, format!("Task '{}' not found.", t.id));
+    }
+
+    /// An unregistered caller id must fail closed.
+    #[tokio::test]
+    async fn send_denied_for_unknown_caller_looks_like_not_found() {
+        let m = TaskManager::with_defaults("session");
+        let t = m
+            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .unwrap();
+
+        let result = TaskSendTool
+            .execute(
+                &serde_json::json!({"taskId": t.id, "message": SIBLING_CANARY}),
+                &ctx_with_caller(m, "task-9999"),
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(result.is_error);
+        assert_eq!(result.content, format!("Task '{}' not found.", t.id));
+    }
+
+    /// A parent must still reach the real (inert) send logic for its own
+    /// descendant — proving the authorization gate does not regress
+    /// legitimate access, even though there is no wired inbox yet.
+    #[tokio::test]
+    async fn send_allowed_for_own_descendant_reaches_inert_inbox_check() {
+        let m = TaskManager::with_defaults("session");
+        let parent = m
+            .register(TaskKind::Subagent, "parent", None, TaskExecutionMode::Background)
+            .unwrap();
+        let child = m
+            .register(TaskKind::Subagent, "child", Some(&parent.id), TaskExecutionMode::Background)
+            .unwrap();
+
+        let result = TaskSendTool
+            .execute(
+                &serde_json::json!({"taskId": child.id, "message": "hello"}),
+                &ctx_with_caller(m, &parent.id),
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(result.is_error);
+        assert_ne!(
+            result.content,
+            format!("Task '{}' not found.", child.id),
+            "authorized access must not be denied as not-found"
+        );
+        assert!(
+            result.content.contains("steering inbox"),
+            "must reach the real (still-inert) inbox check: {}",
+            result.content
+        );
     }
 }

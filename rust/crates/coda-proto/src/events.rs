@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::messages::Correlation;
+use crate::responses::AgentMessageDeliveredItemDto;
 
 /// Event method names.
 pub mod event_method {
@@ -76,6 +77,21 @@ pub mod event_method {
     /// A server-initiated request reached a terminal outcome — answered,
     /// denied, rejected, or explicitly not answered with a typed reason.
     pub const REQUEST_RESOLVED: &str = "event/requestResolved";
+    /// A background context (scheduled run, subagent, or trusted main)
+    /// published a passive user-facing notification via `notify_user`
+    /// (Stage 2). Carries the message bus's own `cursor` — distinct from
+    /// this constant's own `EventBus` seq, which is only the wire-delivery
+    /// position. Never implies the user has seen the notification; recovery
+    /// goes through `session/pendingMessages`, not event replay.
+    pub const AGENT_MESSAGE: &str = "event/agentMessage";
+    /// The single trusted main `AgentLoop` consumer drained one or more
+    /// `ask_main` requests and their injected text was projected into the
+    /// running turn's own live history in the SAME transaction as this
+    /// announcement (Stage 3 chunk B, `coda_serve`'s
+    /// `EngineState::main_messages_delivered`). Metadata only — see
+    /// `Event::AgentMessageDelivered`. Reflected by history, unlike
+    /// `AGENT_MESSAGE`'s passive Stage 2 notification.
+    pub const AGENT_MESSAGE_DELIVERED: &str = "event/agentMessageDelivered";
 }
 
 #[cfg(feature = "schema")]
@@ -174,6 +190,43 @@ pub enum Event {
         state: String,
         timestamp: Option<String>,
         summary: Option<String>,
+    },
+    /// A background context (scheduled run, subagent, or trusted main)
+    /// published a passive user-facing notification via `notify_user`
+    /// (Stage 2). `cursor` is the message bus's own cursor — distinct from
+    /// this notification's `EventBus` seq (carried separately in the
+    /// envelope, not in this variant). `source` is one of `"scheduledTask"`
+    /// | `"subagent"` | `"main"`. Receiving this only means the bus accepted
+    /// the notification; it never means the user has seen it.
+    AgentMessage {
+        id: String,
+        cursor: i64,
+        label: String,
+        text: String,
+        context: Option<String>,
+        source: String,
+        /// The trusted task id this notification is scoped to (`None` for
+        /// `source == "main"`).
+        task_id: Option<String>,
+        /// The scheduled definition id this notification originated from,
+        /// set exactly when `source == "scheduledTask"`.
+        schedule_definition_id: Option<String>,
+    },
+    /// The single trusted main `AgentLoop` consumer (see
+    /// `crate::agent::AgentLoop` step 4c in `coda-agent`) drained one or
+    /// more `ask_main` requests and their `MainMessage::injected_text()` was
+    /// projected into `turn_id`'s running live history in the SAME
+    /// transaction as this announcement (Stage 3 chunk B,
+    /// `coda_serve::state::EngineState::main_messages_delivered`).
+    ///
+    /// Deliberately METADATA ONLY: never re-carries the injected text — a
+    /// client recovers the authoritative entry via `session/getHistory`.
+    /// Reflected by history, unlike [`Event::AgentMessage`]'s passive Stage 2
+    /// notification (display-only): a client must treat this as
+    /// history-affecting, not merely a UI notice.
+    AgentMessageDelivered {
+        turn_id: String,
+        items: Vec<AgentMessageDeliveredItemDto>,
     },
     PromptRewritten {
         hook_command: String,
@@ -380,6 +433,38 @@ struct TaskCompletedPayload {
     description: String,
     #[serde(default)]
     report: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+struct AgentMessagePayload {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    cursor: i64,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    context: Option<String>,
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    task_id: Option<String>,
+    #[serde(default)]
+    schedule_definition_id: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+struct AgentMessageDeliveredPayload {
+    #[serde(default)]
+    turn_id: String,
+    #[serde(default)]
+    items: Vec<AgentMessageDeliveredItemDto>,
 }
 
 #[derive(Default, Deserialize)]
@@ -667,6 +752,23 @@ impl Event {
                     summary: p.summary,
                 }
             }
+            m::AGENT_MESSAGE => {
+                let p: AgentMessagePayload = parse(params);
+                Event::AgentMessage {
+                    id: p.id,
+                    cursor: p.cursor,
+                    label: p.label,
+                    text: p.text,
+                    context: p.context,
+                    source: p.source,
+                    task_id: p.task_id,
+                    schedule_definition_id: p.schedule_definition_id,
+                }
+            }
+            m::AGENT_MESSAGE_DELIVERED => {
+                let p: AgentMessageDeliveredPayload = parse(params);
+                Event::AgentMessageDelivered { turn_id: p.turn_id, items: p.items }
+            }
             m::PROMPT_REWRITTEN => {
                 let p: PromptRewrittenPayload = parse(params);
                 Event::PromptRewritten {
@@ -888,6 +990,22 @@ impl Event {
                 put_opt(&mut map, "summary", summary);
                 (m::SCHEDULE_LIFECYCLE, Value::Object(map))
             }
+            Event::AgentMessage { id, cursor, label, text, context, source, task_id, schedule_definition_id } => {
+                let mut map = Map::new();
+                map.insert("id".into(), id.clone().into());
+                map.insert("cursor".into(), (*cursor).into());
+                map.insert("label".into(), label.clone().into());
+                map.insert("text".into(), text.clone().into());
+                put_opt(&mut map, "context", context);
+                map.insert("source".into(), source.clone().into());
+                put_opt(&mut map, "taskId", task_id);
+                put_opt(&mut map, "scheduleDefinitionId", schedule_definition_id);
+                (m::AGENT_MESSAGE, Value::Object(map))
+            }
+            Event::AgentMessageDelivered { turn_id, items } => (
+                m::AGENT_MESSAGE_DELIVERED,
+                serde_json::json!({ "turnId": turn_id, "items": items }),
+            ),
             Event::PromptRewritten { hook_command, original_prompt, modified_prompt } => (
                 m::PROMPT_REWRITTEN,
                 serde_json::json!({
@@ -1138,6 +1256,48 @@ mod tests {
                 timestamp: Some("2026-01-01T00:00:00Z".into()),
                 summary: None,
             });
+            assert_round_trips(Event::AgentMessage {
+                id: "msg1".into(),
+                cursor: 7,
+                label: "nightly audit".into(),
+                text: "report ready".into(),
+                context: Some("see logs".into()),
+                source: "scheduledTask".into(),
+                task_id: Some("task-77".into()),
+                schedule_definition_id: Some("def-9".into()),
+            });
+            assert_round_trips(Event::AgentMessage {
+                id: "msg2".into(),
+                cursor: 8,
+                label: "main".into(),
+                text: "hi".into(),
+                context: None,
+                source: "main".into(),
+                task_id: None,
+                schedule_definition_id: None,
+            });
+            assert_round_trips(Event::AgentMessageDelivered {
+                turn_id: "t1".into(),
+                items: vec![
+                    AgentMessageDeliveredItemDto {
+                        id: "m1".into(),
+                        seq: 3,
+                        label: "nightly audit".into(),
+                        source: "scheduledTask".into(),
+                        task_id: Some("task-77".into()),
+                        schedule_definition_id: Some("def-9".into()),
+                    },
+                    AgentMessageDeliveredItemDto {
+                        id: "m2".into(),
+                        seq: 4,
+                        label: "worker".into(),
+                        source: "subagent".into(),
+                        task_id: Some("task-2".into()),
+                        schedule_definition_id: None,
+                    },
+                ],
+            });
+            assert_round_trips(Event::AgentMessageDelivered { turn_id: "t2".into(), items: Vec::new() });
         }
 
         #[test]

@@ -1,4 +1,4 @@
-//! Goal judge prompt: build the message, parse the verdict.
+//! Completion judge prompt: build the message, parse the verdict.
 //!
 //! The judge replies with exactly one line: `DONE` or `CONTINUE: <remaining>`.
 //! Only a leading `DONE` (whole first line, case-insensitive) counts as

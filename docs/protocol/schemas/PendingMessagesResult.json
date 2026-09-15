@@ -1,0 +1,114 @@
+{
+  "type": "object",
+  "properties": {
+    "messages": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AgentMessageDto"
+      }
+    },
+    "nextCursor": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "gap": {
+      "type": "boolean"
+    },
+    "dropped": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/DroppedRangeDto"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "truncated": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "messages",
+    "nextCursor",
+    "gap",
+    "truncated"
+  ],
+  "description": "Result of `session/pendingMessages`.\n\n`gap: true` means some notifications between the caller's `afterCursor`\nand the oldest one still retained were evicted and can never be\nrecovered — reported honestly rather than silently resuming, with the\nexact evicted range/count in `dropped`.\n`truncated: true` means more messages exist beyond this page; call again\nwith `nextCursor`.",
+  "title": "PendingMessagesResult",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "AgentMessageDto": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "cursor": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "label": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "context": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "type": "string"
+        },
+        "taskId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The trusted task id this notification is scoped to (`None` for\n`source == \"main\"`, which is not a task at all)."
+        },
+        "scheduleDefinitionId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The scheduled definition id this notification originated from, set\nexactly when `source == \"scheduledTask\"`."
+        }
+      },
+      "required": [
+        "id",
+        "cursor",
+        "label",
+        "text",
+        "source"
+      ],
+      "description": "One engine-owned user notification (Stage 2 `notify_user`), as returned by\n`session/pendingMessages` and carried in `event/agentMessage`.\n\n`cursor` is the message bus's own cursor — NOT the `EventBus` seq that\nwraps the live notification. `source` is one of `\"scheduledTask\"` |\n`\"subagent\"` | `\"main\"`. `taskId`/`scheduleDefinitionId` are the *trusted*\nprovenance an external client can correlate against `TaskManager`/schedule\nstate — `label` is a display string only and is not guaranteed unique.\nReceiving this only means the bus accepted the notification; it never\nmeans the user has seen it."
+    },
+    "DroppedRangeDto": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "to": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "count": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "from",
+        "to",
+        "count"
+      ],
+      "description": "Exact bounds of notifications this client lost to ring eviction before it\ncould read them — see `coda_agent::message::DroppedRange`. Present exactly\nwhen `gap` is `true`."
+    }
+  }
+}

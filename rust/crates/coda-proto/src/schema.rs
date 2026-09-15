@@ -7,9 +7,9 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 use crate::state_events::{
-    ActivityEvent, ConfigChangedEvent, EventsDroppedEvent, LifecycleEvent,
-    RequestPendingEvent, RequestResolvedEvent, Sequenced, SessionChangedEvent,
-    SteeringQueueEvent, TurnEndedEvent,
+    ActivityEvent, AgentMessageDeliveredEvent, AgentMessageEvent, ConfigChangedEvent,
+    EventsDroppedEvent, LifecycleEvent, RequestPendingEvent, RequestResolvedEvent, Sequenced,
+    SessionChangedEvent, SteeringQueueEvent, TurnEndedEvent,
 };
 
 pub fn catalog_document() -> Value {
@@ -59,6 +59,10 @@ pub fn documents() -> BTreeMap<&'static str, Value> {
         ("RequestPendingEvent.json", schemars::schema_for!(Sequenced<RequestPendingEvent>).to_value()),
         ("RequestResolvedEvent.json", schemars::schema_for!(Sequenced<RequestResolvedEvent>).to_value()),
         ("EventsDroppedEvent.json", schemars::schema_for!(Sequenced<EventsDroppedEvent>).to_value()),
+        ("AgentMessageEvent.json", schemars::schema_for!(Sequenced<AgentMessageEvent>).to_value()),
+        ("AgentMessageDeliveredEvent.json", schemars::schema_for!(Sequenced<AgentMessageDeliveredEvent>).to_value()),
+        ("PendingMessagesParams.json", schemars::schema_for!(crate::requests::PendingMessagesParams).to_value()),
+        ("PendingMessagesResult.json", schemars::schema_for!(crate::responses::PendingMessagesResult).to_value()),
     ]);
     for (name, schema) in legacy::documents() {
         assert!(schemas.insert(name, schema).is_none(), "duplicate schema name: {name}");
@@ -105,6 +109,14 @@ mod tests {
             }
         }
         assert!(omission, "truncation metadata must remain public");
+    }
+
+    #[test]
+    fn schedule_run_limits_require_at_least_one_run_in_the_schema() {
+        let schemas = documents();
+        for name in ["ScheduleCreateParams.json", "ScheduledTask.json"] {
+            assert_eq!(schemas[name]["properties"]["maxRuns"]["minimum"].as_f64(), Some(1.0), "{name}");
+        }
     }
 
     #[test]

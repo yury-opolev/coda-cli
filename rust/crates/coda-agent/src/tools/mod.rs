@@ -7,6 +7,7 @@
 //! may touch a path outside `ToolContext::working_directory` unless bypass mode
 //! is active.
 
+mod ask_main;
 mod ask_user_question;
 mod background_task;
 mod edit_file;
@@ -16,11 +17,14 @@ mod glob_tool;
 mod grep_tool;
 mod list_dir;
 mod notebook_edit;
+mod notify_user;
 mod read_file;
 mod run_command;
+mod schedule_cancel_self;
 mod schedule_create;
 mod schedule_tools;
 mod sleep_tool;
+mod source;
 pub mod task;
 mod task_get;
 mod task_list;
@@ -50,6 +54,7 @@ use crate::lsp::LspDiagnosticsTool;
 /// same wording regardless of which tool truncated.
 pub(super) const OUTPUT_TRUNCATED: &str = "… [output truncated]";
 
+pub use ask_main::AskMainTool;
 pub use ask_user_question::AskUserQuestionTool;
 pub use background_task::{BackgroundTaskOutputTool, BackgroundTaskStartTool};
 pub use edit_file::EditTool;
@@ -59,8 +64,10 @@ pub use glob_tool::GlobTool;
 pub use grep_tool::GrepTool;
 pub use list_dir::ListDirTool;
 pub use notebook_edit::NotebookEditTool;
+pub use notify_user::NotifyUserTool;
 pub use read_file::ReadFileTool;
 pub use run_command::{RunCommandTool, DEFAULT_TIMEOUT_SECS, TIMEOUT_ENV};
+pub use schedule_cancel_self::ScheduleCancelSelfTool;
 pub use schedule_create::ScheduleCreateTool;
 pub use schedule_tools::{ScheduleDeleteTool, ScheduleListTool};
 pub use sleep_tool::{SleepTool, MAX_DURATION_MS};
@@ -118,6 +125,8 @@ pub fn built_in_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(SleepTool),
         Arc::new(ToolSearchTool),
         Arc::new(GitWorktreeTool),
+        Arc::new(NotifyUserTool),
+        Arc::new(AskMainTool),
         // ── LSP ───────────────────────────────────────────────────────────────
         Arc::new(LspDiagnosticsTool),
         Arc::new(crate::lsp::LspTool),
@@ -138,6 +147,7 @@ pub fn built_in_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(ScheduleCreateTool),
         Arc::new(ScheduleListTool),
         Arc::new(ScheduleDeleteTool),
+        Arc::new(ScheduleCancelSelfTool),
     ]
 }
 
@@ -245,6 +255,8 @@ mod tests {
             "tool_search",
             "git_worktree",
             "lsp_diagnostics",
+            "notify_user",
+            "ask_main",
         ] {
             assert!(names.contains(expected), "missing tool: {expected}");
         }

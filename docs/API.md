@@ -307,7 +307,8 @@ The model can call these built-in tools (subject to the permission mode). MCP se
 | `web_fetch`, `web_search` | yes | fetch a URL as text; DuckDuckGo search |
 | `todo_write` | yes | maintain a live session checklist |
 | `ask_user_question`, `exit_plan_mode` | — | ask the host a question; submit a plan for approval |
-| `schedule_create`, `schedule_list`, `schedule_delete` | mixed | create/list/delete scheduled tasks (`every`/`at`/`cron`); each firing runs as a `TaskKind.Scheduled` background agent while the session is open |
+| `schedule_create`, `schedule_list`, `schedule_delete` | mixed | create/list/delete scheduled tasks (`every`/`at`/`cron`, optionally bounded by `maxRuns` and `expiresAt`/`expiresIn`); each firing runs as a `TaskKind.Scheduled` background agent while the session is open. Main-agent only, except that a scheduled run sees its own definition in `schedule_list`. |
+| `schedule_cancel_self` | no | a scheduled run retires **its own** schedule once its job is done. Takes no schedule id or task id. Only the scheduled root run may call it; `stopRunning: true` also ends the current run, otherwise the run finishes normally. |
 | `task_start`, `task_output`, `task_stop`, `sleep` | mixed | long-running background jobs + polling |
 | `task_list`, `task_get`, `task_peek`, `task_send` | yes | list all tasks, read one task, peek recent output, steer a running agent task (subagent or scheduled) |
 | `task_wait`, `task_background`, `task_remove` | yes | wait for a task to finish (optional `timeout_seconds`, default 600, max 1800; timeout leaves it running), move a running foreground shell to the background, remove a finished task (log preserved) |

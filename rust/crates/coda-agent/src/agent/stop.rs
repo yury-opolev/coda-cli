@@ -14,7 +14,7 @@
 use tokio_util::sync::CancellationToken;
 
 use crate::events::{AgentEvent, AgentSink};
-use crate::goal::{GoalSupervisor, GoalVerdict};
+use crate::autonomy::{AutonomySupervisor, GoalVerdict};
 use crate::steering::SteeringInbox;
 use coda_tool::{AnswerOutcome, NoAnswerReason};
 
@@ -41,9 +41,17 @@ pub const GOAL_STOP_OPTION: &str = "Stop — goal not met";
 pub(crate) async fn decide_stop(
     _stop_reason: Option<&str>,
     last_assistant_text: &str,
-    goal: &mut Option<GoalSupervisor>,
+    goal: &mut Option<AutonomySupervisor>,
     _stop_continuations: &mut u32,
     steering: Option<&SteeringInbox>,
+    // Stage 3 chunk A: the main-conversation inbox (`ask_main`), passed only
+    // for a MAIN-context run (`AgentLoop::is_main_context`). A child/subagent
+    // run must pass `None` here even though it shares the same underlying
+    // `MessageBus` for publishing — the single intended consumer of this
+    // queue is the trusted main `AgentLoop`, and a child that checked its own
+    // pending count would spin forever waiting for someone else (the main
+    // loop, on its own schedule) to ever drain it.
+    main_inbox: Option<&crate::message::MessageBus>,
     sink: &dyn AgentSink,
     cancel: CancellationToken,
     // Seam: user-question prompt (later phase).  `None` = headless.
@@ -56,6 +64,25 @@ pub(crate) async fn decide_stop(
 
         match verdict {
             GoalVerdict::Continue { nudge } => return Ok(StopAction::Continue { nudge }),
+
+            // Stopping was proved, not merely timed out. The report is the
+            // whole point of the proof — it tells the operator what is blocked,
+            // what was tried, and what they would need to supply — so it is
+            // emitted rather than discarded, and the run ends without ever
+            // asking anyone anything.
+            //
+            // Emitted once. Below this arm the ladder still runs the main-inbox
+            // and steering-seal checks, either of which can force one more
+            // iteration when a message raced in; without the guard the next
+            // natural stop would re-prove the same state and report it twice.
+            GoalVerdict::StopProved { outcome, report } => {
+                if goal.take_report_once() {
+                    sink.emit(AgentEvent::LimitReached {
+                        kind: format!("goal.{}", outcome.as_str()),
+                        message: report,
+                    });
+                }
+            }
 
             GoalVerdict::Escalate { question, .. } => {
                 // Ask the operator — headless (user_question = None) → stop unmet.
@@ -110,6 +137,20 @@ pub(crate) async fn decide_stop(
     // Escalate-continue; these hooks are only reached when the goal verdict is
     // Stop (or when no goal is wired).
 
+    // --- Main inbox pending check (Stage 3 chunk A) ---
+    // Checked BEFORE the steering seal below, mirroring its race-closing
+    // shape: a background task's `ask_main` that lands after this
+    // iteration's step-4c drain but before this stop decision must force one
+    // more iteration so the NEXT step 4c can drain and inject it — otherwise
+    // the item would sit undelivered until some later, unrelated run. Never
+    // adds a nudge itself (the actual injected text is only ever produced by
+    // step 4c's own formatter); an empty `Continue` is enough to loop again.
+    if let Some(bus) = main_inbox {
+        if bus.has_pending_main() {
+            return Ok(StopAction::Continue { nudge: String::new() });
+        }
+    }
+
     // --- Steering seal (§1.5) ---
     // A racing operator message prevents the natural stop and forces one more
     // iteration to deliver it.
@@ -148,14 +189,14 @@ mod tests {
     use std::time::Duration;
 
     use crate::events::{AgentEvent, CollectingSink, NullSink};
-    use crate::goal::{GoalBudget, GoalSupervisor};
+    use crate::autonomy::{GoalBudget, AutonomySupervisor};
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     struct AlwaysFailsJudge;
 
     #[async_trait::async_trait]
-    impl crate::goal::ForkedAgent for AlwaysFailsJudge {
+    impl crate::autonomy::ForkedAgent for AlwaysFailsJudge {
         async fn run(
             &self,
             _: &str,
@@ -167,13 +208,13 @@ mod tests {
     }
 
     /// A supervisor whose budget is immediately exhausted so evaluate() returns Escalate.
-    fn escalating_supervisor() -> GoalSupervisor {
-        let budget = GoalBudget::new(Duration::MAX, 0, 0.5, || Duration::ZERO);
-        GoalSupervisor::new(
+    fn escalating_supervisor() -> AutonomySupervisor {
+        let budget = GoalBudget::new(None, Some(0), 0.5, || Duration::ZERO);
+        AutonomySupervisor::new(
             Box::new(AlwaysFailsJudge),
             "finish the task",
             budget,
-            Some(crate::goal::GoalRetryPolicy::for_tests()),
+            Some(crate::autonomy::GoalRetryPolicy::for_tests()),
         )
     }
 
@@ -197,6 +238,107 @@ mod tests {
         FixedPrompt(AnswerOutcome::Answered(text.to_string()))
     }
 
+    // ── Stage 3 chunk A: main inbox pending check ─────────────────────────────
+
+    #[tokio::test]
+    async fn main_pending_forces_continue_with_empty_nudge_before_steering_seal() {
+        // No goal, no steering — but a pending main-inbox item must still
+        // force Continue (checked BEFORE the steering seal), and the nudge
+        // must be empty: decide_stop never fabricates user-visible text of
+        // its own, it only forces one more iteration so step 4c's own
+        // formatter can inject the real message.
+        let bus = crate::message::MessageBus::new();
+        bus.publish_main(
+            &crate::message::MessageSource::Subagent { task_id: "t1".into(), label: "worker".into() },
+            "please look at this",
+            None,
+            None,
+        )
+        .unwrap();
+        let mut goal = None;
+        let sink = NullSink;
+
+        let result = decide_stop(
+            None,
+            "final text",
+            &mut goal,
+            &mut 0,
+            None,
+            Some(&bus),
+            &sink,
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("no error");
+
+        match result {
+            StopAction::Continue { nudge } => {
+                assert!(nudge.is_empty(), "decide_stop must never fabricate user text: {nudge:?}")
+            }
+            StopAction::Stop => panic!("a pending main-inbox item must force Continue, not Stop"),
+        }
+        // decide_stop only CHECKS pending state — it never drains the queue
+        // itself (that is step 4c's job).
+        assert!(bus.has_pending_main(), "decide_stop must not itself drain the main queue");
+    }
+
+    #[tokio::test]
+    async fn empty_main_inbox_does_not_force_continue() {
+        let bus = crate::message::MessageBus::new();
+        let mut goal = None;
+        let sink = NullSink;
+
+        let result = decide_stop(
+            None,
+            "final text",
+            &mut goal,
+            &mut 0,
+            None,
+            Some(&bus),
+            &sink,
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("no error");
+
+        assert!(matches!(result, StopAction::Stop), "an empty main inbox must not block a natural stop");
+    }
+
+    #[tokio::test]
+    async fn main_inbox_none_ignores_pending_state_elsewhere() {
+        // A child/subagent run passes `None` for `main_inbox` even when it
+        // shares the same underlying bus for publishing — decide_stop must
+        // not reach into any bus it wasn't explicitly handed for this check.
+        let bus = crate::message::MessageBus::new();
+        bus.publish_main(
+            &crate::message::MessageSource::Subagent { task_id: "t1".into(), label: "worker".into() },
+            "pending but irrelevant to this call",
+            None,
+            None,
+        )
+        .unwrap();
+        let mut goal = None;
+        let sink = NullSink;
+
+        let result = decide_stop(
+            None,
+            "final text",
+            &mut goal,
+            &mut 0,
+            None,
+            None, // main_inbox intentionally not passed
+            &sink,
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("no error");
+
+        assert!(matches!(result, StopAction::Stop), "with no main_inbox passed, pending state elsewhere must not matter");
+    }
+
     // ── Escalate branch: try_grant_extension ──────────────────────────────────
 
     #[tokio::test]
@@ -212,6 +354,7 @@ mod tests {
             "some text",
             &mut goal,
             &mut 0,
+            None,
             None,
             &sink,
             CancellationToken::new(),
@@ -253,6 +396,7 @@ mod tests {
                 &mut goal,
                 &mut 0,
                 None,
+                None,
                 &sink,
                 CancellationToken::new(),
                 Some(&prompt),
@@ -283,6 +427,7 @@ mod tests {
             "some text",
             &mut goal,
             &mut 0,
+            None,
             None,
             &sink,
             CancellationToken::new(),
@@ -315,6 +460,7 @@ mod tests {
             &mut goal,
             &mut 0,
             None,
+            None,
             &sink,
             CancellationToken::new(),
             Some(&prompt),
@@ -335,12 +481,12 @@ mod tests {
         // MINOR 7: the "extension already spent" path in decide_stop is reached
         // when try_grant_extension() returns false while the operator answered
         // "continue".  We verify the underlying contract directly via
-        // GoalSupervisor, since triggering that arm through decide_stop would
+        // AutonomySupervisor, since triggering that arm through decide_stop would
         // require the budget to be exhausted-yet-unanswered simultaneously with
         // extension_used=true — a state that cannot arise in the normal sequential
         // flow.
         //
-        // The GoalSupervisor tests in goal/mod.rs already cover this fully.
+        // The AutonomySupervisor tests in autonomy/mod.rs already cover this fully.
         // Here we verify the error message text has not silently drifted.
         assert!(
             "The budget extension was already used; stopping with the goal unmet."
@@ -354,12 +500,12 @@ mod tests {
         // This mirrors what stop.rs checks: try_grant_extension() must return
         // false once the extension has been spent, causing the "already spent"
         // error path to be reached.
-        let budget = GoalBudget::new(Duration::MAX, 0, 0.5, || Duration::ZERO);
-        let mut sup = GoalSupervisor::new(
+        let budget = GoalBudget::new(None, Some(0), 0.5, || Duration::ZERO);
+        let mut sup = AutonomySupervisor::new(
             Box::new(AlwaysFailsJudge),
             "finish the task",
             budget,
-            Some(crate::goal::GoalRetryPolicy::for_tests()),
+            Some(crate::autonomy::GoalRetryPolicy::for_tests()),
         );
         assert!(sup.try_grant_extension(), "first grant must succeed");
         assert!(!sup.try_grant_extension(), "second grant must return false");
@@ -375,7 +521,7 @@ mod tests {
         let sink = CollectingSink::new();
 
         let result = decide_stop(
-            None, "text", &mut goal, &mut 0, None, &sink, CancellationToken::new(), None,
+            None, "text", &mut goal, &mut 0, None, None, &sink, CancellationToken::new(), None,
         )
         .await
         .expect("no error");

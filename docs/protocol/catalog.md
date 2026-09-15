@@ -61,15 +61,16 @@ might infer from its name. Unsupported operations are listed separately.
 | `config/describe` | Reusable | Describe ownership, mutability, applicability and safe effective values. Available before initialize. |
 | `config/set` | Reusable | Delegate supported session settings to their validated setters. Refuse startup-only, file-owned and client-local settings. |
 | `mcp/list` | Reusable | Read-only, secret-free configuration/runtime inventory on the engine host. Available before initialize. |
-| `session/scheduleList` | Reusable | List this engine's scheduled-task definitions; not fleet inventory. |
-| `session/scheduleCreate` | Reusable | Create a scheduled-task definition in the engine's scope. |
-| `session/scheduleDelete` | Reusable | Delete a scheduled-task definition in the engine's scope. |
+| `session/scheduleList` | Reusable | List this engine's scheduled-task definitions; not fleet inventory. Reports live `state`, `runsStarted`, configured bounds and any retirement reason. |
+| `session/scheduleCreate` | Reusable | Create a scheduled-task definition in the engine's scope. Accepts the optional `maxRuns` / `expiresAt` / `expiresIn` bounds only when `schedules.bounds` is advertised. |
+| `session/scheduleDelete` | Reusable | Delete a scheduled-task definition in the engine's scope. Stops future runs; does not interrupt a run already executing. |
 | `hooks/list` | Reusable | List hook configuration with engine-side trust information. |
 | `hooks/info` | Reusable | Describe a hook selected by the method's parameters. |
 | `hooks/trust` | Reusable | Apply the engine's hook trust operation; caller authorization must be supplied by the external control plane. |
 | `skills/list` | Reusable | Discover skills on the engine host. |
 | `skills/trust` | Unsupported | Always refused in serve mode. |
 | `plugins/list` | Limited | Compatibility route currently returns an empty list; not an authoritative installed-plugin inventory. |
+| `session/pendingMessages` | Reusable | Non-destructive recovery of engine-owned background notifications (`notify_user`, Stage 2). Available before initialize; see [Background notifications](#background-notifications-notify_user). |
 
 The new `session/getHistory`, `session/getPendingRequests`,
 `session/resolveRequest`, `session/cancelRequest` and `config/set` methods
@@ -134,6 +135,8 @@ the same structured projection regardless of that hint.
 | `event/configChanged`, `event/steeringQueue` | **Gated:** effective configuration and authoritative queue state/outcomes. |
 | `event/requestPending`, `event/requestResolved` | **Gated:** interaction registry changes and actual resolution outcomes. |
 | `event/eventsDropped` | **Gated:** explicit loss of retained event coverage; obtain an authoritative snapshot/history instead of guessing missing deltas. |
+| `event/agentMessage` | A background context (a scheduled run, a subagent, or trusted main) published a passive notification via `notify_user`. See [Background notifications](#background-notifications-notify_user). |
+| `event/agentMessageDelivered` | The trusted main conversation's own inbox (`ask_main`) delivered one or more accepted requests into the running turn's live history. Metadata only — see [Main inbox](#main-inbox-ask_main). |
 
 `request/permission`, `request/question` and `request/planApproval` are
 server-initiated JSON-RPC requests, not notifications. Reply using their RPC
@@ -179,6 +182,186 @@ local instant using a remote wall clock.
 Queue outcomes are bounded. Preserve original editable drafts separately if
 recovery is needed; a message missing from both pending and retained outcomes
 has an unknown disposition. Never automatically submit it again.
+
+## Bounded schedules
+
+`schedules.bounds` is a capability, not a version check, and clients must read
+it before relying on a schedule bound: an engine without it accepts `maxRuns`,
+`expiresAt` and `expiresIn` on `session/scheduleCreate` and silently ignores
+them, turning "seven runs" into an unbounded schedule with no error. Manage the
+limit client-side when it is absent.
+
+When advertised, `session/scheduleCreate` validates bounds with the same code
+the engine's `schedule_create` tool uses: `maxRuns` must be an integer in
+`1..=4294967295`; `expiresAt` (absolute ISO-8601 with offset) and `expiresIn`
+(relative, `30m` / `2h` / `7d`) are mutually exclusive; a deadline at or before
+"now" is refused; and a definition whose first occurrence already falls outside
+its deadline is refused rather than created dead.
+
+`session/scheduleList` then reports `maxRuns`, `expiresAtUtc`, `runsStarted`,
+`retiredReason` and `retiredAtUtc`, plus a derived `state`. Read these
+literally:
+
+- `runsStarted` counts **accepted launch attempts**, including runs that later
+  failed. Only a launch refused outright, with nothing executed, is uncounted.
+- `expiresAtUtc` is **exclusive**: no run starts at or after it. Expiry does not
+  interrupt a run already executing.
+- `state` is one of `idle`, `running`, `pending`, `retiring`, `completed`,
+  `expired`, `cancelled`, `failed`. **`retiring` means work is still in
+  flight** for a schedule that will not start another run — it is not a
+  finished schedule, and `completed` specifically means the run budget was
+  spent, not that the last run succeeded. The last run's own outcome remains a
+  separate field (`lastOutcome`).
+- Absent bound fields mean *unlimited*, never zero.
+
+Schedules are engine-scoped and **in memory only** in the Rust engine: nothing
+survives an engine restart, and no schedule state is written to disk. Do not
+build resumption on top of `session/scheduleList`.
+
+## Background notifications (`notify_user`)
+
+`messaging.notifyUser` (see `initialize.capabilities`) is a **passive,
+one-way** channel from background work (a scheduled run, a subagent, or the
+trusted main context) to the user's chat surface. It is entirely separate
+from the conversation the model sees:
+
+- It never wakes, resumes or feeds text into the main agent loop — there is
+  no reply channel and no way for the user's response (if any) to reach the
+  background context that sent it. A `notify_user` publication is explicitly
+  **not** a wake: it never causes the engine to start a turn. The separate
+  `ask_main` channel (see [Main inbox](#main-inbox-ask_main) below) is the
+  one that can cause the main conversation to act, and it is a different
+  queue with a different tool.
+- It is **entirely in-memory (RAM) and engine-process-scoped**. There is no
+  disk persistence and no continuation across an engine restart: a fresh
+  engine process starts a fresh, empty notification bus at cursor `0`.
+  Normal chat/session persistence (`.coda/sessions`, rich history) is
+  completely unaffected — this bus never writes anything to disk and never
+  reads anything back from it.
+- Publishing (via the `notify_user` tool) returns a **receipt**, not a
+  delivery confirmation: `accepted` only ever means "the bus took custody of
+  this notification". It is never presented as, and must never be read as,
+  "the user has seen it" — there is no acknowledgement channel from the
+  presentation layer back to the bus.
+
+### `session/pendingMessages` — recovery
+
+`session/pendingMessages` non-destructively pages through the bus starting
+after `afterCursor` (the bus's **own** monotonic cursor — unrelated to the
+`EventBus` `seq` space carried elsewhere in this contract; do not mix the
+two). It is available before `initialize`, exactly like `session/getHistory`
+and `session/listSessions`, so a client can recover missed notifications
+without any other local state.
+
+- `limit` must be a positive integer if supplied; `0` is refused
+  (`-32602`), never silently reinterpreted as "no limit". An over-large
+  value is clamped to the engine's own ring capacity.
+- `engineInstanceId`, when supplied, fences the read exactly like
+  `session/getHistory`'s: a cursor minted by a different engine process is
+  refused (instance-changed error) rather than silently answered from a
+  different process's bus.
+- The result's `gap: true` means some notifications between `afterCursor`
+  and the oldest one still retained were evicted from the ring and can
+  never be recovered. `dropped: { from, to, count }` names the exact evicted
+  cursor range/count whenever `gap` is true — never only a boolean.
+- `truncated: true` means more messages exist beyond this page; call again
+  with the response's `nextCursor`.
+- Each returned message carries `taskId`/`scheduleDefinitionId` — the
+  *trusted* provenance derived from the engine's own `TaskManager`/schedule
+  state, suitable for correlation — in addition to the display-only
+  `label`, which is bounded/sanitized but **not** guaranteed unique.
+
+### Retention and idempotency bounds
+
+The bus is a bounded ring (`200` notifications by default); once full, the
+oldest entries are evicted to make room for new ones — this is what
+`gap`/`dropped` report honestly rather than hiding. A caller-supplied
+`idempotency_key` scopes deduplication to `(origin, key)`: reusing a key
+with identical content is a no-op replay that returns the original receipt;
+reusing it with **different** content is rejected as a conflict, never
+silently accepted as new content under an old key. The idempotency record
+for a key is retained only as long as its originating message is still in
+the ring — once evicted, the key becomes reusable again. Body/context/label
+are each length-bounded (oversized user-supplied text is rejected outright,
+never silently truncated); a caller-supplied idempotency key is bounded too
+and rejected outright when oversized.
+
+## Main inbox (`ask_main`)
+
+`messaging.askMain` (see `initialize.capabilities`) is a second, independent
+FIFO on the SAME engine-owned bus `notify_user` uses — but unlike that
+passive, display-only channel, an item accepted here IS eventually injected
+into the trusted main conversation's own history, by the single trusted
+consumer (the main agent loop, at its own next iteration boundary) and
+nowhere else:
+
+- **Accepted-only, nonblocking, no reply.** `ask_main` (a tool available to
+  subagents and scheduled runs — refused outright when called from the main
+  context itself, which would be a self-question loop nobody could ever
+  answer) returns as soon as the bus takes custody of the request. The
+  caller never waits for an answer, never holds a permit while one is
+  pending, and there is no reply channel back to that specific call. A
+  receipt's `accepted`/`status` only ever means "the bus took custody of
+  this request for later delivery" — never that the main conversation has
+  read or acted on it.
+- **Not user authority.** The text injected into the main conversation's
+  history always carries a literal `[agent-message]` prefix, the trusted
+  source's own label/ids, and an explicit disclaimer that this is a
+  background task request — **never** promoted to, or treated as, a new
+  user instruction.
+- **RAM-only, bounded main queue**, independent of the passive bus's ring:
+  pending requests are never silently evicted to make room for a new one —
+  a full queue refuses new publications outright rather than losing one a
+  caller never knew was dropped. Nothing here survives an engine restart.
+- **Delivery persists an ordinary, source-prefixed transcript entry** — once
+  the single trusted consumer actually drains the queue, the exact text
+  injected is projected into the running turn's own live history (and, once
+  the turn commits, the committed transcript) as a normal user-role entry,
+  recoverable through the ordinary `session/getHistory`/`session/getState`
+  machinery like any other conversation content. `event/agentMessageDelivered`
+  announces the delivery, but carries **metadata only** (ids, the main
+  queue's own `seq`, the `turnId`, trusted source label/ids) — never the
+  injected text itself; a client recovers the authoritative entry via
+  `session/getHistory`.
+- **Passive acceptance, then action at a boundary.** Accepting an `ask_main`
+  request is deliberately silent on the wire: it publishes no event and no
+  passive `notify_user` notification. What it does do is mark the main
+  conversation as having work waiting. The request is then delivered either
+  by a turn that was already running (its next iteration boundary drains the
+  queue before the model is called) or, when the engine is idle, by a turn
+  the engine starts for exactly that purpose. Either way it is the **same**
+  single-flight execution slot and the same history writer every
+  `session/prompt` uses — there is no second conversation, no second writer,
+  and no preemption of a turn in progress.
+- **Wake, retry and blocked semantics.** The idle path is woken by: a newly
+  accepted `ask_main` item, the release of the turn slot (including a
+  cancelled or failed turn), the end of initialization, and a provider
+  becoming wired. It is deliberately **not** woken by a passive
+  `notify_user` publication or by an ordinary task completion. When it
+  cannot act it records *why*, and retries only when that specific condition
+  changes:
+  - **Busy** — another turn holds the slot. Nothing is recorded; the slot's
+    release is itself a wake.
+  - **No provider wired** — the requests stay queued (never consumed, never
+    discarded), the user is told once in fixed wording that never quotes the
+    queued request, and no further attempt is made until a provider is
+    actually wired. Connecting one delivers the backlog with no further
+    action from the client.
+  - **No delivery progress** — a turn ran (or a preflight failed) without
+    anything leaving the queue, for instance because it was interrupted
+    before the injection point. The requests stay queued and are retried
+    when a provider transition happens or genuinely new work is accepted —
+    never merely because the failed attempt's own slot release woke it.
+  There is no attempt cap and no discard: a queued request is never dropped
+  for having been retried too often.
+- **Nothing new on disk, nothing across a restart.** This adds no persisted
+  queue state and no restart continuation. Ordinary transcript persistence
+  is unchanged.
+- **Shutdown.** `shutdown` publishes `stopping` first, so no further turn is
+  admitted, cancels any running turn, then stops and **joins** the idle path
+  within a bounded grace period (aborting it if a provider ignores
+  cancellation entirely) before closing the bus. No delivery, publication or
+  new turn happens after that point.
 
 ## Unsupported and client-local surfaces
 

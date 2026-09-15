@@ -7,6 +7,7 @@
 pub mod config;
 pub mod events;
 pub mod framing;
+pub mod goal_budget;
 pub mod history;
 pub mod jsonrpc;
 pub mod mcp;
@@ -20,6 +21,9 @@ pub mod state_events;
 
 pub use events::{Event, ToolCallStatus};
 pub use framing::{encode_frame, FrameDecoder, FramingError};
+pub use goal_budget::{
+    is_unlimited_token, parse_max_continuations, UNLIMITED_CONTINUATIONS, UNLIMITED_TOKENS,
+};
 pub use jsonrpc::{
     error_codes, Message, Notification, Request, RequestId, Response, ResponseError, Version,
 };

@@ -889,6 +889,10 @@ Coda can run a prompt on a schedule. The agent creates a schedule with
 `schedule_delete`. Each firing runs as an **isolated background agent** — its own
 one-message conversation, never the interactive history.
 
+A schedule can also **stop itself**: give it a run budget or a deadline when you
+create it, or let the scheduled agent end it with `schedule_cancel_self` when the
+job is done. See [Bounding a schedule](#bounding-a-schedule).
+
 ### Creating a schedule
 
 `schedule_create` takes a `prompt` plus **exactly one** selector, and optional
@@ -912,6 +916,67 @@ one-message conversation, never the interactive history.
 { "prompt": "email me the overnight error report", "cron": "0 9 * * 1-5", "timeZone": "America/New_York" }
 ```
 
+### Bounding a schedule
+
+A schedule can stop itself. Two optional bounds may be combined with any
+selector; **omit both and the schedule is unlimited**, exactly as before.
+
+- **`maxRuns`** — a positive whole number of runs.
+- **`expiresAt`** — an absolute ISO-8601 deadline — **or** `expiresIn`, a
+  relative one (`"30m"`, `"2h"`, `"7d"`). The two are mutually exclusive, and a
+  relative value is resolved to an absolute instant **once, at creation**.
+
+```jsonc
+// hourly, for the next week
+{ "prompt": "check the incident queue", "every": "1h", "expiresIn": "7d" }
+
+// daily at 09:00, seven times — "daily for a week" is a run budget, not a duration
+{ "prompt": "post the standup reminder", "cron": "0 9 * * *", "maxRuns": 7 }
+```
+
+Exact semantics, because the obvious reading of each is wrong in a way that
+matters:
+
+- **`maxRuns` counts runs that were *started*, not runs that succeeded.** A run
+  that later fails still consumes one. Only a launch that was refused outright,
+  with nothing executed, is uncounted. Counting successes instead would let a
+  flaky environment retry a "seven times" job forever.
+- **The deadline is exclusive**: a run due exactly at `expiresAt` does not
+  start. The schedule expires when the clock reaches the deadline, not at its
+  last tick before it.
+- **Expiry does not stop a run already in progress.** The in-flight run
+  finishes; only future runs are prevented. While it finishes the schedule is
+  listed as **retiring**, not completed.
+- A retired schedule keeps a reason — **completed** (run budget spent),
+  **expired**, **cancelled** or **failed** — *separately* from the outcome of
+  its last run, because a budget can be spent by a run that failed.
+
+`schedule_list` and the **`/schedule`** browser show the run budget, the
+deadline, and a truthful state: `idle`, `running`, `pending`, `retiring`,
+`completed`, `expired`, `cancelled` or `failed`.
+
+For a **calendar month**, use an explicit `expiresAt` deadline or a `cron` rule
+— there is no month-long interval, and `"30d"` is not a month. `every` is
+absolute elapsed time and does not track wall-clock hours across a DST
+transition; a `cron` rule with an IANA `timeZone` does.
+
+Over `coda serve`, check the **`schedules.bounds`** capability before relying on
+a bound: an engine without it accepts `maxRuns` and silently ignores it.
+
+### A schedule that ends itself
+
+A running scheduled agent can retire its own schedule with
+**`schedule_cancel_self`** — the natural end for a watcher whose condition has
+finally been met. It takes **no schedule id**: it always acts on the schedule
+that started it and cannot reach another one. By default the current run
+finishes normally and only future runs are cancelled; `stopRunning: true` also
+ends the current run. Repeated calls are harmless.
+
+Only the scheduled run itself may do this. A nested subagent inside a scheduled
+job is refused and returns its conclusion to the run that started it, and
+`schedule_create` / `schedule_delete` stay main-agent only — which is also what
+stops a bounded run from recreating itself to escape its own budget.
+
 ### Timezones and DST
 
 Offset-less `at` values and `cron` rules are interpreted in the **machine-local
@@ -927,11 +992,19 @@ to the **earlier** UTC instant for both kinds (it is not run twice).
 ### When schedules run
 
 Schedules execute **only while an interactive Coda session or `coda serve` is
-open** — there is **no background daemon and no OS scheduler**. Definitions are
-persisted in `<project>/.coda/scheduled_tasks.json` and **resume on the next
-startup**. On startup an **overdue** schedule runs **once immediately** (not once
-per missed tick — missed ticks are **coalesced**), then advances to its next future
-boundary.
+open** — there is **no background daemon and no OS scheduler**.
+
+> **The Rust engine keeps schedules in memory only.** Definitions, run counters
+> and retirements live for the lifetime of the process and are **lost at
+> restart**: nothing is written to disk and nothing resumes. The legacy C#
+> engine persists them in `<project>/.coda/scheduled_tasks.json` and resumes on
+> the next startup; where the two differ, the paragraphs below describe the C#
+> behaviour.
+
+On startup (C# engine) an **overdue** schedule runs **once immediately** (not
+once per missed tick — missed ticks are **coalesced**), then advances to its
+next future boundary. A clock jump produces one catch-up run, not a storm, in
+both engines.
 
 > **One session per project.** The schedule runtime is **in-process**: each open
 > Coda session runs its own independent scheduler with no cross-process lease or
@@ -950,29 +1023,42 @@ state. **Different** definitions may run **concurrently**.
 Each firing is a `TaskKind.Scheduled` background agent in the unified task runtime,
 so it is visible in the interactive **`/tasks`** browser and to the `task_*` tools
 (`task_list`, `task_get`, `task_peek`, `task_send`, `task_stop`) and its
-secret-redacted log. The interactive TUI also shows concise **notices** as a run
-starts, completes, fails, or is stopped; `coda serve` forwards the same transitions
-as `event/scheduleLifecycle` JSON-RPC notifications (see
-[`docs/serve-protocol.md`](docs/serve-protocol.md)).
+secret-redacted log. `schedule_list` and the **`/schedule`** browser report each
+definition's live state, run budget and deadline.
+
+In the C# engine the interactive TUI also shows concise **notices** as a run starts,
+completes, fails or is stopped, and `coda serve` forwards the same transitions as
+`event/scheduleLifecycle` JSON-RPC notifications (see
+[`docs/serve-protocol.md`](docs/serve-protocol.md)). **The Rust engine does not
+forward these notifications yet** — its schedule runtime is wired to a null
+lifecycle sink — so poll `schedule_list` / `session/scheduleList` instead.
 
 `schedule_delete` prevents any **future** and **pending** run of a definition, but
 does **not** stop a firing that is already executing (stop that with `task_stop`).
+It is still a delete, not a soft cancel: the definition is forgotten entirely and
+does not appear in `schedule_list` afterwards. A schedule that retires itself —
+by reaching `maxRuns`, passing `expiresAt`, or calling `schedule_cancel_self` —
+stays listed with its retirement reason instead.
 
 Every scheduled run uses the session's **live** permission mode, current model, and
 MCP / LSP / tool configuration at the moment it fires — a mid-session change is
 observed by the next run. Scheduled agents run isolated at depth 1: they **cannot**
-create, list, or delete schedules (`schedule_*` is unavailable to them) and can only
-inspect and steer their **own** descendant tasks.
+create or delete schedules (`schedule_create` / `schedule_delete` are unavailable
+to them), see only their **own** definition in `schedule_list`, and can only
+inspect and steer their **own** descendant tasks. The one schedule action they
+do have is the targetless `schedule_cancel_self` described above.
 
 ### Failure and crash semantics
 
 A run that throws is recorded as **Failed**, a cancelled/stopped run as **Stopped**,
 and the outcome (with a short summary) is surfaced in `schedule_list` and the
 lifecycle notice/event; recurring definitions keep their next boundary and run
-again. One-shot `at` schedules are **at-least-once**: if the process crashes mid-run
-the record survives and reruns on the next startup, and it is **removed only after**
-it reaches a terminal state. Failures are also written to the telemetry log when
-logging is enabled.
+again — a failed run consumes one unit of a `maxRuns` budget but does not retire
+the definition by itself. One-shot `at` schedules are **at-least-once** in the C#
+engine: if the process crashes mid-run the record survives and reruns on the next
+startup, and it is **removed only after** it reaches a terminal state. A one-shot
+whose launch is *refused outright* is retired with a **failed** reason rather than
+retried. Failures are also written to the telemetry log when logging is enabled.
 
 In `coda serve`, the stdio runtime starts immediately; an **API-key** peer's runtime does
 **not** start until a valid key
@@ -991,7 +1077,7 @@ project files if they exist (it never writes to them).
 | Project settings | `<project>/.coda/settings.json` | overrides user settings |
 | Credentials | `~/.coda/credentials/` | DPAPI-encrypted (Windows) / AES-GCM (other OS) |
 | Session transcripts | `<project>/.coda/sessions/<id>.json` | for `/resume` |
-| Scheduled tasks | `<project>/.coda/scheduled_tasks.json` | persisted definitions; resume on next startup |
+| Scheduled tasks | `<project>/.coda/scheduled_tasks.json` | C# engine only: persisted definitions, resume on next startup. The Rust engine keeps schedules **in memory only** and writes nothing here. |
 | Plugins | `~/.coda/`, `<project>/.coda/plugins/` | |
 | Skills | `~/.coda/skills/`, `<project>/.coda/skills/` (+ read-only `~/.claude/skills/`) | `SKILL.md` per skill |
 | MCP servers | `~/.coda/.mcp.json`, `<project>/.mcp.json` | stdio + HTTP; project overrides user |

@@ -433,6 +433,30 @@ impl TaskManager {
         TaskActionResult::Ok
     }
 
+    /// Narrow capability: a task cancelling **itself**.
+    ///
+    /// [`TaskManager::is_authorized_caller`] deliberately grants authority only
+    /// over *strict descendants*, so `request_stop(self, Some(self))` is denied
+    /// by design — a subagent must not be able to name its own id and have the
+    /// generic path treat that as ownership. This is the one exception, and it
+    /// is kept explicit and narrow rather than solved by handing a scheduled
+    /// run main-agent privileges: the caller passes a single id, that id is the
+    /// only thing it can affect, and nothing about an ancestor, a sibling, or
+    /// any other task is reachable through it.
+    ///
+    /// Callers must have already proved that `id` is the caller's own task.
+    pub fn request_self_stop(&self, id: &str) -> TaskActionResult {
+        let task = match self.find_task(id) {
+            Some(t) => t,
+            None => return TaskActionResult::NotFound,
+        };
+        if task.status() != TaskRunStatus::Running {
+            return TaskActionResult::InvalidState;
+        }
+        task.cancel_task();
+        TaskActionResult::Ok
+    }
+
     // ── Subscriptions ─────────────────────────────────────────────────────────
 
     /// Create a subscription seeded with the current task list.

@@ -11,6 +11,10 @@ description = "Headless bootstrap shared by `coda serve` and the standalone `cod
 coda-client = { workspace = true }
 coda-diagnostics = { workspace = true }
 coda-auth = { workspace = true }
+# The goal-budget vocabulary ("none" == no limit) shared with the engine. This
+# crate already speaks the wire protocol through `coda-client`; depending on it
+# directly keeps the CLI parser and the engine's validator from drifting apart.
+coda-proto = { workspace = true }
 # The uncached model-listing probe that turns "a credential was stored" into
 # "the connection works". No agent runtime, no renderer: `coda-auth` already
 # depends on this crate, so it adds nothing new to the engine's graph.

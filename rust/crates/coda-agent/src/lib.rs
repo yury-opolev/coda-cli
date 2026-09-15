@@ -13,8 +13,11 @@
 //!   (`ModePermissionPrompt`, `RulesPermissionPrompt`,
 //!   `LiveBypassClassifierPermissionPrompt`, `ClassifierPermissionPrompt`),
 //!   plus the `ToolActionClassifier` trait and its LLM-backed implementation.
-//! - **`goal`**: `GoalSupervisor`, `GoalBudget`, `GoalVerdict`, `GoalStatus`,
-//!   `GoalOutcome`, `GoalJudgePrompt`, `GoalRetryPolicy`, `ForkedAgent`.
+//! - **`autonomy`**: `AutonomySupervisor`, `GoalBudget`, `GoalVerdict`, `GoalStatus`,
+//!   `GoalOutcome`, `CompletionJudgePrompt`, `GoalRetryPolicy`, `ForkedAgent`,
+//!   `AssumptionLedger`, `LedgerEntry`, `BlockerKind`, `Confidence`,
+//!   `StuckDetector`, `StuckObservation`, `StuckPattern`, `PermissionResolver`,
+//!   `RecoveryGuard`, `RecoveryExecutor`, `RecoveryKind`.
 //! - **`steering`**: `SteeringInbox`, `SteeringEntry`.
 //! - **`events`**: `AgentEvent`, `AgentSink`, `ProtoAdapter`, `NullSink`,
 //!   `CollectingSink`, `ToolCallStatus`.
@@ -38,11 +41,12 @@
 //! - **`output_styles`**: `OutputStyle`, `BuiltInOutputStyles`.
 
 pub mod agent;
+pub mod autonomy;
 pub mod compaction;
 pub mod events;
-pub mod goal;
 pub mod hooks;
 pub mod lsp;
+pub mod message;
 pub mod output_styles;
 pub mod permission;
 pub mod scheduling;
@@ -58,13 +62,19 @@ pub mod tools;
 pub use agent::{AgentError, AgentLoop, AgentLoopBuilder};
 pub use compaction::{CompactionPolicy, CompactionService, TokenEstimator, compaction_tail_start};
 pub use events::{AgentEvent, AgentSink, CollectingSink, NullSink, ToolCallStatus};
-pub use goal::{
-    ForkedAgent, GoalBudget, GoalJudgePrompt, GoalOutcome, GoalRetryPolicy, GoalStatus,
-    GoalSupervisor, GoalVerdict,
+pub use autonomy::{
+    AssumptionLedger, AutonomySupervisor, BlockerKind, CompletionJudgePrompt, Confidence,
+    ForkedAgent, GoalBudget, GoalOutcome, GoalRetryPolicy, GoalStatus, GoalVerdict, LedgerEntry,
+    LedgerError, LedgerSnapshot, PermissionResolver, ProxyAnswer, ProxyAnswerer, RecoveryExecutor,
+    RecoveryGuard, RecoveryKind, StuckDetector, StuckObservation, StuckPattern, WorkItemRef,
 };
 pub use hooks::{
     HookContentHash, HookEventPolicy, HookMatcher, HookRunEntry, HookRunLog, HookRunner,
     HookScope, HookTrustGuard, HookTrustStore, InMemoryHookTrustStore, UserHook,
+};
+pub use message::{
+    AskMainError, AskReceipt, AskStatus, MainMessage, MessageBus, MessageBusObserver,
+    MessageSource, PublishError, PublishReceipt, SinceResult, UserMessage,
 };
 pub use output_styles::{BuiltInOutputStyles, DynOutputStyle, OutputStyle};
 pub use permission::{
@@ -72,9 +82,9 @@ pub use permission::{
     PermissionRuleStore,
 };
 pub use scheduling::{
-    NullScheduleLifecycleSink, ScheduleLifecycleEvent, ScheduleLifecycleSink,
+    NullScheduleLifecycleSink, ScheduleClock, ScheduleLifecycleEvent, ScheduleLifecycleSink,
     ScheduleRuntimeSnapshot, ScheduleRuntimeState, ScheduleRuntimeStatus, ScheduleRuntimeView,
-    ScheduleRuntime, ScheduledAgentRunner, TaskManagerRunner,
+    ScheduleRuntime, ScheduledAgentRunner, ScheduledRun, SystemClock, TaskManagerRunner,
 };
 pub use session::{
     AuditToolCall, AuditTurn, BundleTurn, ImportError, SessionAuditStore, SessionBundle,
@@ -85,7 +95,8 @@ pub use steering::{SteeringEntry, SteeringInbox};
 pub use subagents::{BuiltInAgents, SubagentDefinition, SubagentFactory, SubagentRequest, SubagentRegistry, PluginAgentLoader};
 pub use todos::{TodoItem, TodoStatus, TodoStore};
 pub use tool::{
-    AnswerOutcome, NoAnswerReason, PlanApprover, Tool, ToolContext, ToolControl, ToolDescriptor,
-    ToolNameFilter, ToolOutcome, ToolQuarantine, ToolRegistry, ToolResult, UserQuestion,
+    AnswerOutcome, NoAnswerReason, PlanApprover, ScheduleOrigin, Tool, ToolContext, ToolControl,
+    ToolDescriptor, ToolNameFilter, ToolOutcome, ToolQuarantine, ToolRegistry, ToolResult,
+    UserQuestion,
 };
 pub use tools::{built_in_file_tools, built_in_tools};

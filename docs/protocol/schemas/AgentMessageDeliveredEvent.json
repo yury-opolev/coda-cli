@@ -1,0 +1,70 @@
+{
+  "type": "object",
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "engineInstanceId": {
+      "type": "string"
+    },
+    "turnId": {
+      "type": "string"
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AgentMessageDeliveredItemDto"
+      }
+    }
+  },
+  "required": [
+    "seq",
+    "engineInstanceId",
+    "turnId",
+    "items"
+  ],
+  "description": "Payload of `event/agentMessageDelivered` (Stage 3 chunk B): the single\ntrusted main `AgentLoop` consumer (see `crate::agent::AgentLoop` step 4c\nin `coda-agent`) drained one or more `ask_main` requests and their\n`MainMessage::injected_text()` was projected into `turnId`'s running live\nhistory in the SAME transaction as this announcement. Reflected by\nhistory — unlike [`AgentMessageDto`]'s passive, display-only Stage 2\nnotification — so a client must treat this as history-affecting (re-read\nvia `session/getHistory`), never as content carried on the wire here.",
+  "title": "AgentMessageDeliveredEvent",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "AgentMessageDeliveredItemDto": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "seq": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "label": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string",
+          "description": "One of `\"scheduledTask\"` | `\"subagent\"` | `\"main\"` — see\n[`AgentMessageDto::source`]. `\"main\"` is unreachable here: `ask_main`\nrefuses a main-context caller outright (self-question loop), so\nnothing ever queues an item attributed to `main`."
+        },
+        "taskId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "scheduleDefinitionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "seq",
+        "label",
+        "source"
+      ],
+      "description": "One delivered `ask_main` item's metadata, carried in\n`event/agentMessageDelivered` (Stage 3 chunk B).\n\nDeliberately metadata only — never the injected body text itself. The\nauthoritative content already lives in the running turn's own live\nhistory (`session/getHistory`/`session/getState`), projected in the same\ntransaction as this announcement\n(`coda_serve`'s `EngineState::main_messages_delivered`); repeating it here\nwould be a second, potentially divergent, projection of the same fact."
+    }
+  }
+}

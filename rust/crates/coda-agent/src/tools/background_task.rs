@@ -16,16 +16,29 @@ use crate::events::NullSink;
 
 // ── helper: derive caller depth from context ──────────────────────────────────
 
-fn caller_depth(ctx: &ToolContext) -> u32 {
+/// Resolve the calling agent's nesting depth.
+///
+/// `Ok(0)` means "the main agent" and is reserved for a context that carries no
+/// task identity at all. A caller id that cannot be resolved against the task
+/// manager returns `Err`: it must never be collapsed into the main agent's
+/// depth, because `TaskManager` reads a `None` caller as having session-wide
+/// authority and an unverifiable id would then inherit it.
+fn caller_depth(ctx: &ToolContext) -> Result<u32, String> {
     let task_id = match ctx.caller_task_id.as_deref() {
         Some(id) => id,
-        None => return 0,
+        None => return Ok(0),
     };
-    let mgr = match ctx.get_task_manager() {
-        Some(m) => m,
-        None => return 0,
-    };
-    mgr.get(task_id).map(|s| s.depth).unwrap_or(0)
+    let mgr = ctx.get_task_manager().ok_or_else(|| {
+        "Background tasks are unavailable: this run carries a task identity but no task \
+         manager is wired, so its depth and authority cannot be verified."
+            .to_owned()
+    })?;
+    mgr.get(task_id).map(|s| s.depth).ok_or_else(|| {
+        format!(
+            "Background tasks are unavailable: the calling task '{task_id}' is not registered, \
+             so its depth and authority cannot be verified."
+        )
+    })
 }
 
 // ── BackgroundTaskStartTool ───────────────────────────────────────────────────
@@ -71,7 +84,10 @@ impl Tool for BackgroundTaskStartTool {
         }
 
         // Depth check: reject when the calling context is already at max depth.
-        let current_depth = caller_depth(ctx);
+        let current_depth = match caller_depth(ctx) {
+            Ok(d) => d,
+            Err(e) => return ToolResult::error(e),
+        };
         if current_depth >= MAX_SUBAGENT_DEPTH {
             return ToolResult::error(
                 "Cannot start a background subagent from here: the maximum subagent nesting depth has been reached.",
@@ -104,6 +120,9 @@ impl Tool for BackgroundTaskStartTool {
             model,
             foreground: false,
             caller_task_id: ctx.caller_task_id.clone(),
+            // Trusted context value: a background child of a scheduled run
+            // belongs to the same job; the model cannot set it.
+            schedule_origin: ctx.schedule_origin.clone(),
         };
 
         let sink = std::sync::Arc::new(NullSink);

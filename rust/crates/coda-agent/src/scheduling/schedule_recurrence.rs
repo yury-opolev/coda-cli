@@ -192,6 +192,10 @@ mod tests {
             created_at_utc: next_run,
             updated_at_utc: next_run,
             last_terminal_outcome: None,
+            expires_at_utc: None,
+            max_runs: None,
+            runs_started: 0,
+            retirement: None,
         }
     }
 
@@ -231,6 +235,10 @@ mod tests {
             created_at_utc: utc(2024, 1, 1, 0, 0),
             updated_at_utc: utc(2024, 1, 1, 0, 0),
             last_terminal_outcome: None,
+            expires_at_utc: None,
+            max_runs: None,
+            runs_started: 0,
+            retirement: None,
         };
         assert!(ScheduleRecurrence::advance_recurring_past(&def, utc(2024, 1, 1, 0, 0)).is_err());
     }
@@ -273,6 +281,10 @@ mod tests {
             created_at_utc: utc(2024, 1, 1, 0, 0),
             updated_at_utc: utc(2024, 1, 1, 0, 0),
             last_terminal_outcome: None,
+            expires_at_utc: None,
+            max_runs: None,
+            runs_started: 0,
+            retirement: None,
         };
         assert!(ScheduleRecurrence::advance_recurring_past(&def, utc(2024, 1, 1, 0, 0)).is_err());
     }
@@ -367,6 +379,10 @@ mod tests {
             created_at_utc: stored,
             updated_at_utc: stored,
             last_terminal_outcome: None,
+            expires_at_utc: None,
+            max_runs: None,
+            runs_started: 0,
+            retirement: None,
         };
         // `now` is irrelevant for At — the persisted instant is returned as-is.
         let result = ScheduleRecurrence::advance_recurring_past(&def, utc(2025, 1, 1, 0, 0)).unwrap();

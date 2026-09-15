@@ -918,6 +918,105 @@ protocol does not imply them, and getting them wrong is silently wrong:
   transcript. Selecting it and copying always copies the full id, even when
   the header clips its on-screen display.
 
+### Bounded schedules
+
+A schedule can stop itself. `schedule_create` (and `session/scheduleCreate`)
+accept two optional bounds on top of the usual `every` / `at` / `cron`
+selector:
+
+- **`maxRuns`** — a positive integer run budget.
+- **`expiresAt`** — an absolute ISO-8601 deadline — **or** `expiresIn`, a
+  relative one (`"30m"`, `"2h"`, `"7d"`) using the same unit spelling as
+  `every`. The two are mutually exclusive, and a relative value is resolved to
+  an absolute instant **once, at creation**, so it cannot drift.
+
+Both are optional and both default to absent. **A schedule with neither field
+is unlimited and behaves exactly as it did before** — it runs until deleted.
+
+The exact semantics, because the obvious reading of each is wrong in a way that
+matters:
+
+- **`maxRuns` counts accepted launch attempts, not successes.** An attempt is
+  charged as soon as the runner accepts it and a task exists for it, including
+  a run that later fails in the model, in a tool, or while waiting for a
+  concurrency slot. Only a launch refused outright — no task registered,
+  nothing executed — is uncounted. Counting successes instead would let an
+  unreliable environment retry a "run it seven times" job forever. The counter
+  is monotonic: advancing the recurrence boundary, reconciling, or a
+  cancellation landing mid-run never rolls it back.
+- **The deadline is exclusive.** An occurrence due exactly at `expiresAt` does
+  not run. A definition expires when the clock *reaches* the deadline, not when
+  its next boundary happens to fall beyond it, so an hourly monitor with a
+  Friday deadline is reported expired on Friday rather than at its last
+  Thursday tick — the runtime wakes at the deadline itself even when the next
+  occurrence is far away or a run is in flight.
+- **Expiry does not kill work already running.** By default the in-flight run
+  finishes; only *future* launches are stopped. While that last run is
+  executing the definition reports `retiring`, never `completed` — the work is
+  not done, and saying otherwise is a lie a reader acts on.
+- **Retirement and the last run's outcome are separate facts.** A definition
+  carries a retirement record (`completed` for a spent budget, `expired`,
+  `cancelled`, `failed`) *and*, independently, the outcome of its most recent
+  run. A budget can be spent by a run that failed.
+
+`schedule_list`, `session/scheduleList` and the `/schedules` browser report a
+derived state — `idle`, `running`, `pending`, `retiring`, `completed`,
+`expired`, `cancelled` or `failed` — together with `runsStarted`, the
+configured bounds and the retirement reason. The browser's `runs` and `until`
+columns stay blank for an unbounded schedule rather than rendering a
+placeholder that would imply a limit.
+
+**Everything here is in memory only.** The engine's schedule store is
+constructed with no persistence path, so definitions, run counters and
+retirements exist for the lifetime of the process and are **lost at restart**.
+There is no restart continuation and no new on-disk state. Live run status is
+kept in a separate ephemeral side table that is never serialized, so a store
+reloaded from anywhere can never claim to own runs it does not have.
+
+`session/scheduleDelete` is unchanged: it forgets a definition and stops future
+runs, and does not interrupt a run already executing.
+
+Clients must check the **`schedules.bounds`** capability in
+`InitializeResult.capabilities` before relying on a bound. An engine without it
+accepts `maxRuns` and ignores it, which would silently turn "seven runs" into an
+unbounded schedule.
+
+#### Calendar months and time zones
+
+`every` is an absolute interval and is stored in UTC; it is not re-interpreted
+in a calendar zone, so `24h` drifts by an hour across a DST transition. For
+wall-clock meaning use `cron` with an IANA `timeZone` — `0 9 * * *` in
+`America/New_York` stays at 09:00 local through the transition. There is no
+"every month" interval: express a calendar month with an explicit `expiresAt`
+deadline or a `cron` rule, not with a day count.
+
+#### Self-cancellation
+
+A scheduled run can retire its own schedule with **`schedule_cancel_self`**,
+which is how a watcher ends itself when the thing it was watching for finally
+happens. The tool takes **no schedule id and no task id**: there is nothing in
+its arguments that could point it at another definition, at its parent, or at a
+sibling. The identity it acts on comes from the trusted `ScheduleOrigin` the
+runtime stamped on the run plus the caller's own registered task.
+
+Only the **root** agent of a scheduled run may call it — the task the schedule
+runtime registered (`TaskKind::Scheduled`, no parent). A nested subagent inside
+a scheduled job inherits the origin so it can see its own definition, but it is
+not the run; it returns its conclusion to the run that spawned it instead.
+Every refusal uses identical wording so a caller cannot use the error to probe
+whether some other definition exists.
+
+By default self-cancellation stops only future runs and leaves the current one
+to finish its turn. `stopRunning: true` also ends the current run, via a narrow
+self-stop capability on `TaskManager` rather than by granting the run
+main-agent privileges — `request_stop` deliberately excludes self, and that
+stays true. Repeated calls are idempotent, and the first recorded reason
+stands.
+
+`schedule_create` and `schedule_delete` remain main-agent only. That is what
+stops a bounded run from cloning itself into an unbounded watch to escape its
+own budget.
+
 ### Security invariants
 
 These are load-bearing. Each is pinned by a test, and each was chosen because
@@ -958,6 +1057,13 @@ the obvious alternative is exploitable:
   subagent only over its strict descendants, neither over itself. Denied and
   not-found return identical wording so a caller cannot probe for the existence
   of tasks it may not touch.
+- **A scheduled run's self-cancel carries no target.** `schedule_cancel_self`
+  accepts no schedule id and no task id, so there is no argument a model can
+  forge to redirect it. Its identity comes from the trusted `ScheduleOrigin`
+  and the caller's own registered task, and only the scheduled *root* run
+  qualifies. Its `stopRunning` option uses a narrow `request_self_stop`
+  capability rather than widening `request_stop`, which still denies a task
+  that names itself.
 - **A plugin may not point outside its own directory.** A plugin-declared LSP
   server path is rejected if absolute or if it resolves outside the plugin
   root, since it names an executable to launch. A *project-scoped* plugin may

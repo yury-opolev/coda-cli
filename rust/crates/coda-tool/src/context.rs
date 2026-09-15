@@ -122,6 +122,19 @@ pub enum AnswerOutcome {
     Answered(String),
     /// No answer exists. There is nothing to tell the model.
     NoAnswer(NoAnswerReason),
+    /// The question was deliberately set aside, and the run should carry on.
+    ///
+    /// Distinct from both other variants, and the distinction matters. It is
+    /// not an answer, so it must never reach the model as one. It is also not a
+    /// fault: an autonomous run that could not settle a question records it as
+    /// a blocker and moves to a different branch, which is a considered outcome
+    /// rather than a failure. Collapsing it into `NoAnswer` would abort the run
+    /// — exactly the unattended stall autonomy exists to prevent — and
+    /// collapsing it into `Answered` would fabricate consent.
+    Parked {
+        /// Operator-facing explanation, safe to show the model.
+        reason: String,
+    },
 }
 
 impl AnswerOutcome {
@@ -132,14 +145,22 @@ impl AnswerOutcome {
     pub fn answered(&self) -> Option<&str> {
         match self {
             AnswerOutcome::Answered(a) => Some(a.as_str()),
-            AnswerOutcome::NoAnswer(_) => None,
+            AnswerOutcome::NoAnswer(_) | AnswerOutcome::Parked { .. } => None,
         }
     }
 
     pub fn no_answer_reason(&self) -> Option<NoAnswerReason> {
         match self {
             AnswerOutcome::NoAnswer(r) => Some(*r),
-            AnswerOutcome::Answered(_) => None,
+            AnswerOutcome::Answered(_) | AnswerOutcome::Parked { .. } => None,
+        }
+    }
+
+    /// The park explanation, when the question was set aside.
+    pub fn parked_reason(&self) -> Option<&str> {
+        match self {
+            AnswerOutcome::Parked { reason } => Some(reason.as_str()),
+            AnswerOutcome::Answered(_) | AnswerOutcome::NoAnswer(_) => None,
         }
     }
 }
@@ -177,6 +198,31 @@ pub struct ToolDescriptor {
     pub input_schema_json: String,
     pub is_deferred: bool,
     pub search_hint: Option<String>,
+}
+
+// ── ScheduleOrigin ────────────────────────────────────────────────────────────
+
+/// Provenance stamp identifying the scheduled definition a run originated from.
+///
+/// # Trust
+/// This value is **only** constructed by trusted Rust callers — the schedule
+/// runtime's runner and the subagent host that propagates it to nested
+/// children. It is never parsed from tool arguments, model output, or a wire
+/// request, so a model cannot claim to be running on behalf of another job.
+/// Tools may read it (a later stage uses it for self-cancellation) but a tool
+/// can only ever observe the origin of the run it is already executing in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleOrigin {
+    /// Id of the `ScheduledTask` definition that triggered this run.
+    pub definition_id: String,
+    /// Human-readable definition name, when the definition has one.
+    pub definition_name: Option<String>,
+}
+
+impl ScheduleOrigin {
+    pub fn new(definition_id: impl Into<String>, definition_name: Option<String>) -> Self {
+        Self { definition_id: definition_id.into(), definition_name }
+    }
 }
 
 // ── OpaqueServiceHandle ───────────────────────────────────────────────────────
@@ -253,6 +299,15 @@ pub struct ToolContext {
     pub plan_approver: Option<Arc<dyn PlanApprover>>,
     pub all_tools: Option<Vec<ToolDescriptor>>,
     pub caller_task_id: Option<String>,
+    /// Set only when this run was launched by the schedule runtime (directly or
+    /// as a nested child of such a run).  Trusted: see [`ScheduleOrigin`].
+    pub schedule_origin: Option<ScheduleOrigin>,
+    /// Set only by the trusted top-level (main) agent construction path —
+    /// never by a subagent/task/scheduled-run builder. Lets tools such as
+    /// `notify_user` distinguish "the real main conversation" from an
+    /// ordinary unauthenticated/test context with no caller task id, without
+    /// promoting the latter to main authority (fail-closed).
+    pub is_main_context: bool,
 
     // ── Service handles: engine-specific, opaque to coda-tool ─────────────────
     // coda-agent provides typed accessors via ToolContextServiceExt.
@@ -260,6 +315,8 @@ pub struct ToolContext {
     pub task_manager: Option<OpaqueServiceHandle>,
     pub schedule_store: Option<OpaqueServiceHandle>,
     pub subagent_factory: Option<OpaqueServiceHandle>,
+    /// Engine-owned user-notification bus (Stage 2, `notify_user`).
+    pub message_bus: Option<OpaqueServiceHandle>,
 }
 
 impl std::fmt::Debug for ToolContext {
@@ -273,10 +330,13 @@ impl std::fmt::Debug for ToolContext {
             .field("plan_approver", &self.plan_approver.is_some())
             .field("all_tools", &self.all_tools.as_ref().map(|v| v.len()))
             .field("caller_task_id", &self.caller_task_id)
+            .field("schedule_origin", &self.schedule_origin)
+            .field("is_main_context", &self.is_main_context)
             .field("lsp_manager", &self.lsp_manager.is_some())
             .field("task_manager", &self.task_manager.is_some())
             .field("schedule_store", &self.schedule_store.is_some())
             .field("subagent_factory", &self.subagent_factory.is_some())
+            .field("message_bus", &self.message_bus.is_some())
             .finish()
     }
 }
@@ -292,10 +352,13 @@ impl ToolContext {
             plan_approver: None,
             all_tools: None,
             caller_task_id: None,
+            schedule_origin: None,
+            is_main_context: false,
             lsp_manager: None,
             task_manager: None,
             schedule_store: None,
             subagent_factory: None,
+            message_bus: None,
         }
     }
 
@@ -327,6 +390,21 @@ impl ToolContext {
 
     pub fn with_caller_task_id(mut self, task_id: impl Into<String>) -> Self {
         self.caller_task_id = Some(task_id.into());
+        self
+    }
+
+    /// Stamp the run's scheduled provenance.  Trusted callers only — never
+    /// build this from tool arguments or model output.
+    pub fn with_schedule_origin(mut self, origin: ScheduleOrigin) -> Self {
+        self.schedule_origin = Some(origin);
+        self
+    }
+
+    /// Mark this context as the trusted top-level (main) conversation.
+    /// Trusted callers only (the top-level agent-loop construction path) —
+    /// never set by a subagent host or scheduled-run builder.
+    pub fn with_main_context(mut self) -> Self {
+        self.is_main_context = true;
         self
     }
 }

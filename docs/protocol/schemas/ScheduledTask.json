@@ -40,7 +40,7 @@
     },
     "state": {
       "type": "string",
-      "description": "`\"idle\"`, `\"running\"` or `\"pending\"`.",
+      "description": "`\"idle\"`, `\"running\"`, `\"pending\"`, `\"retiring\"`, `\"completed\"`,\n`\"expired\"`, `\"cancelled\"` or `\"failed\"`.\n\n`\"retiring\"` means a run is still in flight for a schedule that will\nnot start another one: the work is not finished. Engines without the\n`schedules.bounds` capability only ever send the first three.",
       "default": ""
     },
     "activeTaskId": {
@@ -51,6 +51,46 @@
       "default": null
     },
     "lastOutcome": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "maxRuns": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 1,
+      "description": "Configured run budget; absent means unlimited.",
+      "default": null
+    },
+    "expiresAtUtc": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Configured deadline; absent means the schedule never expires.",
+      "default": null
+    },
+    "runsStarted": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0,
+      "description": "Accepted launch attempts so far, including runs that later failed.\nAbsent on an engine without the `schedules.bounds` capability, which\nreads as `0` rather than as a claim that nothing ever ran.",
+      "default": 0
+    },
+    "retiredReason": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Why the schedule will never run again: `\"completed\"` (run budget\nspent), `\"expired\"`, `\"cancelled\"` or `\"failed\"`.",
+      "default": null
+    },
+    "retiredAtUtc": {
       "type": [
         "string",
         "null"

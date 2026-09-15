@@ -1,0 +1,60 @@
+{
+  "type": "object",
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "engineInstanceId": {
+      "type": "string"
+    },
+    "id": {
+      "type": "string"
+    },
+    "cursor": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "label": {
+      "type": "string"
+    },
+    "text": {
+      "type": "string"
+    },
+    "context": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source": {
+      "type": "string"
+    },
+    "taskId": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The trusted task id this notification is scoped to (`None` for\n`source == \"main\"`, which is not a task at all)."
+    },
+    "scheduleDefinitionId": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The scheduled definition id this notification originated from, set\nexactly when `source == \"scheduledTask\"`."
+    }
+  },
+  "required": [
+    "seq",
+    "engineInstanceId",
+    "id",
+    "cursor",
+    "label",
+    "text",
+    "source"
+  ],
+  "description": "One engine-owned user notification (Stage 2 `notify_user`), as returned by\n`session/pendingMessages` and carried in `event/agentMessage`.\n\n`cursor` is the message bus's own cursor — NOT the `EventBus` seq that\nwraps the live notification. `source` is one of `\"scheduledTask\"` |\n`\"subagent\"` | `\"main\"`. `taskId`/`scheduleDefinitionId` are the *trusted*\nprovenance an external client can correlate against `TaskManager`/schedule\nstate — `label` is a display string only and is not guaranteed unique.\nReceiving this only means the bus accepted the notification; it never\nmeans the user has seen it.",
+  "title": "AgentMessageEvent",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}
