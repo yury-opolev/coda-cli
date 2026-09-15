@@ -70,11 +70,18 @@ pub(crate) async fn decide_stop(
             // what was tried, and what they would need to supply — so it is
             // emitted rather than discarded, and the run ends without ever
             // asking anyone anything.
+            //
+            // Emitted once. Below this arm the ladder still runs the main-inbox
+            // and steering-seal checks, either of which can force one more
+            // iteration when a message raced in; without the guard the next
+            // natural stop would re-prove the same state and report it twice.
             GoalVerdict::StopProved { outcome, report } => {
-                sink.emit(AgentEvent::LimitReached {
-                    kind: format!("goal.{}", outcome.as_str()),
-                    message: report,
-                });
+                if goal.take_report_once() {
+                    sink.emit(AgentEvent::LimitReached {
+                        kind: format!("goal.{}", outcome.as_str()),
+                        message: report,
+                    });
+                }
             }
 
             GoalVerdict::Escalate { question, .. } => {

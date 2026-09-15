@@ -112,6 +112,8 @@ pub struct AutonomySupervisor {
     completed_work_items: usize,
     /// Successful file mutations, as a monotonically comparable count.
     files_changed: u64,
+    /// Whether the end-of-run report has already been shown.
+    report_emitted: bool,
 }
 
 impl AutonomySupervisor {
@@ -137,6 +139,7 @@ impl AutonomySupervisor {
             open_work_items: Vec::new(),
             completed_work_items: 0,
             files_changed: 0,
+            report_emitted: false,
         }
     }
 
@@ -170,15 +173,19 @@ impl AutonomySupervisor {
     /// Decide what happens at a natural stop.
     ///
     /// The ladder, in order:
-    /// 1. The completion judge says the goal is met — stop, met.
-    /// 2. The termination proof establishes that nothing further is possible —
+    /// 1. The budget is exhausted — escalate once, then stop unmet.
+    /// 2. The completion judge says the goal is met — stop, met.
+    /// 3. The termination proof establishes that nothing further is possible —
     ///    stop with the proved outcome and a report.
-    /// 3. The budget is exhausted — escalate once, then stop unmet.
     /// 4. Otherwise keep working.
     ///
-    /// The proof sits *above* the budget deliberately. A run that is genuinely
-    /// blocked should say so while it still has budget left, rather than
-    /// burning hours to reach the same conclusion by timing out.
+    /// The budget is checked first because an exhausted budget means the run
+    /// has no licence to make another judge call, which every rung below needs.
+    /// The practical cost is that at the exact instant a *finite* budget runs
+    /// out, a blocked run reports `Unmet` rather than the more useful
+    /// `GenuinelyBlocked`. Both terminate; only the label differs, and only at
+    /// that boundary. With the default 240h budget, or `none`, the proof
+    /// always gets its chance first.
     ///
     /// When the result is `GoalVerdict::Escalate`, the caller MUST call
     /// `try_grant_extension` (then continue) or `mark_stopped_unmet` (then
@@ -308,6 +315,21 @@ impl AutonomySupervisor {
                 None => GoalVerdict::Continue { nudge },
             },
         }
+    }
+
+    /// Claim the right to emit the end-of-run report, once.
+    ///
+    /// Returns `true` the first time and `false` afterwards. The stop ladder
+    /// runs the main-inbox and steering-seal checks after a proved stop, and
+    /// either can force one more iteration when a message raced in; the next
+    /// natural stop would then re-prove the same state and the operator would
+    /// read the same report twice.
+    pub fn take_report_once(&mut self) -> bool {
+        if self.report_emitted {
+            return false;
+        }
+        self.report_emitted = true;
+        true
     }
 
     /// Enforcement that must run on **every** iteration, not only at a natural
@@ -664,6 +686,21 @@ mod tests {
             Some(GoalRetryPolicy::for_tests()),
         );
         assert_eq!(sup.goal(), "ship the feature");
+    }
+
+    /// A raced message can force one more iteration after a proved stop; the
+    /// operator must not read the same report twice because of it.
+    #[test]
+    fn the_end_of_run_report_is_claimed_only_once() {
+        let mut sup = AutonomySupervisor::new(
+            Box::new(AlwaysFailsJudge),
+            "goal",
+            budget_cont(10),
+            Some(GoalRetryPolicy::for_tests()),
+        );
+        assert!(sup.take_report_once(), "the first claim succeeds");
+        assert!(!sup.take_report_once(), "the second must not");
+        assert!(!sup.take_report_once());
     }
 
     // ── The termination proof, through the supervisor ────────────────────────

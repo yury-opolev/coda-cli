@@ -289,6 +289,12 @@ PermissionPrompt.request(tool, input)
 4. budget exhausted -----------------------------> Stop{ Unmet }
 ```
 
+The proof sits between the judge and the budget. At the exact instant a finite
+budget runs out, a blocked run reports `Unmet` rather than the more useful
+`GenuinelyBlocked` — both terminate, only the label differs, and only at that
+boundary. With the default 240h budget, or `none`, the proof always gets its
+chance first.
+
 A parked blocker must never disable termination for the rest of the run. An
 earlier form of this ladder returned "keep going" whenever *something* was
 parked but *something else* was not, on the grounds that a run with real
