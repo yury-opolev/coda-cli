@@ -681,6 +681,32 @@ impl AgentLoop {
 
                 history.push(Message::new(Role::User, result_blocks));
 
+                // The autonomy gate, on the path that actually loops.
+                //
+                // Everything below `decide_stop` runs only when a turn calls no
+                // tools. An agent that calls a tool every turn never gets there,
+                // and `max_iterations` is disabled for goal runs, so without
+                // this check such a run is bounded by nothing at all — not the
+                // budget, not the stuck detector, not the corrective nudge.
+                if let Some(supervisor) = goal.as_mut() {
+                    match supervisor.check_mid_turn() {
+                        crate::autonomy::MidTurn::Continue => {}
+                        crate::autonomy::MidTurn::Nudge(correction) => {
+                            history.push(Message::user(correction));
+                        }
+                        crate::autonomy::MidTurn::Stop { outcome, report } => {
+                            sink.emit(AgentEvent::Stop {
+                                stop_reason: Some(outcome.as_str().to_owned()),
+                            });
+                            sink.emit(AgentEvent::LimitReached {
+                                kind: format!("goal.{}", outcome.as_str()),
+                                message: report,
+                            });
+                            return Ok(goal_status(&goal));
+                        }
+                    }
+                }
+
                 // §8 item 28: persist after tool results (seam; no-op here).
 
                 // A typed terminal control signal from a tool. The batch's
@@ -2521,6 +2547,135 @@ mod tests {
     ///
     /// Mutation-verified: comment out step 3 compaction block and this test
     /// fails (history length doesn't decrease).
+    // ── The autonomy gate on the tool-calling path ──────────────────────────
+
+    /// REGRESSION (hang): every autonomy check used to live behind the stop
+    /// ladder, which is only reached when a turn calls NO tools. An agent that
+    /// called a tool every turn — `cargo test` failing, then failing again,
+    /// forever — reached none of them, and `max_iterations` is deliberately
+    /// disabled for goal runs, so nothing bounded it at all.
+    ///
+    /// Drives the real `AgentLoop` with a model that only ever emits tool
+    /// calls. Before the mid-turn gate this test did not terminate.
+    #[tokio::test]
+    async fn a_goal_run_that_only_calls_tools_still_terminates() {
+        use crate::autonomy::{AutonomySupervisor, ForkedAgent, GoalBudget, GoalRetryPolicy};
+
+        struct NeverDone;
+        #[async_trait]
+        impl ForkedAgent for NeverDone {
+            async fn run(
+                &self,
+                _: &str,
+                _: Vec<Message>,
+                _: CancellationToken,
+            ) -> anyhow::Result<String> {
+                Ok("CONTINUE: not yet".to_owned())
+            }
+        }
+
+        // The model asks for the identical failing call, over and over.
+        let responses: Vec<_> = (0..60)
+            .map(|_| vec![Ok(tool_use_event("t1", "tool_a")), Ok(done())])
+            .collect();
+        let client = MockLlmClient::new(responses);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let tools = Arc::new(ToolRegistry::new([dyn_tool(MockTool::new(
+            "tool_a", false, log,
+        ))]));
+        let sink = CollectingSink::new();
+
+        let goal = AutonomySupervisor::new(
+            Box::new(NeverDone),
+            "make the tests pass",
+            // No ceiling on either dimension: the stuck detector is the only
+            // thing that can stop this, which is exactly the claim under test.
+            GoalBudget::new(None, None, 0.5, || Duration::ZERO),
+            Some(GoalRetryPolicy::for_tests()),
+        );
+
+        let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
+            .with_tool_max_duration(None)
+            .build();
+
+        let mut history = vec![Message::user("go")];
+        let status = tokio::time::timeout(
+            Duration::from_secs(20),
+            agent.run(&mut history, &sink, Some(goal), CancellationToken::new()),
+        )
+        .await
+        .expect("a goal run that only calls tools must terminate, not hang")
+        .expect("the run itself must not error");
+
+        assert_eq!(
+            status.outcome,
+            crate::autonomy::GoalOutcome::Stalled,
+            "a run looping on one tool call is stalled"
+        );
+        assert!(
+            sink.take().iter().any(|e| matches!(
+                e,
+                AgentEvent::LimitReached { kind, .. } if kind == "goal.stalled"
+            )),
+            "the operator must be told why it stopped"
+        );
+    }
+
+    /// The mirror: a goal run making genuine progress through tool calls must
+    /// not be killed by the gate.
+    #[tokio::test]
+    async fn a_goal_run_making_progress_through_tools_is_not_stopped_early() {
+        use crate::autonomy::{AutonomySupervisor, ForkedAgent, GoalBudget, GoalRetryPolicy};
+
+        struct DoneAfterWork;
+        #[async_trait]
+        impl ForkedAgent for DoneAfterWork {
+            async fn run(
+                &self,
+                _: &str,
+                _: Vec<Message>,
+                _: CancellationToken,
+            ) -> anyhow::Result<String> {
+                Ok("DONE".to_owned())
+            }
+        }
+
+        // Three DISTINCT calls, then a text turn.
+        let mut responses: Vec<_> = (0..3)
+            .map(|i| vec![Ok(tool_use_event(&format!("t{i}"), "tool_a")), Ok(done())])
+            .collect();
+        responses.push(vec![Ok(StreamEvent::TextDelta("finished".into())), Ok(done())]);
+
+        let client = MockLlmClient::new(responses);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let tools = Arc::new(ToolRegistry::new([dyn_tool(MockTool::new(
+            "tool_a", true, log,
+        ))]));
+
+        let goal = AutonomySupervisor::new(
+            Box::new(DoneAfterWork),
+            "do the work",
+            GoalBudget::new(None, None, 0.5, || Duration::ZERO),
+            Some(GoalRetryPolicy::for_tests()),
+        );
+
+        let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
+            .with_tool_max_duration(None)
+            .build();
+
+        let mut history = vec![Message::user("go")];
+        let status = agent
+            .run(&mut history, &NullSink, Some(goal), CancellationToken::new())
+            .await
+            .expect("the run must succeed");
+
+        assert_eq!(
+            status.outcome,
+            crate::autonomy::GoalOutcome::Met,
+            "real work must be allowed to finish"
+        );
+    }
+
     #[tokio::test]
     async fn compaction_fires_proactively_when_over_threshold_in_goal_run() {
         use crate::compaction::CompactionService;

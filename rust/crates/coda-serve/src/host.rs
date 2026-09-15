@@ -18,7 +18,8 @@ use coda_agent::{
 use coda_agent::agent::stop::UserQuestionPrompt;
 use coda_agent::events::{AgentEvent, AgentSink};
 use coda_agent::autonomy::{
-    ForkedAgent, PermissionResolver, ProxyAnswerer, RecoveryExecutor, RecoveryGuard,
+    AutonomousPlanApprover, ForkedAgent, PermissionResolver, ProxyAnswerer, RecoveryExecutor,
+    RecoveryGuard,
 };
 use crate::recovery_executor::GitRecoveryExecutor;
 use coda_agent::hooks::runner::{HookExecutor, ShellHookExecutor};
@@ -4613,8 +4614,29 @@ impl ServeHost {
         let services = self.get_or_init_services(Arc::clone(&client)).await;
 
         // Build the agent loop with all services wired (Finding 1).
-        let uq_goal = Arc::clone(&self.user_question) as Arc<dyn UserQuestionPrompt>;
-        let pa = Arc::clone(&self.plan_approver) as Arc<dyn PlanApprover>;
+        //
+        // The goal-escalation seam is deliberately NOT installed under a goal.
+        // Its only job is to ask the operator whether to extend an exhausted
+        // budget, and that question waits without a timeout — so in an attended
+        // session whose operator has walked away, which is the exact case this
+        // feature exists for, it would park the run forever. With no seam the
+        // supervisor resolves exhaustion itself and stops with an honest
+        // `Unmet` and a report, which is what the terminal-state table promises.
+        let uq_goal: Option<Arc<dyn UserQuestionPrompt>> = match &goal {
+            Some(_) => None,
+            None => Some(Arc::clone(&self.user_question) as Arc<dyn UserQuestionPrompt>),
+        };
+
+        // The plan-approval seam. `exit_plan_mode` waits on the operator with
+        // no timeout, so under a goal it is resolved from the active mode just
+        // like the permission seam.
+        let pa: Arc<dyn PlanApprover> = match &goal {
+            Some(supervisor) => Arc::new(AutonomousPlanApprover::new(
+                Arc::clone(&self.permission_mode),
+                supervisor.ledger(),
+            )),
+            None => Arc::clone(&self.plan_approver) as Arc<dyn PlanApprover>,
+        };
 
         // The question seam is the one place autonomy changes what the agent
         // can do to the operator. With a goal active, `ask_user_question` is
@@ -4694,7 +4716,6 @@ impl ServeHost {
         .with_working_directory(&self.working_dir)
         .with_effort(captured.config.effort)
         .with_steering(Arc::clone(&self.session.steering))
-        .with_user_question(uq_goal)
         .with_tool_user_question(uq_tool)
         .with_plan_approver(pa)
         .with_todos(Arc::clone(&self.todos))
@@ -4711,6 +4732,13 @@ impl ServeHost {
         // the builder needs to own it.
         let agent = match captured.config.system_prompt.as_deref() {
             Some(prompt) => agent.with_system_prompt(prompt.to_owned()),
+            None => agent,
+        };
+
+        // Installed only for a goal-less run — see the comment where `uq_goal`
+        // is built.
+        let agent = match uq_goal {
+            Some(seam) => agent.with_user_question(seam),
             None => agent,
         };
 

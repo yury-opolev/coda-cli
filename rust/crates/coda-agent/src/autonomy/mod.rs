@@ -23,6 +23,7 @@ pub mod budget;
 pub mod completion;
 pub mod ledger;
 pub mod permission;
+pub mod plan;
 pub mod recovery;
 pub mod retry;
 pub mod stuck;
@@ -36,6 +37,7 @@ pub use ledger::{
     WorkItemRef,
 };
 pub use permission::PermissionResolver;
+pub use plan::AutonomousPlanApprover;
 pub use recovery::{RecoveryExecutor, RecoveryGuard, RecoveryKind};
 pub use retry::GoalRetryPolicy;
 pub use stuck::{StuckDetector, StuckObservation, StuckPattern};
@@ -43,7 +45,6 @@ pub use termination::{
     ProgressSnapshot, ProgressTracker, TerminationInputs, TerminationProof, NO_PROGRESS_WINDOW,
 };
 pub use verdict::{GoalOutcome, GoalStatus, GoalVerdict};
-
 use completion::SYSTEM_PROMPT;
 
 /// An isolated forked-agent call used by the completion judge.
@@ -59,6 +60,17 @@ pub trait ForkedAgent: Send + Sync {
         messages: Vec<Message>,
         cancel: CancellationToken,
     ) -> anyhow::Result<String>;
+}
+
+/// What the mid-turn gate decided. See [`AutonomySupervisor::check_mid_turn`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MidTurn {
+    /// Nothing to do; carry on with the next model call.
+    Continue,
+    /// Inject this correction before the next model call.
+    Nudge(String),
+    /// End the run now, with a proved outcome and an operator-facing report.
+    Stop { outcome: GoalOutcome, report: String },
 }
 
 /// Autonomous goal supervisor.
@@ -298,7 +310,38 @@ impl AutonomySupervisor {
         }
     }
 
-    /// Tell the supervisor what the run has achieved so far.
+    /// Enforcement that must run on **every** iteration, not only at a natural
+    /// stop.
+    ///
+    /// The stop ladder is reached only when a turn calls no tools. An agent
+    /// that calls a tool every turn — `cargo test` failing, then `cargo test`
+    /// again, forever — would otherwise never be checked at all: not the
+    /// budget, not the stuck detector, not the corrective nudge. That is the
+    /// commonest shape of a runaway and precisely what the stuck heuristics
+    /// were ported to catch, so the check cannot live only on the path that
+    /// shape never takes.
+    ///
+    /// Deliberately does **not** call the completion judge. Asking "is the goal
+    /// done?" mid-turn would cost an LLM round trip per tool batch and cannot
+    /// be answered honestly while work is still in flight.
+    pub fn check_mid_turn(&mut self) -> MidTurn {
+        if self.budget.is_exhausted() && self.budget.extension_used() {
+            self.outcome = GoalOutcome::Unmet;
+            return MidTurn::Stop { outcome: GoalOutcome::Unmet, report: self.build_report() };
+        }
+
+        // `is_stuck` is true only once a loop has survived its own corrective
+        // nudge, so reaching here means the agent was told and carried on.
+        if self.stuck.is_stuck() {
+            self.outcome = GoalOutcome::Stalled;
+            return MidTurn::Stop { outcome: GoalOutcome::Stalled, report: self.build_report() };
+        }
+
+        match self.stuck.take_nudge() {
+            Some(correction) => MidTurn::Nudge(correction),
+            None => MidTurn::Continue,
+        }
+    }
     ///
     /// Called by the loop each turn. Kept as explicit inputs rather than having
     /// the supervisor reach into the todo store or the filesystem, so the

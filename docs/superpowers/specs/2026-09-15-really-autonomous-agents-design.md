@@ -17,7 +17,17 @@ timeout:
 |---|---|---|
 | `tools/ask_user_question.rs` | `ctx.user_question.ask(...)` | `ToolControl::AbortRun{"question.noAnswer.*"}` — run dies |
 | `permission/` prompt stack | `request/permission` RPC | waits indefinitely |
-| `agent/stop.rs` `GoalVerdict::Escalate` | `UserQuestionPrompt::ask` | headless → `NoController` → `mark_stopped_unmet()` |
+| `tools/exit_plan_mode.rs` | `ctx.plan_approver.approve(...)` | waits indefinitely |
+| `agent/stop.rs` `GoalVerdict::Escalate` | `UserQuestionPrompt::ask` | waits in an attended session; headless → `mark_stopped_unmet()` |
+
+Four sites, not three. The plan-approval seam was missed in the first pass of
+this design and found by review: `exit_plan_mode` waits on the operator with no
+timeout, which under `plan` permission mode is the *natural terminal action* of
+a goal run.
+
+There is also a fifth way to never finish, which is not a seam at all: the
+enforcement itself only runs at a natural stop, and an agent that calls a tool
+on every turn never reaches one.
 
 An active goal does not currently suppress any of them. `/goal` promises "keep
 working until a judge says this is done", and each of these three sites breaks
@@ -328,9 +338,22 @@ The second row preserves the existing security invariant in
 A broken answerer must not silently become "chose option 1".
 
 **Termination does not depend on the budget.** Default budgets are 240h / 60000
-and may be `none`, so they cannot serve as the safety net. The StuckDetector
-guarantees termination: no progress, no parked blockers, stuck streak →
-`Stalled`.
+and may be `none`, so they cannot serve as the safety net. The StuckDetector is
+what bounds a run whose budget is unlimited.
+
+Two honest qualifications on that guarantee:
+
+- **The gate must run where the loop actually loops.** All enforcement is
+  consulted at natural stops *and* after every tool batch. An agent that calls
+  a tool on every turn never reaches a natural stop, and `max_iterations` is
+  deliberately disabled for goal runs, so a check that lived only on the
+  stop path would leave the commonest runaway shape bounded by nothing.
+- **Only *repetitive* non-progress is detectable.** Every heuristic keys on
+  repetition, cycles or silence. An agent making genuinely distinct,
+  non-progressing calls forever — reading a thousand different files — trips
+  none of them. With a finite budget (the default) that run still ends. With
+  `--goal-max-continuations none` it does not, and that is the operator's
+  explicit choice rather than a gap being papered over.
 
 ## Testing
 
