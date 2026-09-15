@@ -16,7 +16,8 @@
 //! - **`autonomy`**: `AutonomySupervisor`, `GoalBudget`, `GoalVerdict`, `GoalStatus`,
 //!   `GoalOutcome`, `CompletionJudgePrompt`, `GoalRetryPolicy`, `ForkedAgent`,
 //!   `AssumptionLedger`, `LedgerEntry`, `BlockerKind`, `Confidence`,
-//!   `StuckDetector`, `StuckObservation`, `StuckPattern`.
+//!   `StuckDetector`, `StuckObservation`, `StuckPattern`, `PermissionResolver`,
+//!   `RecoveryGuard`, `RecoveryExecutor`, `RecoveryKind`.
 //! - **`steering`**: `SteeringInbox`, `SteeringEntry`.
 //! - **`events`**: `AgentEvent`, `AgentSink`, `ProtoAdapter`, `NullSink`,
 //!   `CollectingSink`, `ToolCallStatus`.
@@ -64,8 +65,8 @@ pub use events::{AgentEvent, AgentSink, CollectingSink, NullSink, ToolCallStatus
 pub use autonomy::{
     AssumptionLedger, AutonomySupervisor, BlockerKind, CompletionJudgePrompt, Confidence,
     ForkedAgent, GoalBudget, GoalOutcome, GoalRetryPolicy, GoalStatus, GoalVerdict, LedgerEntry,
-    LedgerError, LedgerSnapshot, ProxyAnswer, ProxyAnswerer, StuckDetector, StuckObservation,
-    StuckPattern, WorkItemRef,
+    LedgerError, LedgerSnapshot, PermissionResolver, ProxyAnswer, ProxyAnswerer, RecoveryExecutor,
+    RecoveryGuard, RecoveryKind, StuckDetector, StuckObservation, StuckPattern, WorkItemRef,
 };
 pub use hooks::{
     HookContentHash, HookEventPolicy, HookMatcher, HookRunEntry, HookRunLog, HookRunner,

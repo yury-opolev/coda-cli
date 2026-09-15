@@ -7,8 +7,9 @@
 //!
 //! This module is the home for the wider autonomy machinery described in
 //! `docs/superpowers/specs/2026-09-15-really-autonomous-agents-design.md`:
-//! the assumption ledger, stuck detection, the proxy answerer and the
-//! permission resolver land here alongside `completion`.
+//! the assumption ledger, stuck detection, the proxy answerer, the
+//! permission resolver and the recovery guard land here alongside
+//! `completion`.
 //!
 //! Not thread-safe; owned and mutated exclusively by the single agent loop.
 
@@ -21,6 +22,8 @@ pub mod answerer;
 pub mod budget;
 pub mod completion;
 pub mod ledger;
+pub mod permission;
+pub mod recovery;
 pub mod retry;
 pub mod stuck;
 pub mod verdict;
@@ -31,6 +34,8 @@ pub use ledger::{
     AssumptionLedger, BlockerKind, Confidence, LedgerEntry, LedgerError, LedgerSnapshot,
     WorkItemRef,
 };
+pub use permission::PermissionResolver;
+pub use recovery::{RecoveryExecutor, RecoveryGuard, RecoveryKind};
 pub use retry::GoalRetryPolicy;
 pub use stuck::{StuckDetector, StuckObservation, StuckPattern};
 pub use verdict::{GoalOutcome, GoalStatus, GoalVerdict};
