@@ -17,11 +17,15 @@ use coda_agent::{
 };
 use coda_agent::agent::stop::UserQuestionPrompt;
 use coda_agent::events::{AgentEvent, AgentSink};
-use coda_agent::autonomy::{ForkedAgent, ProxyAnswerer};
+use coda_agent::autonomy::{
+    ForkedAgent, PermissionResolver, ProxyAnswerer, RecoveryExecutor, RecoveryGuard,
+};
+use crate::recovery_executor::GitRecoveryExecutor;
 use coda_agent::hooks::runner::{HookExecutor, ShellHookExecutor};
 use coda_agent::lsp::{LspServerConfig, LspServerManager, LspServerMapBuilder};
 use coda_agent::permission::{
-    ModePermissionPrompt, PermissionMode, PermissionModeState, PermissionPrompt,
+    ForkedAgent as ClassifierForkedAgent, LlmToolActionClassifier, ModePermissionPrompt,
+    PermissionMode, PermissionModeState, PermissionPrompt, ToolActionClassifier,
 };
 use coda_agent::scheduling::{
     ScheduleKind, ScheduleTerminalOutcome, ScheduledTaskStore,
@@ -294,7 +298,10 @@ impl AgentSink for TurnSink {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// LlmForkedAgent — ForkedAgent for AutonomySupervisor, uses the session client
+// LlmForkedAgent — the isolated single-turn LLM call used by the autonomy
+// supervisor's completion judge, the stand-in answerer, and the safety
+// classifier. All three want the same thing: one short, cancellable,
+// side-effect-free call on the session's own client.
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct LlmForkedAgent {
@@ -302,9 +309,8 @@ struct LlmForkedAgent {
     model: String,
 }
 
-#[async_trait]
-impl ForkedAgent for LlmForkedAgent {
-    async fn run(
+impl LlmForkedAgent {
+    async fn run_once(
         &self,
         system: &str,
         messages: Vec<Message>,
@@ -318,6 +324,33 @@ impl ForkedAgent for LlmForkedAgent {
             result = stream.collect() => Ok(result?.text),
             _ = cancel.cancelled() => anyhow::bail!("cancelled"),
         }
+    }
+}
+
+#[async_trait]
+impl ForkedAgent for LlmForkedAgent {
+    async fn run(
+        &self,
+        system: &str,
+        messages: Vec<Message>,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<String> {
+        self.run_once(system, messages, cancel).await
+    }
+}
+
+/// The permission classifier declares its own structurally identical seam, so
+/// the same implementation satisfies both rather than the caller having to
+/// build two objects that do exactly the same thing.
+#[async_trait]
+impl ClassifierForkedAgent for LlmForkedAgent {
+    async fn run(
+        &self,
+        system: &str,
+        messages: Vec<Message>,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<String> {
+        self.run_once(system, messages, cancel).await
     }
 }
 
@@ -4608,6 +4641,34 @@ impl ServeHost {
             None => Arc::clone(&self.user_question) as Arc<dyn UserQuestion>,
         };
 
+        // The permission seam. With a goal active it is resolved from the
+        // active mode's policy instead of being sent to an absent operator: an
+        // allowed action proceeds (after an undo is manufactured for the few
+        // genuinely unrecoverable ones), and a disallowed one is recorded as a
+        // capability blocker so the run continues elsewhere. The mode is still
+        // the envelope — a goal does NOT widen permissions — so a goal run
+        // under `plan` ends quickly with an honest list of what it could not do
+        // rather than stalling on the first prompt.
+        let permission_prompt: Arc<dyn PermissionPrompt> = match &goal {
+            Some(supervisor) => {
+                let classifier: Arc<dyn ToolActionClassifier> =
+                    Arc::new(LlmToolActionClassifier::new(Arc::new(LlmForkedAgent {
+                        client: Arc::clone(&client),
+                        model: self.current_model(),
+                    })));
+                let executor: Arc<dyn RecoveryExecutor> =
+                    Arc::new(GitRecoveryExecutor::new(self.working_dir.clone()));
+                let recovery = RecoveryGuard::new(executor, supervisor.ledger());
+                Arc::new(PermissionResolver::new(
+                    Arc::clone(&self.permission_mode),
+                    classifier,
+                    supervisor.ledger(),
+                    recovery,
+                ))
+            }
+            None => Arc::clone(&self.permission_prompt),
+        };
+
         // ONE coherent read of the configuration this turn runs under, taken
         // after every await that precedes the build. Everything below — the
         // model and effort handed to the builder, the system-prompt override
@@ -4619,7 +4680,7 @@ impl ServeHost {
 
         let agent = AgentLoopBuilder::new(
             Arc::clone(&client),
-            Arc::clone(&self.permission_prompt),
+            permission_prompt,
             Arc::clone(&self.tools),
         )
         .with_permission_mode_state(Arc::clone(&self.permission_mode))
