@@ -4632,11 +4632,17 @@ impl ServeHost {
                     client: Arc::clone(&client),
                     model: self.current_model(),
                 });
-                Arc::new(ProxyAnswerer::new(
+                let answerer = ProxyAnswerer::new(
                     judge,
                     supervisor.ledger(),
                     supervisor.goal().to_owned(),
-                ))
+                );
+                // Seed the stand-in with what the conversation has established
+                // so far. Deciding "which database?" without knowing that one
+                // was already chosen an hour ago is how a proxy contradicts
+                // its own earlier answers.
+                answerer.set_transcript(recent_transcript(&history));
+                Arc::new(answerer)
             }
             None => Arc::clone(&self.user_question) as Arc<dyn UserQuestion>,
         };
@@ -5741,6 +5747,43 @@ fn build_user_message(p: &PromptParams) -> Message {
         }
     }
     Message::new(Role::User, content)
+}
+
+/// Render the tail of a conversation for the stand-in answerer.
+///
+/// Only the text of recent turns: tool payloads are large, mostly mechanical,
+/// and would crowd out the decisions the stand-in actually needs to be
+/// consistent with. Bounded on both message count and characters so a long
+/// conversation cannot turn one question into an enormous request.
+fn recent_transcript(history: &[Message]) -> String {
+    const MAX_MESSAGES: usize = 12;
+    const MAX_CHARS: usize = 4000;
+
+    let start = history.len().saturating_sub(MAX_MESSAGES);
+    let mut lines: Vec<String> = Vec::new();
+    for message in &history[start..] {
+        let text = message.text();
+        if text.trim().is_empty() {
+            continue;
+        }
+        let who = match message.role {
+            Role::User => "operator",
+            Role::Assistant => "agent",
+        };
+        lines.push(format!("{who}: {}", text.trim()));
+    }
+
+    let mut rendered = lines.join("\n");
+    if rendered.len() > MAX_CHARS {
+        // Keep the most recent text: the latest decisions are the ones a new
+        // answer has to stay consistent with.
+        let cut = rendered.len() - MAX_CHARS;
+        let boundary = (cut..rendered.len())
+            .find(|i| rendered.is_char_boundary(*i))
+            .unwrap_or(rendered.len());
+        rendered = format!("(earlier turns omitted)\n{}", &rendered[boundary..]);
+    }
+    rendered
 }
 
 fn wire_goal_status(gs: &GoalStatus) -> Option<Value> {
@@ -11615,6 +11658,49 @@ mod tests {
     }
 
     /// `session/setGoal` stores goal text and budget; validated before prompt.
+    /// The stand-in must be told what the conversation already established, or
+    /// it will contradict decisions it made earlier in the same run.
+    #[test]
+    fn the_transcript_carries_recent_turns_in_order() {
+        let history = vec![
+            Message::user("use sqlite"),
+            Message::assistant("understood, sqlite it is"),
+        ];
+        let rendered = recent_transcript(&history);
+        assert!(rendered.contains("operator: use sqlite"), "{rendered}");
+        assert!(rendered.contains("agent: understood, sqlite it is"), "{rendered}");
+        assert!(
+            rendered.find("operator:") < rendered.find("agent:"),
+            "order must be preserved: {rendered}"
+        );
+    }
+
+    /// One question must not turn into an enormous request just because the
+    /// conversation is long.
+    #[test]
+    fn the_transcript_is_bounded_and_keeps_the_most_recent_turns() {
+        let history: Vec<Message> =
+            (0..200).map(|i| Message::user(format!("message number {i}"))).collect();
+        let rendered = recent_transcript(&history);
+
+        assert!(rendered.len() < 5_000, "bounded: {} chars", rendered.len());
+        assert!(rendered.contains("message number 199"), "the latest turn must survive");
+        assert!(!rendered.contains("message number 0"), "the oldest must be dropped");
+    }
+
+    /// A long single message must be cut on a character boundary, not panic.
+    #[test]
+    fn an_oversized_transcript_is_cut_safely() {
+        let history = vec![Message::user("é".repeat(8_000))];
+        let rendered = recent_transcript(&history);
+        assert!(rendered.len() <= 4_100, "{} chars", rendered.len());
+    }
+
+    #[test]
+    fn an_empty_history_renders_nothing() {
+        assert!(recent_transcript(&[]).is_empty());
+    }
+
     /// The two proved outcomes must reach the wire, or an operator returning to
     /// a finished run has no way to tell "blocked, here is why" from "gave up".
     #[test]

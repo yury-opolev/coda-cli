@@ -127,8 +127,12 @@ fails open to `Continue`.
 
 Replaces the block in `ask_user_question`.
 
-- **Input:** question, options, goal text, recent transcript, project
-  conventions (`CODA.md` / `AGENTS.md`).
+- **Input:** question, options, goal text, and the tail of the conversation so
+  far. Bounded on both message count and characters, so one question cannot
+  turn into an enormous request.
+- **Not** project convention files. The Rust engine has no `CODA.md`/`AGENTS.md`
+  mechanism, so claiming to feed them would be fiction. If one is added later,
+  `ProxyAnswerer::with_conventions` is the seam already waiting for it.
 - **Output:** `{ chosen, rationale, confidence }`. It always chooses; there is
   no "I don't know" return value.
 - **Matching is exact.** The chosen text is resolved against the offered
