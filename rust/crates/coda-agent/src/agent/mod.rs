@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::compaction::{CompactionPolicy, CompactionService, TokenEstimator};
 use crate::events::{AgentEvent, AgentSink};
-use crate::goal::{GoalStatus, GoalSupervisor, last_assistant_text};
+use crate::autonomy::{GoalStatus, AutonomySupervisor, last_assistant_text};
 use crate::lsp::LspServerManager;
 use crate::permission::{PermissionMode, PermissionModeState, PermissionPrompt};
 use crate::scheduling::ScheduledTaskStore;
@@ -196,7 +196,7 @@ impl AgentLoop {
         &self,
         history: &mut Vec<Message>,
         sink: &dyn AgentSink,
-        goal: Option<GoalSupervisor>,
+        goal: Option<AutonomySupervisor>,
         cancel: CancellationToken,
     ) -> Result<GoalStatus, AgentError> {
         // Reopen the steering inbox so messages enqueued between runs (or
@@ -224,7 +224,7 @@ impl AgentLoop {
         &self,
         history: &mut Vec<Message>,
         sink: &dyn AgentSink,
-        mut goal: Option<GoalSupervisor>,
+        mut goal: Option<AutonomySupervisor>,
         cancel: CancellationToken,
         _pending_hook_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
     ) -> Result<GoalStatus, AgentError> {
@@ -658,7 +658,7 @@ impl AgentLoop {
     }
 }
 
-fn goal_status(goal: &Option<GoalSupervisor>) -> GoalStatus {
+fn goal_status(goal: &Option<AutonomySupervisor>) -> GoalStatus {
     goal.as_ref().map(|g| g.status()).unwrap_or_else(GoalStatus::none)
 }
 
@@ -2020,7 +2020,7 @@ mod tests {
     // Fix: fall through to the seal check for BOTH goal and no-goal stop paths.
     #[tokio::test]
     async fn goal_stop_with_racing_message_delivers_steering() {
-        use crate::goal::{ForkedAgent, GoalBudget, GoalRetryPolicy, GoalSupervisor};
+        use crate::autonomy::{ForkedAgent, GoalBudget, GoalRetryPolicy, AutonomySupervisor};
         use coda_llm::Message as LlmMessage;
 
         let steering = Arc::new(SteeringInbox::new());
@@ -2056,7 +2056,7 @@ mod tests {
             vec![Ok(StreamEvent::TextDelta("continuing after steering".into())), Ok(done())],
         ]);
 
-        let goal = GoalSupervisor::new(
+        let goal = AutonomySupervisor::new(
             Box::new(EnqueueOnDoneJudge {
                 inbox: steering.clone(),
                 enqueued: std::sync::atomic::AtomicBool::new(false),
@@ -2429,7 +2429,7 @@ mod tests {
     struct MockFork(String);
 
     #[async_trait]
-    impl crate::goal::ForkedAgent for MockFork {
+    impl crate::autonomy::ForkedAgent for MockFork {
         async fn run(
             &self,
             _system: &str,
@@ -2447,7 +2447,7 @@ mod tests {
     #[tokio::test]
     async fn compaction_fires_proactively_when_over_threshold_in_goal_run() {
         use crate::compaction::CompactionService;
-        use crate::goal::{ForkedAgent, GoalBudget, GoalRetryPolicy, GoalSupervisor};
+        use crate::autonomy::{ForkedAgent, GoalBudget, GoalRetryPolicy, AutonomySupervisor};
 
         let svc = Arc::new(CompactionService::new(Arc::new(MockFork("summary text".into()))));
 
@@ -2470,7 +2470,7 @@ mod tests {
         let tools = Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
         let sink = CollectingSink::new();
 
-        let goal = GoalSupervisor::new(
+        let goal = AutonomySupervisor::new(
             Box::new(DoneJudge),
             "test goal",
             GoalBudget::new(None, Some(3), 0.5, || Duration::ZERO),
@@ -2509,7 +2509,7 @@ mod tests {
 
         struct CountingFork(Arc<AtomicUsize>);
         #[async_trait]
-        impl crate::goal::ForkedAgent for CountingFork {
+        impl crate::autonomy::ForkedAgent for CountingFork {
             async fn run(&self, _: &str, _: Vec<Message>, _: CancellationToken) -> anyhow::Result<String> {
                 self.0.fetch_add(1, Ordering::SeqCst);
                 Ok("summary".to_owned())
@@ -2519,7 +2519,7 @@ mod tests {
         let svc = Arc::new(CompactionService::new(Arc::new(CountingFork(cnt))));
         let policy = CompactionPolicy { token_threshold: 0, ..Default::default() }; // disabled
 
-        use crate::goal::{ForkedAgent, GoalBudget, GoalRetryPolicy, GoalSupervisor};
+        use crate::autonomy::{ForkedAgent, GoalBudget, GoalRetryPolicy, AutonomySupervisor};
         struct DoneJudge;
         #[async_trait]
         impl ForkedAgent for DoneJudge {
@@ -2533,7 +2533,7 @@ mod tests {
             Ok(done()),
         ]]);
         let tools = Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
-        let goal = GoalSupervisor::new(
+        let goal = AutonomySupervisor::new(
             Box::new(DoneJudge),
             "test",
             GoalBudget::new(None, Some(3), 0.5, || Duration::ZERO),
@@ -2568,7 +2568,7 @@ mod tests {
 
         struct EmptyFork;
         #[async_trait]
-        impl crate::goal::ForkedAgent for EmptyFork {
+        impl crate::autonomy::ForkedAgent for EmptyFork {
             async fn run(&self, _: &str, _: Vec<Message>, _: CancellationToken) -> anyhow::Result<String> {
                 Ok(String::new()) // empty → fail
             }

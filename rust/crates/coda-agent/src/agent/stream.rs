@@ -1106,7 +1106,18 @@ mod tests {
         let mut acc = StreamAccumulator::default();
         // An hour ago. If this were used the burst would claim to have taken
         // an hour.
-        acc.segment_start = Some(Instant::now() - std::time::Duration::from_secs(3600));
+        //
+        // `Instant` is monotonic since boot, so subtracting an hour underflows
+        // and panics on a machine that booted more recently — which made this
+        // test fail purely as a function of uptime. Back off to the largest
+        // offset the clock can represent: anything comfortably over the 60s
+        // assertion threshold below proves the fallback was not used.
+        let now = Instant::now();
+        acc.segment_start = Some(
+            now.checked_sub(std::time::Duration::from_secs(3600))
+                .or_else(|| now.checked_sub(std::time::Duration::from_secs(120)))
+                .expect("the monotonic clock must support a 120s offset"),
+        );
 
         let sink = CollectingSink::new();
         drive_stream(stream, &sink, &mut acc).await.unwrap();

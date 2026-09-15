@@ -15,7 +15,7 @@ use std::sync::Arc;
 use coda_llm::{Content, Message, Role};
 use tokio_util::sync::CancellationToken;
 
-use crate::goal::ForkedAgent;
+use crate::autonomy::ForkedAgent;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Token estimator

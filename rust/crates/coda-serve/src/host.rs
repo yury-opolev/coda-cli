@@ -10,14 +10,14 @@ use async_trait::async_trait;
 use chrono::Utc;
 use coda_agent::{
     AgentError, AgentLoopBuilder, CompactionService, GoalBudget, GoalOutcome, GoalStatus,
-    GoalSupervisor, HookContentHash, HookRunner, HookScope, HookTrustGuard, HookTrustStore,
+    AutonomySupervisor, HookContentHash, HookRunner, HookScope, HookTrustGuard, HookTrustStore,
     InMemoryHookTrustStore, NullScheduleLifecycleSink, ScheduleRuntime, SubagentFactory,
     TaskManagerRunner, TodoStore, TokenEstimator, ToolQuarantine, ToolRegistry, UserHook,
     SessionTranscriptStore, fork_session, rewind_session, session_id_is_valid,
 };
 use coda_agent::agent::stop::UserQuestionPrompt;
 use coda_agent::events::{AgentEvent, AgentSink};
-use coda_agent::goal::ForkedAgent;
+use coda_agent::autonomy::ForkedAgent;
 use coda_agent::hooks::runner::{HookExecutor, ShellHookExecutor};
 use coda_agent::lsp::{LspServerConfig, LspServerManager, LspServerMapBuilder};
 use coda_agent::permission::{
@@ -294,7 +294,7 @@ impl AgentSink for TurnSink {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// LlmForkedAgent — ForkedAgent for GoalSupervisor, uses the session client
+// LlmForkedAgent — ForkedAgent for AutonomySupervisor, uses the session client
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct LlmForkedAgent {
@@ -745,7 +745,7 @@ const DEFAULT_GOAL_MAX_DURATION: Duration = Duration::from_secs(240 * 60 * 60);
 /// Resolves the effective goal budget from the operator's (optional) overrides.
 ///
 /// `None` in either returned slot means that dimension is unlimited. Pure so the
-/// defaults can be asserted directly: `build_goal_supervisor` holds a lock and
+/// defaults can be asserted directly: `build_autonomy_supervisor` holds a lock and
 /// builds an LLM-backed judge, neither of which a test wants.
 ///
 /// `max_duration` is expected to have already passed [`validate_goal_budget`];
@@ -1971,13 +1971,13 @@ impl ServeHost {
         }
     }
 
-    fn build_goal_supervisor(&self, client: Arc<dyn LlmClient>) -> Option<GoalSupervisor> {
+    fn build_autonomy_supervisor(&self, client: Arc<dyn LlmClient>) -> Option<AutonomySupervisor> {
         let params = self.goal_params.lock().expect("goal poisoned").clone();
         let goal_text = params.goal.filter(|g| !g.trim().is_empty())?;
         let (max_dur, max_cont) =
             resolve_goal_budget(params.max_duration.as_deref(), params.max_continuations);
         let judge = Box::new(LlmForkedAgent { client, model: self.current_model() });
-        Some(GoalSupervisor::new(judge, goal_text, GoalBudget::start_now(max_dur, max_cont, 0.5), None))
+        Some(AutonomySupervisor::new(judge, goal_text, GoalBudget::start_now(max_dur, max_cont, 0.5), None))
     }
 
     /// Get or initialise the per-session services (SubagentHost, HookRunner,
@@ -4574,7 +4574,7 @@ impl ServeHost {
         }
 
         // Optional goal supervisor.
-        let goal = self.build_goal_supervisor(Arc::clone(&client));
+        let goal = self.build_autonomy_supervisor(Arc::clone(&client));
 
         // Initialise session-scoped services lazily (Finding 1: first turn only).
         let services = self.get_or_init_services(Arc::clone(&client)).await;

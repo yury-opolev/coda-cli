@@ -1,4 +1,4 @@
-//! Exponential-backoff retry policy for the goal judge call.
+//! Exponential-backoff retry policy for the completion judge call.
 //!
 //! `OperationCanceledException` (cancellation) propagates immediately; any
 //! other error is retried up to `max_attempts - 1` times with backoff capped
@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-/// Retry configuration for the goal judge.
+/// Retry configuration for the completion judge.
 #[derive(Debug, Clone)]
 pub struct GoalRetryPolicy {
     /// Maximum number of attempts (≥ 1).

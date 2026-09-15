@@ -14,7 +14,7 @@
 use tokio_util::sync::CancellationToken;
 
 use crate::events::{AgentEvent, AgentSink};
-use crate::goal::{GoalSupervisor, GoalVerdict};
+use crate::autonomy::{AutonomySupervisor, GoalVerdict};
 use crate::steering::SteeringInbox;
 use coda_tool::{AnswerOutcome, NoAnswerReason};
 
@@ -41,7 +41,7 @@ pub const GOAL_STOP_OPTION: &str = "Stop — goal not met";
 pub(crate) async fn decide_stop(
     _stop_reason: Option<&str>,
     last_assistant_text: &str,
-    goal: &mut Option<GoalSupervisor>,
+    goal: &mut Option<AutonomySupervisor>,
     _stop_continuations: &mut u32,
     steering: Option<&SteeringInbox>,
     // Stage 3 chunk A: the main-conversation inbox (`ask_main`), passed only
@@ -170,14 +170,14 @@ mod tests {
     use std::time::Duration;
 
     use crate::events::{AgentEvent, CollectingSink, NullSink};
-    use crate::goal::{GoalBudget, GoalSupervisor};
+    use crate::autonomy::{GoalBudget, AutonomySupervisor};
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     struct AlwaysFailsJudge;
 
     #[async_trait::async_trait]
-    impl crate::goal::ForkedAgent for AlwaysFailsJudge {
+    impl crate::autonomy::ForkedAgent for AlwaysFailsJudge {
         async fn run(
             &self,
             _: &str,
@@ -189,13 +189,13 @@ mod tests {
     }
 
     /// A supervisor whose budget is immediately exhausted so evaluate() returns Escalate.
-    fn escalating_supervisor() -> GoalSupervisor {
+    fn escalating_supervisor() -> AutonomySupervisor {
         let budget = GoalBudget::new(None, Some(0), 0.5, || Duration::ZERO);
-        GoalSupervisor::new(
+        AutonomySupervisor::new(
             Box::new(AlwaysFailsJudge),
             "finish the task",
             budget,
-            Some(crate::goal::GoalRetryPolicy::for_tests()),
+            Some(crate::autonomy::GoalRetryPolicy::for_tests()),
         )
     }
 
@@ -462,12 +462,12 @@ mod tests {
         // MINOR 7: the "extension already spent" path in decide_stop is reached
         // when try_grant_extension() returns false while the operator answered
         // "continue".  We verify the underlying contract directly via
-        // GoalSupervisor, since triggering that arm through decide_stop would
+        // AutonomySupervisor, since triggering that arm through decide_stop would
         // require the budget to be exhausted-yet-unanswered simultaneously with
         // extension_used=true — a state that cannot arise in the normal sequential
         // flow.
         //
-        // The GoalSupervisor tests in goal/mod.rs already cover this fully.
+        // The AutonomySupervisor tests in autonomy/mod.rs already cover this fully.
         // Here we verify the error message text has not silently drifted.
         assert!(
             "The budget extension was already used; stopping with the goal unmet."
@@ -482,11 +482,11 @@ mod tests {
         // false once the extension has been spent, causing the "already spent"
         // error path to be reached.
         let budget = GoalBudget::new(None, Some(0), 0.5, || Duration::ZERO);
-        let mut sup = GoalSupervisor::new(
+        let mut sup = AutonomySupervisor::new(
             Box::new(AlwaysFailsJudge),
             "finish the task",
             budget,
-            Some(crate::goal::GoalRetryPolicy::for_tests()),
+            Some(crate::autonomy::GoalRetryPolicy::for_tests()),
         );
         assert!(sup.try_grant_extension(), "first grant must succeed");
         assert!(!sup.try_grant_extension(), "second grant must return false");

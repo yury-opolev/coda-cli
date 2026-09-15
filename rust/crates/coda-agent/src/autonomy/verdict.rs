@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-/// Decision returned by `GoalSupervisor::evaluate` at every natural stop.
+/// Decision returned by `AutonomySupervisor::evaluate` at every natural stop.
 ///
 /// The `Escalate` variant imposes a caller contract (§4.4): the caller **MUST**
 /// invoke exactly one of `TryGrantExtension` (then continue) or

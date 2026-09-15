@@ -1,9 +1,14 @@
-//! Goal supervisor: autonomous "keep going until done, else ask" lever.
+//! Autonomy supervisor: the "keep going until done" lever for a goal run.
 //!
 //! The supervisor is consulted at every natural stop while a goal is active.
-//! It owns the judge (with retry / backoff), the budget, and the escalation
-//! state machine.  Failures of the judge fail **open** (return `Continue`)
-//! because the budget guarantees eventual termination.
+//! It owns the completion judge (with retry / backoff), the budget, and the
+//! escalation state machine.  Failures of the completion judge fail **open**
+//! (return `Continue`) because the budget guarantees eventual termination.
+//!
+//! This module is the home for the wider autonomy machinery described in
+//! `docs/superpowers/specs/2026-09-15-really-autonomous-agents-design.md`:
+//! the assumption ledger, stuck detection, the proxy answerer and the
+//! permission resolver land here alongside `completion`.
 //!
 //! Not thread-safe; owned and mutated exclusively by the single agent loop.
 
@@ -11,7 +16,7 @@ use coda_llm::{Content, Message, Role};
 use tokio_util::sync::CancellationToken;
 
 pub mod budget;
-pub mod judge;
+pub mod completion;
 pub mod retry;
 pub mod verdict;
 
@@ -19,9 +24,9 @@ pub use budget::GoalBudget;
 pub use retry::GoalRetryPolicy;
 pub use verdict::{GoalOutcome, GoalStatus, GoalVerdict};
 
-use judge::SYSTEM_PROMPT;
+use completion::SYSTEM_PROMPT;
 
-/// An isolated forked-agent call used by the goal judge.
+/// An isolated forked-agent call used by the completion judge.
 ///
 /// Implementors spawn (or simulate) a separate LLM call and return the raw
 /// text response.  The loop provides a real implementation backed by
@@ -38,11 +43,11 @@ pub trait ForkedAgent: Send + Sync {
 
 /// Autonomous goal supervisor.
 ///
-/// Call [`GoalSupervisor::evaluate`] at every natural stop.  When the verdict
+/// Call [`AutonomySupervisor::evaluate`] at every natural stop.  When the verdict
 /// is [`GoalVerdict::Escalate`], the caller MUST resolve it with exactly one of:
-/// - [`GoalSupervisor::try_grant_extension`] (extend the budget; continue), or
-/// - [`GoalSupervisor::mark_stopped_unmet`] (accept failure; stop).
-pub struct GoalSupervisor {
+/// - [`AutonomySupervisor::try_grant_extension`] (extend the budget; continue), or
+/// - [`AutonomySupervisor::mark_stopped_unmet`] (accept failure; stop).
+pub struct AutonomySupervisor {
     judge: Box<dyn ForkedAgent>,
     goal: String,
     budget: GoalBudget,
@@ -54,7 +59,7 @@ pub struct GoalSupervisor {
     escalated: bool,
 }
 
-impl GoalSupervisor {
+impl AutonomySupervisor {
     pub fn new(
         judge: Box<dyn ForkedAgent>,
         goal: impl Into<String>,
@@ -118,7 +123,7 @@ impl GoalSupervisor {
             };
         }
 
-        let user_msg = judge::build_user_message(&self.goal, recent_assistant_text);
+        let user_msg = completion::build_user_message(&self.goal, recent_assistant_text);
         let messages = vec![Message::user(user_msg)];
 
         // Fail-open: if the judge can't be reached, keep working.  Budget
@@ -148,12 +153,12 @@ impl GoalSupervisor {
                 GoalVerdict::Continue { nudge: nudge_unavailable }
             }
             Ok((true, Some(response))) => {
-                if judge::is_complete(&response) {
+                if completion::is_complete(&response) {
                     self.outcome = GoalOutcome::Met;
                     return GoalVerdict::Stop { met: true };
                 }
 
-                self.last_remaining = Some(judge::remaining(&response));
+                self.last_remaining = Some(completion::remaining(&response));
                 self.budget.record_continuation();
                 GoalVerdict::Continue {
                     nudge: format!(
@@ -212,17 +217,17 @@ pub fn last_assistant_text(history: &[Message]) -> String {
 }
 
 /// Namespace for the judge prompt helpers (mirrors the C# static class).
-pub struct GoalJudgePrompt;
+pub struct CompletionJudgePrompt;
 
-impl GoalJudgePrompt {
+impl CompletionJudgePrompt {
     pub fn is_complete(response: &str) -> bool {
-        judge::is_complete(response)
+        completion::is_complete(response)
     }
     pub fn remaining(response: &str) -> String {
-        judge::remaining(response)
+        completion::remaining(response)
     }
     pub fn build_user_message(goal: &str, recent_output: &str) -> String {
-        judge::build_user_message(goal, recent_output)
+        completion::build_user_message(goal, recent_output)
     }
 }
 
@@ -265,7 +270,7 @@ mod tests {
     // §8 item 19: judge failure fails open → Continue, RecordContinuation.
     #[tokio::test]
     async fn judge_failure_fails_open() {
-        let mut sup = GoalSupervisor::new(
+        let mut sup = AutonomySupervisor::new(
             Box::new(AlwaysFailsJudge),
             "finish tests",
             budget_cont(10),
@@ -283,7 +288,7 @@ mod tests {
     #[tokio::test]
     async fn escalation_and_extension_once() {
         // Budget with 0 allowed continuations: immediately exhausted.
-        let mut sup = GoalSupervisor::new(
+        let mut sup = AutonomySupervisor::new(
             Box::new(AlwaysFailsJudge),
             "finish tests",
             budget_cont(0),
@@ -309,7 +314,7 @@ mod tests {
     async fn after_extension_exhaustion_gives_stop_not_met() {
         // Budget: 0 continuations, extension_fraction = 0.5.
         // After grant_extension: max_continuations becomes 1 (raised by at least 1).
-        let mut sup = GoalSupervisor::new(
+        let mut sup = AutonomySupervisor::new(
             Box::new(AlwaysFailsJudge),
             "goal",
             budget_cont(0),
@@ -333,7 +338,7 @@ mod tests {
     // §8 item 20: headless path — mark_stopped_unmet sets outcome.
     #[test]
     fn mark_stopped_unmet_sets_outcome() {
-        let mut sup = GoalSupervisor::new(
+        let mut sup = AutonomySupervisor::new(
             Box::new(AlwaysFailsJudge),
             "goal",
             budget_cont(10),
@@ -347,7 +352,7 @@ mod tests {
     // When judge says DONE the outcome is Met and the loop can stop.
     #[tokio::test]
     async fn judge_done_returns_stop_met() {
-        let mut sup = GoalSupervisor::new(
+        let mut sup = AutonomySupervisor::new(
             Box::new(ScriptedJudge::new(vec!["DONE"])),
             "write a test",
             budget_cont(5),
