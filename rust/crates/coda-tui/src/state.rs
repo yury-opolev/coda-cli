@@ -1637,6 +1637,15 @@ impl UiState {
             | Event::ToolInputModified { .. }
             | Event::ToolResultModified { .. }
             | Event::PermissionsUpdated { .. }
+            // Never materialised here: the authoritative injected entry
+            // already lives in the running turn's own history — the
+            // metadata this event carries is handled entirely in
+            // `serve.rs::dispatch_frame` (needs_resync/needs_rehydrate),
+            // *before* it would ever reach this reducer in production. This
+            // arm exists so a directly-constructed test event (or any other
+            // stale/future caller) still cannot fabricate a transcript
+            // block from it.
+            | Event::AgentMessageDelivered { .. }
             | Event::Unknown { .. } => {}
             // When a display-mutating AgentResponse hook rewrites the assistant
             // response, replace the buffer with the hook's display content so

@@ -259,7 +259,7 @@ mod tests {
     }
 
     fn budget_cont(max_cont: u32) -> GoalBudget {
-        GoalBudget::new(Duration::MAX, max_cont, 0.5, || Duration::ZERO)
+        GoalBudget::new(None, Some(max_cont), 0.5, || Duration::ZERO)
     }
 
     // §8 item 19: judge failure fails open → Continue, RecordContinuation.

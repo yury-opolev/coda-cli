@@ -58,9 +58,10 @@ orchestrator ──spawn/connect──► coda serve
    actions via `request/permission`).
    Autonomous flags (all off by default): `--goal "<objective>"` sets a goal the agent works
    toward until a judge declares it met; `--goal-max-duration <dur>` overrides the wall-clock
-   budget (e.g. `30m`, `2h`, `1d`); `--goal-max-continuations <n>` overrides the turn budget;
-   `--session-memory` enables the background session-memory watcher; `--max-continuations <n>`
-   bounds stop-hook continuations per run (default 10).
+   budget (`90s`, `30m`, `2h`, `7d`, or `none` for no limit; default `240h`);
+   `--goal-max-continuations <n>` overrides the turn budget (`none` for no limit; default
+   `60000`); `--session-memory` enables the background session-memory watcher;
+   `--max-continuations <n>` bounds stop-hook continuations per run (default 10).
 2. Normally send `initialize` → get `{ protocolVersion: string, sessionId: string, serverInfo: string, telemetryLogPath?: string }`.
 3. Send `session/prompt` to run a turn. While it runs you receive `event/*` notifications and may
    receive server-initiated `request/*` you must answer. The `session/prompt` response resolves
@@ -326,12 +327,18 @@ turn already in flight (the running turn captured its options at its start).
 
 **Params:**
 - `goal` (string | null): the objective text, or null/`""` to clear the current goal.
-- `maxDuration` (string, optional): wall-clock budget. Accepts suffix forms (`30m`,
-  `2h`, `1d`) or `hh:mm:ss`. An explicitly-supplied but unparseable value returns a `-32602`
-  error; **omitting the field reverts the budget to the configured default** (settings `goal`
-  block, else 24h) rather than preserving a prior override.
-- `maxContinuations` (int, optional): turn-count budget. **Omitting reverts to the configured
-  default** (settings, else 60000).
+- `maxDuration` (string, optional): wall-clock budget. Accepts suffix forms only — `90s`,
+  `30m`, `2h`, `7d` — or one of `none` / `unlimited` / `off` for **no wall-clock limit**.
+  An explicitly-supplied but unparseable value (including a zero-length one) returns a
+  `-32602` error; **omitting the field reverts the budget to the default, `240h`** rather
+  than preserving a prior override.
+- `maxContinuations` (int, optional): turn-count budget. `-1` means **no turn limit**; any
+  other negative value returns `-32602`. **Omitting reverts to the default, `60000`.**
+
+A goal is a promise to keep working until the judge declares it met, so both defaults are set
+high enough that reaching one indicates a runaway rather than a merely long task. Use `0`
+continuations to escalate at the very first natural stop — that is a real setting, and is not
+the same as "no limit".
 
 **Result:**
 ```json

@@ -540,6 +540,12 @@
       "paramsContract": "clientReaderWithRustMetadata"
     },
     {
+      "method": "event/agentMessageDelivered",
+      "paramsSchema": "schemas/AgentMessageDeliveredEvent.json",
+      "requiresStateEvents": false,
+      "paramsContract": "clientReaderWithRustMetadata"
+    },
+    {
       "method": "event/activity",
       "paramsSchema": "schemas/ActivityEvent.json",
       "requiresStateEvents": true,

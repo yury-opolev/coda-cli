@@ -68,8 +68,8 @@ pub use hooks::{
     HookScope, HookTrustGuard, HookTrustStore, InMemoryHookTrustStore, UserHook,
 };
 pub use message::{
-    MessageBus, MessageBusObserver, MessageSource, PublishError, PublishReceipt, SinceResult,
-    UserMessage,
+    AskMainError, AskReceipt, AskStatus, MainMessage, MessageBus, MessageBusObserver,
+    MessageSource, PublishError, PublishReceipt, SinceResult, UserMessage,
 };
 pub use output_styles::{BuiltInOutputStyles, DynOutputStyle, OutputStyle};
 pub use permission::{

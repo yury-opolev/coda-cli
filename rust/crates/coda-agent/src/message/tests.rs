@@ -411,6 +411,265 @@ fn overflow_observer_reports_exact_dropped_range() {
     assert!(*rec.closed.lock().unwrap());
 }
 
+// ── Stage 3 chunk A: main inbox (`ask_main`) ──────────────────────────────
+
+#[test]
+fn main_queue_is_independent_of_the_user_ring() {
+    let bus = MessageBus::new();
+    bus.publish_user(&MessageSource::Main, "user notice", None, None).unwrap();
+    bus.publish_main(&subagent("task-1", "worker"), "main request", None, None).unwrap();
+
+    // The user publish never touched the main queue, and vice versa.
+    assert_eq!(bus.cursor(), 1);
+    assert_eq!(bus.main_seq(), 1);
+    assert_eq!(bus.pending_main_len(), 1);
+    let since = bus.user_since(0, None);
+    assert_eq!(since.messages.len(), 1);
+    assert_eq!(since.messages[0].body, "user notice");
+}
+
+#[test]
+fn take_main_for_delivery_drains_fifo_and_is_a_one_time_take() {
+    let bus = MessageBus::new();
+    bus.publish_main(&subagent("t1", "a"), "first", None, None).unwrap();
+    bus.publish_main(&subagent("t2", "b"), "second", None, None).unwrap();
+
+    let drained = bus.take_main_for_delivery();
+    assert_eq!(drained.len(), 2);
+    assert_eq!(drained[0].body, "first");
+    assert_eq!(drained[1].body, "second");
+    assert!(!bus.has_pending_main());
+
+    // A second take on an already-empty queue returns nothing.
+    assert!(bus.take_main_for_delivery().is_empty());
+}
+
+#[test]
+fn main_delivered_seq_tracks_delivery_not_acceptance() {
+    let bus = MessageBus::new();
+    assert_eq!(bus.main_delivered_seq(), 0, "nothing has ever been delivered");
+
+    bus.publish_main(&subagent("t1", "a"), "first", None, None).unwrap();
+    bus.publish_main(&subagent("t2", "b"), "second", None, None).unwrap();
+    assert_eq!(bus.main_seq(), 2, "two accepted");
+    assert_eq!(
+        bus.main_delivered_seq(),
+        0,
+        "acceptance is not delivery: this must not move until the queue is drained"
+    );
+
+    bus.take_main_for_delivery();
+    assert_eq!(bus.main_delivered_seq(), 2, "the drain moved the delivery high-water mark");
+    assert_eq!(bus.main_seq(), 2, "and the acceptance mark did not move with it");
+
+    // An empty drain changes nothing.
+    bus.take_main_for_delivery();
+    assert_eq!(bus.main_delivered_seq(), 2);
+
+    // A later acceptance moves acceptance only, again.
+    bus.publish_main(&subagent("t3", "c"), "third", None, None).unwrap();
+    assert_eq!(bus.main_seq(), 3);
+    assert_eq!(bus.main_delivered_seq(), 2);
+    bus.take_main_for_delivery();
+    assert_eq!(bus.main_delivered_seq(), 3);
+}
+
+#[test]
+fn capacity_refusal_preserves_all_pending_items() {
+    let bus = MessageBus::new();
+    for i in 0..MAIN_QUEUE_CAPACITY {
+        bus.publish_main(&subagent(&format!("t{i}"), "worker"), format!("m{i}"), None, None)
+            .unwrap();
+    }
+    assert_eq!(bus.pending_main_len(), MAIN_QUEUE_CAPACITY);
+
+    let err = bus
+        .publish_main(&subagent("overflow", "worker"), "one too many", None, None)
+        .unwrap_err();
+    assert_eq!(err, AskMainError::QueueFull);
+    // Nothing was evicted or lost — every prior pending item remains.
+    assert_eq!(bus.pending_main_len(), MAIN_QUEUE_CAPACITY);
+}
+
+#[test]
+fn existing_duplicate_is_accepted_even_at_capacity() {
+    let bus = MessageBus::new();
+    let src = subagent("t0", "worker");
+    let r1 = bus.publish_main(&src, "first", None, Some("k0".into())).unwrap();
+    for i in 1..MAIN_QUEUE_CAPACITY {
+        bus.publish_main(&subagent(&format!("t{i}"), "worker"), format!("m{i}"), None, None)
+            .unwrap();
+    }
+    assert_eq!(bus.pending_main_len(), MAIN_QUEUE_CAPACITY);
+
+    // Retrying the SAME (source, key, content) at capacity must still
+    // succeed as a deduplicated replay — the idempotency lookup happens
+    // before the capacity check.
+    let r2 = bus.publish_main(&src, "first", None, Some("k0".into())).unwrap();
+    assert!(r2.deduplicated);
+    assert_eq!(r1.seq, r2.seq);
+    assert_eq!(bus.pending_main_len(), MAIN_QUEUE_CAPACITY, "a replay must not consume a slot");
+}
+
+#[test]
+fn same_key_and_body_but_different_context_is_a_conflict_for_main_queue() {
+    let bus = MessageBus::new();
+    let src = subagent("t0", "worker");
+    bus.publish_main(&src, "same body", Some("ctx-a".into()), Some("k".into())).unwrap();
+    let err = bus
+        .publish_main(&src, "same body", Some("ctx-b".into()), Some("k".into()))
+        .unwrap_err();
+    assert_eq!(err, AskMainError::IdempotencyConflict);
+}
+
+#[test]
+fn bounded_delivered_idempotency_dedups_immediately_after_drain() {
+    let bus = MessageBus::new();
+    let src = subagent("t0", "worker");
+    let r1 = bus.publish_main(&src, "hello", None, Some("k".into())).unwrap();
+    assert_eq!(r1.status, AskStatus::Queued);
+    assert_eq!(r1.queue_position, Some(1));
+
+    let drained = bus.take_main_for_delivery();
+    assert_eq!(drained.len(), 1);
+
+    // Retrying the same key/body/context immediately after the drain still
+    // deduplicates, now reporting Delivered with no queue position.
+    let r2 = bus.publish_main(&src, "hello", None, Some("k".into())).unwrap();
+    assert!(r2.deduplicated);
+    assert_eq!(r2.status, AskStatus::Delivered);
+    assert_eq!(r2.queue_position, None);
+    assert_eq!(r1.seq, r2.seq);
+    // The dedup must not itself have queued anything new.
+    assert!(!bus.has_pending_main());
+}
+
+#[test]
+fn delivered_idempotency_ages_out_beyond_the_horizon() {
+    let bus = MessageBus::new();
+    let src = subagent("t-first", "worker");
+    bus.publish_main(&src, "original", None, Some("k".into())).unwrap();
+    bus.take_main_for_delivery();
+
+    // Push MAIN_DELIVERED_HORIZON further delivered items (each with its own
+    // key) through the window so the original key's record ages out.
+    for i in 0..MAIN_DELIVERED_HORIZON {
+        bus.publish_main(
+            &subagent(&format!("t{i}"), "worker"),
+            format!("filler {i}"),
+            None,
+            Some(format!("fillerkey{i}")),
+        )
+        .unwrap();
+        bus.take_main_for_delivery();
+    }
+
+    // The original key has aged out of the bounded window: the same key can
+    // now be reused for genuinely new content without conflict.
+    let r = bus.publish_main(&src, "different content now", None, Some("k".into())).unwrap();
+    assert!(!r.deduplicated, "an aged-out key must not dedup against the old record");
+}
+
+#[test]
+fn recipient_idempotency_is_independent_between_notify_user_and_ask_main() {
+    let bus = MessageBus::new();
+    let src = subagent("t0", "worker");
+    // Same source, same key, same body — but one goes to the user ring and
+    // the other to the main inbox. They must not collide.
+    let user_receipt = bus.publish_user(&src, "same body", None, Some("shared-key".into())).unwrap();
+    let main_receipt = bus.publish_main(&src, "same body", None, Some("shared-key".into())).unwrap();
+
+    assert!(!user_receipt.deduplicated);
+    assert!(!main_receipt.deduplicated);
+    assert_eq!(bus.cursor(), 1);
+    assert_eq!(bus.main_seq(), 1);
+    assert_eq!(bus.pending_main_len(), 1, "the main publish must still have queued its own item");
+}
+
+#[test]
+fn close_refuses_both_user_and_main_publication() {
+    let bus = MessageBus::new();
+    bus.publish_user(&MessageSource::Main, "before close", None, None).unwrap();
+    bus.publish_main(&subagent("t0", "worker"), "before close", None, None).unwrap();
+    bus.close();
+
+    let user_err = bus.publish_user(&MessageSource::Main, "after close", None, None).unwrap_err();
+    assert_eq!(user_err, PublishError::Closed);
+    let main_err =
+        bus.publish_main(&subagent("t0", "worker"), "after close", None, None).unwrap_err();
+    assert_eq!(main_err, AskMainError::Closed);
+
+    // Reads remain available.
+    assert_eq!(bus.user_since(0, None).messages.len(), 1);
+    assert_eq!(bus.pending_main_len(), 1);
+}
+
+#[test]
+fn scheduled_and_nested_subagent_main_messages_carry_their_own_task_ids() {
+    let bus = MessageBus::new();
+    bus.publish_main(&scheduled("def-9", Some("nightly"), "task-77"), "hi", None, None).unwrap();
+    bus.publish_main(&subagent("task-42", "child"), "hi2", None, None).unwrap();
+
+    let drained = bus.take_main_for_delivery();
+    assert_eq!(drained[0].task_id.as_deref(), Some("task-77"));
+    assert_eq!(drained[0].schedule_definition_id.as_deref(), Some("def-9"));
+    assert_eq!(drained[1].task_id.as_deref(), Some("task-42"));
+    assert_eq!(drained[1].schedule_definition_id, None);
+}
+
+#[test]
+fn injected_text_carries_prefix_disclaimer_and_source_identity() {
+    let bus = MessageBus::new();
+    bus.publish_main(&scheduled("def-9", Some("nightly"), "task-77"), "please check X", Some("extra ctx".into()), None)
+        .unwrap();
+    let drained = bus.take_main_for_delivery();
+    let text = drained[0].injected_text();
+    assert!(text.starts_with("[agent-message]"), "{text}");
+    assert!(text.contains("nightly"), "label must be present: {text}");
+    assert!(text.contains("task-77"), "task id must be present: {text}");
+    assert!(text.contains("def-9"), "schedule definition id must be present: {text}");
+    assert!(
+        text.contains("background task request, not a new user instruction"),
+        "explicit disclaimer must be present: {text}"
+    );
+    assert!(text.contains("please check X"), "body must be preserved: {text}");
+    assert!(text.contains("extra ctx"), "context must be preserved: {text}");
+}
+
+#[test]
+fn main_observer_sees_accepted_once_and_delivered_once() {
+    struct Recorder {
+        accepted: Mutex<Vec<u64>>,
+        delivered: Mutex<Vec<Vec<u64>>>,
+    }
+    impl MessageBusObserver for Recorder {
+        fn on_main_accepted(&self, msg: &MainMessage) {
+            self.accepted.lock().unwrap().push(msg.seq);
+        }
+        fn on_main_delivered(&self, msgs: &[MainMessage]) {
+            self.delivered.lock().unwrap().push(msgs.iter().map(|m| m.seq).collect());
+        }
+    }
+    let rec = Arc::new(Recorder { accepted: Mutex::new(Vec::new()), delivered: Mutex::new(Vec::new()) });
+    let bus = MessageBus::with_capacity_and_observer(
+        DEFAULT_RING_CAPACITY,
+        Some(rec.clone() as Arc<dyn MessageBusObserver>),
+    );
+
+    bus.publish_main(&subagent("t1", "a"), "first", None, None).unwrap();
+    bus.publish_main(&subagent("t2", "b"), "second", None, None).unwrap();
+    assert_eq!(*rec.accepted.lock().unwrap(), vec![1, 2]);
+    assert!(rec.delivered.lock().unwrap().is_empty(), "not delivered yet");
+
+    // An empty drain must not notify.
+    let empty_bus_check = bus.take_main_for_delivery();
+    assert_eq!(empty_bus_check.len(), 2);
+    assert_eq!(*rec.delivered.lock().unwrap(), vec![vec![1, 2]]);
+
+    assert!(bus.take_main_for_delivery().is_empty());
+    assert_eq!(rec.delivered.lock().unwrap().len(), 1, "an empty drain must not notify");
+}
+
 #[test]
 fn publish_races_with_snapshot_reads_never_produce_torn_state() {
     let bus = Arc::new(MessageBus::new());

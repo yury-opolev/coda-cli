@@ -78,6 +78,34 @@ pub fn capability_catalog() -> HashMap<String, CapabilityEntry> {
     // conversation on its own — it is a one-way, passive notification.
     m.insert("messaging.notifyUser".into(), CapabilityEntry::supported());
 
+    // ── Stage 3: trusted main conversation's own inbox (`ask_main`) ───────
+    // `ask_main` (a tool available to subagents and scheduled runs — never
+    // to the main context itself, which it refuses outright) publishes an
+    // ACCEPTED-ONLY request onto the same engine-owned bus's second,
+    // independent FIFO. Acceptance is a receipt, never "the main
+    // conversation acted on it": the caller does not wait, holds no permit
+    // and has no reply channel.
+    //
+    // The single trusted consumer is the main `AgentLoop`'s own iteration
+    // boundary (`crate::agent::AgentLoop` step 4c in `coda-agent`). It runs
+    // either inside a turn the operator already started, or inside a turn
+    // the idle main-inbox pump starts for exactly this purpose — on the
+    // SAME single-flight execution slot and history writer, never a second
+    // one, and never preempting a turn in progress. See `ServeHost`'s
+    // `main_pump_step`/`MainPumpBlock` for the wake, blocked-retry and
+    // shutdown semantics, and `docs/protocol/catalog.md` for the
+    // client-facing statement of them.
+    //
+    // When the queue is drained, each item's `MainMessage::injected_text()`
+    // — a literal `[agent-message]` prefix, the trusted source's own
+    // label/ids, and an explicit "not a new user instruction" disclaimer —
+    // is projected into the running turn's own live history exactly like any
+    // other conversation entry, and `event/agentMessageDelivered` announces
+    // the delivery (metadata only: ids/seq/turnId/source, never the body).
+    // RAM-only, bounded, in-memory FIFO: no new persisted state, and nothing
+    // here survives an engine restart.
+    m.insert("messaging.askMain".into(), CapabilityEntry::supported());
+
     // ── Accepted-but-unimplemented surfaces, declared rather than silently
     // ignored. `session/getState` rejects `sections` outright instead of
     // answering a different question than the client asked. ──────────────
@@ -185,6 +213,17 @@ mod tests {
         for name in ["state.snapshot", "state.events", "state.eventReplayBounded", "steering.readOnlyQueue"] {
             assert!(catalog[name].supported, "{name} must be reported supported");
         }
+    }
+
+    /// Stage 3: `ask_main` is wired end to end — the tool, the bounded FIFO,
+    /// the running-turn projection/`event/agentMessageDelivered`
+    /// announcement, and the idle execution path that drains it — so it must
+    /// be advertised.
+    #[test]
+    fn ask_main_capability_is_advertised_only_because_it_is_wired() {
+        let catalog = capability_catalog();
+        assert!(catalog["messaging.askMain"].supported, "ask_main is implemented and must be advertised");
+        assert!(catalog["messaging.askMain"].reason.is_none(), "messaging.askMain is supported; no excuse needed");
     }
 
     #[test]

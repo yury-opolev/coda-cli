@@ -7,6 +7,7 @@
 //! may touch a path outside `ToolContext::working_directory` unless bypass mode
 //! is active.
 
+mod ask_main;
 mod ask_user_question;
 mod background_task;
 mod edit_file;
@@ -23,6 +24,7 @@ mod schedule_cancel_self;
 mod schedule_create;
 mod schedule_tools;
 mod sleep_tool;
+mod source;
 pub mod task;
 mod task_get;
 mod task_list;
@@ -52,6 +54,7 @@ use crate::lsp::LspDiagnosticsTool;
 /// same wording regardless of which tool truncated.
 pub(super) const OUTPUT_TRUNCATED: &str = "… [output truncated]";
 
+pub use ask_main::AskMainTool;
 pub use ask_user_question::AskUserQuestionTool;
 pub use background_task::{BackgroundTaskOutputTool, BackgroundTaskStartTool};
 pub use edit_file::EditTool;
@@ -123,6 +126,7 @@ pub fn built_in_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(ToolSearchTool),
         Arc::new(GitWorktreeTool),
         Arc::new(NotifyUserTool),
+        Arc::new(AskMainTool),
         // ── LSP ───────────────────────────────────────────────────────────────
         Arc::new(LspDiagnosticsTool),
         Arc::new(crate::lsp::LspTool),
@@ -251,6 +255,8 @@ mod tests {
             "tool_search",
             "git_worktree",
             "lsp_diagnostics",
+            "notify_user",
+            "ask_main",
         ] {
             assert!(names.contains(expected), "missing tool: {expected}");
         }

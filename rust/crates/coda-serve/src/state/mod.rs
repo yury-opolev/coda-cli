@@ -48,7 +48,9 @@ use std::time::Instant;
 use chrono::Utc;
 use serde_json::Value;
 
+use coda_agent::message::MainMessage;
 use coda_proto::messages::CapabilityEntry;
+use coda_proto::responses::{AgentMessageDeliveredDto, AgentMessageDeliveredItemDto};
 use coda_proto::state_events as wire;
 use coda_proto::state::{
     ActiveConfig, ActivityPhase, ConcurrentCounters, EffectiveConfig, EngineLifecycle,
@@ -102,6 +104,39 @@ pub struct LiveView {
     pub entries: Vec<coda_proto::history::HistoryEntry>,
     pub truncated: bool,
     pub omitted_bytes: i64,
+}
+
+/// Outcome of [`EngineState::main_messages_delivered`] (Stage 3 chunk B).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MainMessagesDeliveredOutcome {
+    /// No turn was running at the instant this callback fired, so nothing
+    /// was projected — the running turn is the only thing this projection
+    /// ever writes into, and there is no other place for the text to
+    /// honestly go. Reachable only from an externally/test-constructed
+    /// stale callback: the real single trusted consumer
+    /// (`crate::agent::AgentLoop` step 4c, in `coda-agent`) only drains the
+    /// main inbox while its own turn is live.
+    NoActiveTurn,
+    /// Projected onto `turn_id`'s running turn. `projected` names exactly
+    /// the items this call newly projected, in delivery order — an id
+    /// already projected earlier in this same live turn is silently
+    /// excluded (never double-projected), so `projected` can be shorter
+    /// than the input slice, including empty.
+    Projected { turn_id: String, projected: Vec<ProjectedMainMessage> },
+}
+
+/// One item [`EngineState::main_messages_delivered`] actually projected —
+/// metadata only, mirrors `coda_proto::responses::AgentMessageDeliveredItemDto`
+/// but kept as its own type so `state/mod.rs` does not have to reconstruct a
+/// wire DTO to report what it did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectedMainMessage {
+    pub id: String,
+    pub seq: u64,
+    pub label: String,
+    pub source_kind: &'static str,
+    pub task_id: Option<String>,
+    pub schedule_definition_id: Option<String>,
 }
 
 /// Convenience for a gated state event.
@@ -1061,6 +1096,81 @@ impl EngineState {
         });
     }
 
+    // ── Main inbox projection (Stage 3 chunk B, `ask_main`) ───────────────
+
+    /// Projects one drain batch of delivered `ask_main` items
+    /// (`MessageBus::take_main_for_delivery`, observed via
+    /// `MessageBusEventBridge::on_main_delivered`) into the running turn's
+    /// live history and announces `event/agentMessageDelivered` — both in
+    /// this ONE transaction, so no reader can ever see the announcement
+    /// without also being able to read what it announced (the same
+    /// discipline [`Self::steering_delivered`] documents).
+    ///
+    /// Only the turn that is actually running may receive this projection:
+    /// there is no other honest destination for injected text. When no turn
+    /// is running this returns [`MainMessagesDeliveredOutcome::NoActiveTurn`]
+    /// and publishes nothing — a caller reaching this with no active turn
+    /// (only possible from an externally/test-constructed stale callback;
+    /// the real single trusted consumer only drains this queue from inside
+    /// its own live turn) must never fabricate history.
+    ///
+    /// Dedup is by each item's own stable `id`, scoped to the running turn's
+    /// live state (`LiveTurnAccumulator::push_main_message_text`) — an id
+    /// already projected earlier in this same turn is silently excluded from
+    /// both the live projection and the announced `items`, so a duplicate
+    /// callback can never double-project or double-announce.
+    pub fn main_messages_delivered(&self, msgs: &[MainMessage]) -> MainMessagesDeliveredOutcome {
+        let mut outcome = MainMessagesDeliveredOutcome::NoActiveTurn;
+        self.transact(|s| {
+            let Some(turn_id) = s.current_turn_id().map(str::to_string) else {
+                return Vec::new();
+            };
+            let Some(t) = s.turn.as_mut() else { return Vec::new() };
+            let mut projected = Vec::new();
+            for m in msgs {
+                if t.live.push_main_message_text(&m.id, &m.injected_text()) {
+                    projected.push(ProjectedMainMessage {
+                        id: m.id.clone(),
+                        seq: m.seq,
+                        label: m.label.clone(),
+                        source_kind: m.source_kind,
+                        task_id: m.task_id.clone(),
+                        schedule_definition_id: m.schedule_definition_id.clone(),
+                    });
+                }
+            }
+            outcome = MainMessagesDeliveredOutcome::Projected {
+                turn_id: turn_id.clone(),
+                projected: projected.clone(),
+            };
+            if projected.is_empty() {
+                // Every id in this batch was already projected earlier in
+                // this same turn (or the batch was empty): nothing new
+                // happened, so nothing is announced either.
+                return Vec::new();
+            }
+            let params = serde_json::json!(AgentMessageDeliveredDto {
+                turn_id,
+                items: projected
+                    .into_iter()
+                    .map(|p| AgentMessageDeliveredItemDto {
+                        id: p.id,
+                        seq: p.seq as i64,
+                        label: p.label,
+                        source: p.source_kind.to_string(),
+                        task_id: p.task_id,
+                        schedule_definition_id: p.schedule_definition_id,
+                    })
+                    .collect(),
+            });
+            // Ungated: reaches every client regardless of `stateEvents`
+            // negotiation, exactly like `event/agentMessage` (Stage 2) —
+            // never silently missed by a legacy-event-mode client.
+            vec![(coda_proto::events::event_method::AGENT_MESSAGE_DELIVERED.to_string(), params, false)]
+        });
+        outcome
+    }
+
     // ── Read accessors ────────────────────────────────────────────────────
 
     pub fn steering_pending_snapshot(&self) -> Vec<SteeringPendingDto> {
@@ -1592,6 +1702,111 @@ pub(crate) mod tests {
         assert!(state.history_view().live.is_none(), "no turn is running to project into");
         let snapshot = state.project("v1", limits());
         assert_eq!(snapshot.steering.outcomes[0].outcome, SteeringOutcomeKind::Delivered);
+    }
+
+    // ── Main inbox projection (Stage 3 chunk B, `ask_main`) ───────────────
+    //
+    // These construct real `coda_agent::message::MainMessage` values via a
+    // real `MessageBus` (the type has no public constructor of its own —
+    // only `MessageBus::publish_main` builds one), then feed them into
+    // `EngineState::main_messages_delivered` directly, exactly the way
+    // `MessageBusEventBridge::on_main_delivered` does (see
+    // `state::message_bus_observer`'s own tests for the bridge/wire-level
+    // coverage of this same path).
+
+    fn drain_one_main_message(body: &str) -> Vec<MainMessage> {
+        let bus = coda_agent::MessageBus::new();
+        let source = coda_agent::message::MessageSource::Subagent {
+            task_id: "t1".into(),
+            label: "worker".into(),
+        };
+        bus.publish_main(&source, body, None, None).unwrap();
+        bus.take_main_for_delivery()
+    }
+
+    #[test]
+    fn main_messages_delivered_projects_the_exact_injected_text_into_the_running_turn() {
+        let state = test_state();
+        state.begin_turn("t1", "start", active_config(), ActivityPhase::Responding);
+
+        let drained = drain_one_main_message("please look at X");
+        let expected_text = drained[0].injected_text();
+
+        let outcome = state.main_messages_delivered(&drained);
+        match outcome {
+            MainMessagesDeliveredOutcome::Projected { turn_id, projected } => {
+                assert_eq!(turn_id, "t1");
+                assert_eq!(projected.len(), 1);
+                assert_eq!(projected[0].id, drained[0].id);
+                assert_eq!(projected[0].seq, drained[0].seq);
+                assert_eq!(projected[0].source_kind, "subagent");
+                assert_eq!(projected[0].task_id.as_deref(), Some("t1"));
+            }
+            other => panic!("expected Projected, got {other:?}"),
+        }
+
+        let entries = live_user_entries(&state);
+        assert_eq!(
+            entries,
+            vec![("start".to_string(), None), (expected_text, None)],
+            "the exact committed-source injected_text() must appear as an ordinary live user \
+             block, appended after the turn's own prompt"
+        );
+    }
+
+    #[test]
+    fn main_messages_delivered_dedups_by_id_within_the_same_live_turn_not_by_text() {
+        let state = test_state();
+        state.begin_turn("t1", "start", active_config(), ActivityPhase::Responding);
+
+        let drained = drain_one_main_message("please look at X");
+        let first = state.main_messages_delivered(&drained);
+        assert!(matches!(first, MainMessagesDeliveredOutcome::Projected { ref projected, .. } if projected.len() == 1));
+
+        // The SAME items delivered again — an externally/test-constructed
+        // stale re-delivery, since the real bus's `take_main_for_delivery`
+        // drains each item at most once.
+        let second = state.main_messages_delivered(&drained);
+        match second {
+            MainMessagesDeliveredOutcome::Projected { turn_id, projected } => {
+                assert_eq!(turn_id, "t1");
+                assert!(projected.is_empty(), "a duplicate id must not be projected a second time");
+            }
+            other => panic!("expected Projected (empty), got {other:?}"),
+        }
+
+        let entries = live_user_entries(&state);
+        assert_eq!(
+            entries.iter().filter(|(text, _)| text == &drained[0].injected_text()).count(),
+            1,
+            "the injected text must appear exactly once despite two delivery callbacks"
+        );
+    }
+
+    #[test]
+    fn main_messages_delivered_with_no_active_turn_fabricates_no_history() {
+        let state = test_state();
+        let drained = drain_one_main_message("please look at X");
+
+        let outcome = state.main_messages_delivered(&drained);
+        assert_eq!(outcome, MainMessagesDeliveredOutcome::NoActiveTurn);
+        assert!(state.history_view().live.is_none(), "no active turn must never fabricate a live view");
+    }
+
+    #[test]
+    fn main_messages_delivered_with_an_empty_batch_projects_nothing() {
+        let state = test_state();
+        state.begin_turn("t1", "start", active_config(), ActivityPhase::Responding);
+
+        let outcome = state.main_messages_delivered(&[]);
+        match outcome {
+            MainMessagesDeliveredOutcome::Projected { turn_id, projected } => {
+                assert_eq!(turn_id, "t1");
+                assert!(projected.is_empty());
+            }
+            other => panic!("expected Projected (empty), got {other:?}"),
+        }
+        assert_eq!(live_user_entries(&state), vec![("start".to_string(), None)]);
     }
 
     // ── Pending reverse requests: phase + snapshot section (Stage D) ─────

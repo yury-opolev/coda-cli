@@ -122,3 +122,8 @@ pub struct EventsDroppedEvent {
 /// `session/pendingMessages`' list entries (`AgentMessageDto`) so a client
 /// can merge live and recovered notifications with one type.
 pub type AgentMessageEvent = crate::responses::AgentMessageDto;
+
+/// Payload of `event/agentMessageDelivered` (Stage 3 chunk B `ask_main`
+/// delivery). See `crate::responses::AgentMessageDeliveredDto` — metadata
+/// only, never the injected body text.
+pub type AgentMessageDeliveredEvent = crate::responses::AgentMessageDeliveredDto;

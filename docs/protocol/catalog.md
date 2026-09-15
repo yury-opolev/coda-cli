@@ -136,6 +136,7 @@ the same structured projection regardless of that hint.
 | `event/requestPending`, `event/requestResolved` | **Gated:** interaction registry changes and actual resolution outcomes. |
 | `event/eventsDropped` | **Gated:** explicit loss of retained event coverage; obtain an authoritative snapshot/history instead of guessing missing deltas. |
 | `event/agentMessage` | A background context (a scheduled run, a subagent, or trusted main) published a passive notification via `notify_user`. See [Background notifications](#background-notifications-notify_user). |
+| `event/agentMessageDelivered` | The trusted main conversation's own inbox (`ask_main`) delivered one or more accepted requests into the running turn's live history. Metadata only — see [Main inbox](#main-inbox-ask_main). |
 
 `request/permission`, `request/question` and `request/planApproval` are
 server-initiated JSON-RPC requests, not notifications. Reply using their RPC
@@ -224,11 +225,13 @@ one-way** channel from background work (a scheduled run, a subagent, or the
 trusted main context) to the user's chat surface. It is entirely separate
 from the conversation the model sees:
 
-- It never wakes, resumes or feeds text into the main agent loop. There is
+- It never wakes, resumes or feeds text into the main agent loop — there is
   no reply channel and no way for the user's response (if any) to reach the
-  background context that sent it. Delivering an automatic reply into the
-  main conversation ("ask_main"/a pump loop) is an explicitly out-of-scope,
-  later stage — nothing described here does that.
+  background context that sent it. A `notify_user` publication is explicitly
+  **not** a wake: it never causes the engine to start a turn. The separate
+  `ask_main` channel (see [Main inbox](#main-inbox-ask_main) below) is the
+  one that can cause the main conversation to act, and it is a different
+  queue with a different tool.
 - It is **entirely in-memory (RAM) and engine-process-scoped**. There is no
   disk persistence and no continuation across an engine restart: a fresh
   engine process starts a fresh, empty notification bus at cursor `0`.
@@ -282,6 +285,83 @@ the ring — once evicted, the key becomes reusable again. Body/context/label
 are each length-bounded (oversized user-supplied text is rejected outright,
 never silently truncated); a caller-supplied idempotency key is bounded too
 and rejected outright when oversized.
+
+## Main inbox (`ask_main`)
+
+`messaging.askMain` (see `initialize.capabilities`) is a second, independent
+FIFO on the SAME engine-owned bus `notify_user` uses — but unlike that
+passive, display-only channel, an item accepted here IS eventually injected
+into the trusted main conversation's own history, by the single trusted
+consumer (the main agent loop, at its own next iteration boundary) and
+nowhere else:
+
+- **Accepted-only, nonblocking, no reply.** `ask_main` (a tool available to
+  subagents and scheduled runs — refused outright when called from the main
+  context itself, which would be a self-question loop nobody could ever
+  answer) returns as soon as the bus takes custody of the request. The
+  caller never waits for an answer, never holds a permit while one is
+  pending, and there is no reply channel back to that specific call. A
+  receipt's `accepted`/`status` only ever means "the bus took custody of
+  this request for later delivery" — never that the main conversation has
+  read or acted on it.
+- **Not user authority.** The text injected into the main conversation's
+  history always carries a literal `[agent-message]` prefix, the trusted
+  source's own label/ids, and an explicit disclaimer that this is a
+  background task request — **never** promoted to, or treated as, a new
+  user instruction.
+- **RAM-only, bounded main queue**, independent of the passive bus's ring:
+  pending requests are never silently evicted to make room for a new one —
+  a full queue refuses new publications outright rather than losing one a
+  caller never knew was dropped. Nothing here survives an engine restart.
+- **Delivery persists an ordinary, source-prefixed transcript entry** — once
+  the single trusted consumer actually drains the queue, the exact text
+  injected is projected into the running turn's own live history (and, once
+  the turn commits, the committed transcript) as a normal user-role entry,
+  recoverable through the ordinary `session/getHistory`/`session/getState`
+  machinery like any other conversation content. `event/agentMessageDelivered`
+  announces the delivery, but carries **metadata only** (ids, the main
+  queue's own `seq`, the `turnId`, trusted source label/ids) — never the
+  injected text itself; a client recovers the authoritative entry via
+  `session/getHistory`.
+- **Passive acceptance, then action at a boundary.** Accepting an `ask_main`
+  request is deliberately silent on the wire: it publishes no event and no
+  passive `notify_user` notification. What it does do is mark the main
+  conversation as having work waiting. The request is then delivered either
+  by a turn that was already running (its next iteration boundary drains the
+  queue before the model is called) or, when the engine is idle, by a turn
+  the engine starts for exactly that purpose. Either way it is the **same**
+  single-flight execution slot and the same history writer every
+  `session/prompt` uses — there is no second conversation, no second writer,
+  and no preemption of a turn in progress.
+- **Wake, retry and blocked semantics.** The idle path is woken by: a newly
+  accepted `ask_main` item, the release of the turn slot (including a
+  cancelled or failed turn), the end of initialization, and a provider
+  becoming wired. It is deliberately **not** woken by a passive
+  `notify_user` publication or by an ordinary task completion. When it
+  cannot act it records *why*, and retries only when that specific condition
+  changes:
+  - **Busy** — another turn holds the slot. Nothing is recorded; the slot's
+    release is itself a wake.
+  - **No provider wired** — the requests stay queued (never consumed, never
+    discarded), the user is told once in fixed wording that never quotes the
+    queued request, and no further attempt is made until a provider is
+    actually wired. Connecting one delivers the backlog with no further
+    action from the client.
+  - **No delivery progress** — a turn ran (or a preflight failed) without
+    anything leaving the queue, for instance because it was interrupted
+    before the injection point. The requests stay queued and are retried
+    when a provider transition happens or genuinely new work is accepted —
+    never merely because the failed attempt's own slot release woke it.
+  There is no attempt cap and no discard: a queued request is never dropped
+  for having been retried too often.
+- **Nothing new on disk, nothing across a restart.** This adds no persisted
+  queue state and no restart continuation. Ordinary transcript persistence
+  is unchanged.
+- **Shutdown.** `shutdown` publishes `stopping` first, so no further turn is
+  admitted, cancels any running turn, then stops and **joins** the idle path
+  within a bounded grace period (aborting it if a provider ignores
+  cancellation entirely) before closing the bus. No delivery, publication or
+  new turn happens after that point.
 
 ## Unsupported and client-local surfaces
 

@@ -28,8 +28,10 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::message::{MessageSource, PublishError};
+use crate::message::PublishError;
 use crate::tool::{Tool, ToolContext, ToolContextServiceExt as _, ToolOutcome, ToolResult};
+
+use super::source::resolve_trusted_source;
 
 #[derive(Debug, Deserialize)]
 struct NotifyUserInput {
@@ -117,80 +119,6 @@ impl Tool for NotifyUserTool {
             ),
         }
     }
-}
-
-/// Resolve the trusted [`MessageSource`] for this call, or a user-facing
-/// refusal message when the identity cannot be positively established.
-///
-/// Fails closed: every branch that cannot prove a specific identity refuses
-/// rather than defaulting to `Main`.
-fn resolve_trusted_source(ctx: &ToolContext) -> Result<MessageSource, String> {
-    if let Some(origin) = &ctx.schedule_origin {
-        // Even a scheduled run needs its own registered task id to attribute
-        // the notification to (the task the schedule runtime registered for
-        // this specific firing) — never fabricated. And, exactly like the
-        // subagent branch below, that task id must be *verified* against the
-        // task manager rather than trusted on the strength of merely being
-        // present: `schedule_origin` alone says "this run started under a
-        // schedule", not "this specific caller_task_id is real". A nested
-        // child of a scheduled run carries the same schedule_origin as its
-        // ancestor but its *own* task id — verifying it here is what keeps
-        // that child's notification attributed to itself, not silently
-        // promoted to the root task merely because the origin matches.
-        let Some(task_id) = ctx.caller_task_id.clone() else {
-            return Err(
-                "Scheduled context is missing its own task id; refusing to attribute this \
-                 notification."
-                    .into(),
-            );
-        };
-        let Some(manager) = ctx.get_task_manager() else {
-            return Err(
-                "No task manager is available to verify this scheduled run's identity; \
-                 refusing to attribute this notification."
-                    .into(),
-            );
-        };
-        if manager.get(&task_id).is_none() {
-            return Err(format!(
-                "Task '{task_id}' is not known to the task manager; refusing to attribute this \
-                 scheduled notification."
-            ));
-        }
-        return Ok(MessageSource::ScheduledTask {
-            definition_id: origin.definition_id.clone(),
-            definition_name: origin.definition_name.clone(),
-            task_id,
-        });
-    }
-
-    if let Some(task_id) = &ctx.caller_task_id {
-        let Some(manager) = ctx.get_task_manager() else {
-            return Err(
-                "No task manager is available to verify this subagent's identity; refusing to \
-                 attribute this notification."
-                    .into(),
-            );
-        };
-        let Some(snapshot) = manager.get(task_id) else {
-            return Err(format!(
-                "Task '{task_id}' is not known to the task manager; refusing to attribute this \
-                 notification."
-            ));
-        };
-        return Ok(MessageSource::Subagent { task_id: task_id.clone(), label: snapshot.description });
-    }
-
-    if ctx.is_main_context {
-        return Ok(MessageSource::Main);
-    }
-
-    Err(
-        "This context has no verifiable identity (no schedule origin, no known caller task, and \
-         no trusted main marker); refusing to send a notification rather than guessing who it is \
-         from."
-            .into(),
-    )
 }
 
 #[cfg(test)]

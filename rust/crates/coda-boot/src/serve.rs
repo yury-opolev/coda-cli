@@ -75,7 +75,8 @@ pub struct ServeArgs {
     #[arg(long, value_name = "TEXT")]
     pub goal: Option<String>,
 
-    /// Maximum wall-clock time for the goal. Format: `30m`, `2h`, `90s`.
+    /// Maximum wall-clock time for the goal: `90s`, `30m`, `2h`, `7d`, or
+    /// `none` for no limit. [default: 240h]
     #[arg(
         long,
         visible_alias = "goal-max-duration",
@@ -84,12 +85,14 @@ pub struct ServeArgs {
     )]
     pub goal_timeout: Option<String>,
 
-    /// Maximum continuation turns the goal supervisor may grant.
+    /// Maximum continuation turns the goal supervisor may grant, or `none`
+    /// for no limit. [default: 60000]
     #[arg(
         long,
         visible_alias = "goal-max-continuations",
         value_name = "N",
-        requires = "goal"
+        requires = "goal",
+        value_parser = coda_proto::parse_max_continuations
     )]
     pub max_continuations: Option<i32>,
 

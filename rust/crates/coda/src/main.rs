@@ -147,7 +147,8 @@ struct InteractiveArgs {
     #[arg(long, value_name = "TEXT")]
     goal: Option<String>,
 
-    /// Maximum wall-clock time allowed for the goal. Format: `30m`, `2h`, `90s`.
+    /// Maximum wall-clock time allowed for the goal: `90s`, `30m`, `2h`, `7d`,
+    /// or `none` for no limit. [default: 240h]
     #[arg(
         long,
         visible_alias = "goal-max-duration",
@@ -156,12 +157,14 @@ struct InteractiveArgs {
     )]
     goal_timeout: Option<String>,
 
-    /// Maximum number of continuation turns the goal supervisor may grant.
+    /// Maximum number of continuation turns the goal supervisor may grant,
+    /// or `none` for no limit. [default: 60000]
     #[arg(
         long,
         visible_alias = "goal-max-continuations",
         value_name = "N",
-        requires = "goal"
+        requires = "goal",
+        value_parser = coda_proto::parse_max_continuations
     )]
     max_continuations: Option<i32>,
 
@@ -243,7 +246,8 @@ struct RunArgs {
     #[arg(long, value_name = "TEXT")]
     goal: Option<String>,
 
-    /// Maximum wall-clock time for the goal. Format: `30m`, `2h`, `90s`.
+    /// Maximum wall-clock time for the goal: `90s`, `30m`, `2h`, `7d`, or
+    /// `none` for no limit. [default: 240h]
     #[arg(
         long,
         visible_alias = "goal-max-duration",
@@ -252,12 +256,14 @@ struct RunArgs {
     )]
     goal_timeout: Option<String>,
 
-    /// Maximum continuation turns the goal supervisor may grant.
+    /// Maximum continuation turns the goal supervisor may grant, or `none`
+    /// for no limit. [default: 60000]
     #[arg(
         long,
         visible_alias = "goal-max-continuations",
         value_name = "N",
-        requires = "goal"
+        requires = "goal",
+        value_parser = coda_proto::parse_max_continuations
     )]
     max_continuations: Option<i32>,
 
@@ -1096,6 +1102,50 @@ mod tests {
             Cli::try_parse_from(["coda", "run", "-p", "x", "--goal-timeout", "30m"]).is_err(),
             "--goal-timeout without --goal must fail"
         );
+    }
+
+    /// An operator must be able to say "no ceiling" in the same word on both
+    /// dimensions; `none` on the continuation flag becomes the wire sentinel.
+    #[test]
+    fn run_accepts_none_as_an_unlimited_goal_budget() {
+        for token in coda_proto::UNLIMITED_TOKENS {
+            let a = run(&[
+                "--goal",
+                "ship it",
+                "--goal-timeout",
+                token,
+                "--max-continuations",
+                token,
+            ]);
+            assert_eq!(a.goal_timeout.as_deref(), Some(token));
+            assert_eq!(
+                a.max_continuations,
+                Some(coda_proto::UNLIMITED_CONTINUATIONS),
+                "{token} must parse to the unlimited sentinel"
+            );
+        }
+    }
+
+    /// The sentinel must not be typeable directly: a stray `-1` is far more
+    /// likely to be a mistake than a deliberate request for no limit.
+    #[test]
+    fn run_rejects_a_negative_continuation_count() {
+        for bad in ["-1", "-5", "lots"] {
+            assert!(
+                Cli::try_parse_from([
+                    "coda",
+                    "run",
+                    "-p",
+                    "x",
+                    "--goal",
+                    "ship it",
+                    "--max-continuations",
+                    bad,
+                ])
+                .is_err(),
+                "--max-continuations {bad} must be rejected"
+            );
+        }
     }
 
     #[test]

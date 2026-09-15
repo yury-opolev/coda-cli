@@ -682,6 +682,7 @@ dependencies = [
  "coda-client",
  "coda-diagnostics",
  "coda-llm",
+ "coda-proto",
  "fs2",
  "libc",
  "serde_json",

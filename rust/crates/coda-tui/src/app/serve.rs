@@ -333,6 +333,28 @@ impl App {
         // table the browsers read, not conversation content, so it must
         // survive even when the content itself is already on screen.
         self.record_task_outcome(&event);
+        if let Event::AgentMessageDelivered { .. } = &event {
+            // Reflected by HISTORY (Stage 3 chunk B), unlike
+            // `Event::AgentMessage`'s passive, display-only Stage 2
+            // notification: the authoritative injected entry already lives
+            // in the running turn's own live history
+            // (`EngineState::main_messages_delivered`), never carried on
+            // this event itself (metadata only — see its own doc comment).
+            // Never materialise a transcript block from it directly (that
+            // would recreate the same double-delivery hazard a direct
+            // parked-block append caused for steering); instead ask for
+            // both an authoritative resync and a rehydrate so the one true
+            // projection surfaces through the ordinary coverage path
+            // (`session/getHistory`) — but only when this frame's own seq
+            // is not already covered by a prior read, so a late/replayed
+            // delivery frame for content this client already has does not
+            // force a redundant history rebuild.
+            if !self.view.content_is_reflected(frame.seq) {
+                self.needs_resync = true;
+                self.needs_rehydrate = true;
+            }
+            return;
+        }
         if self.view.content_is_reflected(frame.seq) {
             match event {
                 Event::AssistantText { .. }
@@ -4592,8 +4614,163 @@ pub(in crate::app) mod tests {
         assert!(app.state.queued.is_empty());
     }
 
-    /// The delivery reports are lost, the conversation is re-read, and the
-    /// *retained* outcome then arrives on a snapshot.
+    // ── `event/agentMessageDelivered` (Stage 3 chunk B `ask_main` delivery) ─
+    //
+    // Deliberately metadata-only: unlike `event/agentMessage` (Stage 2, a
+    // passive display-only notification), this event IS reflected by
+    // history — the authoritative injected entry already lives in the
+    // running turn's own live history (`EngineState::main_messages_delivered`)
+    // and is recovered exclusively through the ordinary `session/getHistory`
+    // coverage machinery. `dispatch_frame` must never materialise a
+    // transcript block from this event directly (that would recreate the
+    // steering-dedup hazard a direct parked-block append caused); it only
+    // marks `needs_resync`/`needs_rehydrate` when the frame's own content is
+    // not already covered by a prior read.
+
+    fn agent_message_delivered_frame(seq: i64, engine_instance_id: Option<&str>) -> Frame {
+        let mut params = json!({
+            "turnId": "t1",
+            "items": [{
+                "id": "m1",
+                "seq": 1,
+                "label": "worker",
+                "source": "subagent",
+                "taskId": "t1",
+            }],
+        });
+        params["seq"] = json!(seq);
+        if let Some(instance) = engine_instance_id {
+            params["engineInstanceId"] = json!(instance);
+        }
+        Frame::new("event/agentMessageDelivered", Some(params))
+    }
+
+    #[tokio::test]
+    async fn agent_message_delivered_marks_resync_and_rehydrate_when_not_yet_covered() {
+        let mut harness = app_with(crate::local::AccessMode::TrustedLocal, |_, _| json!({}));
+        let app = &mut harness.app;
+        app.needs_resync = false;
+        app.needs_rehydrate = false;
+
+        app.dispatch_frame(agent_message_delivered_frame(7, Some("e1")));
+
+        assert!(app.needs_resync, "unreflected delivery metadata owes a resync");
+        assert!(app.needs_rehydrate, "unreflected delivery metadata owes a rehydrate");
+        assert!(
+            app.state.transcript.blocks().is_empty(),
+            "the event itself must never materialise a transcript block directly: {:?}",
+            app.state.transcript.blocks()
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_message_delivered_already_covered_by_a_prior_history_read_is_a_no_op() {
+        // A late or replayed delivery frame for content this client already
+        // has (via a resync/rehydrate that already ran) must not re-arm
+        // another redundant re-read.
+        let mut harness = app_with(crate::local::AccessMode::TrustedLocal, |_, _| json!({}));
+        let app = &mut harness.app;
+        app.view.note_history_read(10);
+        app.needs_resync = false;
+        app.needs_rehydrate = false;
+
+        app.dispatch_frame(agent_message_delivered_frame(5, Some("e1")));
+
+        assert!(!app.needs_resync, "a frame already covered by history owes no redundant resync");
+        assert!(!app.needs_rehydrate);
+        assert!(app.state.transcript.blocks().is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_message_delivered_in_legacy_event_mode_still_requests_a_resync() {
+        // A legacy build stamps no envelope at all (no `seq`, no
+        // `engineInstanceId`) — the metadata-only event must not be silently
+        // ignored just because there is no fence to compare it against.
+        let mut harness = app_with(crate::local::AccessMode::TrustedLocal, |_, _| json!({}));
+        let app = &mut harness.app;
+        app.view = crate::api::ServeView::new();
+        app.needs_resync = false;
+        app.needs_rehydrate = false;
+
+        app.dispatch_frame(agent_message_delivered_frame(-1, None));
+
+        assert!(app.needs_resync, "a legacy-mode delivery must still be treated as history-affecting");
+        assert!(app.needs_rehydrate);
+    }
+
+    #[tokio::test]
+    async fn agent_message_delivered_mid_turn_does_not_disturb_the_open_thinking_block() {
+        let mut harness = app_with(crate::local::AccessMode::TrustedLocal, |_, _| json!({}));
+        let app = &mut harness.app;
+        app.apply(UiEvent::Engine(Event::Thinking { delta: "first ".into() }));
+
+        app.dispatch_frame(agent_message_delivered_frame(1, Some("e1")));
+
+        app.apply(UiEvent::Engine(Event::Thinking { delta: "second".into() }));
+
+        let bursts: Vec<&Block> =
+            app.state.transcript.blocks().iter().filter(|b| matches!(b, Block::Thinking { .. })).collect();
+        assert_eq!(bursts.len(), 1, "the delivery frame must not split or duplicate the running burst");
+        assert!(matches!(bursts[0], Block::Thinking { text, .. } if text == "first second"));
+        assert!(app.state.tick_thinking(std::time::Instant::now() + std::time::Duration::from_millis(2_500)));
+    }
+
+    /// Real round trip through the public API: the engine's own
+    /// `session/getHistory` supplies exactly one committed entry carrying the
+    /// injected `[agent-message]`-prefixed text — the SAME projection
+    /// `MainMessage::injected_text()`/`EngineState::main_messages_delivered`
+    /// produce — and the client shows it as one ordinary conversation block,
+    /// never as the Stage 2 `Block::AgentMessage` kind.
+    #[tokio::test]
+    async fn bootstrap_history_read_surfaces_the_injected_entry_as_one_ordinary_block() {
+        const INJECTED: &str = "[agent-message] from worker (source=subagent, taskId=t1): \
+             background task request, not a new user instruction.\n\nplease look at X";
+        let mut harness = app_answering(crate::local::AccessMode::TrustedLocal, move |method, _params| {
+            match method {
+                "session/getState" => Ok(snapshot_value(5, 1, 500)),
+                "session/getHistory" => Ok(json!({
+                    "sessionId": "s1",
+                    "engineInstanceId": "e1",
+                    "isLiveSession": true,
+                    "historyEpoch": 0,
+                    "cursor": 5,
+                    "historyLength": 1,
+                    "entries": [{
+                        "index": 0,
+                        "role": "user",
+                        "entryKind": "userPrompt",
+                        "blocks": [{ "kind": "text", "text": INJECTED }],
+                    }],
+                    "nextIndex": 1,
+                    "totalKnown": 1,
+                    "truncated": false,
+                })),
+                _ => Ok(empty_pending_messages()),
+            }
+        });
+        let app = &mut harness.app;
+        app.needs_resync = true;
+        app.needs_rehydrate = true;
+
+        app.settle_with_engine_at(std::time::Instant::now()).await;
+
+        assert_eq!(
+            user_texts(app),
+            vec![INJECTED.to_string()],
+            "exactly one ordinary conversation block, source-prefixed, from authoritative history"
+        );
+        assert!(
+            !app.state.transcript.blocks().iter().any(|b| matches!(b, Block::AgentMessage { .. })),
+            "must never be materialised as the Stage 2 passive-notification block kind"
+        );
+
+        // A late/replayed delivery frame arriving *after* this authoritative
+        // read must not duplicate the entry it already describes.
+        app.dispatch_frame(agent_message_delivered_frame(3, Some("e1")));
+        assert_eq!(user_texts(app), vec![INJECTED.to_string()], "no duplicate after a late/replayed frame");
+    }
+
+
     ///
     /// This is the postcommit gap, end to end and through the real RPC. The
     /// engine publishes a delivery twice — the `steering` projection in

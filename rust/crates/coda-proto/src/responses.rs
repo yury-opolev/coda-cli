@@ -66,6 +66,49 @@ pub struct AgentMessageDto {
     pub schedule_definition_id: Option<String>,
 }
 
+/// One delivered `ask_main` item's metadata, carried in
+/// `event/agentMessageDelivered` (Stage 3 chunk B).
+///
+/// Deliberately metadata only — never the injected body text itself. The
+/// authoritative content already lives in the running turn's own live
+/// history (`session/getHistory`/`session/getState`), projected in the same
+/// transaction as this announcement
+/// (`coda_serve`'s `EngineState::main_messages_delivered`); repeating it here
+/// would be a second, potentially divergent, projection of the same fact.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AgentMessageDeliveredItemDto {
+    pub id: String,
+    pub seq: i64,
+    pub label: String,
+    /// One of `"scheduledTask"` | `"subagent"` | `"main"` — see
+    /// [`AgentMessageDto::source`]. `"main"` is unreachable here: `ask_main`
+    /// refuses a main-context caller outright (self-question loop), so
+    /// nothing ever queues an item attributed to `main`.
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_definition_id: Option<String>,
+}
+
+/// Payload of `event/agentMessageDelivered` (Stage 3 chunk B): the single
+/// trusted main `AgentLoop` consumer (see `crate::agent::AgentLoop` step 4c
+/// in `coda-agent`) drained one or more `ask_main` requests and their
+/// `MainMessage::injected_text()` was projected into `turnId`'s running live
+/// history in the SAME transaction as this announcement. Reflected by
+/// history — unlike [`AgentMessageDto`]'s passive, display-only Stage 2
+/// notification — so a client must treat this as history-affecting (re-read
+/// via `session/getHistory`), never as content carried on the wire here.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AgentMessageDeliveredDto {
+    pub turn_id: String,
+    pub items: Vec<AgentMessageDeliveredItemDto>,
+}
+
 /// Exact bounds of notifications this client lost to ring eviction before it
 /// could read them — see `coda_agent::message::DroppedRange`. Present exactly
 /// when `gap` is `true`.
