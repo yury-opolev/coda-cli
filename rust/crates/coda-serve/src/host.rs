@@ -17,7 +17,7 @@ use coda_agent::{
 };
 use coda_agent::agent::stop::UserQuestionPrompt;
 use coda_agent::events::{AgentEvent, AgentSink};
-use coda_agent::autonomy::ForkedAgent;
+use coda_agent::autonomy::{ForkedAgent, ProxyAnswerer};
 use coda_agent::hooks::runner::{HookExecutor, ShellHookExecutor};
 use coda_agent::lsp::{LspServerConfig, LspServerManager, LspServerMapBuilder};
 use coda_agent::permission::{
@@ -4581,8 +4581,32 @@ impl ServeHost {
 
         // Build the agent loop with all services wired (Finding 1).
         let uq_goal = Arc::clone(&self.user_question) as Arc<dyn UserQuestionPrompt>;
-        let uq_tool = Arc::clone(&self.user_question) as Arc<dyn UserQuestion>;
         let pa = Arc::clone(&self.plan_approver) as Arc<dyn PlanApprover>;
+
+        // The question seam is the one place autonomy changes what the agent
+        // can do to the operator. With a goal active, `ask_user_question` is
+        // answered by a stand-in that records its reasoning, rather than
+        // suspending the run against a terminal nobody is watching. With no
+        // goal, this is untouched and the interactive prompt is used exactly as
+        // before — which is what keeps ordinary sessions unchanged.
+        //
+        // The ledger handed to the stand-in MUST be the supervisor's own, or
+        // its assumptions would be invisible to both the end-of-run report and
+        // the termination proof.
+        let uq_tool: Arc<dyn UserQuestion> = match &goal {
+            Some(supervisor) => {
+                let judge: Arc<dyn ForkedAgent> = Arc::new(LlmForkedAgent {
+                    client: Arc::clone(&client),
+                    model: self.current_model(),
+                });
+                Arc::new(ProxyAnswerer::new(
+                    judge,
+                    supervisor.ledger(),
+                    supervisor.goal().to_owned(),
+                ))
+            }
+            None => Arc::clone(&self.user_question) as Arc<dyn UserQuestion>,
+        };
 
         // ONE coherent read of the configuration this turn runs under, taken
         // after every await that precedes the build. Everything below — the
@@ -11530,6 +11554,28 @@ mod tests {
     }
 
     /// `session/setGoal` stores goal text and budget; validated before prompt.
+    /// The two proved outcomes must reach the wire, or an operator returning to
+    /// a finished run has no way to tell "blocked, here is why" from "gave up".
+    #[test]
+    fn the_proved_outcomes_serialise_to_the_wire() {
+        for (outcome, expected) in [
+            (GoalOutcome::GenuinelyBlocked, "GenuinelyBlocked"),
+            (GoalOutcome::Stalled, "Stalled"),
+            (GoalOutcome::Met, "Met"),
+            (GoalOutcome::Unmet, "Unmet"),
+        ] {
+            let gs = GoalStatus { outcome, ..GoalStatus::none() };
+            let wire = wire_goal_status(&gs).expect("a non-None outcome is reported");
+            assert_eq!(wire["outcome"], expected);
+        }
+    }
+
+    /// No goal, no goalStatus — an ordinary interactive turn is unchanged.
+    #[test]
+    fn a_run_without_a_goal_reports_no_goal_status() {
+        assert!(wire_goal_status(&GoalStatus::none()).is_none());
+    }
+
     #[tokio::test]
     async fn set_goal_stores_all_params() {
         let host = make_host();
@@ -11541,8 +11587,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(r["ok"], true);
-        assert_eq!(r["goal"], "Implement feature X");
+        assert_eq!(r["ok"], true);        assert_eq!(r["goal"], "Implement feature X");
         assert_eq!(r["maxDuration"], "1h");
         assert_eq!(r["maxContinuations"], 10);
         // Verify the state is actually stored.

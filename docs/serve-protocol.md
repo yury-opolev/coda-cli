@@ -57,11 +57,17 @@ orchestrator ──spawn/connect──► coda serve
    `bypass` (no prompts), and `yolo-safe` (bypass with a safety classifier that escalates risky
    actions via `request/permission`).
    Autonomous flags (all off by default): `--goal "<objective>"` sets a goal the agent works
-   toward until a judge declares it met; `--goal-max-duration <dur>` overrides the wall-clock
-   budget (`90s`, `30m`, `2h`, `7d`, or `none` for no limit; default `240h`);
-   `--goal-max-continuations <n>` overrides the turn budget (`none` for no limit; default
-   `60000`); `--session-memory` enables the background session-memory watcher;
-   `--max-continuations <n>` bounds stop-hook continuations per run (default 10).
+   toward until a judge declares it met. **A goal also changes how the run handles questions**:
+   `ask_user_question` is answered by a stand-in model that records its reasoning, rather than
+   suspending the run against a terminal nobody is watching, and the run ends in one of four
+   honest states (met, genuinely blocked, stalled, or out of budget) — never by waiting.
+   The permission mode remains the autonomy envelope: a goal does **not** imply `--yolo`, and an
+   action the mode forbids is recorded as a capability blocker rather than prompting.
+   `--goal-max-duration <dur>` overrides the wall-clock budget (`90s`, `30m`, `2h`, `7d`, or
+   `none` for no limit; default `240h`); `--goal-max-continuations <n>` overrides the turn budget
+   (`none` for no limit; default `60000`); `--session-memory` enables the background
+   session-memory watcher; `--max-continuations <n>` bounds stop-hook continuations per run
+   (default 10).
 2. Normally send `initialize` → get `{ protocolVersion: string, sessionId: string, serverInfo: string, telemetryLogPath?: string }`.
 3. Send `session/prompt` to run a turn. While it runs you receive `event/*` notifications and may
    receive server-initiated `request/*` you must answer. The `session/prompt` response resolves
@@ -367,12 +373,23 @@ a `goalStatus` object:
 }
 ```
 
-- `outcome`: `"Met"` | `"Unmet"` (never `"None"` — that case omits the field).
+- `outcome`: `"Met"` | `"Unmet"` | `"GenuinelyBlocked"` | `"Stalled"` (never `"None"` — that
+  case omits the field).
 - `remaining`: the judge's last "what still remains" text, or null when the goal was met.
 - `continuations`: the number of forced-continue nudges issued during the run.
 - `elapsedSeconds`: wall-clock seconds elapsed during the goal run.
 - `escalated`: true when the budget was exhausted and an escalation question was sent.
 - `extensionUsed`: true when the one bounded extension was granted.
+
+The two proved outcomes are reported alongside an `event/limitReached` notification whose `kind`
+is `goal.genuinelyBlocked` or `goal.stalled` and whose `message` is the operator-facing report:
+each parked blocker, what was tried, what a human would need to supply, and any low-confidence
+decision the stand-in made on their behalf.
+
+- `GenuinelyBlocked` — every remaining piece of work is parked behind a recorded blocker. This
+  is the provable "nothing further is possible", not a guess.
+- `Stalled` — the run was looping with nothing left that it could advance. This is what
+  guarantees termination when the operator set no budget.
 
 **Resume:** pass `sessionId` to `initialize` to resume a prior conversation. On that request, serve
 loads the transcript and persisted metadata before session initialization. If a transcript

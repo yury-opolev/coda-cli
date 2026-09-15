@@ -229,6 +229,9 @@ impl AgentLoop {
         _pending_hook_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
     ) -> Result<GoalStatus, AgentError> {
         let mut stop_continuations: u32 = 0;
+        // Successful file mutations this run, the progress signal that tells a
+        // slow run apart from a stalled one.
+        let mut files_changed: u64 = 0;
         let mut activity = ToolActivity::new();
         let mut blocked_compaction_at: Option<usize> = None;
 
@@ -542,6 +545,38 @@ impl AgentLoop {
                 // No tool calls → stop-decision ladder (§1.5).
                 let recent_text = last_assistant_text(history);
 
+                // A turn that called no tool is a monologue. The detector needs
+                // to see it: three in a row is an agent talking rather than
+                // working, and is one of the shapes that would otherwise loop
+                // forever without a budget to catch it.
+                if let Some(supervisor) = goal.as_ref() {
+                    supervisor.stuck().observe_monologue();
+                }
+
+                // Tell the supervisor what this turn achieved, before it
+                // decides anything. Progress is measured from work actually
+                // done — todos finished, files changed — so a turn that only
+                // produced prose is correctly seen as standing still.
+                if let Some(supervisor) = goal.as_mut() {
+                    let (open, completed) = match self.todos.as_deref() {
+                        Some(store) => {
+                            let items = store.items();
+                            let open: Vec<String> = items
+                                .iter()
+                                .filter(|t| t.status != crate::todos::TodoStatus::Completed)
+                                .map(|t| t.content.clone())
+                                .collect();
+                            let completed = items
+                                .iter()
+                                .filter(|t| t.status == crate::todos::TodoStatus::Completed)
+                                .count();
+                            (open, completed)
+                        }
+                        None => (Vec::new(), 0),
+                    };
+                    supervisor.record_progress(open, completed, files_changed);
+                }
+
                 let action = decide_stop(
                     acc.stop_reason.as_deref(),
                     &recent_text,
@@ -610,6 +645,40 @@ impl AgentLoop {
                     run_tools(&tool_uses_in_history, &activity, sink, &batch_ctx, cancel.clone())
                         .await?;
 
+                // Feed the autonomy supervisor what just happened. The stuck
+                // detector needs each call paired with its result to recognise
+                // a loop, and the file counter is the progress signal that
+                // distinguishes a slow run from a stalled one.
+                if let Some(supervisor) = goal.as_ref() {
+                    let stuck = supervisor.stuck();
+                    // The reasoning that accompanied this batch. Part of the
+                    // detector's notion of "the same action": two calls made
+                    // for genuinely different reasons are not a repeat.
+                    let thought = last_assistant_text(history);
+                    for (use_block, result_block) in
+                        tool_uses_in_history.iter().zip(result_blocks.iter())
+                    {
+                        let (Content::ToolUse { name, input_json, .. },
+                             Content::ToolResult { content, is_error, .. }) =
+                            (use_block, result_block)
+                        else {
+                            continue;
+                        };
+                        if !*is_error && is_file_mutation(name) {
+                            files_changed = files_changed.saturating_add(1);
+                        }
+                        stuck.observe(
+                            crate::autonomy::StuckObservation::new(
+                                name,
+                                input_json,
+                                content,
+                                *is_error,
+                            )
+                            .with_thought(thought.clone()),
+                        );
+                    }
+                }
+
                 history.push(Message::new(Role::User, result_blocks));
 
                 // §8 item 28: persist after tool results (seam; no-op here).
@@ -658,8 +727,16 @@ impl AgentLoop {
     }
 }
 
-fn goal_status(goal: &Option<AutonomySupervisor>) -> GoalStatus {
-    goal.as_ref().map(|g| g.status()).unwrap_or_else(GoalStatus::none)
+/// Tools whose success means a file actually changed on disk.
+///
+/// Used only as a progress signal, so a conservative list is fine: a mutation
+/// this misses simply is not counted as progress, and the other signals still
+/// apply.
+fn is_file_mutation(tool_name: &str) -> bool {
+    matches!(tool_name, "edit_file" | "write_file" | "notebook_edit")
+}
+
+fn goal_status(goal: &Option<AutonomySupervisor>) -> GoalStatus {    goal.as_ref().map(|g| g.status()).unwrap_or_else(GoalStatus::none)
 }
 
 /// Replace the `Text` block in the last assistant message with `new_text`.
