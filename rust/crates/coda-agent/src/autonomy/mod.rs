@@ -19,6 +19,7 @@ pub mod budget;
 pub mod completion;
 pub mod ledger;
 pub mod retry;
+pub mod stuck;
 pub mod verdict;
 
 pub use budget::GoalBudget;
@@ -27,6 +28,7 @@ pub use ledger::{
     WorkItemRef,
 };
 pub use retry::GoalRetryPolicy;
+pub use stuck::{StuckDetector, StuckObservation, StuckPattern};
 pub use verdict::{GoalOutcome, GoalStatus, GoalVerdict};
 
 use completion::SYSTEM_PROMPT;

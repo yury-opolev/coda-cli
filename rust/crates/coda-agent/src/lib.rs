@@ -15,7 +15,8 @@
 //!   plus the `ToolActionClassifier` trait and its LLM-backed implementation.
 //! - **`autonomy`**: `AutonomySupervisor`, `GoalBudget`, `GoalVerdict`, `GoalStatus`,
 //!   `GoalOutcome`, `CompletionJudgePrompt`, `GoalRetryPolicy`, `ForkedAgent`,
-//!   `AssumptionLedger`, `LedgerEntry`, `BlockerKind`, `Confidence`.
+//!   `AssumptionLedger`, `LedgerEntry`, `BlockerKind`, `Confidence`,
+//!   `StuckDetector`, `StuckObservation`, `StuckPattern`.
 //! - **`steering`**: `SteeringInbox`, `SteeringEntry`.
 //! - **`events`**: `AgentEvent`, `AgentSink`, `ProtoAdapter`, `NullSink`,
 //!   `CollectingSink`, `ToolCallStatus`.
@@ -63,7 +64,7 @@ pub use events::{AgentEvent, AgentSink, CollectingSink, NullSink, ToolCallStatus
 pub use autonomy::{
     AssumptionLedger, AutonomySupervisor, BlockerKind, CompletionJudgePrompt, Confidence,
     ForkedAgent, GoalBudget, GoalOutcome, GoalRetryPolicy, GoalStatus, GoalVerdict, LedgerEntry,
-    LedgerError, LedgerSnapshot, WorkItemRef,
+    LedgerError, LedgerSnapshot, StuckDetector, StuckObservation, StuckPattern, WorkItemRef,
 };
 pub use hooks::{
     HookContentHash, HookEventPolicy, HookMatcher, HookRunEntry, HookRunLog, HookRunner,

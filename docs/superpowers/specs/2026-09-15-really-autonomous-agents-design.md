@@ -162,15 +162,32 @@ Heuristics and thresholds as shipped by OpenHands' `StuckDetector`:
 | same action → same observation | 4 |
 | same action → same error | streak exceeds 3 |
 | agent monologue, no tool progress | 3 |
-| alternating `[A,B,A,B,A,B]` | 6 |
+| repeating cycle of 2–4 distinct events | 3 full repetitions |
 
 Equality is **semantic** — tool name, arguments and thought — ignoring call ids,
 response ids and timestamps.
+
+The cycle heuristic generalises OpenHands' `[A,B,A,B,A,B]` rule in two ways,
+both closing hangs that the literal rule misses and that nothing else would
+catch once the budget can be `none`:
+
+- **Period 2 to 4**, not just 2. An agent rotating through three or four tools
+  forever trips the original rule not at all.
+- **Over events, not actions.** A monologue breaks every action streak, so
+  `[A, think, A, think, …]` evades all three action heuristics. Counting
+  thinking turns as cycle steps catches it. A period-2 cycle still trips at six
+  events exactly as before.
 
 On the first trip of a streak it injects a corrective nudge once
 ("repeating the exact same call will not work — review the error and either
 correct the arguments or try a different approach") and only escalates the
 branch to stuck if the streak continues.
+
+A nudge is remembered against the **specific streak** that earned it — the
+pattern plus a fingerprint of the offending action — and all grace is restored
+once the agent breaks out of every loop. Remembering only the pattern would
+mean the second error loop of a long run, on a different tool for a different
+reason, got no warning at all and was declared stuck immediately.
 
 ### AssumptionLedger
 
