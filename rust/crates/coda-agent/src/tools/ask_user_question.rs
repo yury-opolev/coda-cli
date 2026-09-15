@@ -96,6 +96,15 @@ impl Tool for AskUserQuestionTool {
                 AnswerOutcome::Answered(answer) => {
                     ToolResult::ok(format!("User answered: {answer}"))
                 }
+                // A deliberate set-aside, not a fault: the question was
+                // recorded as a blocker and the run should carry on elsewhere.
+                // Non-fatal, so the agent can route around it, and phrased so
+                // it cannot read as an answer.
+                AnswerOutcome::Parked { reason } => ToolResult::error(format!(
+                    "This question was not settled and has been recorded as a blocker ({reason}). \
+                     No option was chosen. Do not ask it again — continue with a different part \
+                     of the task."
+                )),
                 // SECURITY: a fault is not an answer. Never the first option,
                 // never an empty success, never a retry. The run stops with a
                 // typed abort so no follow-up model request can be issued on

@@ -64,7 +64,8 @@ pub use events::{AgentEvent, AgentSink, CollectingSink, NullSink, ToolCallStatus
 pub use autonomy::{
     AssumptionLedger, AutonomySupervisor, BlockerKind, CompletionJudgePrompt, Confidence,
     ForkedAgent, GoalBudget, GoalOutcome, GoalRetryPolicy, GoalStatus, GoalVerdict, LedgerEntry,
-    LedgerError, LedgerSnapshot, StuckDetector, StuckObservation, StuckPattern, WorkItemRef,
+    LedgerError, LedgerSnapshot, ProxyAnswer, ProxyAnswerer, StuckDetector, StuckObservation,
+    StuckPattern, WorkItemRef,
 };
 pub use hooks::{
     HookContentHash, HookEventPolicy, HookMatcher, HookRunEntry, HookRunLog, HookRunner,

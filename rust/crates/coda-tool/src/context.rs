@@ -122,6 +122,19 @@ pub enum AnswerOutcome {
     Answered(String),
     /// No answer exists. There is nothing to tell the model.
     NoAnswer(NoAnswerReason),
+    /// The question was deliberately set aside, and the run should carry on.
+    ///
+    /// Distinct from both other variants, and the distinction matters. It is
+    /// not an answer, so it must never reach the model as one. It is also not a
+    /// fault: an autonomous run that could not settle a question records it as
+    /// a blocker and moves to a different branch, which is a considered outcome
+    /// rather than a failure. Collapsing it into `NoAnswer` would abort the run
+    /// — exactly the unattended stall autonomy exists to prevent — and
+    /// collapsing it into `Answered` would fabricate consent.
+    Parked {
+        /// Operator-facing explanation, safe to show the model.
+        reason: String,
+    },
 }
 
 impl AnswerOutcome {
@@ -132,14 +145,22 @@ impl AnswerOutcome {
     pub fn answered(&self) -> Option<&str> {
         match self {
             AnswerOutcome::Answered(a) => Some(a.as_str()),
-            AnswerOutcome::NoAnswer(_) => None,
+            AnswerOutcome::NoAnswer(_) | AnswerOutcome::Parked { .. } => None,
         }
     }
 
     pub fn no_answer_reason(&self) -> Option<NoAnswerReason> {
         match self {
             AnswerOutcome::NoAnswer(r) => Some(*r),
-            AnswerOutcome::Answered(_) => None,
+            AnswerOutcome::Answered(_) | AnswerOutcome::Parked { .. } => None,
+        }
+    }
+
+    /// The park explanation, when the question was set aside.
+    pub fn parked_reason(&self) -> Option<&str> {
+        match self {
+            AnswerOutcome::Parked { reason } => Some(reason.as_str()),
+            AnswerOutcome::Answered(_) | AnswerOutcome::NoAnswer(_) => None,
         }
     }
 }

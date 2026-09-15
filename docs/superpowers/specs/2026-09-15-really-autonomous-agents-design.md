@@ -123,6 +123,14 @@ Replaces the block in `ask_user_question`.
   conventions (`CODA.md` / `AGENTS.md`).
 - **Output:** `{ chosen, rationale, confidence }`. It always chooses; there is
   no "I don't know" return value.
+- **Matching is exact.** The chosen text is resolved against the offered
+  options by exact then case-insensitive comparison, and nothing else. There is
+  deliberately no substring or fuzzy fallback: substring matching reads
+  `"Do not delete"` as `Delete`, inverting the stand-in's meaning and returning
+  it as a confident answer. It also resolves plain hallucinations to whichever
+  option shares a few letters — usually the first, the one outcome the question
+  seam must never produce by accident. A reply that cannot be matched exactly
+  has not chosen, and is parked.
 - **Tie-break:** when confidence is low, choose the option that preserves the
   most future choice — that is, the most reversible option. This is the
   mitigation for the documented mis-calibration of simulated users: a

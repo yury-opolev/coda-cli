@@ -12,9 +12,12 @@
 //!
 //! Not thread-safe; owned and mutated exclusively by the single agent loop.
 
+use std::sync::Arc;
+
 use coda_llm::{Content, Message, Role};
 use tokio_util::sync::CancellationToken;
 
+pub mod answerer;
 pub mod budget;
 pub mod completion;
 pub mod ledger;
@@ -22,6 +25,7 @@ pub mod retry;
 pub mod stuck;
 pub mod verdict;
 
+pub use answerer::{ProxyAnswer, ProxyAnswerer};
 pub use budget::GoalBudget;
 pub use ledger::{
     AssumptionLedger, BlockerKind, Confidence, LedgerEntry, LedgerError, LedgerSnapshot,
@@ -54,6 +58,17 @@ pub trait ForkedAgent: Send + Sync {
 /// is [`GoalVerdict::Escalate`], the caller MUST resolve it with exactly one of:
 /// - [`AutonomySupervisor::try_grant_extension`] (extend the budget; continue), or
 /// - [`AutonomySupervisor::mark_stopped_unmet`] (accept failure; stop).
+///
+/// ## What is shared and what is not
+///
+/// The budget and the completion outcome are driven only by the agent loop, at
+/// a natural stop, and stay plain fields behind the loop's `&mut`.
+///
+/// The ledger and the stuck detector are written from tool threads while the
+/// loop reads them, so each is separately `Arc`-shared with its own interior
+/// lock. Sharing the pieces rather than the whole supervisor keeps the seams
+/// honest about what they touch — the question seam can reach the ledger and
+/// nothing else — and avoids one coarse lock serialising unrelated work.
 pub struct AutonomySupervisor {
     judge: Box<dyn ForkedAgent>,
     goal: String,
@@ -64,6 +79,10 @@ pub struct AutonomySupervisor {
     /// `true` after the first `Escalate` verdict is returned, so callers
     /// (tests and the serve layer) can observe the escalation lifecycle.
     escalated: bool,
+    /// Shared with the question and permission seams.
+    ledger: Arc<AssumptionLedger>,
+    /// Shared with the loop's per-iteration observation.
+    stuck: Arc<StuckDetector>,
 }
 
 impl AutonomySupervisor {
@@ -83,7 +102,24 @@ impl AutonomySupervisor {
             outcome: GoalOutcome::None,
             last_remaining: None,
             escalated: false,
+            ledger: Arc::new(AssumptionLedger::new()),
+            stuck: Arc::new(StuckDetector::new()),
         }
+    }
+
+    /// The goal being pursued.
+    pub fn goal(&self) -> &str {
+        &self.goal
+    }
+
+    /// The assumption ledger, for wiring into the question and permission seams.
+    pub fn ledger(&self) -> Arc<AssumptionLedger> {
+        Arc::clone(&self.ledger)
+    }
+
+    /// The stuck detector, for the loop to feed each iteration.
+    pub fn stuck(&self) -> Arc<StuckDetector> {
+        Arc::clone(&self.stuck)
     }
 
     /// Current status snapshot (for the loop to expose as `LastGoalStatus`).
@@ -387,5 +423,64 @@ mod tests {
     fn last_assistant_text_empty_when_no_assistant_turn() {
         let history = vec![Message::user("hello")];
         assert_eq!(last_assistant_text(&history), "");
+    }
+
+    // ── Shared components ────────────────────────────────────────────────────
+
+    /// The seams write to the ledger through their own handles while the loop
+    /// reads it. If the handles were copies rather than shares, every
+    /// assumption recorded by a tool would be invisible to the report and to
+    /// the termination proof.
+    #[test]
+    fn the_ledger_handed_to_a_seam_is_the_supervisors_own() {
+        let sup = AutonomySupervisor::new(
+            Box::new(AlwaysFailsJudge),
+            "goal",
+            budget_cont(10),
+            Some(GoalRetryPolicy::for_tests()),
+        );
+
+        let seam_handle = sup.ledger();
+        seam_handle.record_assumption(
+            "asked by a tool",
+            &["a".to_owned()],
+            "a",
+            "because",
+            Confidence::High,
+        );
+
+        assert_eq!(sup.ledger().len(), 1, "the supervisor must see the seam's write");
+    }
+
+    #[test]
+    fn the_stuck_detector_handed_to_the_loop_is_the_supervisors_own() {
+        let sup = AutonomySupervisor::new(
+            Box::new(AlwaysFailsJudge),
+            "goal",
+            budget_cont(10),
+            Some(GoalRetryPolicy::for_tests()),
+        );
+
+        let loop_handle = sup.stuck();
+        for _ in 0..4 {
+            loop_handle.observe(StuckObservation::new("run_command", "{}", "E", true));
+        }
+
+        assert_eq!(
+            sup.stuck().detect(),
+            Some(StuckPattern::RepeatedActionError),
+            "the supervisor must see what the loop observed"
+        );
+    }
+
+    #[test]
+    fn the_goal_text_is_readable_for_the_stand_in() {
+        let sup = AutonomySupervisor::new(
+            Box::new(AlwaysFailsJudge),
+            "ship the feature",
+            budget_cont(10),
+            Some(GoalRetryPolicy::for_tests()),
+        );
+        assert_eq!(sup.goal(), "ship the feature");
     }
 }

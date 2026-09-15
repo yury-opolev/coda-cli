@@ -108,6 +108,7 @@ impl RequestOutcome {
             RequestOutcome::Question(AnswerOutcome::NoAnswer(r)) => {
                 format!("noAnswer.{}", r.as_str())
             }
+            RequestOutcome::Question(AnswerOutcome::Parked { .. }) => "parked".into(),
         }
     }
 
