@@ -43,6 +43,12 @@ pub struct SubagentHost {
     client: Arc<dyn coda_llm::LlmClient>,
     permission_prompt: Arc<dyn PermissionPrompt>,
     permission_mode: Arc<PermissionModeState>,
+    /// Shared with the run that spawned this host, so a subagent waits out an
+    /// outage on the same terms as its parent. A goal run is unattended for
+    /// hours; a subagent inside it that gave up after fifteen minutes would
+    /// fail its branch and discard its context at exactly the moment waiting
+    /// would have worked.
+    outage_policy: Option<crate::agent::stream::SharedOutagePolicy>,
     /// The full tool registry; restricted per spawn via `resolve_child_tools`.
     tools: Arc<ToolRegistry>,
     quarantine: Arc<ToolQuarantine>,
@@ -86,6 +92,7 @@ impl SubagentHost {
             client,
             permission_prompt,
             permission_mode,
+            outage_policy: None,
             tools,
             quarantine,
             task_manager,
@@ -144,6 +151,16 @@ impl SubagentHost {
     /// Read-only accessor for the message bus this host was wired with.
     pub fn message_bus(&self) -> Option<&Arc<crate::message::MessageBus>> {
         self.message_bus.as_ref()
+    }
+
+    /// Share the run's outage-retry policy with every child this host spawns.
+    pub fn with_outage_policy(
+        self: Arc<Self>,
+        policy: crate::agent::stream::SharedOutagePolicy,
+    ) -> Arc<Self> {
+        let mut host = self.clone_for_background();
+        host.outage_policy = Some(policy);
+        Arc::new(host)
     }
 
     pub fn with_defaults(
@@ -324,6 +341,12 @@ impl SubagentHost {
         if let Some(bus) = &self.message_bus {
             builder = builder.with_message_bus(Arc::clone(bus));
         }
+        // Inherit the parent's outage policy: a subagent inside an unattended
+        // goal run must wait out a provider outage for as long as the parent
+        // would, not give up after the interactive default.
+        if let Some(policy) = &self.outage_policy {
+            builder = builder.with_outage_policy(Arc::clone(policy));
+        }
         // A nested child inherits the scheduled provenance of the run that
         // spawned it; ordinary main-agent children carry `None`.
         if let Some(origin) = &request.schedule_origin {
@@ -357,6 +380,24 @@ impl SubagentHost {
             return Err(format!(
                 "Subagent stopped without completing its task ({reason}). \
                  Any partial output was discarded rather than reported as a result."
+            ));
+        }
+
+        // The same rule for a provider failure, which used to fall through to
+        // the success path below: a subagent whose model call failed returned
+        // its empty transcript as though the work were done, and the parent had
+        // no way to tell "the provider was down" from "there was nothing to
+        // say". Under a goal that is the worst possible confusion — the parent
+        // would mark the branch complete and move on, and the operator would
+        // come back to work that never happened.
+        //
+        // Named explicitly so the parent can tell an outage apart from a task
+        // that genuinely failed, and retry rather than give up.
+        if let Err(AgentError::Llm(err)) = &run_result {
+            return Err(format!(
+                "Subagent could not reach the model provider ({err}). \
+                 This is a provider failure, not a failed task: nothing was \
+                 completed and no output was produced. Retrying later may succeed."
             ));
         }
 
@@ -476,6 +517,7 @@ impl SubagentHost {
             base_max_iterations: self.base_max_iterations,
             working_directory: self.working_directory.clone(),
             hook_runner: self.hook_runner.clone(),
+            outage_policy: self.outage_policy.clone(),
             semaphore: self.semaphore.clone(),
         }
     }

@@ -8,7 +8,8 @@
 //! that a retry is only attempted when the accumulator is still empty: no
 //! duplicate text, tool results, or usage can reach the sink.
 
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use coda_llm::anthropic::StreamEvent;
 use coda_llm::{ChatRequest, Content, LlmClient, LlmError, ResponseStream, Usage};
@@ -156,14 +157,173 @@ pub(crate) async fn drive_stream(
 }
 
 /// Configuration controlling the retry arms around the stream call.
+/// How long to keep retrying a provider that is simply unreachable, and how
+/// far apart to space the attempts.
+///
+/// Distinct from the count-based retry that handles a blip. A provider outage
+/// is not a blip: it lasts minutes or hours, and the right response is to wait
+/// it out rather than to fail a run that has hours of budget left. Before this
+/// existed the loop made three attempts about fifteen seconds apart and then
+/// propagated the error, which ended an unattended goal run fifteen seconds
+/// into an outage the operator would never see.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutageRetryPolicy {
+    /// Hard cap on attempts, independent of the clock. Zero disables retrying.
+    pub max_attempts: u32,
+    /// Total wall-clock time to keep trying before giving up.
+    pub deadline: Duration,
+    /// First gap between attempts.
+    pub initial_backoff: Duration,
+    /// Upper bound on the gap, so a long outage settles into steady polling
+    /// rather than doubling into an absurd wait.
+    pub max_backoff: Duration,
+}
+
+impl OutageRetryPolicy {
+    /// For a run someone is watching.
+    ///
+    /// Fifteen minutes is long enough to ride out a provider incident, and a
+    /// minute between attempts keeps the status line moving so the session
+    /// reads as waiting rather than hung.
+    pub fn interactive() -> Self {
+        Self {
+            // 15 minutes at a 60s ceiling needs ~20 attempts; 60 leaves room
+            // for the short early gaps without the count ever being the
+            // binding constraint.
+            max_attempts: 60,
+            deadline: Duration::from_secs(15 * 60),
+            initial_backoff: Duration::from_millis(500),
+            max_backoff: Duration::from_secs(60),
+        }
+    }
+
+    /// For a goal run nobody is watching.
+    ///
+    /// A full day, because that is the scale of outage an unattended run needs
+    /// to survive: the operator started it and left, and a run that gave up
+    /// after fifteen minutes would leave them exactly where they started. The
+    /// gap grows to fifteen minutes, so a day of waiting costs about a hundred
+    /// requests rather than tens of thousands.
+    ///
+    /// The goal budget still governs the run as a whole — this only decides
+    /// how long a single unreachable call is worth waiting on.
+    pub fn goal() -> Self {
+        Self {
+            // 24h at a 15-minute ceiling needs ~96 attempts.
+            max_attempts: 500,
+            deadline: Duration::from_secs(24 * 60 * 60),
+            initial_backoff: Duration::from_millis(500),
+            max_backoff: Duration::from_secs(15 * 60),
+        }
+    }
+
+    /// Never retry.
+    pub fn none() -> Self {
+        Self { max_attempts: 0, ..Self::interactive() }
+    }
+
+    /// `n` retries with no waiting, for tests.
+    pub fn for_tests(max_attempts: u32) -> Self {
+        Self {
+            max_attempts,
+            deadline: Duration::from_secs(3600),
+            initial_backoff: Duration::ZERO,
+            max_backoff: Duration::ZERO,
+        }
+    }
+
+    /// The gap before retry number `retry` (one-based), doubling from
+    /// `initial_backoff` and clamped to `max_backoff`.
+    pub fn backoff(&self, retry: u32) -> Duration {
+        let exponent = retry.saturating_sub(1).min(32);
+        let scale = 2u32.saturating_pow(exponent);
+        self.initial_backoff.saturating_mul(scale).min(self.max_backoff)
+    }
+
+    /// Whether another attempt is allowed, given how many have been made and
+    /// when the outage started.
+    pub fn may_retry(&self, retries_made: u32, since: Option<Instant>) -> bool {
+        if retries_made >= self.max_attempts {
+            return false;
+        }
+        since.map(|t| t.elapsed() < self.deadline).unwrap_or(true)
+    }
+}
+
+/// The retry state for a session: the policy, and whether the provider has
+/// ever actually answered.
+///
+/// The `proven` flag is what separates an outage from a misconfiguration. Both
+/// look identical at the socket — a wrong hostname and a provider that just
+/// went down both fail to connect — but they deserve opposite treatment. An
+/// outage is worth waiting out for hours; a typo in an endpoint is worth
+/// telling the operator about in seconds. Waiting fifteen minutes to report a
+/// bad URL is the kind of "hang" that makes a tool feel broken.
+///
+/// So the long wait is earned: once a call has succeeded, this session knows
+/// the provider is real and reachable, and a later failure is an outage. Until
+/// then, failures fail fast.
+#[derive(Debug, Clone)]
+pub struct OutageState {
+    pub policy: OutageRetryPolicy,
+    /// Whether any call in this session has ever reached the provider.
+    pub proven: bool,
+}
+
+impl OutageState {
+    pub fn new(policy: OutageRetryPolicy) -> Self {
+        Self { policy, proven: false }
+    }
+
+    /// The policy actually in force, given what we know about the provider.
+    ///
+    /// Before the provider has proved itself, a short leash: enough to ride out
+    /// a genuine blip on the first call, not enough to look like a hang.
+    pub fn effective(&self) -> OutageRetryPolicy {
+        if self.proven {
+            self.policy.clone()
+        } else {
+            OutageRetryPolicy {
+                max_attempts: 3,
+                deadline: Duration::from_secs(10),
+                initial_backoff: Duration::from_millis(500),
+                max_backoff: Duration::from_secs(2),
+            }
+        }
+    }
+}
+
+/// A live, shared outage policy.
+///
+/// Shared rather than copied because a subagent must wait out an outage on the
+/// same terms as the run that spawned it. A goal run is unattended for hours;
+/// a subagent inside it that gave up after fifteen minutes would fail the
+/// branch, discard its context, and hand the parent a failure at the one moment
+/// waiting would have worked. Same reasoning as `PermissionModeState`: one
+/// handle, read live, so every part of a run agrees.
+pub type SharedOutagePolicy = Arc<Mutex<OutageState>>;
+
+/// Build a shared handle, defaulting to the interactive policy.
+pub fn shared_outage_policy() -> SharedOutagePolicy {
+    Arc::new(Mutex::new(OutageState::new(OutageRetryPolicy::interactive())))
+}
+
 pub(crate) struct RetryConfig {
-    pub max_transport_retries: u32,
     pub max_schema_evictions: u32,
+    /// How long to wait out an unreachable provider.
+    pub outage: OutageRetryPolicy,
+    /// Session-wide retry state, so a success here teaches every later call
+    /// (and every subagent) that the provider is real.
+    pub outage_state: Option<SharedOutagePolicy>,
 }
 
 impl Default for RetryConfig {
     fn default() -> Self {
-        Self { max_transport_retries: 2, max_schema_evictions: 3 }
+        Self {
+            max_schema_evictions: 3,
+            outage: OutageRetryPolicy::interactive(),
+            outage_state: None,
+        }
     }
 }
 
@@ -187,6 +347,9 @@ pub(crate) async fn stream_with_retries(
     let mut acc = StreamAccumulator::default();
     let mut overflow_retried = false;
     let mut transport_retries = 0u32;
+    // When the provider first became unreachable, so the retry window is
+    // measured from the start of the outage rather than from each attempt.
+    let mut first_transport_failure: Option<Instant> = None;
     let mut schema_evictions = 0u32;
     // Counts outer stream attempts (connect + consume), purely for the
     // optional `ModelRequestStart`/`ModelRequestEnd` debug-detail pair below
@@ -288,6 +451,10 @@ pub(crate) async fn stream_with_retries(
 
         match drive_result {
             Ok(()) => {
+                // The provider answered, so this session now knows it is real
+                // and reachable. A later failure is an outage worth waiting
+                // out, not a misconfiguration worth reporting immediately.
+                mark_provider_proven(retry_cfg);
                 // Close any burst the provider did not explicitly close.
                 if acc.thinking_burst_open {
                     let elapsed_ms = acc
@@ -332,19 +499,45 @@ pub(crate) async fn stream_with_retries(
             }
 
             // --- arm 2: transient transport retry ---
+            //
+            // Bounded by wall-clock rather than by a count. A provider outage
+            // lasts minutes or hours, and three attempts fifteen seconds apart
+            // is not a serious attempt to survive one. The `acc.is_empty()`
+            // guard is what keeps this safe at any duration: nothing has been
+            // emitted, so replaying the request cannot duplicate text, tool
+            // calls or usage however many times it happens.
             Err(err)
-                if transport_retries < retry_cfg.max_transport_retries
-                    && !cancel.is_cancelled()
+                if !cancel.is_cancelled()
                     && acc.is_empty()
-                    && is_transient_transport_error(&err) =>
+                    && is_transient_transport_error(&err)
+                    && effective_outage_policy(retry_cfg)
+                        .may_retry(transport_retries, first_transport_failure) =>
             {
-                // §5: guard is airtight — nothing emitted yet, so replay is clean.
+                let started_waiting = *first_transport_failure.get_or_insert_with(Instant::now);
+                let policy = effective_outage_policy(retry_cfg);
                 transport_retries += 1;
-                let backoff = transport_retry_backoff(transport_retries);
+                let backoff = policy.backoff(transport_retries);
+
+                // Say so, once the wait is long enough that silence would read
+                // as a hang. An operator watching a status line needs to know
+                // the run is waiting rather than wedged.
+                if backoff >= Duration::from_secs(5) {
+                    sink.emit(AgentEvent::Warning {
+                        message: format!(
+                            "The model provider is unreachable ({}). Waiting {} before retrying; \
+                             will keep trying for up to {}.",
+                            err,
+                            format_duration(backoff),
+                            format_duration(policy.deadline),
+                        ),
+                    });
+                }
+
                 tokio::select! {
                     _ = tokio::time::sleep(backoff) => {}
                     _ = cancel.cancelled() => return Err(LlmError::Cancelled),
                 }
+                let _ = started_waiting;
                 acc.clear(); // Defensive clear (should already be empty).
             }
 
@@ -496,15 +689,212 @@ pub(crate) fn is_context_overflow_error(err: &LlmError) -> bool {
 
 /// Returns `true` for transport-level failures that are safe to retry before
 /// anything has been emitted.
-pub(crate) fn is_transient_transport_error(err: &LlmError) -> bool {
-    matches!(err, LlmError::Transport(_) | LlmError::IncompleteStream)
+/// The policy in force, narrowed while the provider is still unproven.
+///
+/// Falls back to the config's own policy when no session state is wired (tests,
+/// and any embedder that has not opted in).
+fn effective_outage_policy(retry_cfg: &RetryConfig) -> OutageRetryPolicy {
+    match &retry_cfg.outage_state {
+        Some(state) => {
+            let guard = state.lock().expect("outage state poisoned");
+            OutageState { policy: retry_cfg.outage.clone(), proven: guard.proven }.effective()
+        }
+        None => retry_cfg.outage.clone(),
+    }
 }
 
-/// Backoff durations for transport retries (0.5s, 2s, …).
-fn transport_retry_backoff(attempt: u32) -> std::time::Duration {
-    match attempt {
-        1 => std::time::Duration::from_millis(500),
-        _ => std::time::Duration::from_secs(2),
+/// Record that the provider answered, so later failures in this session are
+/// treated as an outage rather than as a misconfiguration.
+fn mark_provider_proven(retry_cfg: &RetryConfig) {
+    if let Some(state) = &retry_cfg.outage_state {
+        let mut guard = state.lock().expect("outage state poisoned");
+        if !guard.proven {
+            guard.proven = true;
+        }
+    }
+}
+
+/// Whether an error is worth waiting out.
+///
+/// Covers three shapes, and the third was missed for a long time:
+/// - `Transport` — the socket failed. A machine that lost its network, DNS that
+///   stopped resolving, a connection refused.
+/// - `IncompleteStream` — the response was cut off before it finished.
+/// - A **retryable API error** — the provider answered, but with 429, 502, 503
+///   or 529. This is what a provider outage actually looks like from the
+///   client, and matching only on transport meant the one scenario the retry
+///   exists for — "the LLM provider is down" — was not retried at all. The
+///   inner HTTP layer made four quick attempts over a few seconds and then the
+///   error propagated and killed the run.
+pub(crate) fn is_transient_transport_error(err: &LlmError) -> bool {
+    match err {
+        LlmError::Transport(_) | LlmError::IncompleteStream => true,
+        // `is_retryable` is `Transient | RateLimited`; an auth failure or a bad
+        // request is neither, and waiting would not help those.
+        other => other.is_retryable(),
+    }
+}
+
+/// Render a duration the way an operator would say it.
+fn format_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    match secs {
+        0 => format!("{}ms", d.as_millis()),
+        1..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m", secs / 60),
+        _ => format!("{}h", secs / 3600),
+    }
+}
+
+#[cfg(test)]
+mod outage_tests {
+    use super::*;
+
+    #[test]
+    fn backoff_doubles_and_then_holds_at_the_ceiling() {
+        let p = OutageRetryPolicy::interactive();
+        assert_eq!(p.backoff(1), Duration::from_millis(500));
+        assert_eq!(p.backoff(2), Duration::from_secs(1));
+        assert_eq!(p.backoff(3), Duration::from_secs(2));
+        // …and eventually pins to the cap rather than growing without bound.
+        assert_eq!(p.backoff(20), Duration::from_secs(60));
+        assert_eq!(p.backoff(1000), Duration::from_secs(60));
+    }
+
+    /// The two modes differ in exactly the two ways that matter: how long they
+    /// wait in total, and how far apart the attempts get.
+    #[test]
+    fn a_goal_run_waits_far_longer_and_polls_far_slower() {
+        let interactive = OutageRetryPolicy::interactive();
+        let goal = OutageRetryPolicy::goal();
+
+        assert_eq!(interactive.deadline, Duration::from_secs(15 * 60));
+        assert_eq!(interactive.max_backoff, Duration::from_secs(60));
+
+        assert_eq!(goal.deadline, Duration::from_secs(24 * 60 * 60));
+        assert_eq!(goal.max_backoff, Duration::from_secs(15 * 60));
+    }
+
+    /// A day of outage must cost about a hundred requests, not tens of
+    /// thousands — the attempt cap has to be able to span the deadline.
+    #[test]
+    fn the_goal_attempt_cap_can_actually_span_a_day() {
+        let p = OutageRetryPolicy::goal();
+        let attempts_needed = p.deadline.as_secs() / p.max_backoff.as_secs();
+        assert!(
+            (p.max_attempts as u64) > attempts_needed,
+            "{} attempts cannot cover {attempts_needed} ceiling-length waits",
+            p.max_attempts
+        );
+    }
+
+    #[test]
+    fn the_interactive_attempt_cap_can_span_its_deadline() {
+        let p = OutageRetryPolicy::interactive();
+        let attempts_needed = p.deadline.as_secs() / p.max_backoff.as_secs();
+        assert!((p.max_attempts as u64) > attempts_needed);
+    }
+
+    #[test]
+    fn a_none_policy_never_retries() {
+        let p = OutageRetryPolicy::none();
+        assert!(!p.may_retry(0, None));
+    }
+
+    #[test]
+    fn retrying_stops_at_the_attempt_cap() {
+        let p = OutageRetryPolicy::for_tests(2);
+        assert!(p.may_retry(0, None));
+        assert!(p.may_retry(1, None));
+        assert!(!p.may_retry(2, None), "the cap is a hard stop");
+    }
+
+    #[test]
+    fn retrying_stops_once_the_deadline_has_passed() {
+        let p = OutageRetryPolicy {
+            max_attempts: 1000,
+            deadline: Duration::from_millis(1),
+            initial_backoff: Duration::ZERO,
+            max_backoff: Duration::ZERO,
+        };
+        let long_ago = Instant::now() - Duration::from_secs(60);
+        assert!(!p.may_retry(0, Some(long_ago)));
+    }
+
+    // ── Proven vs unproven ───────────────────────────────────────────────────
+
+    /// A misconfigured endpoint and a provider outage look identical at the
+    /// socket, but waiting fifteen minutes to report a typo makes the tool feel
+    /// broken. Until the provider has answered once, failures fail fast.
+    #[test]
+    fn an_unproven_provider_is_given_only_a_short_leash() {
+        let state = OutageState::new(OutageRetryPolicy::goal());
+        let effective = state.effective();
+        assert!(
+            effective.deadline <= Duration::from_secs(30),
+            "an unproven provider must not be waited on for {:?}",
+            effective.deadline
+        );
+    }
+
+    /// Once it has answered, this session knows the provider is real, so a
+    /// later failure is an outage worth waiting out.
+    #[test]
+    fn a_proven_provider_earns_the_full_policy() {
+        let mut state = OutageState::new(OutageRetryPolicy::goal());
+        state.proven = true;
+        assert_eq!(state.effective().deadline, Duration::from_secs(24 * 60 * 60));
+    }
+
+    #[test]
+    fn proving_applies_to_the_interactive_policy_too() {
+        let mut state = OutageState::new(OutageRetryPolicy::interactive());
+        assert!(state.effective().deadline <= Duration::from_secs(30));
+        state.proven = true;
+        assert_eq!(state.effective().deadline, Duration::from_secs(15 * 60));
+    }
+
+    // ── What counts as worth waiting out ─────────────────────────────────────
+
+    /// The scenario the whole mechanism exists for: the provider is up enough
+    /// to answer, and what it answers is "I am overloaded". Matching only on
+    /// transport errors meant this — an actual provider outage — was never
+    /// retried at all.
+    #[test]
+    fn a_provider_outage_status_is_worth_waiting_out() {
+        for status in [429u16, 500, 502, 503, 529] {
+            let err = LlmError::from_status(status, "", None);
+            assert!(
+                is_transient_transport_error(&err),
+                "HTTP {status} is a provider outage and must be waited out"
+            );
+        }
+    }
+
+    /// Waiting cannot fix a bad key or a malformed request, and pretending
+    /// otherwise would turn a clear error into a silent stall.
+    #[test]
+    fn a_permanent_failure_is_not_waited_out() {
+        for status in [400u16, 401, 403, 404] {
+            let err = LlmError::from_status(status, "", None);
+            assert!(
+                !is_transient_transport_error(&err),
+                "HTTP {status} will never succeed by waiting"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dropped_connection_is_worth_waiting_out() {
+        assert!(is_transient_transport_error(&LlmError::IncompleteStream));
+    }
+
+    #[test]
+    fn durations_render_the_way_an_operator_would_say_them() {
+        assert_eq!(format_duration(Duration::from_millis(500)), "500ms");
+        assert_eq!(format_duration(Duration::from_secs(30)), "30s");
+        assert_eq!(format_duration(Duration::from_secs(15 * 60)), "15m");
+        assert_eq!(format_duration(Duration::from_secs(24 * 60 * 60)), "24h");
     }
 }
 
@@ -1180,7 +1570,7 @@ mod tests {
         let client = AlwaysFailsClient;
         let quarantine = ToolQuarantine::new();
         let mut request = coda_llm::ChatRequest::new("model".to_owned(), vec![]);
-        let retry_cfg = RetryConfig { max_transport_retries: 0, max_schema_evictions: 0 };
+        let retry_cfg = RetryConfig { max_schema_evictions: 0, outage: OutageRetryPolicy::none(), outage_state: None };
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut blocked = None;
 
@@ -1278,7 +1668,7 @@ mod tests {
         let client = RejectsBeforeAnyStreamClient;
         let quarantine = ToolQuarantine::new();
         let mut request = coda_llm::ChatRequest::new("model".to_owned(), vec![]);
-        let retry_cfg = RetryConfig { max_transport_retries: 0, max_schema_evictions: 0 };
+        let retry_cfg = RetryConfig { max_schema_evictions: 0, outage: OutageRetryPolicy::none(), outage_state: None };
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut blocked = None;
 
@@ -1357,7 +1747,7 @@ mod tests {
         let client = AlwaysFailsClient;
         let quarantine = ToolQuarantine::new();
         let mut request = coda_llm::ChatRequest::new("model".to_owned(), vec![]);
-        let retry_cfg = RetryConfig { max_transport_retries: 0, max_schema_evictions: 0 };
+        let retry_cfg = RetryConfig { max_schema_evictions: 0, outage: OutageRetryPolicy::none(), outage_state: None };
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut blocked = None;
 
@@ -1428,7 +1818,7 @@ mod tests {
         let client = AlwaysFailsClient;
         let quarantine = ToolQuarantine::new();
         let mut request = coda_llm::ChatRequest::new("model".to_owned(), vec![]);
-        let retry_cfg = RetryConfig { max_transport_retries: 0, max_schema_evictions: 0 };
+        let retry_cfg = RetryConfig { max_schema_evictions: 0, outage: OutageRetryPolicy::none(), outage_state: None };
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut blocked = None;
 
@@ -1669,7 +2059,7 @@ mod tests {
         }
         // Bounded to exactly one retry per family (§ "Bounds1transientretry
         // 500ms acceptable") — enough to observe the swallow, never more.
-        let retry_cfg = RetryConfig { max_transport_retries: 1, max_schema_evictions: 1 };
+        let retry_cfg = RetryConfig { max_schema_evictions: 1, outage: OutageRetryPolicy::for_tests(1), outage_state: None };
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut blocked = None;
         let compact: Option<&(dyn Fn() -> bool + Send + Sync)> = match family {
@@ -1808,7 +2198,7 @@ mod tests {
         let client = AlwaysFailsClient;
         let quarantine = ToolQuarantine::new();
         let mut request = coda_llm::ChatRequest::new("model".to_owned(), vec![]);
-        let retry_cfg = RetryConfig { max_transport_retries: 1, max_schema_evictions: 1 };
+        let retry_cfg = RetryConfig { max_schema_evictions: 1, outage: OutageRetryPolicy::for_tests(1), outage_state: None };
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut blocked = None;
 
@@ -1919,7 +2309,7 @@ mod tests {
 
         let quarantine = ToolQuarantine::new();
         let mut request = coda_llm::ChatRequest::new("claude-opus-5".to_owned(), vec![]);
-        let retry_cfg = RetryConfig { max_transport_retries: 0, max_schema_evictions: 0 };
+        let retry_cfg = RetryConfig { max_schema_evictions: 0, outage: OutageRetryPolicy::none(), outage_state: None };
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut blocked = None;
 

@@ -915,6 +915,9 @@ pub struct ServeHost {
     /// The live permission mode, shared with the prompt above so a change here
     /// is observed by the next tool decision without restarting the engine.
     permission_mode: Arc<PermissionModeState>,
+    /// How long this session waits out an unreachable provider. Shared with
+    /// every subagent so an unattended goal run waits as one.
+    outage_policy: coda_agent::agent::stream::SharedOutagePolicy,
     user_question: Arc<WireUserQuestion>,
     plan_approver: Arc<WirePlanApprover>,
     /// Retained so `session/getPendingRequests`, `session/resolveRequest` and
@@ -1392,6 +1395,7 @@ impl ServeHost {
             .set_observer(Arc::clone(&engine_state) as Arc<dyn crate::state::requests::RequestObserver>);
 
         let host = Arc::new(Self {
+            outage_policy: coda_agent::agent::stream::shared_outage_policy(),
             session: Session::with_steering_observer(
                 session_id.clone(),
                 Some(Arc::clone(&steering_observer) as Arc<dyn coda_agent::steering::SteeringObserver>),
@@ -2060,7 +2064,8 @@ impl ServeHost {
         )
         .with_model_source(Arc::clone(&model_source))
         .with_schedule_store(Arc::clone(&self.schedule_store))
-        .with_message_bus(Arc::clone(&self.message_bus));
+        .with_message_bus(Arc::clone(&self.message_bus))
+        .with_outage_policy(Arc::clone(&self.outage_policy));
 
         // 2. Trust guard using the session-scoped trust store.
         let trust_guard = HookTrustGuard::new(
@@ -4724,6 +4729,7 @@ impl ServeHost {
         .with_lsp_manager(Arc::clone(&self.lsp_manager))
         .with_subagent_factory(Arc::clone(&services.subagent_host) as Arc<dyn SubagentFactory>)
         .with_message_bus(Arc::clone(&self.message_bus))
+        .with_outage_policy(Arc::clone(&self.outage_policy))
         .with_main_context()
         .with_hook_runner(Arc::clone(&services.hook_runner));
 
