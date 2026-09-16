@@ -538,8 +538,25 @@ impl Renderer {
 }
 
 /// Whether a link's display text honestly represents its destination.
+/// Whether a link's display text is honest about where it goes.
+///
+/// The test is not "does the text equal the URL" — for a markdown link it
+/// almost never does, and `[the STT docs](https://learn.microsoft.com/…)` is
+/// entirely honest. Treating that as deceptive flagged practically every link
+/// ever rendered, which trained the reader to ignore the warning glyph and so
+/// destroyed the one signal it existed to give.
+///
+/// Only text that *presents itself as a destination* can mislead about one. So
+/// prose is always honest, and a URL or bare host in the display text is
+/// checked against the real target.
 fn link_text_matches(display: &str, target: &str) -> bool {
     let display = display.trim();
+
+    // Prose: not claiming to be a destination, so it cannot lie about one.
+    if !looks_like_destination(display) {
+        return true;
+    }
+
     if display.eq_ignore_ascii_case(target) {
         return true;
     }
@@ -551,6 +568,27 @@ fn link_text_matches(display: &str, target: &str) -> bool {
         }
         // Relative links, anchors and mailto: are not spoofing a host.
         None => !display.contains("://"),
+    }
+}
+
+/// Whether display text reads as a URL or bare hostname rather than as prose.
+///
+/// Deliberately narrow: a scheme, or a single dotted token with no whitespace.
+/// "Read the docs at example.com for details" is prose that happens to mention
+/// a host, and flagging it would bring back the over-warning this guards
+/// against.
+fn looks_like_destination(display: &str) -> bool {
+    if display.contains("://") {
+        return true;
+    }
+    // A bare host is one token, has a dot with something either side, and no
+    // spaces: `example.com`, `www.example.co.uk`.
+    if display.split_whitespace().count() != 1 {
+        return false;
+    }
+    match display.split_once('.') {
+        Some((before, after)) => !before.is_empty() && !after.is_empty() && !after.starts_with('.'),
+        None => false,
     }
 }
 
@@ -794,8 +832,7 @@ mod tests {
     }
 
     #[test]
-    fn flags_a_deceptive_link_with_a_warning_glyph() {
-        let rows = render("[bank.com](https://evil.example/phish)", 60);
+    fn flags_a_deceptive_link_with_a_warning_glyph() {        let rows = render("[bank.com](https://evil.example/phish)", 60);
         let row = rows
             .iter()
             .find(|r| r.text.contains("bank.com"))
@@ -804,9 +841,41 @@ mod tests {
         assert_eq!(row.spans[0].role, Role::LinkDeceptive);
     }
 
+    /// REGRESSION: prose display text was treated as deceptive because it did
+    /// not equal the URL — which is true of practically every markdown link
+    /// ever written. Every link rendered with a warning glyph, which trained
+    /// the reader to ignore it and destroyed the signal entirely.
     #[test]
-    fn treats_a_relative_link_as_honest() {
-        let rows = render("[the docs](./docs/readme.md)", 60);
+    fn ordinary_prose_link_text_is_never_flagged() {
+        for source in [
+            "[STT documentation](https://learn.microsoft.com/azure/ai-services/speech-service/)",
+            "[the docs](https://example.com/a/b)",
+            "[click here](https://example.com)",
+            "[Read the guide at example.com for details](https://other.example/x)",
+        ] {
+            let rows = render(source, 100);
+            let flagged = rows.iter().any(|r| r.text.contains('\u{26A0}'));
+            assert!(!flagged, "prose must not be flagged: {source}");
+        }
+    }
+
+    /// The signal still has to work where it matters: text that *presents
+    /// itself as a destination* and points somewhere else.
+    #[test]
+    fn text_posing_as_a_destination_is_still_flagged() {
+        for source in [
+            "[bank.com](https://evil.example/phish)",
+            "[https://good.example](https://evil.example)",
+            "[www.paypal.com](https://phish.example)",
+        ] {
+            let rows = render(source, 100);
+            let flagged = rows.iter().any(|r| r.text.contains('\u{26A0}'));
+            assert!(flagged, "must be flagged: {source}");
+        }
+    }
+
+    #[test]
+    fn treats_a_relative_link_as_honest() {        let rows = render("[the docs](./docs/readme.md)", 60);
         let row = rows.iter().find(|r| !r.spans.is_empty()).expect("a link row");
         assert_eq!(row.spans[0].role, Role::Link);
     }

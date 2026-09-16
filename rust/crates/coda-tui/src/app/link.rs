@@ -80,15 +80,52 @@ impl App {
     ///
     /// The link's capabilities are resolved here, where filesystem access is
     /// allowed, and handed to the surface, which must stay pure. So the menu
-    /// can disable an entry it could only have had refused.
-    pub(super) fn open_link_menu(&mut self, url: String) {
+    /// can disable an entry it could only have had refused. The `anchor` is the
+    /// pointer cell the click landed on, so the menu opens beside it like a
+    /// native context menu rather than centred on the screen.
+    pub(super) fn open_link_menu(&mut self, url: String, anchor: (u16, u16)) {
         let capabilities = browser::link_capabilities(&url);
-        self.surfaces.push(Box::new(LinkMenuSurface::new(
-            url,
-            capabilities.openable,
-            capabilities.private,
-        )));
+        self.surfaces.push(Box::new(
+            LinkMenuSurface::new(url, capabilities.openable, capabilities.private)
+                .at(anchor.0, anchor.1),
+        ));
         self.dirty = true;
+    }
+
+    /// The link under a pointer position, with its on-row bounds, for hover.
+    ///
+    /// Like [`link_at_pointer`](Self::link_at_pointer) but keeps the cell
+    /// range, which is what the draw layer underlines. The row index is into
+    /// the cached `rows`, matching what the draw layer is handed, so the two
+    /// never disagree about which run to mark.
+    pub(super) fn hovered_link_at_pointer(
+        &self,
+        column: u16,
+        row: u16,
+    ) -> Option<crate::draw::HoveredLink> {
+        let pos = self.mouse_to_selection(column, row)?;
+        let span = self.rows.get(pos.row)?.link_span_at(pos.col)?;
+        Some(crate::draw::HoveredLink { row: pos.row, start: span.start, end: span.end })
+    }
+
+    /// Recomputes the hovered link after a pointer move, redrawing on change.
+    ///
+    /// A mouse-move fires for every cell the pointer crosses, so redrawing on
+    /// each one would make the whole TUI crawl. The frame is marked dirty only
+    /// when the hovered link actually changes — crossing into, out of, or
+    /// between links — which happens a handful of times per gesture, not once
+    /// per cell. A link beneath an open surface is never hovered: the surface
+    /// owns the pointer, so the underline is cleared while one is up.
+    pub(super) fn update_hovered_link(&mut self, column: u16, row: u16) {
+        let next = self
+            .surfaces
+            .is_empty()
+            .then(|| self.hovered_link_at_pointer(column, row))
+            .flatten();
+        if next != self.hovered_link {
+            self.hovered_link = next;
+            self.dirty = true;
+        }
     }
 
     /// Performs the action a link context menu emitted, closing the menu first.

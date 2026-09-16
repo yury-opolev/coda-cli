@@ -80,7 +80,7 @@ fn draw_at(
     terminal
         .draw(|frame| {
             draw::draw_with_pin(
-                frame, state, composer, &viewport, &rows, &theme, None, None,
+                frame, state, composer, &viewport, &rows, &theme, None, None, None,
                 header_id_selected, now,
             );
         })
@@ -307,6 +307,7 @@ fn a_selected_span_is_rendered_differently_from_an_unselected_one() {
                     &Theme::default(),
                     None,
                     selection,
+                    None,
                     false,
                     std::time::Instant::now(),
                 );
@@ -326,6 +327,119 @@ fn a_selected_span_is_rendered_differently_from_an_unselected_one() {
     assert_ne!(
         plain, selected,
         "a selection must be visible on screen; if these match, nothing drove the highlight"
+    );
+}
+
+// ── Link hover ───────────────────────────────────────────────────────────────
+
+/// Renders `rows` with `hovered` applied and returns the drawn buffer.
+///
+/// Goes through `draw_with_pin` — the real path — so the hover underline is
+/// exercised end to end rather than by poking at an internal helper.
+fn hover_buffer(
+    rows: &[RenderLine],
+    hovered: Option<draw::HoveredLink>,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    let theme = Theme::warm_ember().with_depth(ColorDepth::TrueColor);
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+    let state = session();
+    let composer = Composer::new();
+    let mut viewport = Viewport::new();
+    viewport.update(rows.len(), height as usize);
+    terminal
+        .draw(|frame| {
+            draw::draw_with_pin(
+                frame, &state, &composer, &viewport, rows, &theme, None, None, hovered, false,
+                std::time::Instant::now(),
+            );
+        })
+        .expect("draw");
+    terminal.backend().buffer().clone()
+}
+
+/// Whether the cells spelling `needle` are underlined on the row that holds it.
+///
+/// Locates the run by its text so the check does not hinge on which buffer row
+/// the transcript happens to start at, then reports the underline flag of each
+/// of the run's cells.
+fn needle_underline(buffer: &ratatui::buffer::Buffer, needle: &str, width: u16, height: u16) -> Vec<bool> {
+    use ratatui::style::Modifier;
+    for y in 0..height {
+        let line: String = (0..width).map(|x| buffer[(x, y)].symbol()).collect();
+        if let Some(byte) = line.find(needle) {
+            // The transcript text here is ASCII, so a byte offset is a column.
+            let start = byte as u16;
+            return (start..start + needle.len() as u16)
+                .map(|x| buffer[(x, y)].modifier.contains(Modifier::UNDERLINED))
+                .collect();
+        }
+    }
+    panic!("the row containing {needle:?} was not drawn");
+}
+
+/// Hovering a link underlines exactly its own cells, and moving off clears it.
+///
+/// This is the browser-like affordance the user asked for: the link reads as a
+/// link under the pointer. The underline is applied at draw time, so a test
+/// through the real draw path is what proves it actually reaches the screen.
+#[test]
+fn a_hovered_link_is_underlined_and_moving_off_it_removes_the_underline() {
+    use coda_render::LinkSpan;
+
+    let (width, height) = (40u16, 10u16);
+    // Cells 4..8 ("docs") are the link, in the middle of ordinary prose.
+    let rows = vec![RenderLine::new("see docs here", coda_render::Role::Assistant)
+        .with_links(vec![LinkSpan::new(4, 8, "https://example.com/docs")])];
+
+    let hovered = hover_buffer(&rows, Some(draw::HoveredLink { row: 0, start: 4, end: 8 }), width, height);
+    assert!(
+        needle_underline(&hovered, "docs", width, height).iter().all(|&u| u),
+        "every cell of the hovered link must be underlined"
+    );
+    // The surrounding prose must not pick up the underline.
+    assert!(
+        needle_underline(&hovered, "see ", width, height).iter().all(|&u| !u),
+        "text before the link must not be underlined"
+    );
+
+    let off = hover_buffer(&rows, None, width, height);
+    assert!(
+        needle_underline(&off, "docs", width, height).iter().all(|&u| !u),
+        "with nothing hovered the link is not underlined"
+    );
+}
+
+/// Hover is scoped to the row under the pointer, not to every matching link.
+///
+/// Two separate links, only one hovered: underlining both would be worse than
+/// none, since it would stop the cue meaning "this is what you are about to
+/// click".
+#[test]
+fn hovering_a_link_on_one_row_does_not_underline_another() {
+    use coda_render::LinkSpan;
+
+    let (width, height) = (40u16, 10u16);
+    let rows = vec![
+        RenderLine::new("go here now", coda_render::Role::Assistant)
+            .with_links(vec![LinkSpan::new(3, 7, "https://a.example")]),
+        RenderLine::new("or here too", coda_render::Role::Assistant)
+            .with_links(vec![LinkSpan::new(3, 7, "https://b.example")]),
+    ];
+
+    // Hover the first row's link only.
+    let buffer = hover_buffer(&rows, Some(draw::HoveredLink { row: 0, start: 3, end: 7 }), width, height);
+    assert!(
+        needle_underline(&buffer, "here", width, height).iter().all(|&u| u),
+        "the hovered row's link must be underlined"
+    );
+    // "here too" belongs to the second row; its link cells must stay plain.
+    assert!(
+        needle_underline(&buffer, "here too", width, height)[..4]
+            .iter()
+            .all(|&u| !u),
+        "an un-hovered link on another row must not be underlined"
     );
 }
 
@@ -353,6 +467,7 @@ fn drawing_reports_the_transcript_origin_for_mouse_mapping() {
                 &viewport,
                 &rows,
                 &Theme::default(),
+                None,
                 None,
                 None,
                 false,
@@ -1071,7 +1186,7 @@ fn the_pinned_activity_row_survives_a_detached_viewport() {
     terminal
         .draw(|frame| {
             draw::draw_with_pin(
-                frame, &state, &composer, &viewport, &rows, &theme, None, None, false,
+                frame, &state, &composer, &viewport, &rows, &theme, None, None, None, false,
                 std::time::Instant::now(),
             );
         })
@@ -1199,7 +1314,7 @@ fn draw_at_buffer(
     terminal
         .draw(|frame| {
             draw::draw_with_pin(
-                frame, state, composer, &viewport, &rows, &theme, None, None,
+                frame, state, composer, &viewport, &rows, &theme, None, None, None,
                 header_id_selected, std::time::Instant::now(),
             );
         })
@@ -1390,7 +1505,7 @@ fn cards_style_uses_blank_spacing_between_conversation_turns() {
     terminal
         .draw(|frame| {
             draw::draw_with_pin(
-                frame, &state, &composer, &viewport, &rows, &theme, None, None, false,
+                frame, &state, &composer, &viewport, &rows, &theme, None, None, None, false,
                 std::time::Instant::now(),
             );
         })

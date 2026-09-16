@@ -176,6 +176,24 @@ pub fn layout_with_pending(
     }
 }
 
+/// The transcript link currently under the pointer.
+///
+/// Coordinates are in the *cached row* space the draw layer is handed, not
+/// screen cells: `row` indexes the `rows` slice and `start`/`end` are the
+/// link's cell bounds on that row. Carried as a plain value rather than a
+/// borrow so the application can hold it across frames — it is only recomputed
+/// when the pointer actually crosses a link boundary, which is what keeps a
+/// mouse-move from forcing a relayout on every cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HoveredLink {
+    /// Index into the `rows` slice of the row the link sits on.
+    pub row: usize,
+    /// First cell of the link, inclusive.
+    pub start: usize,
+    /// One cell past the last cell of the link.
+    pub end: usize,
+}
+
 /// Converts one rendered row into a styled ratatui line.
 ///
 /// Cell-coordinate spans from the renderer are mapped onto grapheme clusters so
@@ -280,7 +298,7 @@ pub fn draw(
     theme: &Theme,
     now: Instant,
 ) {
-    draw_with_pin(frame, state, composer, viewport, rows, theme, None, None, false, now);
+    draw_with_pin(frame, state, composer, viewport, rows, theme, None, None, None, false, now);
 }
 
 /// Draws the whole screen, optionally showing a pin row at the top of the
@@ -302,6 +320,7 @@ pub fn draw_with_pin(
     theme: &Theme,
     pin_text: Option<&str>,
     selection: Option<&crate::selection::TranscriptSelection>,
+    hovered: Option<HoveredLink>,
     header_id_selected: bool,
     now: Instant,
 ) -> (u16, u16) {
@@ -330,6 +349,7 @@ pub fn draw_with_pin(
         theme,
         pin_text,
         selection,
+        hovered,
     );
     if let Some(header) = regions.header {
         draw_header(frame, header, state, theme, header_id_selected);
@@ -639,6 +659,7 @@ fn draw_transcript_with_pin(
     theme: &Theme,
     pin_text: Option<&str>,
     selection: Option<&crate::selection::TranscriptSelection>,
+    hovered: Option<HoveredLink>,
 ) -> (u16, u16) {
     let width = area.width as usize;
 
@@ -671,11 +692,23 @@ fn draw_transcript_with_pin(
         .take(take)
         .enumerate()
         .map(|(offset, row)| {
+            let global_row = visible.start + offset;
             let line = to_line(row, theme, width);
+            // Underline the link under the pointer so it reads like a link on
+            // hover, the way a browser does. Applied here rather than in
+            // `to_line` so a transcript with nothing hovered costs nothing, and
+            // before the selection pass so a link that is both hovered and
+            // selected shows both cues.
+            let line = match hovered {
+                Some(h) if h.row == global_row && h.end > h.start => {
+                    restyle_cells(line, h.start, h.end, ratatui::style::Modifier::UNDERLINED)
+                }
+                _ => line,
+            };
             // Highlight the selected span of this row, if any. Done here
             // rather than in `to_line` so an unselected transcript costs
             // nothing extra.
-            match selection.and_then(|s| s.range_for_row(visible.start + offset, width)) {
+            match selection.and_then(|s| s.range_for_row(global_row, width)) {
                 Some((start, end)) if end > start => highlight_span(line, start, end, theme),
                 _ => line,
             }
@@ -693,8 +726,23 @@ fn draw_transcript_with_pin(
 /// highlight works on both the light and dark themes without either needing to
 /// know about it.
 fn highlight_span(line: Line<'static>, start: usize, end: usize, _theme: &Theme) -> Line<'static> {
-    use ratatui::style::Modifier;
+    restyle_cells(line, start, end, ratatui::style::Modifier::REVERSED)
+}
 
+/// Adds `modifier` to the cells in `[start, end)` of an already-styled line,
+/// splitting spans on cell boundaries so a wide glyph is never cut in half.
+///
+/// Shared by the selection highlight (which reverses) and the link-hover cue
+/// (which underlines): both need the exact same cell-accurate span surgery,
+/// and keeping it in one place is what stops the two copies from drifting. The
+/// modifier is *added* to each touched span's own style, so the run keeps its
+/// colour and only gains the extra cue.
+fn restyle_cells(
+    line: Line<'static>,
+    start: usize,
+    end: usize,
+    modifier: ratatui::style::Modifier,
+) -> Line<'static> {
     let mut out: Vec<Span<'static>> = Vec::new();
     let mut cell = 0usize;
 
@@ -705,14 +753,14 @@ fn highlight_span(line: Line<'static>, start: usize, end: usize, _theme: &Theme)
         let span_end = cell + width;
         cell = span_end;
 
-        // Entirely outside the selection.
+        // Entirely outside the range.
         if span_end <= start || span_start >= end {
             out.push(Span::styled(text, span.style));
             continue;
         }
 
-        // Split the span at the selection boundaries, measured in cells so a
-        // wide character is never cut in half.
+        // Split the span at the range boundaries, measured in cells so a wide
+        // character is never cut in half.
         let before = crate::selection::slice_by_cells(&text, 0, start.saturating_sub(span_start));
         let mid = crate::selection::slice_by_cells(
             &text,
@@ -725,7 +773,7 @@ fn highlight_span(line: Line<'static>, start: usize, end: usize, _theme: &Theme)
             out.push(Span::styled(before, span.style));
         }
         if !mid.is_empty() {
-            out.push(Span::styled(mid, span.style.add_modifier(Modifier::REVERSED)));
+            out.push(Span::styled(mid, span.style.add_modifier(modifier)));
         }
         if !after.is_empty() {
             out.push(Span::styled(after, span.style));
@@ -743,7 +791,7 @@ pub fn draw_transcript(
     rows: &[RenderLine],
     theme: &Theme,
 ) {
-    draw_transcript_with_pin(frame, area, viewport, rows, theme, None, None);
+    draw_transcript_with_pin(frame, area, viewport, rows, theme, None, None, None);
 }
 
 fn draw_scrollbar(frame: &mut Frame, area: Rect, viewport: &Viewport, theme: &Theme) {
