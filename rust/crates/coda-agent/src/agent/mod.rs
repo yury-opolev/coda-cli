@@ -40,7 +40,10 @@ pub mod stream;
 pub mod tools;
 
 use stop::{StopAction, UserQuestionPrompt, decide_stop};
-use stream::{RetryConfig, is_context_overflow_error, stream_with_retries};
+use stream::{
+    is_context_overflow_error, stream_with_retries, OutageRetryPolicy, RetryConfig,
+    SharedOutagePolicy,
+};
 use tools::{BatchContext, ToolBatchResult, run_tools};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -176,11 +179,12 @@ pub struct AgentLoop {
     // Tuning knobs.
     tool_max_duration: Option<Duration>,
     tool_progress_interval: Duration,
-    max_transport_retries: u32,
+    max_transport_retries: Option<u32>,
     max_schema_evictions: u32,
     /// Seam for stop hooks (later phase).
     #[allow(dead_code)]
-    max_stop_continuations: u32,
+    max_stop_continuations: u32,    /// Shared so subagents wait out an outage on the same terms as this run.
+    outage_policy: Option<SharedOutagePolicy>,
 }
 
 impl AgentLoop {
@@ -236,8 +240,31 @@ impl AgentLoop {
         let mut blocked_compaction_at: Option<usize> = None;
 
         let retry_cfg = RetryConfig {
-            max_transport_retries: self.max_transport_retries,
             max_schema_evictions: self.max_schema_evictions,
+            // A goal run is unattended by definition, so it waits out an outage
+            // for a day rather than the quarter hour a watched session does.
+            //
+            // Published to the shared handle, not just used locally, so every
+            // subagent this run spawns waits on the same terms. A subagent that
+            // gave up after fifteen minutes would fail its branch and discard
+            // its context at exactly the moment waiting would have worked.
+            outage: {
+                let mut policy = if goal.is_some() {
+                    OutageRetryPolicy::goal()
+                } else {
+                    OutageRetryPolicy::interactive()
+                };
+                // An explicit builder cap still wins, so an embedder (and the
+                // tests) can pin the attempt count without knowing about modes.
+                if let Some(cap) = self.max_transport_retries {
+                    policy.max_attempts = cap;
+                }
+                if let Some(shared) = &self.outage_policy {
+                    shared.lock().expect("outage policy poisoned").policy = policy.clone();
+                }
+                policy
+            },
+            outage_state: self.outage_policy.clone(),
         };
 
         for iteration in 0_usize.. {
@@ -899,9 +926,10 @@ pub struct AgentLoopBuilder {
     granted_directories: Option<std::collections::HashSet<String>>,
     tool_max_duration: Option<Duration>,
     tool_progress_interval: Duration,
-    max_transport_retries: u32,
+    max_transport_retries: Option<u32>,
     max_schema_evictions: u32,
     max_stop_continuations: u32,
+    outage_policy: Option<SharedOutagePolicy>,
 }
 
 impl AgentLoopBuilder {
@@ -942,9 +970,10 @@ impl AgentLoopBuilder {
             granted_directories: None,
             tool_max_duration: Some(Duration::from_secs(30 * 60)),
             tool_progress_interval: Duration::from_secs(15),
-            max_transport_retries: 2,
+            max_transport_retries: None,
             max_schema_evictions: 3,
             max_stop_continuations: 3,
+            outage_policy: None,
         }
     }
 
@@ -976,6 +1005,18 @@ impl AgentLoopBuilder {
     /// Overrides the default 500-iteration per-turn runaway-loop backstop.
     pub fn with_max_iterations(mut self, n: usize) -> Self {
         self.max_iterations = n;
+        self
+    }
+
+    /// Share the outage-retry policy with this run's subagents.
+    ///
+    /// The run publishes the policy it selected (goal or interactive) to this
+    /// handle, and a subagent host holding the same handle reads it. Without
+    /// the sharing a subagent inside an unattended goal run would give up after
+    /// fifteen minutes, failing its branch at the one moment waiting would have
+    /// worked.
+    pub fn with_outage_policy(mut self, policy: SharedOutagePolicy) -> Self {
+        self.outage_policy = Some(policy);
         self
     }
 
@@ -1020,7 +1061,7 @@ impl AgentLoopBuilder {
     }
 
     pub fn with_max_transport_retries(mut self, n: u32) -> Self {
-        self.max_transport_retries = n;
+        self.max_transport_retries = Some(n);
         self
     }
 
@@ -1141,6 +1182,7 @@ impl AgentLoopBuilder {
             max_transport_retries: self.max_transport_retries,
             max_schema_evictions: self.max_schema_evictions,
             max_stop_continuations: self.max_stop_continuations,
+            outage_policy: self.outage_policy,
         }
     }
 }
