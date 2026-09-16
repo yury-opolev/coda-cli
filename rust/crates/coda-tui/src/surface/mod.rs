@@ -19,6 +19,7 @@ use ratatui::text::Line;
 
 pub mod auth;
 pub mod browser;
+pub mod context_menu;
 pub mod effort;
 pub mod form;
 pub mod mcp_editor;
@@ -201,6 +202,17 @@ pub enum SurfaceAction {
 
     /// Adjust the highlighted model without activating it.
     AdjustModelEffort { model: String, direction: i32 },
+
+    /// Act on a hyperlink chosen from its right-click context menu.
+    ///
+    /// The menu is a surface, so it cannot reach the clipboard or a browser
+    /// itself; it names the URL and the chosen [`context_menu::LinkAction`],
+    /// and the application performs the copy or the launch. Carrying the URL by
+    /// value keeps the surface free of any handle to engine or OS state.
+    LinkAction {
+        url: String,
+        action: context_menu::LinkAction,
+    },
 
     /// A browser row action that needs the engine or the filesystem.
     ///

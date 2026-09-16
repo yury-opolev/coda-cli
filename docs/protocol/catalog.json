@@ -257,6 +257,15 @@
       "availability": "reusable"
     },
     {
+      "method": "session/import",
+      "paramsSchema": "schemas/ImportParams.json",
+      "resultSchema": "schemas/ImportResult.json",
+      "paramsContract": "clientWriter",
+      "resultContract": "clientReader",
+      "requiresInitialize": false,
+      "availability": "reusable"
+    },
+    {
       "method": "session/getState",
       "paramsSchema": "schemas/GetStateParams.json",
       "resultSchema": "schemas/StateSnapshot.json",

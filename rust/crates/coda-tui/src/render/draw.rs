@@ -311,8 +311,14 @@ pub fn draw_with_pin(
         area,
     );
 
+    // Width-aware: a long line grows the panel by the *visual* rows it wraps
+    // into, not by its count of `'\n'`s, or the fix below just trades a
+    // horizontal clip for a vertical one.
     let regions = layout_with_pending(
-        area, composer.line_count(), viewport.is_scrollable(), state.is_busy(),
+        area,
+        composer.visual_line_count(composer_text_width(area.width)),
+        viewport.is_scrollable(),
+        state.is_busy(),
         state.queued.len() + state.unsent.len(),
     );
 
@@ -780,6 +786,20 @@ const BOTTOM_EDGE_GLYPH: &str = glyphs::COMPOSER_BOTTOM;
 /// caret drifts away from the text it is meant to sit in.
 pub const COMPOSER_TEXT_COLUMN: u16 = 3;
 
+/// Cell width available for composer text, given the composer panel's own
+/// width.
+///
+/// The composer is never split horizontally — `layout_with_pending` only ever
+/// divides the frame *vertically*, so the panel always spans the whole
+/// terminal width — which is what lets this be computed straight from that
+/// width before the vertical layout exists at all. That matters because the
+/// layout needs a row count (how many rows wrapped text needs) before it can
+/// hand out rows, and this is what the wrapping is measured against to get
+/// that count.
+pub fn composer_text_width(width: u16) -> usize {
+    width.saturating_sub(COMPOSER_TEXT_COLUMN) as usize
+}
+
 /// Breathing room between a modal's border and its contents.
 ///
 /// Horizontal only: vertical padding would cost rows that modals — which are
@@ -839,10 +859,16 @@ fn draw_composer(
     let prompt_style = theme.style(Role::ComposerPrompt);
     let text_style = theme.style(Role::ComposerText);
 
+    // The same width `visual_line_count` was sized against in `draw_with_pin`
+    // (both are `composer_text_width` of the composer's own, unchanged,
+    // full-terminal width), so the rows rendered here always fill the height
+    // that was reserved for them.
+    let text_width = composer_text_width(inner.width);
     let lines: Vec<Line> = composer
-        .lines()
+        .visual_rows(text_width)
+        .into_iter()
         .enumerate()
-        .map(|(index, line)| {
+        .map(|(index, row)| {
             // A leading space keeps the glyph off the terminal edge; the
             // continuation indent matches its width so wrapped lines align
             // under the first one's text.
@@ -851,6 +877,11 @@ fn draw_composer(
             // ellipsis marked the one region inviting input as though it were
             // disabled, when typing there queues the next message. Progress is
             // the status bar's job.
+            //
+            // `index == 0` is the composer's first *visual* row, not its first
+            // logical line: every row after it gets the continuation marker,
+            // whether the row before it ended in a typed newline or just ran
+            // out of width, since both look the same to someone reading it.
             let marker = if index == 0 {
                 glyphs::PROMPT_PADDED
             } else {
@@ -858,15 +889,18 @@ fn draw_composer(
             };
             Line::from(vec![
                 Span::styled(marker, prompt_style),
-                Span::styled(line.to_string(), text_style),
+                Span::styled(row.to_string(), text_style),
             ])
         })
         .collect();
 
     frame.render_widget(Paragraph::new(lines), inner);
 
-    // Place the hardware cursor so the terminal draws it for us.
-    let (line, column) = composer.cursor_position();
+    // Place the hardware cursor so the terminal draws it for us. Read from the
+    // same wrapped geometry the rows above were built from (`visual_rows`,
+    // `visual_line_count`, and this all derive from the same `wrap_line`
+    // ranges), so the caret can never drift from the character it marks.
+    let (line, column) = composer.visual_cursor_position(text_width);
     let x = inner.x + COMPOSER_TEXT_COLUMN + column as u16;
     let y = inner.y + line as u16;
     if x < inner.right() && y < inner.bottom() {

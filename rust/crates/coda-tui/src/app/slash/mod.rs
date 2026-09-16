@@ -91,6 +91,7 @@ impl App {
             "resume" => self.cmd_resume(&invocation).await,
             "fork" => self.cmd_fork().await,
             "rewind" => self.cmd_rewind(&invocation).await,
+            "import" => self.cmd_import(&invocation).await,
             _ if spec.scope == Scope::Engine => self.run_engine_command(spec, invocation).await,
             _ => self.notice(
                 format!("/{} is not implemented yet.", spec.name),

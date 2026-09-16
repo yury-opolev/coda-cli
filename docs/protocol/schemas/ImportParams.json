@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "properties": {
+    "path": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "path"
+  ],
+  "description": "Params for `session/import`.\n\nThe inverse of export: `path` names a portable `*.coda-session.json`\nbundle (see `coda_agent::session::bundle`). A relative path resolves\nagainst the *engine's* working directory, not this client's — the engine\nowns session storage, so it is the one that knows what \"relative\" means\n(mirrors C# `ImportCommand`, which resolves against `Session.WorkingDirectory`).",
+  "title": "ImportParams",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

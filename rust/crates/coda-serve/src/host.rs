@@ -13,7 +13,7 @@ use coda_agent::{
     AutonomySupervisor, HookContentHash, HookRunner, HookScope, HookTrustGuard, HookTrustStore,
     InMemoryHookTrustStore, NullScheduleLifecycleSink, ScheduleRuntime, SubagentFactory,
     TaskManagerRunner, TodoStore, TokenEstimator, ToolQuarantine, ToolRegistry, UserHook,
-    SessionTranscriptStore, fork_session, rewind_session, session_id_is_valid,
+    SessionBundleService, SessionTranscriptStore, fork_session, rewind_session, session_id_is_valid,
 };
 use coda_agent::agent::stop::UserQuestionPrompt;
 use coda_agent::events::{AgentEvent, AgentSink};
@@ -63,7 +63,7 @@ use uuid::Uuid;
 
 use crate::dispatch::{
     CancelRequestParams, CompactParams, ConfigSetParams, ForkParams, GetEventsParams,
-    GetHistoryParams, GetStateParams, HooksInfoParams, HooksTrustParams, InitParams,
+    GetHistoryParams, GetStateParams, HooksInfoParams, HooksTrustParams, ImportParams, InitParams,
     ListSessionsParams, MessagesParams, ModelsParams, PendingMessagesParams, PromptParams,
     ResolveRequestParams, RewindParams, RpcError, ScheduleCreateParams, ScheduleDeleteParams,
     ServeBackend, SetEffortParams, SetGoalParams, SetModelParams, SetPermissionModeParams,
@@ -2419,6 +2419,22 @@ fn safe_engine_error(code: i64) -> coda_proto::state::TurnErrorSummary {
     }
 }
 
+/// Resolves a `/import` path exactly like the C# original
+/// (`Path.IsPathRooted(args[0]) ? args[0] : Path.Combine(WorkingDirectory, args[0])`):
+/// an absolute path is used as-is, a relative one joins the *engine's*
+/// working directory — never this process's own current directory, and
+/// never a path the caller already resolved, since the engine is the one
+/// that owns session storage and therefore the one that knows what
+/// "relative" means here.
+fn resolve_bundle_path(working_dir: &str, path: &str) -> PathBuf {
+    let candidate = Path::new(path);
+    if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        Path::new(working_dir).join(candidate)
+    }
+}
+
 /// Why a prompt turn is being run (Stage 3 chunk C).
 ///
 /// An **explicit** discriminant, deliberately not inferred from the request
@@ -3735,6 +3751,33 @@ impl ServeBackend for ServeHost {
             wire: None,
         });
         result
+    }
+
+    /// `session/import` — read a portable `*.coda-session.json` bundle from
+    /// disk and persist it as a new session in this workspace.
+    ///
+    /// The inverse of export. Deliberately does **not** claim the foreground
+    /// turn slot the way `fork`/`rewind`/`compact` do: those replace the
+    /// *live* session's committed history, so a concurrent prompt must be
+    /// excluded; import only ever writes the bundle's own (possibly
+    /// re-minted) id under `.coda/sessions/`, never the active session, so it
+    /// needs neither that exclusion nor a `historyEpoch` bump. A malformed
+    /// bundle, an unreadable path or an unsupported schema version is
+    /// `-32602` (see `coda_agent::session::ImportError`'s `Display`) and
+    /// never partially writes — `SessionBundleService::import_bundle`
+    /// validates the whole bundle before it saves anything.
+    async fn session_import(&self, p: ImportParams) -> Result<Value, RpcError> {
+        let path = p.path.trim();
+        if path.is_empty() {
+            return Err(RpcError::invalid_params("path must not be empty"));
+        }
+        let resolved = resolve_bundle_path(&self.working_dir, path);
+        let service = SessionBundleService::new(self.working_dir.clone(), env!("CARGO_PKG_VERSION"));
+        let session_id = service
+            .import_bundle(&resolved)
+            .await
+            .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+        Ok(json!({ "ok": true, "sessionId": session_id }))
     }
 
     // ── Stage D ──────────────────────────────────────────────────────────
@@ -11215,6 +11258,235 @@ mod tests {
         let _store = coda_agent::SessionTranscriptStore::new(dir.path());
         let in_memory = host.session.history.lock().unwrap().len();
         assert_eq!(in_memory, 0, "in-memory history must be empty after rewind");
+    }
+
+    // ── session/import tests ──────────────────────────────────────────────────
+    //
+    // Unlike fork/rewind, import never touches the live session: it only
+    // ever writes the bundle's own (possibly re-minted) id under
+    // `.coda/sessions/` in the *target* workspace. Every test below therefore
+    // builds its bundle in one temp directory and imports it into another,
+    // exactly like `SessionBundleService`'s own round-trip test.
+
+    /// Saves `messages` under `id` in `source_dir`, exports them, and writes
+    /// the resulting bundle to `bundle_path` (which need not be inside
+    /// `source_dir`).
+    async fn write_bundle_for(
+        source_dir: &std::path::Path,
+        id: &str,
+        messages: &[Message],
+        bundle_path: &std::path::Path,
+    ) {
+        let store = SessionTranscriptStore::new(source_dir);
+        store.save(id, messages, None).await.unwrap();
+        let service = SessionBundleService::new(source_dir, "0.1.0");
+        let bundle = service.export(id, Utc::now()).await.unwrap();
+        service.write_bundle(&bundle, bundle_path, false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn import_round_trips_a_freshly_exported_bundle() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let id = "abc123456789";
+        let messages = vec![Message::user("hello"), Message::assistant("world")];
+        let bundle_path = source_dir.path().join("export.coda-session.json");
+        write_bundle_for(source_dir.path(), id, &messages, &bundle_path).await;
+
+        let working_dir = target_dir.path().to_str().unwrap().to_owned();
+        let host = make_host_in_dir(&working_dir, ScriptedClient::new(vec![]));
+
+        let r = host
+            .session_import(ImportParams { path: bundle_path.to_str().unwrap().to_owned() })
+            .await
+            .unwrap();
+        assert_eq!(r["ok"], true);
+        let session_id = r["sessionId"].as_str().unwrap();
+        assert_eq!(session_id, id, "no collision: the bundle's own id must be preserved");
+
+        let store = SessionTranscriptStore::new(target_dir.path());
+        let loaded = store.load(session_id).await.unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].text(), "hello");
+        assert_eq!(loaded[1].text(), "world");
+    }
+
+    #[tokio::test]
+    async fn import_does_not_touch_the_active_session_or_bump_the_history_epoch() {
+        // The contrast with `fork_bumps_history_epoch_and_is_never_invisible`
+        // is the point: fork/rewind/compact replace the *live* conversation,
+        // import never does.
+        let source_dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let id = "abc123456789";
+        let bundle_path = source_dir.path().join("export.coda-session.json");
+        write_bundle_for(source_dir.path(), id, &[Message::user("hi")], &bundle_path).await;
+
+        let working_dir = target_dir.path().to_str().unwrap().to_owned();
+        let host = make_host_in_dir(&working_dir, ScriptedClient::new(vec![]));
+
+        let original_active_id = host.active_session_id();
+        let before = host.session_get_state(GetStateParams::default()).await.unwrap();
+
+        host.session_import(ImportParams { path: bundle_path.to_str().unwrap().to_owned() })
+            .await
+            .unwrap();
+
+        let after = host.session_get_state(GetStateParams::default()).await.unwrap();
+        assert_eq!(
+            host.active_session_id(),
+            original_active_id,
+            "import must not change which session is live"
+        );
+        assert_eq!(
+            after["historyEpoch"], before["historyEpoch"],
+            "import must not bump historyEpoch"
+        );
+    }
+
+    #[tokio::test]
+    async fn importing_the_same_bundle_twice_yields_two_distinct_session_ids() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let id = "abc123456789";
+        let bundle_path = source_dir.path().join("export.coda-session.json");
+        write_bundle_for(source_dir.path(), id, &[Message::user("hi")], &bundle_path).await;
+
+        let working_dir = target_dir.path().to_str().unwrap().to_owned();
+        let host = make_host_in_dir(&working_dir, ScriptedClient::new(vec![]));
+        let path_str = bundle_path.to_str().unwrap().to_owned();
+
+        let first = host.session_import(ImportParams { path: path_str.clone() }).await.unwrap();
+        let second = host.session_import(ImportParams { path: path_str }).await.unwrap();
+
+        let first_id = first["sessionId"].as_str().unwrap().to_owned();
+        let second_id = second["sessionId"].as_str().unwrap().to_owned();
+        assert_eq!(first_id, id, "the first import into an empty workspace keeps the bundle's own id");
+        assert_ne!(
+            first_id, second_id,
+            "importing the same bundle twice must not clobber the first import"
+        );
+
+        // Both must be independently resumable.
+        let store = SessionTranscriptStore::new(target_dir.path());
+        assert!(store.load(&first_id).await.is_some());
+        assert!(store.load(&second_id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn importing_a_missing_file_reports_a_clean_error() {
+        let target_dir = tempfile::tempdir().unwrap();
+        let working_dir = target_dir.path().to_str().unwrap().to_owned();
+        let host = make_host_in_dir(&working_dir, ScriptedClient::new(vec![]));
+
+        let err = host
+            .session_import(ImportParams { path: "no-such-bundle.coda-session.json".into() })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, -32602);
+    }
+
+    #[tokio::test]
+    async fn importing_a_malformed_bundle_reports_a_clean_error_and_writes_nothing() {
+        let target_dir = tempfile::tempdir().unwrap();
+        let working_dir = target_dir.path().to_str().unwrap().to_owned();
+        let bad_path = target_dir.path().join("bad.coda-session.json");
+        tokio::fs::write(&bad_path, br#"{"id":"x"}"#).await.unwrap();
+
+        let host = make_host_in_dir(&working_dir, ScriptedClient::new(vec![]));
+        let err = host
+            .session_import(ImportParams { path: bad_path.to_str().unwrap().to_owned() })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, -32602);
+
+        let sessions_dir = target_dir.path().join(".coda").join("sessions");
+        assert!(
+            !sessions_dir.exists(),
+            "a rejected bundle must never create the sessions directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn importing_an_empty_path_is_refused_without_touching_the_filesystem() {
+        let target_dir = tempfile::tempdir().unwrap();
+        let working_dir = target_dir.path().to_str().unwrap().to_owned();
+        let host = make_host_in_dir(&working_dir, ScriptedClient::new(vec![]));
+
+        let err = host.session_import(ImportParams { path: "   ".into() }).await.unwrap_err();
+        assert_eq!(err.code, -32602);
+    }
+
+    #[tokio::test]
+    async fn a_relative_import_path_resolves_against_the_working_directory() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let id = "abc123456789";
+
+        // The bundle lives directly under the target working directory, so
+        // it can be named without any path component at all.
+        let bundle_path = target_dir.path().join("mine.coda-session.json");
+        write_bundle_for(source_dir.path(), id, &[Message::user("hi")], &bundle_path).await;
+
+        let working_dir = target_dir.path().to_str().unwrap().to_owned();
+        let host = make_host_in_dir(&working_dir, ScriptedClient::new(vec![]));
+
+        let r = host
+            .session_import(ImportParams { path: "mine.coda-session.json".into() })
+            .await
+            .unwrap();
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["sessionId"], id, "relative path must resolve against the working directory");
+    }
+
+    #[tokio::test]
+    async fn an_absolute_import_path_is_used_as_is_even_outside_the_working_directory() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let id = "abc123456789";
+        let bundle_path = source_dir.path().join("export.coda-session.json");
+        write_bundle_for(source_dir.path(), id, &[Message::user("hi")], &bundle_path).await;
+
+        let working_dir = target_dir.path().to_str().unwrap().to_owned();
+        let host = make_host_in_dir(&working_dir, ScriptedClient::new(vec![]));
+
+        // The bundle lives entirely outside working_dir; only an absolute
+        // path can find it.
+        let r = host
+            .session_import(ImportParams { path: bundle_path.to_str().unwrap().to_owned() })
+            .await
+            .unwrap();
+        assert_eq!(r["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn an_imported_session_is_listed_and_therefore_resumable() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let id = "abc123456789";
+        let bundle_path = source_dir.path().join("export.coda-session.json");
+        write_bundle_for(source_dir.path(), id, &[Message::user("hi")], &bundle_path).await;
+
+        let working_dir = target_dir.path().to_str().unwrap().to_owned();
+        let host = make_host_in_dir(&working_dir, ScriptedClient::new(vec![]));
+
+        let r = host
+            .session_import(ImportParams { path: bundle_path.to_str().unwrap().to_owned() })
+            .await
+            .unwrap();
+        let session_id = r["sessionId"].as_str().unwrap().to_owned();
+
+        let listing = host.session_list_sessions(ListSessionsParams::default()).await.unwrap();
+        let ids: Vec<String> = listing["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["sessionId"].as_str().unwrap().to_owned())
+            .collect();
+        assert!(
+            ids.contains(&session_id),
+            "an imported session must appear in session/listSessions so /resume can find it"
+        );
     }
 
     #[tokio::test]

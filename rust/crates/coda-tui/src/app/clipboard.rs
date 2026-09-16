@@ -8,6 +8,8 @@
 use arboard;
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
+use coda_boot::browser::LinkOpenMode;
+
 use super::{App, PointerAction, WHEEL_ROWS};
 use crate::transcript::NoticeLevel;
 
@@ -89,6 +91,15 @@ impl App {
                 // one-cell selection that Ctrl+Y would then copy.
                 if !self.selection.has_selection() {
                     self.selection.clear();
+                    // A click that selected nothing is a click, not a drag: if
+                    // it landed on a link, activate it. Guarded on no surface
+                    // being open, so a click never reaches through a modal to
+                    // the transcript beneath it.
+                    if self.surfaces.is_empty() {
+                        if let Some(url) = self.link_at_pointer(mouse.column, mouse.row) {
+                            self.open_link(&url, LinkOpenMode::Default);
+                        }
+                    }
                 }
                 self.dirty = true;
             }
@@ -99,6 +110,15 @@ impl App {
             // gesture does not depend on aim.
             MouseEventKind::Down(MouseButton::Right) => {
                 self.dirty = true;
+                // A right-click on a link opens its context menu instead. Taken
+                // before the copy/paste gesture so a link never falls through to
+                // it, and guarded on no surface being open.
+                if self.surfaces.is_empty() {
+                    if let Some(url) = self.link_at_pointer(mouse.column, mouse.row) {
+                        self.open_link_menu(url);
+                        return None;
+                    }
+                }
                 return pointer_action(self.selection.has_selection() || self.header_id_selected);
             }
             _ => {}
@@ -144,14 +164,19 @@ impl App {
         if origin_y == 0 || row < origin_y {
             return false;
         }
-        let line = (row - origin_y) as usize;
-        if line >= self.composer.line_count() {
+        // A screen row here is a *visual* row: once a long line soft-wraps it
+        // no longer lines up with a logical line, so this has to go through
+        // the same wrapped geometry the composer was drawn with rather than
+        // `move_cursor_to`, which assumes row and logical line are the same
+        // thing.
+        let visual_row = (row - origin_y) as usize;
+        if visual_row >= self.composer.visual_line_count(self.composer_text_width) {
             return false;
         }
         // Left of the prompt marker counts as column zero rather than missing,
         // so clicking the gutter puts the caret at the start of the line.
         let cell = column.saturating_sub(origin_x) as usize;
-        self.composer.move_cursor_to(line, cell);
+        self.composer.move_cursor_to_visual(self.composer_text_width, visual_row, cell);
         true
     }
     /// Folds or unfolds the block whose header was clicked.

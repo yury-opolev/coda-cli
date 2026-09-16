@@ -164,6 +164,7 @@ re-fetches the catalog from models.dev first.
 | `config/describe` | `{}` | `{ entries: ConfigEntry[] }` |
 | `config/set` | `{ key, value }` | `{ ok, key, appliedAt, effective?, error? }` |
 | `mcp/list` | `{}` | `{ servers: McpServer[], enabled, managerAvailable }` |
+| `session/import` | `{ path }` | `{ ok, sessionId }` |
 
 **Initialization gate.** `session/getHistory`, `session/getPendingRequests`,
 `session/resolveRequest`, `session/cancelRequest` and `config/set` require a completed
@@ -171,6 +172,17 @@ re-fetches the catalog from models.dev first.
 `config/describe`, `mcp/list`, `session/getState`, `session/getEvents` — is valid **before**
 `initialize`, so a client can choose a session before resuming one. Every route that shipped
 before this contract keeps exactly the behaviour it had; the gate is not retrofitted.
+
+**`session/import` does not touch the live session.** It is the inverse of export: `path`
+names a portable `*.coda-session.json` bundle (see `coda_agent::session::bundle`), which the
+engine reads, validates, and writes into its own workspace as a new session — minting a fresh
+id when the bundle's own id already exists locally, so importing the same bundle twice never
+clobbers the earlier import. A relative `path` resolves against the *engine's* working
+directory, never this client's; an absolute path is used as-is. Unlike `fork`/`rewind`/
+`compact`, it never replaces the live conversation, so it neither claims the foreground turn
+slot nor bumps `historyEpoch`, and it is not gated on `initialize`. A malformed bundle, an
+unreadable path or an unsupported schema version is `-32602` and leaves the sessions directory
+exactly as it was — validation happens before anything is written.
 
 **Turn duration is server-measured.** `turn.startedAt` and `turn.phaseSince` are the engine's
 UTC wall clock — fine for display, wrong for measuring. A remote client's clock may be skewed,

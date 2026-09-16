@@ -336,6 +336,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         summary: "Remove the last exchange(s) from the conversation.",
         scope: Scope::Local,
     },
+    CommandSpec {
+        name: "import",
+        aliases: &[],
+        args: "<file>",
+        summary: "Import a *.coda-session.json bundle into this workspace.",
+        scope: Scope::Local,
+    },
 ];
 
 impl CommandSpec {
@@ -671,7 +678,7 @@ mod tests {
         let new_names = [
             "init", "memory", "output-style", "permissions", "yolo", "provider", "login", "logout",
             "headers", "log", "marketplace", "plugin", "skill", "export", "diff", "image",
-            "compact", "resume", "fork", "rewind",
+            "compact", "resume", "fork", "rewind", "import",
         ];
         for name in new_names {
             let spec = lookup(name).unwrap_or_else(|| panic!("/{name} not found"));
@@ -689,7 +696,7 @@ mod tests {
         let new_names = [
             "init", "memory", "output-style", "permissions", "yolo", "provider", "login", "logout",
             "headers", "log", "marketplace", "plugin", "skill", "export", "diff", "image",
-            "compact", "resume", "fork", "rewind",
+            "compact", "resume", "fork", "rewind", "import",
         ];
         for name in new_names {
             assert!(text.contains(name), "/{name} missing from help output");

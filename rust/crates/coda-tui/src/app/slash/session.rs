@@ -1,4 +1,4 @@
-//! Session commands: resume, fork, rewind, compact, export, diff, image.
+//! Session commands: resume, fork, rewind, compact, export, import, diff, image.
 //!
 //! Grouped because they all act on the conversation itself rather than on
 //! configuration or on installed components.
@@ -281,6 +281,42 @@ impl App {
             Ok(Ok(path)) => self.notice(format!("Conversation exported to {}", path.display()), NoticeLevel::Info),
             Ok(Err(e)) => self.notice(format!("Export failed: {e}"), NoticeLevel::Error),
             Err(_) => self.notice("Export was interrupted.", NoticeLevel::Error),
+        }
+    }
+
+    /// `/import <file>` — import a `*.coda-session.json` bundle into this
+    /// workspace's sessions and report the id to `/resume`.
+    ///
+    /// The inverse of `/export --json`/`coda export`. Calls `session/import`;
+    /// the engine resolves a relative path against *its own* working
+    /// directory (an absolute path is used as-is), validates the bundle
+    /// before writing anything, and mints a fresh id if the bundle's own id
+    /// already exists locally — so importing the same bundle twice never
+    /// clobbers the earlier import. Mirrors C# `ImportCommand`.
+    pub(super) async fn cmd_import(&mut self, invocation: &commands::Invocation) {
+        let Some(path) = invocation.first() else {
+            self.notice("Usage: /import <file>", NoticeLevel::Warning);
+            return;
+        };
+        if !self.require_engine("/import") {
+            return;
+        }
+
+        match self
+            .ask::<messages::ImportResult>(
+                method::IMPORT,
+                Some(serde_json::json!({ "path": path })),
+            )
+            .await
+        {
+            Ok(r) => {
+                let escaped = coda_render::text::sanitize(&r.session_id);
+                self.notice(
+                    format!("Imported as {escaped}. Use /resume {escaped} to continue."),
+                    NoticeLevel::Info,
+                );
+            }
+            Err(e) => self.notice(format!("Import failed: {e}"), NoticeLevel::Error),
         }
     }
 

@@ -1489,6 +1489,7 @@ impl App {
             selection: crate::selection::TranscriptSelection::new(),
             transcript_origin: (0, 0),
             composer_origin: (0, 0),
+            composer_text_width: 0,
             session_effort: None,
             engine_log_path: initialized.telemetry_log_path.clone(),
             header_id_rect: None,

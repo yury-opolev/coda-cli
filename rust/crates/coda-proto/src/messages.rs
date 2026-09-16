@@ -56,6 +56,10 @@ pub mod method {
     /// bootstrap and the slash command cannot drift apart.
     pub const FORK: &str = "session/fork";
     pub const REWIND: &str = "session/rewind";
+    /// Import a portable `*.coda-session.json` bundle (see
+    /// `coda_agent::session::bundle`) as a new session in the current
+    /// workspace. The inverse of export; never touches the live session.
+    pub const IMPORT: &str = "session/import";
 
     // ── Stage D (§2.2) ───────────────────────────────────────────────────
     /// UI-safe rich history for the live session or a validated saved one,
@@ -734,6 +738,42 @@ pub struct CompactResult {
     pub tokens_after: Option<i64>,
     #[serde(default)]
     pub error: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Import
+// ---------------------------------------------------------------------------
+
+/// Params for `session/import`.
+///
+/// The inverse of export: `path` names a portable `*.coda-session.json`
+/// bundle (see `coda_agent::session::bundle`). A relative path resolves
+/// against the *engine's* working directory, not this client's — the engine
+/// owns session storage, so it is the one that knows what "relative" means
+/// (mirrors C# `ImportCommand`, which resolves against `Session.WorkingDirectory`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ImportParams {
+    pub path: String,
+}
+
+/// Result of `session/import`.
+///
+/// Only ever returned on success: a malformed bundle, an unreadable path or
+/// an unsupported schema version is a JSON-RPC error, not an `ok: false`
+/// result (there is nothing partial about an import — either the new
+/// session was written, or nothing was).
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ImportResult {
+    #[serde(default)]
+    pub ok: bool,
+    /// The id to `/resume` — the bundle's own id, or a freshly minted one if
+    /// that id already exists locally.
+    #[serde(default)]
+    pub session_id: String,
 }
 
 // ---------------------------------------------------------------------------
