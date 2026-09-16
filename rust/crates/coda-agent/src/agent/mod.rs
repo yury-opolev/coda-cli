@@ -1560,9 +1560,124 @@ mod tests {
         assert_eq!(text_events, vec!["hello"], "text must appear exactly once after transport retry");
     }
 
+    /// REGRESSION: the retry arm matched only transport-level errors, so a
+    /// provider answering 503 — which is what an outage actually looks like
+    /// from the client — fell straight through to the fatal path. The one
+    /// scenario the retry exists for was the one it did not cover.
+    ///
+    /// Drives the real loop: two 503s, then success.
     #[tokio::test]
-    async fn no_transport_retry_after_text_emitted() {
+    async fn a_provider_outage_status_is_retried_and_the_run_recovers() {
         let sink = CollectingSink::new();
+
+        let client = MockLlmClient::new(vec![
+            vec![Err(LlmError::from_status(503, "service unavailable", None))],
+            vec![Err(LlmError::from_status(503, "service unavailable", None))],
+            vec![Ok(StreamEvent::TextDelta("recovered".into())), Ok(done())],
+        ]);
+
+        let tools = Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
+        let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
+            .with_max_transport_retries(5)
+            .with_tool_max_duration(None)
+            .build();
+
+        let mut history = vec![Message::user("hi")];
+        agent
+            .run(&mut history, &sink, None, CancellationToken::new())
+            .await
+            .expect("a 503 must be waited out, not fatal");
+
+        let text: Vec<String> = sink
+            .take()
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::AssistantText { delta } => Some(delta.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, vec!["recovered".to_owned()], "output must appear exactly once");
+    }
+
+    /// A rate limit is an outage of a different shape and must also be waited
+    /// out rather than ending the run.
+    #[tokio::test]
+    async fn a_rate_limit_is_waited_out_rather_than_fatal() {
+        let sink = CollectingSink::new();
+        let client = MockLlmClient::new(vec![
+            vec![Err(LlmError::from_status(429, "slow down", None))],
+            vec![Ok(StreamEvent::TextDelta("ok".into())), Ok(done())],
+        ]);
+
+        let tools = Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
+        let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
+            .with_max_transport_retries(5)
+            .with_tool_max_duration(None)
+            .build();
+
+        let mut history = vec![Message::user("hi")];
+        agent
+            .run(&mut history, &sink, None, CancellationToken::new())
+            .await
+            .expect("a 429 must be retried");
+    }
+
+    /// Waiting cannot fix a bad key. Retrying one for fifteen minutes would
+    /// turn a clear, immediate error into a silent stall.
+    #[tokio::test]
+    async fn an_auth_failure_is_reported_immediately_rather_than_waited_out() {
+        let sink = CollectingSink::new();
+        let client = MockLlmClient::new(vec![
+            vec![Err(LlmError::from_status(401, "bad key", None))],
+            vec![Ok(StreamEvent::TextDelta("never reached".into())), Ok(done())],
+        ]);
+
+        let tools = Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
+        let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
+            .with_max_transport_retries(5)
+            .with_tool_max_duration(None)
+            .build();
+
+        let mut history = vec![Message::user("hi")];
+        let result = agent.run(&mut history, &sink, None, CancellationToken::new()).await;
+        assert!(result.is_err(), "an auth failure must surface, not stall");
+    }
+
+    /// A sustained outage: several consecutive failures, then recovery. This is
+    /// the shape of the scenario the feature exists for — the provider is down
+    /// for a while and the run has to still be there when it returns.
+    #[tokio::test]
+    async fn a_sustained_outage_is_survived_and_produces_output_once() {
+        let sink = CollectingSink::new();
+
+        let mut responses: Vec<Vec<Result<StreamEvent, LlmError>>> = (0..4)
+            .map(|_| vec![Err(LlmError::Transport("network down".into()))])
+            .collect();
+        responses.push(vec![Ok(StreamEvent::TextDelta("back".into())), Ok(done())]);
+
+        let client = MockLlmClient::new(responses);
+        let tools = Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
+        let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
+            .with_max_transport_retries(10)
+            .with_tool_max_duration(None)
+            .build();
+
+        let mut history = vec![Message::user("hi")];
+        agent
+            .run(&mut history, &sink, None, CancellationToken::new())
+            .await
+            .expect("four failures then success must survive");
+
+        let count = sink
+            .take()
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::AssistantText { delta } if delta == "back"))
+            .count();
+        assert_eq!(count, 1, "replay must not duplicate output");
+    }
+
+    #[tokio::test]
+    async fn no_transport_retry_after_text_emitted() {        let sink = CollectingSink::new();
 
         // First call: text then transport error → mid-stream failure, no retry.
         let client = MockLlmClient::new(vec![vec![
