@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- This is a reusable protocol library; a stray warning here is a latent
+         interop bug, so the build refuses to accept one. -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!-- The public API is documented in prose on the types themselves; we do
+         not want CS1591 forcing a doc comment onto every trivial member. -->
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <RootNamespace>Coda.Client</RootNamespace>
+  </PropertyGroup>
+
+  <!-- The wire-mapping tests assert the exact int?/string? a budget encodes to.
+       That encoding is an internal detail (callers use the intent vocabulary),
+       so it is shared with the test assembly rather than made public API. -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="Coda.Client.Tests" />
+  </ItemGroup>
+
+</Project>
