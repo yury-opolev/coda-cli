@@ -22,7 +22,7 @@ pub(super) fn documents() -> BTreeMap<&'static str, Value> {
         ModelsParams, ModelsResult, SetGoalParams, SetGoalResult,
         SetEffortParams, SetEffortResult, SetPermissionModeParams, SetPermissionModeResult,
         SetSystemPromptParams, SetSystemPromptResult, ModelAdjustEffortParams, ModelEffortResult,
-        ReasoningCapabilityResult, CompactParams, CompactResult, ScheduleListResult,
+        ReasoningCapabilityResult, CompactParams, CompactResult, ImportParams, ImportResult, ScheduleListResult,
         ScheduledTask, ScheduleCreateParams, ScheduleDeleteParams, SkillsListResult,
         PluginsListResult, HooksListResult, PermissionRequest, PermissionResponse,
         QuestionRequest, QuestionResponse, PlanApprovalRequest, PlanApprovalResponse,

@@ -1,0 +1,17 @@
+{
+  "type": "object",
+  "properties": {
+    "ok": {
+      "type": "boolean",
+      "default": false
+    },
+    "sessionId": {
+      "type": "string",
+      "description": "The id to `/resume` — the bundle's own id, or a freshly minted one if\nthat id already exists locally.",
+      "default": ""
+    }
+  },
+  "description": "Result of `session/import`.\n\nOnly ever returned on success: a malformed bundle, an unreadable path or\nan unsupported schema version is a JSON-RPC error, not an `ok: false`\nresult (there is nothing partial about an import — either the new\nsession was written, or nothing was).",
+  "title": "ImportResult",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

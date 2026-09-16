@@ -47,6 +47,7 @@ might infer from its name. Unsupported operations are listed separately.
 | `session/fork` | Reusable | Branch committed history into a new session; owns the foreground slot and changes the history epoch. |
 | `session/rewind` | Reusable | Remove later committed history; owns the foreground slot and changes the history epoch. |
 | `session/compact` | Reusable | Compact history with the configured provider; busy while running, with a new history epoch on replacement. |
+| `session/import` | Reusable | Import a portable `*.coda-session.json` bundle as a new session in the current workspace; the inverse of export. Never touches the live session, so it neither owns the foreground slot nor changes the history epoch. |
 | `session/getPendingRequests` | Reusable | Read outstanding permission/question/plan requests without resolving them. |
 | `session/resolveRequest` | Reusable | Resolve an instance-bound request handle exactly once, with kind-specific validated outcome. A stale or consumed handle is an error. |
 | `session/cancelRequest` | Reusable | Apply deny / no-answer / reject to one outstanding request. Does not shut down the connection. |

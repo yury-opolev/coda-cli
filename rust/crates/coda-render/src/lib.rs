@@ -9,7 +9,7 @@ pub mod text;
 pub mod tool;
 pub mod theme;
 
-pub use line::{Gutter, RenderLine, Span, CHILD_CELLS, MARKER_CELLS};
+pub use line::{Gutter, LinkSpan, RenderLine, Span, CHILD_CELLS, MARKER_CELLS};
 pub use theme::{ColorDepth, Role, Theme, ThemeColor};
 
 

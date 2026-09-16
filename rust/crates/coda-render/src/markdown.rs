@@ -9,7 +9,7 @@
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
 use crate::diff;
-use crate::line::{RenderLine, Span};
+use crate::line::{LinkSpan, RenderLine, Span};
 use crate::syntax::{Language, Tokenizer};
 use crate::text;
 use crate::theme::Role;
@@ -67,11 +67,27 @@ impl Callout {
     }
 }
 
+/// A link discovered while accumulating inline text.
+///
+/// Records both what the link *is* (its `url`) and how it must look (the
+/// [`Role`] its display text takes — [`Role::Link`], or [`Role::LinkDeceptive`]
+/// when the text lies about where it leads). `start`/`end` are `char` offsets
+/// into the paragraph buffer; they turn into cell coordinates only once the row
+/// they fall on is known, because that is the first point a wide glyph's true
+/// width can be measured.
+#[derive(Debug, Clone)]
+struct InlineLink {
+    start: usize,
+    end: usize,
+    role: Role,
+    url: String,
+}
+
 /// Accumulated inline text plus the link ranges found inside it.
 #[derive(Debug, Default)]
 struct InlineBuffer {
     text: String,
-    links: Vec<(usize, usize, Role)>,
+    links: Vec<InlineLink>,
 }
 
 impl InlineBuffer {
@@ -83,7 +99,7 @@ impl InlineBuffer {
         self.text.trim().is_empty()
     }
 
-    fn take(&mut self) -> (String, Vec<(usize, usize, Role)>) {
+    fn take(&mut self) -> (String, Vec<InlineLink>) {
         (
             std::mem::take(&mut self.text),
             std::mem::take(&mut self.links),
@@ -321,7 +337,8 @@ impl Renderer {
         }
     }
 
-    /// Records the link's colour span, flagging deceptive display text.
+    /// Records the link's colour span and destination, flagging deceptive
+    /// display text.
     fn close_link(&mut self) {
         let (Some(target), Some(start)) = (self.link_target.take(), self.link_start.take()) else {
             return;
@@ -344,13 +361,23 @@ impl Renderer {
             .collect();
 
         if link_text_matches(&display, &target) {
-            self.inline.links.push((start, end, Role::Link));
+            self.inline.links.push(InlineLink {
+                start,
+                end,
+                role: Role::Link,
+                url: target,
+            });
         } else {
-            // The display text claims to be a different destination; mark it.
+            // The display text claims to be a different destination; mark it,
+            // and let the warning glyph belong to the link so a click anywhere
+            // on the flagged run still resolves to the real target.
             self.inline.push("\u{26A0}"); // ⚠
-            self.inline
-                .links
-                .push((start, end + 1, Role::LinkDeceptive));
+            self.inline.links.push(InlineLink {
+                start,
+                end: end + 1,
+                role: Role::LinkDeceptive,
+                url: target,
+            });
         }
     }
 
@@ -400,7 +427,7 @@ impl Renderer {
         self.emit_wrapped(&text, links);
     }
 
-    fn emit_wrapped(&mut self, text: &str, links: Vec<(usize, usize, Role)>) {
+    fn emit_wrapped(&mut self, text: &str, links: Vec<InlineLink>) {
         // Sanitize prose text before wrapping. Model output can contain
         // adversarial control characters and ANSI escape sequences; the draw
         // layer must never receive them. Code blocks are already sanitized in
@@ -424,9 +451,9 @@ impl Renderer {
             };
 
             let offset = text::width(&lead);
-            let spans = link_spans(&links, consumed, chunk.chars().count(), offset);
+            let (spans, link_spans) = row_link_spans(chunk, &links, consumed, offset);
             consumed += chunk.chars().count() + 1; // account for the split space
-            self.push_row(format!("{lead}{chunk}"), self.role, spans);
+            self.push_row_with_links(format!("{lead}{chunk}"), self.role, spans, link_spans);
         }
     }
 
@@ -476,6 +503,16 @@ impl Renderer {
     }
 
     fn push_row(&mut self, text: String, role: Role, spans: Vec<Span>) {
+        self.push_row_with_links(text, role, spans, Vec::new());
+    }
+
+    fn push_row_with_links(
+        &mut self,
+        text: String,
+        role: Role,
+        spans: Vec<Span>,
+        links: Vec<LinkSpan>,
+    ) {
         let indent = " ".repeat(self.indent);
         let (prefix, prefix_cells, prefix_role) = match self.callout {
             Some(callout) => (
@@ -488,7 +525,8 @@ impl Renderer {
 
         let shift = text::width(&prefix);
         let mut line = RenderLine::new(format!("{prefix}{text}"), role)
-            .with_spans(spans.iter().map(|s| s.shifted(shift)).collect());
+            .with_spans(spans.iter().map(|s| s.shifted(shift)).collect())
+            .with_links(links.iter().map(|l| l.shifted(shift)).collect());
 
         if let Some(prefix_role) = prefix_role {
             line = line.with_prefix(prefix_cells, prefix_role);
@@ -532,29 +570,52 @@ fn first_token_len(text: &str) -> usize {
     leading + trimmed.split_whitespace().next().map_or(0, str::len)
 }
 
-/// Maps link ranges from whole-paragraph char offsets onto one wrapped row.
-fn link_spans(
-    links: &[(usize, usize, Role)],
-    row_start: usize,
-    row_len: usize,
-    offset: usize,
-) -> Vec<Span> {
-    let row_end = row_start + row_len;
-    links
-        .iter()
-        .filter_map(|&(start, end, role)| {
-            let clipped_start = start.max(row_start);
-            let clipped_end = end.min(row_end);
-            if clipped_end <= clipped_start {
-                return None;
-            }
-            Some(Span::new(
-                clipped_start - row_start + offset,
-                clipped_end - row_start + offset,
-                role,
-            ))
-        })
-        .collect()
+/// Maps link ranges (whole-paragraph `char` offsets) onto one wrapped row, in
+/// terminal **cell** coordinates.
+///
+/// Two coordinate systems meet here. A link is recorded in `char`s while the
+/// paragraph is accumulated, but a drawn row is addressed in cells, and a CJK
+/// glyph occupies two of them. Converting through the row's own text — summing
+/// real glyph widths up to each boundary rather than assuming one char is one
+/// cell — is what keeps a link's colour and its clickable range sitting exactly
+/// under the text the reader sees, however wide that text is.
+///
+/// Returns the colour spans and the clickable link spans together because they
+/// are derived from the same clip and must never disagree about where a link
+/// begins and ends.
+fn row_link_spans(
+    chunk: &str,
+    links: &[InlineLink],
+    row_start_char: usize,
+    offset_cells: usize,
+) -> (Vec<Span>, Vec<LinkSpan>) {
+    let row_len_char = chunk.chars().count();
+    let row_end_char = row_start_char + row_len_char;
+
+    // Cell offset at each char boundary of the chunk: `cells[i]` is the display
+    // width of the first `i` chars. Measured on growing prefixes rather than by
+    // summing per-char widths, so a zero-width combining mark stays attached to
+    // the base glyph it modifies instead of being miscounted on its own.
+    let mut cells = Vec::with_capacity(row_len_char + 1);
+    cells.push(0usize);
+    for (byte, ch) in chunk.char_indices() {
+        cells.push(text::width(&chunk[..byte + ch.len_utf8()]));
+    }
+
+    let mut color = Vec::new();
+    let mut clickable = Vec::new();
+    for link in links {
+        let clipped_start = link.start.max(row_start_char);
+        let clipped_end = link.end.min(row_end_char);
+        if clipped_end <= clipped_start {
+            continue;
+        }
+        let start = cells[clipped_start - row_start_char] + offset_cells;
+        let end = cells[clipped_end - row_start_char] + offset_cells;
+        color.push(Span::new(start, end, link.role));
+        clickable.push(LinkSpan::new(start, end, link.url.clone()));
+    }
+    (color, clickable)
 }
 
 #[cfg(test)]
@@ -748,6 +809,69 @@ mod tests {
         let rows = render("[the docs](./docs/readme.md)", 60);
         let row = rows.iter().find(|r| !r.spans.is_empty()).expect("a link row");
         assert_eq!(row.spans[0].role, Role::Link);
+    }
+
+    #[test]
+    fn a_link_row_carries_its_destination_url() {
+        let rows = render("see the [docs](https://example.com/docs) now", 60);
+        let row = rows.iter().find(|r| !r.links.is_empty()).expect("a link row");
+        assert_eq!(row.links[0].url, "https://example.com/docs");
+    }
+
+    #[test]
+    fn a_links_clickable_range_matches_its_ascii_display_text() {
+        // The display text names the host, so the link is honest and carries no
+        // warning glyph: "example.com" is eleven ASCII cells from the row start.
+        let rows = render("[example.com](https://example.com)", 60);
+        let row = rows.iter().find(|r| !r.links.is_empty()).expect("a link row");
+        assert_eq!((row.links[0].start, row.links[0].end), (0, 11));
+        assert_eq!(row.link_at(0), Some("https://example.com"));
+        assert_eq!(row.link_at(10), Some("https://example.com"));
+        assert_eq!(row.link_at(11), None, "the cell after the link is not clickable");
+    }
+
+    #[test]
+    fn a_wide_character_in_link_text_does_not_shift_the_clickable_range() {
+        // "\u{65E5}\u{672C}\u{8A9E}" is three chars but six cells wide. A range
+        // measured in chars would stop at cell three, leaving half the visible
+        // link dead to a click. A relative target keeps the link honest (no
+        // warning glyph) so the range is exactly the display text.
+        let rows = render("[\u{65E5}\u{672C}\u{8A9E}](./page)", 60);
+        let row = rows.iter().find(|r| !r.links.is_empty()).expect("a link row");
+        assert_eq!((row.links[0].start, row.links[0].end), (0, 6));
+        assert_eq!(row.link_at(5), Some("./page"), "the last cell is clickable");
+        assert_eq!(row.link_at(6), None, "the cell past the link is not");
+    }
+
+    #[test]
+    fn wide_text_before_a_link_shifts_it_by_cells_not_chars() {
+        // "\u{5B57} " is three cells before the link — a two-cell glyph and a
+        // space. Counting chars would place the link two cells too far left.
+        let rows = render("\u{5B57} [go](./go)", 60);
+        let row = rows.iter().find(|r| !r.links.is_empty()).expect("a link row");
+        assert_eq!((row.links[0].start, row.links[0].end), (3, 5));
+        assert_eq!(row.link_at(2), None, "the space before the link is not clickable");
+        assert_eq!(row.link_at(3), Some("./go"));
+    }
+
+    #[test]
+    fn a_deceptive_link_still_carries_its_real_destination() {
+        let rows = render("[bank.com](https://evil.example/phish)", 60);
+        let row = rows.iter().find(|r| !r.links.is_empty()).expect("a link row");
+        assert_eq!(row.links[0].url, "https://evil.example/phish");
+        // The warning glyph is part of the clickable run, so a click anywhere
+        // on the flagged text resolves to the true, non-spoofed target.
+        assert_eq!(row.link_at(0), Some("https://evil.example/phish"));
+    }
+
+    #[test]
+    fn a_link_that_wraps_keeps_its_destination_on_every_row() {
+        let rows = render("[alpha beta gamma delta](https://example.com/x)", 16);
+        let link_rows: Vec<_> = rows.iter().filter(|r| !r.links.is_empty()).collect();
+        assert!(link_rows.len() >= 2, "the label should wrap onto more than one row");
+        for row in link_rows {
+            assert!(row.links.iter().all(|l| l.url == "https://example.com/x"));
+        }
     }
 
     #[test]

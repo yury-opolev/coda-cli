@@ -161,6 +161,61 @@ impl Span {
     }
 }
 
+/// A hyperlink target attached to a cell range on a rendered row.
+///
+/// Carried *beside* [`Span`] rather than inside it because the two answer
+/// different questions: a `Span` says how a run is coloured, a `LinkSpan` says
+/// where a run points. Keeping the URL out of `Span` means the syntax
+/// highlighter — which emits the overwhelming majority of spans — never has to
+/// carry a `None` per token, and the draw layer, which only cares about colour,
+/// never has to know links exist at all. The link's *colour* still rides on an
+/// ordinary `Span` (with [`Role::Link`]); this type only adds the destination
+/// and the clickable bounds, so hit-testing a pointer never depends on how the
+/// row happens to be painted.
+///
+/// Coordinates are terminal **cells**, in the same space as [`Span`], so a
+/// pointer column maps onto a link with no per-row conversion. That matters for
+/// wide text: a CJK glyph is two cells, and a range measured in `char`s would
+/// drift left of what the user actually sees and clicks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkSpan {
+    /// First cell of the link text, inclusive.
+    pub start: usize,
+    /// One cell past the last cell of the link text.
+    pub end: usize,
+    /// The destination, exactly as the author wrote it. Never trusted: the
+    /// scheme is validated at the moment of opening, not here, because a row is
+    /// rendered long before anyone decides to click it.
+    pub url: String,
+}
+
+impl LinkSpan {
+    pub fn new(start: usize, end: usize, url: impl Into<String>) -> Self {
+        Self { start, end, url: url.into() }
+    }
+
+    /// Shifts the range right, used when a gutter is prepended after wrapping.
+    ///
+    /// The URL is cloned rather than moved so the same link may appear on more
+    /// than one wrapped row of a paragraph without the caller juggling
+    /// ownership.
+    pub fn shifted(&self, by: usize) -> LinkSpan {
+        LinkSpan {
+            start: self.start + by,
+            end: self.end + by,
+            url: self.url.clone(),
+        }
+    }
+
+    /// Whether `cell` falls within `[start, end)`.
+    ///
+    /// Half-open on purpose: the cell one past the last glyph is *not* the
+    /// link, so clicking the space after a link does nothing.
+    pub fn contains(&self, cell: usize) -> bool {
+        cell >= self.start && cell < self.end
+    }
+}
+
 /// One fully laid-out transcript row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderLine {
@@ -171,6 +226,13 @@ pub struct RenderLine {
     pub gutter: Gutter,
     /// Foreground overrides in cell coordinates (syntax, links).
     pub spans: Vec<Span>,
+    /// Clickable hyperlink ranges in cell coordinates.
+    ///
+    /// Parallel to [`RenderLine::spans`], not folded into it: a span colours a
+    /// run, a link makes it actionable, and the two are produced and consumed
+    /// by different code. Empty on almost every row, so the common case costs
+    /// one unallocated `Vec`.
+    pub links: Vec<LinkSpan>,
     /// Cells at the start of the row drawn in [`RenderLine::prefix_role`].
     pub prefix_cells: usize,
     pub prefix_role: Option<Role>,
@@ -207,6 +269,7 @@ impl RenderLine {
             role,
             gutter: Gutter::None,
             spans: Vec::new(),
+            links: Vec::new(),
             prefix_cells: 0,
             prefix_role: None,
             fill_width: false,
@@ -262,6 +325,7 @@ impl RenderLine {
         let shift = gutter.cells();
         self.text = format!("{prefix}{}", self.text);
         self.spans = self.spans.iter().map(|s| s.shifted(shift)).collect();
+        self.links = self.links.iter().map(|l| l.shifted(shift)).collect();
         self.prefix_cells += shift;
         self.gutter = gutter;
         self
@@ -269,6 +333,13 @@ impl RenderLine {
 
     pub fn with_spans(mut self, spans: Vec<Span>) -> Self {
         self.spans = spans;
+        self
+    }
+
+    /// Attaches clickable hyperlink ranges, in the same cell space as
+    /// [`RenderLine::spans`].
+    pub fn with_links(mut self, links: Vec<LinkSpan>) -> Self {
+        self.links = links;
         self
     }
 
@@ -303,6 +374,20 @@ impl RenderLine {
             }
         }
         self.role
+    }
+
+    /// The hyperlink destination at a given cell, if the cell falls inside a
+    /// link.
+    ///
+    /// This is the whole of link hit-testing: a pointer column is mapped to a
+    /// row and a cell elsewhere, and this answers "is there a link here, and
+    /// where does it go". Returns the first matching range; links never
+    /// overlap, because each comes from one `[text](url)` span.
+    pub fn link_at(&self, cell: usize) -> Option<&str> {
+        self.links
+            .iter()
+            .find(|link| link.contains(cell))
+            .map(|link| link.url.as_str())
     }
 }
 
@@ -445,6 +530,50 @@ mod tests {
     fn an_empty_span_is_reported_as_empty() {
         assert!(Span::new(4, 4, Role::Code).is_empty());
         assert!(!Span::new(4, 5, Role::Code).is_empty());
+    }
+
+    // ── Links ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_link_span_contains_its_own_cells_and_not_the_one_past_its_end() {
+        let link = LinkSpan::new(3, 7, "https://example.com");
+        assert!(!link.contains(2), "the cell before the link is not the link");
+        assert!(link.contains(3), "the first cell is the link");
+        assert!(link.contains(6), "the last cell is the link");
+        assert!(!link.contains(7), "the cell just past the link is not the link");
+    }
+
+    #[test]
+    fn link_at_finds_the_url_under_a_cell_and_nothing_just_outside_it() {
+        let line = RenderLine::new("see docs here", Role::Assistant)
+            .with_links(vec![LinkSpan::new(4, 8, "https://example.com/docs")]);
+        assert_eq!(line.link_at(3), None, "the cell before the link has no url");
+        assert_eq!(line.link_at(4), Some("https://example.com/docs"));
+        assert_eq!(line.link_at(7), Some("https://example.com/docs"));
+        assert_eq!(line.link_at(8), None, "the cell after the link has no url");
+    }
+
+    #[test]
+    fn a_row_with_no_links_never_reports_one() {
+        let line = RenderLine::new("plain text", Role::Assistant);
+        assert_eq!(line.link_at(0), None);
+        assert_eq!(line.link_at(5), None);
+    }
+
+    #[test]
+    fn applying_a_gutter_shifts_links_with_the_spans() {
+        let line = RenderLine::new("example", Role::Assistant)
+            .with_spans(vec![Span::new(0, 7, Role::Link)])
+            .with_links(vec![LinkSpan::new(0, 7, "https://example.com")])
+            .with_gutter(Gutter::AgentComplete);
+
+        // The marker gutter is three cells wide, so both the colour span and
+        // the clickable range slide right by exactly that much and stay aligned.
+        assert_eq!(line.spans, vec![Span::new(3, 10, Role::Link)]);
+        assert_eq!(line.link_at(2), None, "the gutter itself is not clickable");
+        assert_eq!(line.link_at(3), Some("https://example.com"));
+        assert_eq!(line.link_at(9), Some("https://example.com"));
+        assert_eq!(line.link_at(10), None);
     }
 
     #[test]

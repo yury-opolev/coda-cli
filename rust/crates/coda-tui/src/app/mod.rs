@@ -28,6 +28,7 @@ mod effort;
 mod engine;
 mod identity;
 mod image;
+mod link;
 mod models;
 mod queue;
 mod serve;
@@ -236,6 +237,11 @@ pub struct App {
     transcript_origin: (u16, u16),
     /// Screen cell of the composer's first text column, for click-to-caret.
     composer_origin: (u16, u16),
+    /// Cell width available for composer text, captured alongside
+    /// `composer_origin` so a click is translated through the exact same
+    /// wrapping the composer was last drawn with, rather than one that has
+    /// silently drifted from it after a resize.
+    composer_text_width: usize,
     /// The effort level currently applied to the session.
     ///
     /// `None` means auto / not set. Updated when the picker confirms a choice.
@@ -1136,9 +1142,13 @@ impl App {
 
     fn redraw(&mut self, guard: &mut TerminalGuard) -> Result<()> {
         let size = guard.terminal().size()?;
+        // Captured once and reused below for both sizing the panel and
+        // mapping a click into it, so the two can never disagree about how
+        // wide a row of composer text is.
+        let composer_text_width = draw::composer_text_width(size.width);
         let regions = draw::layout_with_pending(
             ratatui::layout::Rect::new(0, 0, size.width, size.height),
-            self.composer.line_count(),
+            self.composer.visual_line_count(composer_text_width),
             self.viewport.is_scrollable(),
             self.state.is_busy(),
             self.state.queued.len() + self.state.unsent.len(),
@@ -1154,6 +1164,7 @@ impl App {
             regions.composer.x + draw::COMPOSER_TEXT_COLUMN,
             regions.composer.y + 1,
         );
+        self.composer_text_width = composer_text_width;
         // Same rect drawing will use, so a click can never target stale layout.
         self.header_id_rect = regions.header.and_then(|h| draw::header_id_rect(h, &self.state));
 
@@ -1525,6 +1536,7 @@ impl App {
             SurfaceAction::AdjustModelEffort { model, direction } => {
                 self.adjust_model_effort(model, direction).await;
             }
+            SurfaceAction::LinkAction { url, action } => self.perform_link_action(url, action),
         }
     }
 

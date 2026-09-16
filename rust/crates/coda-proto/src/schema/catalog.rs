@@ -80,6 +80,7 @@ pub(super) fn document() -> Value {
         rpc(m::COMPACT, Some("CompactParams"), Some("CompactResult"), C, C),
         rpc(m::FORK, Some("ForkParams"), Some("ForkResponse"), S, S),
         rpc(m::REWIND, Some("RewindParams"), Some("RewindResponse"), S, S),
+        rpc(m::IMPORT, Some("ImportParams"), Some("ImportResult"), C, C),
         rpc(m::GET_STATE, Some("GetStateParams"), Some("StateSnapshot"), S, S),
         rpc(m::GET_EVENTS, Some("GetEventsParams"), Some("GetEventsResult"), S, S),
         rpc(m::GET_HISTORY, Some("GetHistoryParams"), Some("GetHistoryResult"), S, S),

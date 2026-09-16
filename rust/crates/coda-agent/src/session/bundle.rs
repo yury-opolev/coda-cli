@@ -551,6 +551,13 @@ mod tests {
         let loaded = store.load(id).await.unwrap();
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].text(), "hello");
+        assert_eq!(loaded[1].text(), "world");
+        // The reported id must actually be resumable, not just readable by
+        // its own name — i.e. it must show up wherever a resume picker looks.
+        assert!(
+            store.list().into_iter().any(|s| s.id == imported_id),
+            "the imported session must appear in the store listing"
+        );
     }
 
     #[tokio::test]
@@ -568,6 +575,48 @@ mod tests {
 
         let new_id = svc.import_bundle(&bundle_path).await.unwrap();
         assert_ne!(new_id, id, "collision must mint a new id");
+    }
+
+    #[tokio::test]
+    async fn importing_the_same_bundle_twice_yields_two_distinct_session_ids() {
+        // The first import into an untouched workspace has nothing to
+        // collide with, so it keeps the bundle's own id; only the *second*
+        // import — now colliding with the first — must mint a fresh one.
+        // Neither import may clobber the other: both must independently
+        // resume.
+        let export_dir = tempfile::tempdir().unwrap();
+        let import_dir = tempfile::tempdir().unwrap();
+        let export_svc = SessionBundleService::new(export_dir.path(), "0.1.0");
+        let import_svc = SessionBundleService::new(import_dir.path(), "0.1.0");
+
+        let id = "abc123456789";
+        let msgs = vec![Message::user("hello")];
+        make_session(&export_dir, id, &msgs).await;
+        let bundle = export_svc.export(id, Utc::now()).await.unwrap();
+        let bundle_path = export_dir.path().join("export.coda-session.json");
+        export_svc.write_bundle(&bundle, &bundle_path, false).await.unwrap();
+
+        let first_id = import_svc.import_bundle(&bundle_path).await.unwrap();
+        let second_id = import_svc.import_bundle(&bundle_path).await.unwrap();
+
+        assert_eq!(first_id, id, "the first import into an empty workspace keeps the bundle's id");
+        assert_ne!(first_id, second_id, "importing the same bundle twice must not collide");
+
+        let store = SessionTranscriptStore::new(import_dir.path());
+        assert!(store.load(&first_id).await.is_some(), "the first import must still resume");
+        assert!(store.load(&second_id).await.is_some(), "the second import must independently resume");
+        let listed: Vec<String> = store.list().into_iter().map(|s| s.id).collect();
+        assert!(listed.contains(&first_id) && listed.contains(&second_id));
+    }
+
+    #[tokio::test]
+    async fn importing_a_nonexistent_bundle_file_reports_a_clean_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = SessionBundleService::new(dir.path(), "0.1.0");
+        let missing = dir.path().join("does-not-exist.coda-session.json");
+
+        let err = svc.import_bundle(&missing).await.unwrap_err();
+        assert!(matches!(err, ImportError::Io(_)), "a missing file must be a clean error, not a panic");
     }
 
     #[tokio::test]
@@ -600,5 +649,27 @@ mod tests {
         tokio::fs::write(&bad_path, b"not json at all").await.unwrap();
         let err = svc.import_bundle(&bad_path).await.unwrap_err();
         assert!(matches!(err, ImportError::NotABundle { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_malformed_bundle_leaves_the_sessions_directory_untouched() {
+        // Validation happens entirely before any write: `import_bundle`
+        // reads, parses, and validates the schema before it ever asks
+        // `SessionTranscriptStore` to save anything, so a bundle that fails
+        // any of those checks must leave `.coda/sessions` exactly as it was
+        // — not present at all, for a target directory that never had one.
+        let dir = tempfile::tempdir().unwrap();
+        let svc = SessionBundleService::new(dir.path(), "0.1.0");
+        let bad_path = dir.path().join("bad.json");
+        tokio::fs::write(&bad_path, br#"{"id":"x"}"#).await.unwrap();
+
+        let err = svc.import_bundle(&bad_path).await.unwrap_err();
+        assert!(matches!(err, ImportError::NotABundle { .. }));
+
+        let sessions_dir = dir.path().join(".coda").join("sessions");
+        assert!(
+            !sessions_dir.exists(),
+            "a rejected bundle must never create the sessions directory"
+        );
     }
 }

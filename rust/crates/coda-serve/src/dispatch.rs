@@ -280,6 +280,17 @@ pub struct CompactParams {
     pub instructions: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportParams {
+    /// Path to a `*.coda-session.json` bundle. Absence/emptiness is caught
+    /// by the backend, not here: `#[serde(default)]` only means "a present
+    /// but empty string still parses", the same latitude every other
+    /// required-string param on this route gets.
+    #[serde(default)]
+    pub path: String,
+}
+
 /// Server-side pagination validation stays with the advertised engine limits;
 /// the deserialized wire types are shared with clients and schema generation.
 pub trait NormalizeQuery {
@@ -405,6 +416,11 @@ pub trait ServeBackend: Send + Sync {
     async fn session_compact(&self, p: CompactParams) -> Result<Value, RpcError>;
     async fn session_fork(&self, p: ForkParams) -> Result<Value, RpcError>;
     async fn session_rewind(&self, p: RewindParams) -> Result<Value, RpcError>;
+    /// Import a portable `*.coda-session.json` bundle as a new session in
+    /// this workspace. The inverse of export; unlike fork/rewind/compact it
+    /// never touches the live session, so it does not share their foreground
+    /// slot or bump `historyEpoch`.
+    async fn session_import(&self, p: ImportParams) -> Result<Value, RpcError>;
 
     // ── Stage D ──────────────────────────────────────────────────────────
     /// UI-safe rich history, read at the same consistency boundary as
@@ -539,6 +555,7 @@ pub async fn dispatch(
         "session/compact" => backend.session_compact(optional(params)).await,
         "session/fork" => backend.session_fork(optional(params)).await,
         "session/rewind" => backend.session_rewind(optional(params)).await,
+        "session/import" => backend.session_import(required(params)?).await,
         "session/getHistory" => {
             let mut p: GetHistoryParams = optional_strict(params)?;
             p.normalise()?;
@@ -698,6 +715,12 @@ mod tests {
         async fn session_rewind(&self, _p: RewindParams) -> Result<Value, RpcError> {
             Ok(json!({ "ok": true, "removed": 1, "remaining": 2 }))
         }
+        async fn session_import(&self, p: ImportParams) -> Result<Value, RpcError> {
+            if p.path.trim().is_empty() {
+                return Err(RpcError::invalid_params("path must not be empty"));
+            }
+            Ok(json!({ "ok": true, "sessionId": "imported0000" }))
+        }
 
         // ── Stage D ──────────────────────────────────────────────────────
         async fn session_get_history(&self, p: GetHistoryParams) -> Result<Value, RpcError> {
@@ -837,6 +860,9 @@ mod tests {
         }
         async fn session_rewind(&self, p: RewindParams) -> Result<Value, RpcError> {
             self.0.session_rewind(p).await
+        }
+        async fn session_import(&self, p: ImportParams) -> Result<Value, RpcError> {
+            self.0.session_import(p).await
         }
         async fn session_get_history(&self, p: GetHistoryParams) -> Result<Value, RpcError> {
             self.0.session_get_history(p).await
@@ -1530,6 +1556,9 @@ mod tests {
         async fn session_rewind(&self, _p: RewindParams) -> Result<Value, RpcError> {
             Err(RpcError { code: self.0, message: self.1.into() })
         }
+        async fn session_import(&self, _p: ImportParams) -> Result<Value, RpcError> {
+            Err(RpcError { code: self.0, message: self.1.into() })
+        }
         async fn session_get_history(&self, _p: GetHistoryParams) -> Result<Value, RpcError> {
             Err(RpcError { code: self.0, message: self.1.into() })
         }
@@ -1637,5 +1666,40 @@ mod tests {
         let r =
             dispatch("session/rewind", Some(json!({"n": 3})), &FakeBackend).await.unwrap();
         assert_eq!(r["ok"], true);
+    }
+
+    // ── session/import dispatch tests ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn dispatches_session_import() {
+        let r = dispatch(
+            "session/import",
+            Some(json!({ "path": "bundle.coda-session.json" })),
+            &FakeBackend,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["ok"], true);
+        assert!(r["sessionId"].is_string());
+    }
+
+    #[tokio::test]
+    async fn session_import_without_params_returns_32602() {
+        // `path` is required: unlike fork/rewind/compact, an omitted params
+        // object is never "use the defaults" here — there is no default file.
+        let err = dispatch("session/import", None, &FakeBackend).await.unwrap_err();
+        assert_eq!(err.code, -32602);
+    }
+
+    #[tokio::test]
+    async fn session_import_with_empty_path_is_refused_by_the_backend() {
+        // `required()` only guarantees a params object was sent, not that
+        // `path` itself is non-empty (`#[serde(default)]` lets it default to
+        // `""`) — the backend is what rejects an empty path, same as C#'s
+        // `string.IsNullOrWhiteSpace(args[0])` guard.
+        let err = dispatch("session/import", Some(json!({ "path": "" })), &FakeBackend)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, -32602);
     }
 }

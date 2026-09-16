@@ -7,6 +7,15 @@
 //! Positions are tracked as byte offsets into the buffer, but all movement is
 //! grapheme-aware: a cursor never lands inside a multi-byte character or splits
 //! an emoji.
+//!
+//! Long lines soft-wrap for display: [`wrap_line`] is the one place that
+//! decides where a row breaks, and the composer's rendered text
+//! ([`Composer::visual_rows`]), its height ([`Composer::visual_line_count`])
+//! and its caret ([`Composer::visual_cursor_position`]) are all read out of
+//! those same ranges. Deriving all three from one function is what keeps a
+//! resize or a long paste from ever making them disagree.
+
+use std::ops::Range;
 
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -153,6 +162,11 @@ impl Composer {
     ///
     /// Snaps to the nearer grapheme boundary, so clicking the right half of a
     /// wide character puts the caret after it rather than inside it.
+    ///
+    /// `line` is a *logical* line, i.e. it assumes one row of text per `'\n'`.
+    /// Once a line can soft-wrap, a click instead needs
+    /// [`move_cursor_to_visual`], whose row is a row actually drawn on
+    /// screen.
     pub fn move_cursor_to(&mut self, line: usize, cell_column: usize) {
         let mut start = 0usize;
         for _ in 0..line {
@@ -166,32 +180,122 @@ impl Composer {
             .find('\n')
             .map_or(self.buffer.len(), |offset| start + offset);
 
-        let mut at = start;
-        let mut cells = 0usize;
-        for grapheme in self.buffer[start..end].graphemes(true) {
-            let w = coda_render::text::grapheme_width(grapheme);
-            if cells + w > cell_column {
-                // Inside this grapheme: take whichever edge is nearer.
-                if cell_column.saturating_sub(cells) * 2 >= w {
-                    at += grapheme.len();
-                }
-                break;
-            }
-            cells += w;
-            at += grapheme.len();
-        }
-        self.cursor = at.min(end);
+        self.cursor = (start + column_to_offset(&self.buffer[start..end], cell_column)).min(end);
         // A click is a new intent, so a stale popup should not survive it.
         self.clear_completions();
+    }
+
+    /// The visual row and cell column of the cursor after soft-wrapping the
+    /// buffer at `text_width`, both zero-based.
+    ///
+    /// [`cursor_position`] answers the same question in *logical* terms, which
+    /// is all the caret needs as long as every line fits on one screen row.
+    /// Once a line wraps, the row it lands on no longer matches its index in
+    /// `'\n'`-separated text, so the renderer needs this instead. It walks the
+    /// exact same [`wrap_line`] ranges used to draw the composer
+    /// ([`visual_rows`]) and to size it ([`visual_line_count`]), so the caret
+    /// can never drift from the character it marks.
+    pub fn visual_cursor_position(&self, text_width: usize) -> (usize, usize) {
+        let logical_line = self.buffer[..self.cursor].matches('\n').count();
+        let line_start = self.line_start();
+        let offset_in_line = self.cursor - line_start;
+
+        let mut visual_row = 0usize;
+        for (index, line) in self.buffer.split('\n').enumerate() {
+            let ranges = wrap_line(line, text_width);
+            if index == logical_line {
+                // The last row whose text starts at or before the cursor. A
+                // caret sitting exactly on a wrap point then reads as the
+                // start of the row that follows, rather than a phantom
+                // trailing position on the row before it.
+                let row_in_line = ranges
+                    .iter()
+                    .rposition(|range| range.start <= offset_in_line)
+                    .expect("a row always starts at 0, so at least one matches");
+                let range = &ranges[row_in_line];
+                let end = offset_in_line.clamp(range.start, range.end);
+                let column = coda_render::text::width(&line[range.start..end]);
+                return (visual_row + row_in_line, column);
+            }
+            visual_row += ranges.len();
+        }
+        // Unreachable: `logical_line` counts the `'\n'`s before the cursor, so
+        // it always indexes one of `buffer.split('\n')`'s own segments.
+        (visual_row, 0)
+    }
+
+    /// Moves the cursor to a visual `row` and cell `column`, clamped to the
+    /// text — the click counterpart of [`visual_cursor_position`], and to
+    /// [`move_cursor_to`] what that method is to [`cursor_position`].
+    ///
+    /// Needed once text can wrap: the row a pointer lands on is a row of
+    /// *wrapped* text, not necessarily a whole logical line, so translating a
+    /// click back into a buffer offset has to walk the same [`wrap_line`]
+    /// ranges used to draw the composer rather than assume row and logical
+    /// line are the same thing.
+    pub fn move_cursor_to_visual(&mut self, text_width: usize, visual_row: usize, cell_column: usize) {
+        let mut remaining = visual_row;
+        let mut line_start = 0usize;
+        let mut lines = self.buffer.split('\n').peekable();
+
+        while let Some(line) = lines.next() {
+            let ranges = wrap_line(line, text_width);
+            if remaining < ranges.len() {
+                let range = ranges[remaining].clone();
+                let offset = column_to_offset(&line[range.start..range.end], cell_column);
+                self.cursor = line_start + range.start + offset;
+                self.clear_completions();
+                return;
+            }
+            remaining -= ranges.len();
+            line_start += line.len() + 1;
+            if lines.peek().is_none() {
+                // Past every row the text has: clamp to its very end, mirroring
+                // `move_cursor_to`'s "click below the last line" rule.
+                self.cursor = self.buffer.len();
+                self.clear_completions();
+                return;
+            }
+        }
     }
 
     pub fn lines(&self) -> impl Iterator<Item = &str> {
         self.buffer.split('\n')
     }
 
-    /// Number of visual lines, always at least one.
+    /// Number of logical lines — segments between `'\n'`s — always at least
+    /// one.
+    ///
+    /// This is *not* how many rows the composer draws once a line can wrap:
+    /// see [`visual_line_count`] for that.
     pub fn line_count(&self) -> usize {
         self.buffer.matches('\n').count() + 1
+    }
+
+    /// Every visual row the buffer occupies when soft-wrapped at
+    /// `text_width`, in the order the composer draws them.
+    pub fn visual_rows(&self, text_width: usize) -> Vec<&str> {
+        let mut rows = Vec::new();
+        for line in self.buffer.split('\n') {
+            for range in wrap_line(line, text_width) {
+                rows.push(&line[range]);
+            }
+        }
+        rows
+    }
+
+    /// Rows the buffer occupies when soft-wrapped at `text_width`, always at
+    /// least one per logical line — an empty line still needs a row for the
+    /// caret to sit on.
+    ///
+    /// Feeds the composer's height: `layout_with_pending` grows the panel by
+    /// *visual* rows, not by counts of `'\n'`, or a long line would still be
+    /// cut off — just vertically instead of off the right edge.
+    pub fn visual_line_count(&self, text_width: usize) -> usize {
+        self.buffer
+            .split('\n')
+            .map(|line| wrap_line(line, text_width).len())
+            .sum()
     }
 
     pub fn set_text(&mut self, text: impl Into<String>) {
@@ -592,6 +696,121 @@ impl Composer {
         }
         self.buffer.len()
     }
+}
+
+// -- Wrapping -----------------------------------------------------------
+
+/// Byte range, relative to the start of one logical line, of a single
+/// soft-wrapped row.
+type RowRange = Range<usize>;
+
+/// Splits one logical line — text with no `'\n'` in it — into the byte
+/// ranges its soft-wrapped rows occupy at `width` cells.
+///
+/// This is the one place that decides where a row ends. [`Composer`]'s
+/// rendered text, its height, and its caret are all read out of these same
+/// ranges rather than three separate calculations that a resize or a long
+/// paste could quietly make disagree.
+///
+/// The policy, in order of preference:
+///
+/// 1. Prefer breaking at a space: when the next grapheme would overflow the
+///    row, back up to the most recent space seen on this row and end the row
+///    there instead, moving the whole pending word to a fresh row.
+/// 2. If there is no space to back up to — a single run of non-space text
+///    wider than `width` — hard-break at the grapheme boundary the overflow
+///    happened on, so a long URL or an unbroken CJK run is still shown in
+///    full rather than lost, and a grapheme cluster is never split in half.
+/// 3. Exactly one character is ever omitted from the rendered rows: the
+///    single space that *is* the break point, in either policy above. Every
+///    other character the user typed — including the second, third, ... space
+///    of a run — is preserved verbatim. This is an editor, not a prose
+///    formatter: silently collapsing whitespace the user actually typed would
+///    make the display lie about the buffer.
+///
+/// A logical line always yields at least one row, even an empty one, so the
+/// caret always has somewhere to land.
+///
+/// `width == 0` cannot fit anything. That is guarded up front, rather than
+/// left to fall out of the loop below, so a terminal briefly too narrow to be
+/// useful in cannot turn into an unbounded loop or a panic.
+fn wrap_line(line: &str, width: usize) -> Vec<RowRange> {
+    if width == 0 {
+        return vec![0..line.len()];
+    }
+
+    let mut rows = Vec::new();
+    let mut row_start = 0usize;
+    let mut cells = 0usize;
+    // Byte offset of the most recent space seen on the current row, if any —
+    // the fallback break point when a later word does not fit.
+    let mut last_space: Option<usize> = None;
+
+    for (byte_index, grapheme) in line.grapheme_indices(true) {
+        let w = coda_render::text::grapheme_width(grapheme);
+        let is_space = grapheme == " ";
+
+        // `cells > 0` matters: it is what lets a single grapheme (or word)
+        // wider than `width` still land on an otherwise-empty row instead of
+        // being endlessly deferred, which is how splitting it is avoided.
+        if cells > 0 && cells + w > width {
+            if is_space {
+                // The overflowing character is itself the separator: the
+                // natural, invisible place to break.
+                rows.push(row_start..byte_index);
+                row_start = byte_index + grapheme.len();
+                cells = 0;
+                last_space = None;
+                continue;
+            }
+            if let Some(space_at) = last_space.take() {
+                // Back up to the last space: the whole word that did not fit
+                // moves to a fresh row rather than being split.
+                rows.push(row_start..space_at);
+                row_start = space_at + 1; // a space is exactly one byte
+                cells = coda_render::text::width(&line[row_start..byte_index]);
+            } else {
+                // No break point on this row at all: a single run wider than
+                // `width`. Hard-break here rather than let it hang off the
+                // edge — the whole point of the fallback.
+                rows.push(row_start..byte_index);
+                row_start = byte_index;
+                cells = 0;
+            }
+        }
+
+        if is_space {
+            last_space = Some(byte_index);
+        }
+        cells += w;
+    }
+    rows.push(row_start..line.len());
+    rows
+}
+
+/// Byte offset within `text` where `cell_column` lands, snapping to whichever
+/// edge of a straddled grapheme is nearer.
+///
+/// Shared by the logical ([`Composer::move_cursor_to`]) and visual
+/// ([`Composer::move_cursor_to_visual`]) click-to-caret paths, so a click
+/// resolves the same way whether or not the row it landed on happens to be a
+/// wrapped continuation.
+fn column_to_offset(text: &str, cell_column: usize) -> usize {
+    let mut at = 0usize;
+    let mut cells = 0usize;
+    for grapheme in text.graphemes(true) {
+        let w = coda_render::text::grapheme_width(grapheme);
+        if cells + w > cell_column {
+            // Inside this grapheme: take whichever edge is nearer.
+            if cell_column.saturating_sub(cells) * 2 >= w {
+                at += grapheme.len();
+            }
+            return at;
+        }
+        cells += w;
+        at += grapheme.len();
+    }
+    at
 }
 
 #[cfg(test)]
@@ -1155,5 +1374,186 @@ mod tests {
                 assert!(composer.text().is_char_boundary(offset));
             }
         }
+    }
+
+    // -- Wrapping -------------------------------------------------------
+
+    #[test]
+    fn a_line_shorter_than_the_width_occupies_one_row() {
+        assert_eq!(wrap_line("hello", 10), vec![0..5]);
+    }
+
+    #[test]
+    fn a_line_longer_than_the_width_wraps_into_the_rows_it_needs() {
+        // Ten letters, no spaces to break at, four cells at a time: three rows.
+        assert_eq!(wrap_line("aaaaaaaaaa", 4), vec![0..4, 4..8, 8..10]);
+    }
+
+    #[test]
+    fn wrapping_prefers_a_word_boundary() {
+        let text = "hello world";
+        let rendered: Vec<&str> = wrap_line(text, 5).into_iter().map(|r| &text[r]).collect();
+        assert_eq!(rendered, vec!["hello", "world"]);
+    }
+
+    #[test]
+    fn a_single_word_longer_than_the_width_is_hard_broken_rather_than_lost() {
+        let word = "supercalifragilistic";
+        let ranges = wrap_line(word, 7);
+        assert!(ranges.len() > 1, "a 21-character word must not fit on one 7-cell row");
+        for range in &ranges {
+            assert!(coda_render::text::width(&word[range.clone()]) <= 7);
+        }
+        // Nothing is lost: every byte is accounted for by some row.
+        let rebuilt: String = ranges.into_iter().map(|r| &word[r]).collect();
+        assert_eq!(rebuilt, word);
+    }
+
+    #[test]
+    fn a_wide_character_counts_as_two_cells_and_is_never_split() {
+        let text = "日本語日本語日本語";
+        let ranges = wrap_line(text, 5);
+        for range in &ranges {
+            assert!(coda_render::text::width(&text[range.clone()]) <= 5);
+        }
+        let rebuilt: String = ranges.into_iter().map(|r| &text[r]).collect();
+        assert_eq!(rebuilt, text, "no character may be dropped or duplicated");
+    }
+
+    #[test]
+    fn a_grapheme_wider_than_the_whole_row_still_gets_its_own_row() {
+        // Each row is one two-cell character even though the budget is only
+        // one cell: splitting a grapheme in half is worse than overflowing it.
+        assert_eq!(wrap_line("日本", 1), vec![0..3, 3..6]);
+    }
+
+    #[test]
+    fn interior_whitespace_that_still_fits_is_preserved_verbatim() {
+        // This is an editor, not a prose formatter: three typed spaces stay
+        // three spaces as long as there is room. Prose wrapping would collapse
+        // a run of whitespace down to a single space instead.
+        assert_eq!(wrap_line("a   b", 10), vec![0..5]);
+    }
+
+    #[test]
+    fn a_zero_width_does_not_panic_or_infinite_loop() {
+        let ranges = wrap_line("this line would wrap forever if the guard were missing", 0);
+        assert_eq!(ranges.len(), 1, "width 0 falls back to one unwrapped row");
+    }
+
+    #[test]
+    fn a_short_composer_line_occupies_one_visual_row() {
+        let composer = composer_with("hi");
+        assert_eq!(composer.visual_line_count(80), 1);
+    }
+
+    #[test]
+    fn visual_line_count_grows_once_a_line_actually_wraps() {
+        // `line_count` never changes here -- there is no '\n' -- but the
+        // composer must still grow taller, or the wrapped text is clipped
+        // vertically instead of running off the right edge: one bug for another.
+        let composer = composer_with("hello world");
+        assert_eq!(composer.line_count(), 1);
+        assert_eq!(composer.visual_line_count(5), 2);
+    }
+
+    #[test]
+    fn visual_rows_renders_the_wrapped_text() {
+        let composer = composer_with("hello world");
+        assert_eq!(composer.visual_rows(5), vec!["hello", "world"]);
+    }
+
+    #[test]
+    fn an_explicit_newline_still_starts_a_new_row() {
+        let composer = composer_with("one\ntwo");
+        assert_eq!(composer.visual_rows(80), vec!["one", "two"]);
+    }
+
+    #[test]
+    fn explicit_newlines_combine_correctly_with_soft_wrapping() {
+        let composer = composer_with("ab cd\nef gh");
+        assert_eq!(composer.visual_rows(4), vec!["ab", "cd", "ef", "gh"]);
+        assert_eq!(composer.visual_line_count(4), 4);
+    }
+
+    #[test]
+    fn the_visual_cursor_sits_at_the_end_of_a_wrapped_row() {
+        let mut composer = composer_with("hello world");
+        composer.move_start();
+        for _ in 0..5 {
+            composer.move_right();
+        }
+        assert_eq!(composer.visual_cursor_position(5), (0, 5));
+    }
+
+    #[test]
+    fn the_visual_cursor_sits_at_the_start_of_the_next_wrapped_row() {
+        let mut composer = composer_with("hello world");
+        composer.move_start();
+        for _ in 0..6 {
+            composer.move_right();
+        }
+        assert_eq!(composer.visual_cursor_position(5), (1, 0));
+    }
+
+    #[test]
+    fn the_visual_cursor_sits_at_the_start_of_a_row_after_an_explicit_newline() {
+        let mut composer = composer_with("one\ntwo");
+        composer.move_start();
+        for _ in 0..4 {
+            composer.move_right();
+        }
+        assert_eq!(composer.visual_cursor_position(80), (1, 0));
+    }
+
+    #[test]
+    fn the_visual_cursor_tracks_a_wrapped_row_after_an_explicit_newline() {
+        let mut composer = composer_with("ab cd\nef gh");
+        composer.move_end();
+        assert_eq!(composer.visual_cursor_position(4), (3, 2));
+    }
+
+    #[test]
+    fn a_zero_width_does_not_panic_when_computing_visual_geometry() {
+        let composer = composer_with("hello world, this must not loop forever");
+        // No '\n' in the text, so even the degenerate guard keeps it on one row.
+        assert_eq!(composer.visual_line_count(0), 1);
+        assert_eq!(composer.visual_cursor_position(0).0, 0);
+        assert_eq!(composer.visual_rows(0).len(), 1);
+    }
+
+    #[test]
+    fn a_visual_click_places_the_caret_within_a_wrapped_row() {
+        let mut composer = composer_with("hello world");
+        composer.move_cursor_to_visual(5, 1, 2);
+        composer.insert("X");
+        assert_eq!(composer.text(), "hello woXrld");
+    }
+
+    #[test]
+    fn a_visual_click_past_a_wrapped_rows_end_lands_at_its_end() {
+        let mut composer = composer_with("hello world");
+        composer.move_cursor_to_visual(5, 0, 99);
+        composer.insert("!");
+        assert_eq!(composer.text(), "hello! world");
+    }
+
+    #[test]
+    fn a_visual_click_below_the_last_row_clamps_to_the_end() {
+        let mut composer = composer_with("hello world");
+        composer.move_cursor_to_visual(5, 99, 0);
+        composer.insert("!");
+        assert_eq!(composer.text(), "hello world!");
+    }
+
+    #[test]
+    fn a_visual_click_on_a_wrapped_continuation_stays_on_its_own_logical_line() {
+        // Row 1 is "world" -- the wrapped tail of the FIRST logical line, not
+        // logical line 1 ("next"). A click handler that treated a visual row
+        // as though it were a logical line would land this in "next" instead.
+        let mut composer = composer_with("hello world\nnext");
+        composer.move_cursor_to_visual(5, 1, 0);
+        composer.insert("X");
+        assert_eq!(composer.text(), "hello Xworld\nnext");
     }
 }
