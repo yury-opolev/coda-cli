@@ -235,6 +235,10 @@ pub struct App {
     /// is scrolled. Recording it during the draw keeps the two in step rather
     /// than duplicating the layout arithmetic here.
     transcript_origin: (u16, u16),
+    /// The transcript link under the pointer, underlined while hovered.
+    hovered_link: Option<draw::HoveredLink>,
+    /// The top surface's content rect, captured at draw time for mouse hit-testing.
+    surface_content: ratatui::layout::Rect,
     /// Screen cell of the composer's first text column, for click-to-caret.
     composer_origin: (u16, u16),
     /// Cell width available for composer text, captured alongside
@@ -499,14 +503,7 @@ impl App {
                 self.dirty = true;
                 guard.terminal().autoresize()?;
             }
-            TerminalEvent::Mouse(mouse) => {
-                if let Some(action) = self.decide_pointer_action(mouse) {
-                    match action {
-                        PointerAction::Copy => self.copy_selection_via_pointer(),
-                        PointerAction::Paste => self.paste_from_pointer(),
-                    }
-                }
-            }
+            TerminalEvent::Mouse(mouse) => self.on_mouse(mouse).await,
             TerminalEvent::FocusGained | TerminalEvent::FocusLost => {}
         }
         Ok(())
@@ -1211,6 +1208,10 @@ impl App {
         // The transcript origin is captured from the draw so mouse-to-row
         // translation always matches the layout that was actually rendered.
         let mut origin = self.transcript_origin;
+        // The top surface's content rect, captured from the same render pass
+        // that draws it, so a later click is hit-tested against exactly the
+        // geometry on screen rather than a recomputation that could drift.
+        let mut surface_content = self.surface_content;
         // Hidden for the duration of the write. Ratatui shows the cursor after
         // painting, at whatever position the frame asked for, but never hides
         // it beforehand — so while cells are being written the hardware cursor
@@ -1222,16 +1223,18 @@ impl App {
         guard.terminal().hide_cursor()?;
         guard.terminal().draw(|frame| {
             origin = draw::draw_with_pin(
-                frame, state, composer, viewport, rows, theme, pin, selection, self.header_id_selected, std::time::Instant::now(),
+                frame, state, composer, viewport, rows, theme, pin, selection, self.hovered_link, self.header_id_selected, std::time::Instant::now(),
             );
             // Surfaces draw last and bottom-up, so a detail sits over its list
             // and the whole stack sits over the shell. Rendered as a second
             // pass rather than a tenth parameter on draw_with_pin.
             for rendered in surfaces.render(frame.area(), theme) {
+                surface_content = rendered.content;
                 draw::draw_surface(frame, &rendered, theme);
             }
         })?;
         self.transcript_origin = origin;
+        self.surface_content = surface_content;
 
         self.last_frame_at = Some(std::time::Instant::now());
         self.dirty = false;

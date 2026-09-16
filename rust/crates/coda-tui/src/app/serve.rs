@@ -1488,6 +1488,8 @@ impl App {
             staged_images: Vec::new(),
             selection: crate::selection::TranscriptSelection::new(),
             transcript_origin: (0, 0),
+            hovered_link: None,
+            surface_content: ratatui::layout::Rect::new(0, 0, 0, 0),
             composer_origin: (0, 0),
             composer_text_width: 0,
             session_effort: None,

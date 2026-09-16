@@ -115,15 +115,52 @@ impl App {
                 // it, and guarded on no surface being open.
                 if self.surfaces.is_empty() {
                     if let Some(url) = self.link_at_pointer(mouse.column, mouse.row) {
-                        self.open_link_menu(url);
+                        self.open_link_menu(url, (mouse.column, mouse.row));
                         return None;
                     }
                 }
                 return pointer_action(self.selection.has_selection() || self.header_id_selected);
             }
+            // A bare pointer move — motion with no button held — refreshes the
+            // link-hover underline. Redrawing is gated inside the helper so a
+            // move that stays on the same link (or on no link) costs nothing.
+            MouseEventKind::Moved => self.update_hovered_link(mouse.column, mouse.row),
             _ => {}
         }
         None
+    }
+
+    /// Routes a pointer event: to the open surface first, then the transcript.
+    ///
+    /// A surface owns the pointer exactly as it owns the keyboard — a click
+    /// must never reach through a menu to the transcript beneath it. Only when
+    /// no surface consumes the event does it fall through to the transcript
+    /// gestures (scroll, select, link, paste), which are themselves guarded on
+    /// the stack being empty where that matters. The top surface's content rect
+    /// is captured at draw time, so a click is hit-tested against exactly the
+    /// geometry that was drawn.
+    pub(super) async fn on_mouse(&mut self, mouse: MouseEvent) {
+        if !self.surfaces.is_empty() {
+            use crate::surface::stack::StackOutcome;
+            match self.surfaces.handle_mouse(mouse, self.surface_content) {
+                StackOutcome::Handled => {
+                    self.dirty = true;
+                    return;
+                }
+                StackOutcome::Action(action) => {
+                    self.dirty = true;
+                    self.apply_surface_action(action).await;
+                    return;
+                }
+                StackOutcome::Ignored => {}
+            }
+        }
+        if let Some(action) = self.decide_pointer_action(mouse) {
+            match action {
+                PointerAction::Copy => self.copy_selection_via_pointer(),
+                PointerAction::Paste => self.paste_from_pointer(),
+            }
+        }
     }
     /// Whether `(column, row)` falls within the header's session-id rect.
     ///

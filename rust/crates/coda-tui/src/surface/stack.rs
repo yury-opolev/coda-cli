@@ -7,7 +7,7 @@
 
 use super::{Modality, Surface, SurfaceAction, SurfaceOutcome};
 use coda_render::theme::Theme;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 
@@ -141,6 +141,38 @@ impl SurfaceStack {
         }
     }
 
+    /// Routes a pointer event to the top surface, the counterpart to
+    /// [`handle_key`](Self::handle_key).
+    ///
+    /// `content` is the top surface's own content rect, captured by the caller
+    /// at draw time, so the surface hit-tests against exactly what was drawn.
+    /// There is deliberately no Esc-style rule here: whether a click dismisses
+    /// is a decision each surface makes for itself — a context menu closes on
+    /// an outside click, a form does not — rather than a blanket stack policy.
+    pub fn handle_mouse(&mut self, event: MouseEvent, content: Rect) -> StackOutcome {
+        let Some(surface) = self.surfaces.last_mut() else {
+            return StackOutcome::Ignored;
+        };
+        match surface.handle_mouse(event, content) {
+            SurfaceOutcome::Handled => StackOutcome::Handled,
+            SurfaceOutcome::Close => {
+                self.surfaces.pop();
+                StackOutcome::Handled
+            }
+            SurfaceOutcome::Emit(action) => StackOutcome::Action(action),
+            SurfaceOutcome::Push(next) => {
+                self.push(next);
+                StackOutcome::Handled
+            }
+            SurfaceOutcome::Replace(next) => {
+                self.surfaces.pop();
+                self.surfaces.push(next);
+                StackOutcome::Handled
+            }
+            SurfaceOutcome::Ignored => StackOutcome::Ignored,
+        }
+    }
+
     /// Renders every surface bottom-up.
     ///
     /// Each surface is given its *content* area, not its outer region: it
@@ -167,7 +199,15 @@ impl SurfaceStack {
                         .min(area.width.saturating_sub(super::chrome::BORDER_COLS * 2))
                         .max(1);
                     let size = surface.desired_size(max_content_w, theme);
-                    let region = super::chrome::fit_content_region(size, &hints, area);
+                    // Anchored beside the pointer when the surface asks (a
+                    // context menu), centred otherwise. Both size the box the
+                    // same way, so only its position differs.
+                    let region = match surface.anchor() {
+                        Some(anchor) => {
+                            super::chrome::anchored_region(size, &hints, area, anchor)
+                        }
+                        None => super::chrome::fit_content_region(size, &hints, area),
+                    };
                     let content = super::chrome::content(region, &hints, placement);
                     (region, content)
                 } else {

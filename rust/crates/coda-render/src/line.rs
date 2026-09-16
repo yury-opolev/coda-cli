@@ -376,6 +376,16 @@ impl RenderLine {
         self.role
     }
 
+    /// The whole link under a given cell, range and destination together.
+    ///
+    /// Hover needs the *bounds* of the link, not just where it points: to
+    /// underline the run under the pointer the draw layer has to know which
+    /// cells the link occupies. Returns the first matching range; links never
+    /// overlap, because each comes from one `[text](url)` span.
+    pub fn link_span_at(&self, cell: usize) -> Option<&LinkSpan> {
+        self.links.iter().find(|link| link.contains(cell))
+    }
+
     /// The hyperlink destination at a given cell, if the cell falls inside a
     /// link.
     ///
@@ -384,10 +394,7 @@ impl RenderLine {
     /// where does it go". Returns the first matching range; links never
     /// overlap, because each comes from one `[text](url)` span.
     pub fn link_at(&self, cell: usize) -> Option<&str> {
-        self.links
-            .iter()
-            .find(|link| link.contains(cell))
-            .map(|link| link.url.as_str())
+        self.link_span_at(cell).map(|link| link.url.as_str())
     }
 }
 
@@ -554,10 +561,24 @@ mod tests {
     }
 
     #[test]
+    fn link_span_at_returns_the_bounds_so_hover_can_underline_the_whole_run() {
+        // Hit-testing a click only needs the url, but underlining the link on
+        // hover needs its cell range, so this returns the span, not the string.
+        let span = LinkSpan::new(4, 8, "https://example.com/docs");
+        let line = RenderLine::new("see docs here", Role::Assistant)
+            .with_links(vec![span.clone()]);
+        assert_eq!(line.link_span_at(3), None, "the cell before the link is outside it");
+        assert_eq!(line.link_span_at(4), Some(&span));
+        assert_eq!(line.link_span_at(7), Some(&span));
+        assert_eq!(line.link_span_at(8), None, "the cell after the link is outside it");
+    }
+
+    #[test]
     fn a_row_with_no_links_never_reports_one() {
         let line = RenderLine::new("plain text", Role::Assistant);
         assert_eq!(line.link_at(0), None);
         assert_eq!(line.link_at(5), None);
+        assert_eq!(line.link_span_at(0), None);
     }
 
     #[test]

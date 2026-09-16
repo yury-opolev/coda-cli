@@ -11,13 +11,24 @@
 use super::{Placement, Surface, SurfaceAction, SurfaceOutcome};
 use crate::render::glyphs;
 use coda_render::theme::{Role, Theme};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::{layout::Rect, text::Line};
 
 /// The width the menu prefers before degrading to full-screen on a tiny
 /// terminal. Wide enough for the entry labels and a short disabled-reason note.
 pub const PREFERRED_WIDTH: u16 = 48;
 const SIDE_PADDING: usize = 2;
+
+/// Rows drawn before the first entry: a blank, the destination, a blank.
+///
+/// Named so the pointer hit-test and the renderer agree on where an entry
+/// lands — entry `i` is drawn at content row `HEADER_ROWS + i`. A
+/// `debug_assert!` in [`LinkMenuSurface::render`] pins the two together, so a
+/// change to the header that forgot to update this fails a test rather than
+/// silently making clicks land a row off.
+const HEADER_ROWS: usize = 3;
 
 /// Which action a menu entry stands for.
 ///
@@ -56,6 +67,10 @@ pub struct LinkMenuSurface {
     url: String,
     entries: Vec<MenuEntry>,
     selected: usize,
+    /// The pointer cell the menu was opened on, so it can appear beside the
+    /// click. `None` centres it — the right default for a menu raised any other
+    /// way than by a pointer.
+    anchor: Option<(u16, u16)>,
 }
 
 impl LinkMenuSurface {
@@ -90,7 +105,32 @@ impl LinkMenuSurface {
         // Start on the first enabled row so the default Enter never lands on a
         // dead entry. Copy is always enabled and first, so this is normally 0.
         let selected = entries.iter().position(|entry| entry.enabled).unwrap_or(0);
-        Self { url, entries, selected }
+        Self { url, entries, selected, anchor: None }
+    }
+
+    /// Anchors the menu to a pointer cell, so it opens beside the click like a
+    /// native context menu instead of centred.
+    ///
+    /// Consumed and returned by value so a call site reads as
+    /// `LinkMenuSurface::new(..).at(col, row)`; the anchor only affects where
+    /// the box is drawn, never how big it is.
+    pub fn at(mut self, column: u16, row: u16) -> Self {
+        self.anchor = Some((column, row));
+        self
+    }
+
+    /// The entry index at a pointer cell, given the menu's drawn `content` rect.
+    ///
+    /// Returns `None` for a cell outside the content or on a non-entry row (the
+    /// blank lines or the destination), so a click on the menu's own body never
+    /// activates an entry. Entry `i` sits at content row `HEADER_ROWS + i`,
+    /// matching what [`render`](Self::render) draws.
+    fn entry_at(&self, column: u16, row: u16, content: Rect) -> Option<usize> {
+        if !within(column, row, content) {
+            return None;
+        }
+        let index = ((row - content.y) as usize).checked_sub(HEADER_ROWS)?;
+        (index < self.entries.len()).then_some(index)
     }
 
     /// Moves the highlight, wrapping top-to-bottom, over *every* row.
@@ -154,6 +194,43 @@ impl Surface for LinkMenuSurface {
         }
     }
 
+    fn handle_mouse(&mut self, event: MouseEvent, content: Rect) -> SurfaceOutcome {
+        match event.kind {
+            // Hover moves the highlight onto the entry under the pointer, the
+            // same feel as link hover in the transcript. Only a real change is
+            // worth a redraw, so an unchanged hover is Ignored and costs
+            // nothing — a move fires for every cell the pointer crosses.
+            MouseEventKind::Moved => match self.entry_at(event.column, event.row, content) {
+                Some(index) if index != self.selected => {
+                    self.selected = index;
+                    SurfaceOutcome::Handled
+                }
+                _ => SurfaceOutcome::Ignored,
+            },
+            // The press is swallowed and the choice is made on release, so the
+            // click that closes the menu cannot also fall through and act on
+            // whatever the menu was covering. A release on an entry activates
+            // it; on the menu's own body it is swallowed so the menu stays
+            // open; anywhere outside it dismisses, the way a context menu does.
+            MouseEventKind::Down(MouseButton::Left) => SurfaceOutcome::Handled,
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(index) = self.entry_at(event.column, event.row, content) {
+                    self.selected = index;
+                    self.activate()
+                } else if within(event.column, event.row, content) {
+                    SurfaceOutcome::Handled
+                } else {
+                    SurfaceOutcome::Close
+                }
+            }
+            _ => SurfaceOutcome::Ignored,
+        }
+    }
+
+    fn anchor(&self) -> Option<(u16, u16)> {
+        self.anchor
+    }
+
     fn render(&self, area: Rect, theme: &Theme) -> Vec<Line<'static>> {
         let padding = SIDE_PADDING.min((area.width as usize).saturating_sub(1) / 2);
         let width = (area.width as usize).saturating_sub(padding * 2).max(1);
@@ -172,6 +249,11 @@ impl Surface for LinkMenuSurface {
             ),
             Line::raw(""),
         ];
+        // The hit-test assumes entry `i` begins at content row HEADER_ROWS, so
+        // the header the loop draws over must be exactly that tall. Pinned here
+        // rather than trusted, because a click landing a row off is invisible
+        // until someone tries it.
+        debug_assert_eq!(lines.len(), HEADER_ROWS);
 
         for (index, entry) in self.entries.iter().enumerate() {
             let marker = if index == self.selected {
@@ -201,6 +283,16 @@ impl Surface for LinkMenuSurface {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+}
+
+/// Whether a cell falls inside a rect, half-open on the right and bottom so a
+/// rect's own width and height bound it exactly.
+///
+/// A free function because both the entry hit-test and the outside-click
+/// dismissal ask the same question, and answering it in one place keeps the
+/// two from disagreeing about where the menu ends.
+fn within(column: u16, row: u16, rect: Rect) -> bool {
+    column >= rect.x && column < rect.right() && row >= rect.y && row < rect.bottom()
 }
 
 #[cfg(test)]
@@ -286,5 +378,122 @@ mod tests {
             .join("\n");
         assert!(text.contains("https://example.com/page"), "the URL must be visible");
         assert!(text.contains("Open in private window"));
+    }
+
+    // ── Pointer ──────────────────────────────────────────────────────────────
+
+    /// A content rect whose entries land at known rows.
+    ///
+    /// Entry `i` sits at `content.y + HEADER_ROWS + i`, so with `y == 5` the
+    /// three entries are at rows 8, 9 and 10. The height covers them and the
+    /// trailing blank, matching a real drawn menu.
+    fn content() -> Rect {
+        Rect::new(10, 5, PREFERRED_WIDTH, 8)
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE }
+    }
+
+    fn click(column: u16, row: u16) -> MouseEvent {
+        // A click is a release: the menu makes its choice on button-up so the
+        // closing click cannot fall through to what it was covering.
+        mouse(MouseEventKind::Up(MouseButton::Left), column, row)
+    }
+
+    #[test]
+    fn a_left_click_on_an_entry_routes_to_its_own_action() {
+        // The handlers are faked by reading the emitted action rather than
+        // performing it — the surface cannot open a browser, by construction.
+        let cases = [
+            (8u16, LinkAction::Copy),
+            (9, LinkAction::Open),
+            (10, LinkAction::OpenPrivate),
+        ];
+        for (row, expected) in cases {
+            let mut menu = LinkMenuSurface::new("https://example.com/x".into(), true, true);
+            match menu.handle_mouse(click(15, row), content()) {
+                SurfaceOutcome::Emit(SurfaceAction::LinkAction { url, action }) => {
+                    assert_eq!(url, "https://example.com/x");
+                    assert_eq!(action, expected, "the entry at row {row} routed wrongly");
+                }
+                _ => panic!("the entry at row {row} did not emit a link action"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_left_click_on_a_disabled_entry_is_swallowed_without_emitting() {
+        // No private browser: the third entry (row 10) is disabled and a click
+        // on it must do nothing, exactly like Enter on it.
+        let mut menu = LinkMenuSurface::new("https://example.com".into(), true, false);
+        assert!(matches!(menu.handle_mouse(click(15, 10), content()), SurfaceOutcome::Handled));
+    }
+
+    #[test]
+    fn a_left_click_outside_the_menu_dismisses_it() {
+        let mut menu = LinkMenuSurface::new("https://example.com".into(), true, true);
+        // Far above-left of the content rect.
+        assert!(matches!(menu.handle_mouse(click(0, 0), content()), SurfaceOutcome::Close));
+    }
+
+    #[test]
+    fn a_left_click_on_the_menu_body_keeps_it_open() {
+        // The destination line sits at content.y + 1; clicking it is neither an
+        // entry nor outside, so the menu stays put rather than dismissing.
+        let mut menu = LinkMenuSurface::new("https://example.com".into(), true, true);
+        assert!(matches!(menu.handle_mouse(click(15, 6), content()), SurfaceOutcome::Handled));
+    }
+
+    #[test]
+    fn the_press_is_swallowed_so_the_closing_click_cannot_fall_through() {
+        // Button-down never acts; only the release does. Without this the click
+        // that dismisses the menu would also reach the transcript underneath.
+        let mut menu = LinkMenuSurface::new("https://example.com".into(), true, true);
+        let press = mouse(MouseEventKind::Down(MouseButton::Left), 0, 0);
+        assert!(matches!(menu.handle_mouse(press, content()), SurfaceOutcome::Handled));
+    }
+
+    #[test]
+    fn hovering_an_entry_highlights_it_and_an_unchanged_hover_costs_no_redraw() {
+        let mut menu = LinkMenuSurface::new("https://example.com".into(), true, true);
+        assert_eq!(menu.selected, 0);
+        // Moving onto the third entry highlights it and asks for a redraw.
+        let onto = mouse(MouseEventKind::Moved, 15, 10);
+        assert!(matches!(menu.handle_mouse(onto, content()), SurfaceOutcome::Handled));
+        assert_eq!(menu.selected, 2, "hover did not follow the pointer");
+        // Moving within the same entry changes nothing, so it is Ignored and
+        // the frame is never marked dirty for it.
+        let within_same = mouse(MouseEventKind::Moved, 16, 10);
+        assert!(matches!(menu.handle_mouse(within_same, content()), SurfaceOutcome::Ignored));
+        assert_eq!(menu.selected, 2);
+    }
+
+    #[test]
+    fn a_click_activates_the_entry_under_the_pointer_even_without_a_prior_hover() {
+        // Clicking entry 1 directly must select and emit it, not the default 0.
+        let mut menu = LinkMenuSurface::new("https://example.com".into(), true, true);
+        match menu.handle_mouse(click(15, 9), content()) {
+            SurfaceOutcome::Emit(SurfaceAction::LinkAction { action, .. }) => {
+                assert_eq!(action, LinkAction::Open);
+            }
+            _ => panic!("a direct click did not emit a link action"),
+        }
+    }
+
+    #[test]
+    fn the_menu_centres_by_default_and_anchors_to_a_click_when_asked() {
+        // Raised any way but by a pointer, the menu centres (no anchor); raised
+        // by a right-click it remembers the cell so it can open beside it.
+        assert_eq!(
+            LinkMenuSurface::new("https://example.com".into(), true, true).anchor(),
+            None
+        );
+        assert_eq!(
+            LinkMenuSurface::new("https://example.com".into(), true, true)
+                .at(7, 3)
+                .anchor(),
+            Some((7, 3))
+        );
     }
 }

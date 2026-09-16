@@ -13,7 +13,7 @@
 //! [`Surface::cursor`].
 
 use coda_render::theme::Theme;
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 
@@ -255,11 +255,33 @@ pub trait Surface {
         }
     }
 
+    /// Where this surface prefers to be anchored, when its placement supports
+    /// it — only [`Placement::FitContent`] does today.
+    ///
+    /// A context menu returns the pointer cell it was opened on, so it appears
+    /// beside the click like a native menu; every other surface returns `None`
+    /// and is centred. Returning a point never forces the surface off-screen:
+    /// the stack clamps and flips so the box is always drawn fully on screen.
+    fn anchor(&self) -> Option<(u16, u16)> {
+        None
+    }
+
     fn modality(&self) -> Modality {
         Modality::Normal
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> SurfaceOutcome;
+
+    /// Handles a pointer event landing on this surface.
+    ///
+    /// `content` is the same rect passed to [`render`](Surface::render), so a
+    /// surface maps a pointer cell onto its own rows with no extra bookkeeping
+    /// and no second hit-tester. The default ignores every event: a surface is
+    /// keyboard-driven until it deliberately opts into the pointer, so adding
+    /// mouse support to one surface can never regress another.
+    fn handle_mouse(&mut self, _event: MouseEvent, _content: Rect) -> SurfaceOutcome {
+        SurfaceOutcome::Ignored
+    }
 
     /// Renders at most `area.height` lines, scrolled so the focused element is
     /// visible.
@@ -401,6 +423,51 @@ pub mod chrome {
         let h = want_h.min(area.height).max(1);
         let x = area.x + area.width.saturating_sub(w) / 2;
         let y = area.y + area.height.saturating_sub(h) / 2;
+        Rect::new(x, y, w, h)
+    }
+
+    /// Computes the outer region for a [`Placement::FitContent`] surface that
+    /// wants to open *beside a pointer* rather than centred, like a native
+    /// context menu.
+    ///
+    /// The box prefers to sit just below and to the right of `anchor` — where a
+    /// menu raised by a click is expected. It *flips* to the left of the
+    /// pointer when it would otherwise overflow the right edge, and *above* the
+    /// pointer when it would overflow the bottom, and finally clamps, so it is
+    /// never drawn even one cell off-screen — not on a huge terminal, and not
+    /// on one only a little larger than the box itself. Sizing matches
+    /// [`fit_content_region`] exactly, so switching a surface between centred
+    /// and anchored never changes how big it is.
+    pub fn anchored_region(
+        content_size: (u16, u16),
+        hints: &str,
+        area: Rect,
+        anchor: (u16, u16),
+    ) -> Rect {
+        let (cw, ch) = content_size;
+        let h_rows = hint_rows(hints, cw);
+        let w = cw.saturating_add(BORDER_COLS * 2).min(area.width).max(1);
+        let h = ch
+            .saturating_add(h_rows)
+            .saturating_add(BORDER_ROWS)
+            .min(area.height)
+            .max(1);
+        let (ax, ay) = anchor;
+
+        // Open to the right of the pointer; flip left of it on overflow.
+        let mut x = ax;
+        if x.saturating_add(w) > area.right() {
+            x = ax.saturating_sub(w);
+        }
+        x = x.min(area.right().saturating_sub(w)).max(area.x);
+
+        // Open just below the pointer; flip above it on overflow.
+        let mut y = ay.saturating_add(1);
+        if y.saturating_add(h) > area.bottom() {
+            y = ay.saturating_sub(h);
+        }
+        y = y.min(area.bottom().saturating_sub(h)).max(area.y);
+
         Rect::new(x, y, w, h)
     }
 }
@@ -837,6 +904,63 @@ mod tests {
                 region.width >= 1 && region.height >= 1,
                 "region vanished for content ({cw}x{ch})"
             );
+        }
+    }
+
+    // ── Anchored (context-menu) geometry ─────────────────────────────────────
+
+    /// Plain-ASCII stand-in for the link menu's hints, so the anchored box
+    /// measures its footer the same way the real one does without dragging a
+    /// raw glyph into a geometry test.
+    const MENU_HINTS: &str = "arrows move  Enter select  Esc close";
+
+    #[test]
+    fn an_anchored_menu_opens_beside_a_click_in_the_middle_of_the_screen() {
+        // A middle click with room on every side opens down-and-right of the
+        // pointer, its top-left corner at the click — like a native menu.
+        let area = Rect::new(0, 0, 120, 40);
+        let region = chrome::anchored_region((40, 5), MENU_HINTS, area, (60, 20));
+        assert_eq!(region.x, 60, "the menu should open at the click column");
+        assert_eq!(region.y, 21, "the menu should open just below the click row");
+        assert!(region.right() <= area.right() && region.bottom() <= area.bottom());
+    }
+
+    #[test]
+    fn an_anchored_menu_flips_left_rather_than_overflow_the_right_edge() {
+        // Near the right edge there is no room to the right, so it opens to the
+        // left of the pointer instead of spilling off the screen.
+        let area = Rect::new(0, 0, 120, 40);
+        let region = chrome::anchored_region((40, 5), MENU_HINTS, area, (118, 20));
+        assert!(region.right() <= area.right(), "the menu overflowed the right edge");
+        assert!(region.x < 118, "the menu did not flip to the left of the pointer");
+    }
+
+    #[test]
+    fn an_anchored_menu_flips_above_rather_than_overflow_the_bottom_edge() {
+        // Near the bottom there is no room below, so it opens above the pointer.
+        let area = Rect::new(0, 0, 120, 40);
+        let region = chrome::anchored_region((40, 5), MENU_HINTS, area, (60, 39));
+        assert!(region.bottom() <= area.bottom(), "the menu overflowed the bottom edge");
+        assert!(region.y < 39, "the menu did not flip above the pointer");
+    }
+
+    #[test]
+    fn an_anchored_menu_is_never_drawn_off_screen_wherever_the_click_lands() {
+        // Every corner and the middle, on a terminal only a little larger than
+        // the box itself: the region must always be fully on screen and drawable.
+        let area = Rect::new(0, 0, 60, 20);
+        for col in [0u16, 1, 30, 58, 59] {
+            for row in [0u16, 1, 10, 18, 19] {
+                let region = chrome::anchored_region((40, 6), MENU_HINTS, area, (col, row));
+                assert!(
+                    region.x >= area.x
+                        && region.y >= area.y
+                        && region.right() <= area.right()
+                        && region.bottom() <= area.bottom(),
+                    "anchored menu escaped the screen at ({col},{row}): {region:?}"
+                );
+                assert!(region.width >= 1 && region.height >= 1);
+            }
         }
     }
 }
