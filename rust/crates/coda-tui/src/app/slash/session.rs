@@ -144,6 +144,7 @@ impl App {
                     self.header_id_selected = false;
                     self.selection.clear();
                     self.dragging = false;
+                    self.scrollbar.grab = None;
                     self.notice(
                         format!("Forked into a new session {escaped} (original frozen)."),
                         NoticeLevel::Info,

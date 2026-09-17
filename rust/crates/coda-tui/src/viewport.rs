@@ -230,6 +230,47 @@ impl Viewport {
         self.height.saturating_sub(1).max(1)
     }
 
+    /// Moves the viewport to `row`, detaching unless it lands at the bottom.
+    ///
+    /// Re-attaching at the end is what makes a drag to the foot of the track
+    /// resume following: parking the offset there while still detached would
+    /// leave the thumb pinned at the bottom but the transcript frozen, which
+    /// reads as the UI having stopped.
+    pub fn scroll_to_row(&mut self, row: usize) {
+        if !self.is_scrollable() {
+            return;
+        }
+        let target = row.min(self.max_offset());
+        if target >= self.max_offset() {
+            self.attach();
+        } else {
+            self.detach();
+            self.offset = target;
+        }
+    }
+
+    /// Scrolls so the thumb's top row sits at `thumb_top` in a track of
+    /// `track` rows — the inverse of [`Self::thumb`], used to drag the thumb.
+    ///
+    /// `thumb_top` is clamped to the track, so a drag that runs past either
+    /// end parks there rather than being ignored: the pointer routinely leaves
+    /// the one-cell scrollbar column mid-gesture, and a drag that stopped
+    /// responding the moment it did would be unusable.
+    pub fn scroll_to_thumb(&mut self, track: usize, thumb_top: usize) {
+        let Some((_, size)) = self.thumb(track) else {
+            return;
+        };
+        let span = track.saturating_sub(size);
+        let max = self.max_offset();
+        let target = if span == 0 {
+            max
+        } else {
+            let progress = thumb_top.min(span) as f64 / span as f64;
+            (max as f64 * progress).round() as usize
+        };
+        self.scroll_to_row(target);
+    }
+
     /// Position of the scrollbar thumb as a fraction, for rendering.
     ///
     /// Returns `None` when everything fits and no scrollbar is needed.
@@ -477,6 +518,67 @@ mod tests {
                 assert!(
                     position + size <= track,
                     "thumb {position}+{size} overflows {track} (total {total})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dragging_the_thumb_to_the_top_of_its_track_scrolls_to_the_start() {
+        let mut viewport = viewport(100, 10);
+        viewport.scroll_to_thumb(10, 0);
+        assert_eq!(viewport.offset(), 0);
+        assert!(!viewport.is_following(), "the top is not the bottom");
+    }
+
+    #[test]
+    fn dragging_the_thumb_to_the_foot_of_its_track_resumes_following() {
+        let mut viewport = viewport(100, 10);
+        viewport.scroll_to_top();
+        viewport.scroll_to_thumb(10, 10);
+        assert_eq!(viewport.offset(), viewport.max_offset());
+        assert!(viewport.is_following(), "the bottom re-attaches");
+    }
+
+    #[test]
+    fn dragging_the_thumb_lands_where_it_was_dropped() {
+        // The thumb is its own size, so a track of 10 showing 10 of 100 rows
+        // has a one-row thumb and nine rows of travel over 90 scrollable rows.
+        let mut viewport = viewport(100, 10);
+        viewport.scroll_to_thumb(10, 3);
+        assert_eq!(viewport.offset(), 30);
+        let (position, _) = viewport.thumb(10).expect("a thumb");
+        assert_eq!(position, 3, "the thumb is drawn back where it was dropped");
+    }
+
+    #[test]
+    fn dragging_past_the_end_of_the_track_parks_at_the_end() {
+        let mut viewport = viewport(100, 10);
+        viewport.scroll_to_top();
+        viewport.scroll_to_thumb(10, 999);
+        assert_eq!(viewport.offset(), viewport.max_offset());
+    }
+
+    #[test]
+    fn dragging_a_thumb_that_fills_its_track_does_nothing() {
+        let mut viewport = viewport(5, 10);
+        viewport.scroll_to_thumb(10, 4);
+        assert_eq!(viewport.offset(), 0, "nothing to scroll");
+        assert!(viewport.is_following());
+    }
+
+    #[test]
+    fn every_track_row_maps_onto_a_valid_offset() {
+        for total in [11usize, 50, 500, 5000] {
+            let track = 10;
+            for row in 0..track {
+                let mut viewport = viewport(total, 10);
+                viewport.scroll_to_thumb(track, row);
+                assert!(
+                    viewport.offset() <= viewport.max_offset(),
+                    "row {row} of {total} left offset {} past {}",
+                    viewport.offset(),
+                    viewport.max_offset(),
                 );
             }
         }

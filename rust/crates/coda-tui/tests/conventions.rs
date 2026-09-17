@@ -404,6 +404,50 @@ fn the_pointer_handler_offers_a_click_to_fold() {
     );
 }
 
+/// A draggable scrollbar is worthless if nothing routes the pointer to it.
+///
+/// Same shape as the fold rule above, and the same reason: `begin_scrollbar_drag`
+/// and `drag_scrollbar` need a live `App`, so only the wiring can be asserted.
+/// Both halves are required — a press that never becomes a drag leaves the
+/// thumb jumping on click and refusing to follow the pointer, which is the bug
+/// this replaced.
+#[test]
+fn the_pointer_handler_routes_a_drag_to_the_scrollbar() {
+    let source = std::fs::read_to_string("src/app/clipboard.rs").expect("read clipboard.rs");
+    let code = without_test_modules(&source);
+    let start = code
+        .find("fn decide_pointer_action")
+        .expect("decide_pointer_action is gone; this rule needs rewriting");
+    let body = &code[start..];
+    let end = body.find("\n    pub(super) fn ").unwrap_or(body.len());
+    let body = &body[..end];
+
+    assert!(
+        body.contains("begin_scrollbar_drag"),
+        "decide_pointer_action never calls begin_scrollbar_drag, so pressing the \
+         scrollbar starts a transcript selection instead of taking hold of the thumb."
+    );
+    assert!(
+        body.contains("drag_scrollbar"),
+        "decide_pointer_action never calls drag_scrollbar, so the thumb cannot be \
+         dragged — only clicked."
+    );
+
+    // The scrollbar overlaps the transcript's rows, so anything tested ahead of
+    // it would claim a press meant for the thumb.
+    let press = body
+        .find("begin_scrollbar_drag")
+        .expect("checked above");
+    for contender in ["hit_header_id", "move_caret_to_click", "toggle_fold_at_click"] {
+        let other = body.find(contender).unwrap_or(usize::MAX);
+        assert!(
+            press < other,
+            "{contender} is tested before begin_scrollbar_drag, so it would swallow \
+             a press on the scrollbar column."
+        );
+    }
+}
+
 /// The source of one `App` method, from its signature to the next sibling item.
 ///
 /// Comment-stripped source, so a doc comment cannot satisfy — or violate — a

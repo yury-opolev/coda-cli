@@ -22,6 +22,16 @@ use crate::viewport::Viewport;
 /// Width of the scrollbar column.
 const SCROLLBAR_WIDTH: u16 = 1;
 
+/// Blank cells kept to the right of a right-aligned annotation — the message
+/// timestamp.
+///
+/// The transcript is narrowed by exactly the scrollbar's width when one is
+/// shown, so without this the timestamp ends flush against the scrollbar
+/// glyphs and reads as part of them. Reserved unconditionally rather than only
+/// when a scrollbar is present, so the timestamp column does not shift sideways
+/// the moment the conversation grows past one screen.
+pub const RIGHT_TEXT_MARGIN: usize = 1;
+
 /// Most rows the completion popup may take.
 ///
 /// Eight is enough to see the shape of the list without burying the
@@ -216,7 +226,7 @@ pub fn to_line(row: &RenderLine, theme: &Theme, width: usize) -> Line<'static> {
     // truncating what the user actually wrote.
     let content_width: usize = spans.iter().map(|s| text::width(&s.content)).sum();
     let right = row.right_text.as_deref();
-    let right_width = right.map_or(0, text::width);
+    let right_width = right.map_or(0, |text| text::width(text) + RIGHT_TEXT_MARGIN);
     let show_right = right.is_some() && width >= content_width + right_width + 1;
 
     if row.fill_width || show_right {
@@ -231,6 +241,9 @@ pub fn to_line(row: &RenderLine, theme: &Theme, width: usize) -> Line<'static> {
             right.expect("checked above").to_string(),
             theme.style(Role::UserTime),
         ));
+        // Styled with the row's own base so a filled background still reaches
+        // the right edge behind the gap.
+        spans.push(Span::styled(" ".repeat(RIGHT_TEXT_MARGIN), base));
     }
 
     Line::from(spans)
@@ -1360,9 +1373,30 @@ mod tests {
         let line = to_line(&row, &theme(), 20);
 
         let rendered = plain_text(&line);
-        assert!(rendered.ends_with("09:41"), "got {rendered:?}");
         assert!(rendered.starts_with("hello"));
         assert_eq!(text::width(&rendered), 20);
+        // One blank cell short of the edge, so the stamp never abuts the
+        // scrollbar that occupies the very next column.
+        assert!(
+            rendered.ends_with(&format!("09:41{}", " ".repeat(RIGHT_TEXT_MARGIN))),
+            "got {rendered:?}",
+        );
+    }
+
+    #[test]
+    fn a_timestamp_keeps_its_margin_clear_of_the_message_text() {
+        let row = RenderLine::new("hello", Role::User)
+            .with_fill(Role::UserBackground)
+            .with_right_text("09:41");
+        let line = to_line(&row, &theme(), 20);
+        let rendered = plain_text(&line);
+
+        let stamp = rendered.find("09:41").expect("the stamp is shown");
+        assert_eq!(
+            rendered.len() - (stamp + "09:41".len()),
+            RIGHT_TEXT_MARGIN,
+            "exactly the margin sits after the stamp: {rendered:?}",
+        );
     }
 
     #[test]

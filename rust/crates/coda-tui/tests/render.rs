@@ -443,6 +443,85 @@ fn hovering_a_link_on_one_row_does_not_underline_another() {
     );
 }
 
+/// The message timestamp must never sit flush against the scrollbar, or the
+/// two read as one smear of glyphs down the right edge.
+#[test]
+fn a_message_timestamp_keeps_a_blank_cell_clear_of_the_scrollbar() {
+    let width = 60u16;
+    let height = 14u16;
+
+    let mut state = session();
+    // Enough traffic to overflow the transcript, so a scrollbar is drawn.
+    for i in 0..20 {
+        state.apply(UiEvent::Submitted {
+            text: format!("message {i}"),
+        });
+    }
+
+    let theme = Theme::warm_ember().with_depth(ColorDepth::TrueColor);
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+    let composer = Composer::new();
+
+    // Laid out exactly as `draw` will, scrollbar included, so the rows are
+    // wrapped to the width they are actually painted at.
+    let mut viewport = Viewport::new();
+    let regions = draw::layout_with_pending(
+        ratatui::layout::Rect::new(0, 0, width, height),
+        composer.line_count(),
+        true,
+        state.is_busy(),
+        0,
+    );
+    let rows = state
+        .transcript
+        .render(regions.transcript.width as usize, state.display_mode);
+    viewport.update(rows.len(), regions.transcript.height as usize);
+    assert!(viewport.is_scrollable(), "the fixture must overflow the viewport");
+
+    terminal
+        .draw(|frame| {
+            draw::draw(
+                frame,
+                &state,
+                &composer,
+                &viewport,
+                &rows,
+                &theme,
+                std::time::Instant::now(),
+            )
+        })
+        .expect("draw");
+
+    let buffer = terminal.backend().buffer().clone();
+    let stamped: Vec<u16> = (0..height)
+        .filter(|&y| {
+            (0..width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .contains("09:41")
+        })
+        .collect();
+    assert!(!stamped.is_empty(), "no timestamped row was drawn");
+
+    for y in stamped {
+        let row: String = (0..width).map(|x| buffer[(x, y)].symbol()).collect();
+        let last = buffer[(width - 1, y)].symbol().to_string();
+        assert!(
+            last == "\u{2588}" || last == "\u{2502}",
+            "row {y} should end in the scrollbar, got {last:?} in {row:?}",
+        );
+        assert_eq!(
+            buffer[(width - 2, y)].symbol(),
+            " ",
+            "row {y} must keep a blank cell between the stamp and the scrollbar: {row:?}",
+        );
+        assert!(
+            row.ends_with("09:41 \u{2588}") || row.ends_with("09:41 \u{2502}"),
+            "the stamp must sit one cell off the scrollbar: {row:?}",
+        );
+    }
+}
+
 /// A drawn frame must report where the transcript actually is, or a click
 /// cannot be translated into a transcript row.
 #[test]

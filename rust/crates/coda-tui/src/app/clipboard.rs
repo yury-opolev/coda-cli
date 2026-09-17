@@ -13,6 +13,29 @@ use coda_boot::browser::LinkOpenMode;
 use super::{App, PointerAction, WHEEL_ROWS};
 use crate::transcript::NoticeLevel;
 
+/// The scrollbar's on-screen geometry and the thumb drag over it, if any.
+///
+/// Kept here rather than on the event loop because it is one thing: the
+/// scrollbar is only ever touched through the pointer, and the drag offset is
+/// meaningless without the rect it is measured against.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct ScrollbarPointer {
+    /// Where the scrollbar column was drawn, or `None` when the transcript
+    /// fits and no scrollbar is shown.
+    ///
+    /// Captured from the same layout that is about to be drawn, so a press is
+    /// hit-tested against exactly the geometry on screen rather than against a
+    /// recomputation that could drift from it.
+    pub(super) area: Option<ratatui::layout::Rect>,
+    /// Rows between the top of the thumb and the pointer while the thumb is
+    /// being dragged; `None` when no drag is in progress.
+    ///
+    /// Held so the thumb keeps the grip it was taken hold of: without it every
+    /// drag event would re-centre the thumb on the pointer, and the transcript
+    /// would lurch on the first cell of movement.
+    pub(super) grab: Option<u16>,
+}
+
 impl App {
     /// Maps a pointer event onto its effect, returning the clipboard action the
     /// gesture asks for (if any).
@@ -36,6 +59,13 @@ impl App {
             // so without this there is no way to select anything at all — the
             // capture takes the native behaviour away and gives nothing back.
             MouseEventKind::Down(MouseButton::Left) => {
+                // The scrollbar is tested first and claims the gesture outright.
+                // It overlaps the transcript's row range, so anything checked
+                // ahead of it — a fold header, a selection anchor — would be
+                // started by a press meant for the thumb.
+                if self.begin_scrollbar_drag(mouse.column, mouse.row) {
+                    return None;
+                }
                 // The header's session id is a distinct selection target: a
                 // click there selects the whole id and claims the gesture, so
                 // it can never also start a caret move, a fold, or a
@@ -65,6 +95,12 @@ impl App {
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
+                // A thumb drag owns the pointer until it is released, wherever
+                // it wanders: the column is one cell wide, so insisting the
+                // pointer stay inside it would abandon the gesture constantly.
+                if self.drag_scrollbar(mouse.row) {
+                    return None;
+                }
                 // A drag that stays within the id keeps it selected; it never
                 // grows into a partial-text range the way transcript drag does.
                 if self.hit_header_id(mouse.column, mouse.row) {
@@ -81,6 +117,13 @@ impl App {
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
+                // Releasing the thumb ends the gesture and nothing else: it
+                // selected nothing, so falling through would let the release
+                // open a link sitting under the scrollbar column.
+                if self.scrollbar.grab.take().is_some() {
+                    self.dirty = true;
+                    return None;
+                }
                 if self.dragging {
                     if let Some(pos) = self.mouse_to_selection(mouse.column, mouse.row) {
                         self.selection.update(pos);
@@ -169,6 +212,58 @@ impl App {
     /// the header has already moved on from.
     pub(super) fn hit_header_id(&self, column: u16, row: u16) -> bool {
         header_id_hit(self.header_id_rect, column, row)
+    }
+
+    /// Starts a scrollbar-thumb drag, if the press landed on the scrollbar.
+    ///
+    /// A press on the thumb grabs it exactly where it was taken hold of, so
+    /// the transcript does not lurch under the pointer. A press on the bare
+    /// track jumps the thumb's centre to the pointer and then grabs it there,
+    /// so a click-to-jump continues into a drag without a second gesture.
+    ///
+    /// Returns whether the press was consumed.
+    pub(super) fn begin_scrollbar_drag(&mut self, column: u16, row: u16) -> bool {
+        let Some(area) = self.scrollbar.area else {
+            return false;
+        };
+        if !scrollbar_hit(area, column, row) {
+            return false;
+        }
+        let track = area.height as usize;
+        let Some((position, size)) = self.viewport.thumb(track) else {
+            return false;
+        };
+
+        let (grab, jump_to) = scrollbar_grab(position, size, (row - area.y) as usize);
+        if let Some(thumb_top) = jump_to {
+            self.viewport.scroll_to_thumb(track, thumb_top);
+            self.remember_position();
+        }
+
+        self.scrollbar.grab = Some(grab as u16);
+        // The scrollbar owns the gesture outright: no caret, no fold, no
+        // selection and no stale header highlight left behind it.
+        self.selection.clear();
+        self.header_id_selected = false;
+        self.dragging = false;
+        self.dirty = true;
+        true
+    }
+
+    /// Continues a thumb drag, if one is in progress.
+    ///
+    /// Only the row matters: the thumb travels one axis, so a pointer that
+    /// strays out of the one-cell column keeps scrolling rather than dropping
+    /// the gesture. Returns whether a drag was in progress.
+    pub(super) fn drag_scrollbar(&mut self, row: u16) -> bool {
+        let (Some(area), Some(grab)) = (self.scrollbar.area, self.scrollbar.grab) else {
+            return false;
+        };
+        let thumb_top = row.saturating_sub(area.y).saturating_sub(grab) as usize;
+        self.viewport.scroll_to_thumb(area.height as usize, thumb_top);
+        self.remember_position();
+        self.dirty = true;
+        true
     }
 
     /// Restores the most recently unsent message into an empty composer.
@@ -460,6 +555,37 @@ fn header_id_hit(rect: Option<ratatui::layout::Rect>, column: u16, row: u16) -> 
     column >= rect.x && column < rect.x + rect.width && row == rect.y
 }
 
+/// Whether `(column, row)` falls within the scrollbar column drawn this frame.
+///
+/// Unlike the header id this spans many rows, so both axes are bounded.
+fn scrollbar_hit(rect: ratatui::layout::Rect, column: u16, row: u16) -> bool {
+    column >= rect.x
+        && column < rect.x + rect.width
+        && row >= rect.y
+        && row < rect.y + rect.height
+}
+
+/// Where a press `offset_in_track` rows down a track takes hold of a thumb of
+/// `size` rows currently at `position`: the grip to keep for the rest of the
+/// drag, and the thumb top to jump to first, if any.
+///
+/// A press *on* the thumb grabs it exactly where it was taken hold of, so the
+/// transcript does not lurch under the pointer. A press on the bare track has
+/// no such grip to keep, so the thumb is centred on the pointer and then held
+/// there — which is what lets a click-to-jump continue straight into a drag
+/// instead of needing a second gesture.
+///
+/// A free function so the arithmetic is testable without a live `App` (building
+/// one needs a real engine).
+fn scrollbar_grab(position: usize, size: usize, offset_in_track: usize) -> (usize, Option<usize>) {
+    if (position..position + size).contains(&offset_in_track) {
+        (offset_in_track - position, None)
+    } else {
+        let centre = size / 2;
+        (centre, Some(offset_in_track.saturating_sub(centre)))
+    }
+}
+
 /// Decides what a copy gesture should copy: the header's full session id —
 /// never a clipped or narrowed on-screen substring — when it is selected,
 /// otherwise the transcript selection, when there is one.
@@ -504,6 +630,50 @@ mod tests {
         assert!(!header_id_hit(rect, 16, 0), "past the right edge");
         assert!(!header_id_hit(rect, 10, 1), "wrong row");
         assert!(!header_id_hit(None, 10, 0), "no header this frame");
+    }
+
+    #[test]
+    fn scrollbar_hit_bounds_both_axes() {
+        let rect = ratatui::layout::Rect::new(79, 1, 1, 20);
+        assert!(scrollbar_hit(rect, 79, 1), "top of the track");
+        assert!(scrollbar_hit(rect, 79, 20), "bottom of the track");
+        assert!(!scrollbar_hit(rect, 79, 21), "past the foot");
+        assert!(!scrollbar_hit(rect, 79, 0), "above the head");
+        assert!(!scrollbar_hit(rect, 78, 10), "left of the column");
+        assert!(!scrollbar_hit(rect, 80, 10), "right of the column");
+    }
+
+    #[test]
+    fn pressing_the_thumb_keeps_the_grip_it_was_taken_hold_of() {
+        // A five-row thumb sitting three rows down, pressed on its middle row.
+        let (grab, jump) = scrollbar_grab(3, 5, 5);
+        assert_eq!(grab, 2, "two rows below the thumb's top");
+        assert_eq!(jump, None, "pressing the thumb must not move it");
+    }
+
+    #[test]
+    fn pressing_the_thumb_at_either_end_grabs_that_end() {
+        assert_eq!(scrollbar_grab(3, 5, 3), (0, None), "its first row");
+        assert_eq!(scrollbar_grab(3, 5, 7), (4, None), "its last row");
+        assert!(scrollbar_grab(3, 5, 8).1.is_some(), "one past it is the track");
+    }
+
+    #[test]
+    fn pressing_the_bare_track_centres_the_thumb_on_the_pointer_and_holds_it() {
+        let (grab, jump) = scrollbar_grab(0, 4, 10);
+        assert_eq!(jump, Some(8), "the thumb's centre lands on the pointer");
+        assert_eq!(grab, 2, "and is then held at that centre");
+        // The grip must be self-consistent: the thumb top plus the grip is
+        // where the pointer actually is, so the very next drag event does not
+        // shift the content.
+        assert_eq!(jump.unwrap() + grab, 10);
+    }
+
+    #[test]
+    fn pressing_the_track_above_a_thumb_bigger_than_the_press_parks_at_the_top() {
+        let (grab, jump) = scrollbar_grab(8, 6, 1);
+        assert_eq!(jump, Some(0), "no room above: park at the head of the track");
+        assert_eq!(grab, 3);
     }
 
     #[test]

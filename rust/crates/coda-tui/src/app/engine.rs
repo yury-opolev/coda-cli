@@ -367,6 +367,7 @@ impl App {
         self.header_id_selected = false;
         self.selection.clear();
         self.dragging = false;
+        self.scrollbar.grab = None;
         // Last, and once: the engine is initialised and this session is
         // talking to it again.
         self.set_engine_connected(true);
