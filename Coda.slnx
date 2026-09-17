@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Coda.Client/Coda.Client.csproj" />
+    <Project Path="src/Coda.Launcher/Coda.Launcher.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Coda.Client.Tests/Coda.Client.Tests.csproj" />
+  </Folder>
+</Solution>

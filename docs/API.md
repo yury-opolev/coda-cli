@@ -5,7 +5,7 @@ Coda's agent engine can be driven programmatically two ways:
 | Interface | Process model | Audience | Best for |
 |---|---|---|---|
 | **`coda serve`** (JSON-RPC) | out-of-process; talk to a spawned `coda` over a transport | any language | an orchestrator driving Coda as a coding subagent |
-| **`Coda.Sdk`** (.NET library) | in-process; reference the assemblies | .NET hosts | embedding the engine directly |
+| **`Coda.Client`** (.NET library) | out-of-process; owns a spawned `coda serve` | .NET hosts | embedding Coda in a .NET app |
 
 Both expose the **same engine** (the agent loop, tools, providers, permission model). The wire JSON-RPC protocol is transport-agnostic and unchanged across transports.
 
@@ -155,143 +155,41 @@ $ coda serve --api-key "$KEY" --cwd /repo
 
 ---
 
-## 2. `Coda.Sdk` — embed the engine in-process (.NET 10)
+## 2. `Coda.Client` — drive the engine from .NET
 
-Reference `Coda.Sdk` (which pulls in `Coda.Agent`, `Coda.Mcp`, `LlmClient`, `LlmAuth*`). The entry point is **`CodaSession`** — the callable engine that wires the provider client, tools, subagents, LSP, and permission policy, and keeps the conversation across calls.
-
-### `CodaSession`
+`Coda.Client` is a .NET SDK for the protocol above. It launches and owns a
+`coda serve` child process and speaks JSON-RPC to it, so a .NET host gets the
+agent **out-of-process** — the engine is the same native `coda` binary everyone
+else runs, not a second implementation compiled into your app.
 
 ```csharp
-public sealed class CodaSession : IDisposable, IAsyncDisposable
+using Coda.Client;
+
+await using var client = await CodaClient.StartAsync(
+    EngineCommand.Default
+        .WithWorkingDirectory(repoRoot)
+        .WithProvider("github-copilot"));
+
+await using var session = await client.CreateSessionAsync();
+
+await foreach (var evt in session.PromptAsync("Add a retry policy to the HTTP client."))
 {
-    public CodaSession(
-        CredentialManager credentials,
-        SessionOptions options,
-        ClientFingerprint? fingerprint = null,
-        HttpClient? httpClient = null,
-        List<ChatMessage>? history = null,
-        string? sessionId = null);
-
-    public string SessionId { get; }
-    public SessionOptions Options { get; set; }          // provider/model/mode may change between runs
-    public IReadOnlyList<ChatMessage> History { get; }
-    public TokenUsage SessionUsage { get; }              // cumulative across runs
-    public TodoStore Todos { get; }
-    public ScheduledTaskStore Schedules { get; }
-    public TaskManager Tasks { get; }                    // unified in-process runtime: background subagents + shells
-
-    public Task InitializeAsync(CancellationToken ct = default);            // starts configured LSP servers + schedule runtime when EnableScheduleRuntime (no-op if neither)
-    public Task<RunResult> RunAsync(string prompt, IAgentSink? sink = null, CancellationToken ct = default);
-    public Task<RunResult> RunAsync(IReadOnlyList<ContentBlock> userContent, IAgentSink? sink = null, CancellationToken ct = default); // text + images
-    public Task CompactAsync(CancellationToken ct = default);              // summarize history in place
-    public void Reset();                                                   // clear the conversation
-    public void Dispose();                                                 // tears down tasks (bounded), LSP, owned HttpClient
-    public ValueTask DisposeAsync();                                       // graceful path: awaits TaskManager shutdown, then teardown
+    switch (evt)
+    {
+        case AssistantDelta d: Console.Write(d.Text); break;
+        case ToolCall t:       Console.WriteLine($"[{t.Name}]"); break;
+    }
 }
 ```
 
-`RunAsync` runs **one user turn**: it streams the assistant reply (with tool use) to the optional `sink`, keeps the conversation in `History`, and returns a `RunResult`. On failure the turn is rolled back so history never corrupts. Call `InitializeAsync` once after construction if you configured LSP servers or set `EnableScheduleRuntime` (it starts the schedule runtime that executes due `schedule_*` definitions while the session is open; see [Scheduled tasks](../README.md#scheduled-tasks)).
+Permission requests, clarifying questions and plan approvals arrive as
+server-initiated requests that the host answers; see
+[`serve-protocol.md`](serve-protocol.md) for the full set and their payloads.
 
-### `SessionOptions`
-
-```csharp
-public sealed record SessionOptions
-{
-    public required string ProviderId { get; init; }     // e.g. ClaudeAiProvider.Id, ApiKeyProvider.Id, GitHubCopilotProvider.Id
-    public required string Model { get; init; }          // e.g. "claude-sonnet-4-6"
-    public required string WorkingDirectory { get; init; }
-
-    public PermissionMode PermissionMode { get; init; } = PermissionMode.Default;
-    public IReadOnlyList<ITool> ExtraTools { get; init; } = [];   // e.g. MCP tools, on top of the built-ins
-    public IPermissionPrompt? InteractivePrompt { get; init; }    // null = headless (an "Ask" decision denies)
-    public IUserQuestionPrompt? UserQuestionPrompt { get; init; } // null = headless
-    public IPlanApprover? PlanApprover { get; init; }             // null = headless
-
-    public int MaxIterations { get; init; } = 20;
-    public bool EnableSessionMemory { get; init; }               // background notes file after work-bearing turns
-    public bool EnableBypassClassifier { get; init; }            // vet each mutating action in bypass mode
-    public string? Goal { get; init; }                           // autonomous goal: keep working until a judge agrees
-    public TimeSpan? GoalMaxDuration { get; init; }             // wall-clock budget override (null → settings/default 24h)
-    public int? GoalMaxContinuations { get; init; }             // turn budget override (null → settings/default 60000)
-    public int MaxStopContinuations { get; init; } = 10;
-    public int AutoCompactTokenThreshold { get; init; } = 100_000; // 0 disables auto-compaction
-    public string? OutputStyle { get; init; }                    // persona, e.g. "concise"
-    public bool EnableScheduleRuntime { get; init; }             // execute due schedules while the session is open (interactive/serve; default false)
-}
-```
-
-### `RunResult`
-
-```csharp
-public sealed record RunResult(
-    bool Success,
-    string FinalText,
-    IReadOnlyList<ToolCallRecord> ToolCalls,
-    string? StopReason,
-    string? Error)
-{
-    public TokenUsage Usage { get; init; }         // Zero when the provider didn't report usage
-    public GoalStatus? Goal { get; init; }         // Non-null when a goal was active; Outcome != None when goal ran
-}
-
-public sealed record ToolCallRecord(string Name, string Input, string? Result, bool IsError);
-```
-
-### Streaming: `IAgentSink`
-
-Pass an `IAgentSink` to `RunAsync` to observe the turn live (or `null` to just await the `RunResult`).
-
-```csharp
-public interface IAgentSink
-{
-    void OnAssistantText(string delta);
-    void OnAssistantTextComplete();
-    void OnToolCall(string toolName, string inputJson);
-    void OnToolResult(string toolName, ToolResult result);
-    void OnError(string message);
-    void OnStopReason(string? stopReason) { }   // optional (default no-op)
-    void OnUsage(TokenUsage usage) { }           // optional (default no-op)
-}
-```
-
-Provided implementations in `Coda.Sdk`:
-- `PlainTextSink(TextWriter output, TextWriter error)` — human-readable headless output.
-- `JsonStreamSink(TextWriter writer)` — newline-delimited JSON events; call `EmitResult(RunResult)` once at the end.
-- `RecordingSink(IAgentSink? inner = null)` — captures final text, tool calls, stop reason, and usage (and forwards to `inner`).
-
-### Minimal example
-
-```csharp
-using Coda.Agent;            // PermissionMode
-using Coda.Sdk;
-using LlmAuth;
-using LlmAuth.Providers.ClaudeAi;
-using LlmAuth.Storage.Windows;
-
-using var claude = new ClaudeAiProvider();
-var credentials = new CredentialManager(new DpapiTokenStore(), [claude, new ApiKeyProvider()]);
-// Sign in once (opens the browser + loopback listener); see the README "Usage" section:
-// await credentials.LoginAsync(ClaudeAiProvider.Id);
-
-var options = new SessionOptions
-{
-    ProviderId = ClaudeAiProvider.Id,
-    Model = "claude-sonnet-4-6",
-    WorkingDirectory = Directory.GetCurrentDirectory(),
-    PermissionMode = PermissionMode.AcceptEdits,   // or Default + an InteractivePrompt to approve interactively
-};
-
-using var session = new CodaSession(credentials, options);
-await session.InitializeAsync();                   // starts LSP servers if configured
-
-RunResult result = await session.RunAsync(
-    "Add a unit test for Foo.Bar and run the suite.",
-    new PlainTextSink(Console.Out, Console.Error));
-
-Console.WriteLine(result.Success ? $"\n✓ {result.StopReason}" : $"\n✗ {result.Error}");
-```
-
-For headless automation, leave `InteractivePrompt`/`UserQuestionPrompt`/`PlanApprover` null and use `PermissionMode.AcceptEdits` or `BypassPermissions` (optionally with `EnableBypassClassifier = true`).
+> **In-process embedding is no longer offered.** The previous `Coda.Sdk` compiled
+> a second, C# implementation of the agent into the host process. It was retired
+> with the rest of the C# engine — there is now one engine, in Rust, and one way
+> to embed it. The retired code is reachable at the `csharp-final` tag.
 
 ---
 
