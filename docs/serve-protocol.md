@@ -23,11 +23,14 @@ current Rust CLI and operational diagnostics.
 The [Rust API catalog](protocol/catalog.md) is the implementation-specific
 method/event inventory, including supported limits and generated schemas.
 
-## Legacy C# host
+## Transport scope
 
-**The transport, authentication and detailed flag behavior in the Lifecycle
-and MCP sections below describe the C# implementation, still available
-through `publish.ps1 -Legacy`. They are not claims about the Rust engine.**
+**The transport, authentication and detailed flag behaviour described below
+were written against the retired C# host. The Rust engine speaks the same wire
+protocol over stdio; the named-pipe/Unix-socket transport and its API-key
+authentication were C#-only and are gone.** Treat anything transport-specific
+here as historical unless the [Rust API catalog](protocol/catalog.md) confirms
+it.
 
 `coda serve` runs Coda as a **JSON-RPC 2.0 agent server** over either stdio or an
 API-key-authenticated local named pipe/Unix socket, so an external orchestrator can drive it as a
@@ -132,10 +135,10 @@ interactive TUI and `coda run`, exposing each server's tools to the session as
 
 ## Orchestrator → Coda (requests)
 
-The reference below retains the shared legacy method vocabulary. Sections
+The reference below retains the shared historical method vocabulary. Sections
 marked **Rust** describe the additive Rust contract, not features of the
-legacy C# host. Consult the Rust catalog for the complete routed inventory;
-the legacy goal/startup details are not a promise of identical defaults.
+retired C# host. Consult the Rust catalog for the complete routed inventory;
+the historical goal/startup details are not a promise of identical defaults.
 
 | Method | Params | Result |
 |---|---|---|
@@ -333,7 +336,7 @@ is the same value used by the state snapshot, `event/activity`, `event/turnEnded
 diagnostics context and the execution scope above. There is no second, independently-minted id
 for logging.
 
-### `session/setGoal` (legacy C# defaults)
+### `session/setGoal` (historical C# defaults)
 
 Mutates the session's autonomous goal settings in-place (persist-until-cleared). The goal
 drives the agent to keep working turn after turn until a judge declares it met (or the budget
@@ -440,7 +443,7 @@ legacy compatibility, but do not infer the originating agent or the whole
 turn from them: Rust's legacy root IDs may be batch-scoped and source IDs
 may carry provider call IDs.
 
-The **legacy C#** identity contract for `event/toolCall`, `event/toolProgress`,
+The retired **C#** identity contract for `event/toolCall`, `event/toolProgress`,
 and `event/toolResult` is:
 
 - `rootTurnId` identifies the root turn. `event/turnComplete` carries it even when that turn made

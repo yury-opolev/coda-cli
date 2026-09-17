@@ -1,7 +1,7 @@
 # Rust serve API catalog
 
 This catalog describes the Rust `coda serve` / `coda-engine serve` contract,
-not the legacy C# socket host. The wire protocol version remains `1`; the
+not the retired C# socket host. The wire protocol version remains `1`; the
 additive state contract is `2026-09-1`. Read `initialize.capabilities` rather
 than inferring support from a product version or a method name.
 

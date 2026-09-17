@@ -11,12 +11,11 @@ Coda ships two front-ends over one engine: an **interactive TUI** (built with
 [ratatui](https://ratatui.rs)) for humans, and a **programmatic `coda serve` API**
 so an orchestrator can drive Coda as a coding subagent.
 
-> The engine is written in C# / .NET 10 and is also embeddable in-process as a
-> .NET library (`Coda.Sdk`). The C# TUI is the legacy front-end; the Rust/ratatui
-> TUI is the primary going-forward distribution.
+> The engine is written in Rust. A .NET client SDK (`Coda.Client`) drives it
+> out-of-process over the `coda serve` protocol.
 
 > **API reference:** the programmatic interface — the `coda serve` JSON-RPC
-> protocol, its transports/authentication, and the embeddable `Coda.Sdk` — is
+> protocol, its transports/authentication, and the .NET `Coda.Client` SDK — is
 > documented in **[`docs/API.md`](docs/API.md)** (wire-level protocol details in
 > [`docs/serve-protocol.md`](docs/serve-protocol.md)).
 
@@ -119,21 +118,19 @@ for limits, failure behavior, and compatibility with older logging flags.
 - **You stay in control** — permission modes (`default` / `acceptEdits` / `plan` /
   `bypass`), allow/deny rules and [lifecycle hooks](docs/hooks.md) from settings files, and an
   interactive approve/deny prompt for risky actions.
-- **Autonomy helpers (opt-in)** — a background **session-memory** notes file, a
-  **safety classifier** that vets actions in bypass mode, and an autonomous **goal
+- **Autonomy helpers (opt-in)** — a **safety classifier** that vets actions in
+  bypass mode, and an autonomous **goal
   loop** that keeps working until a judge says the goal is met. Plus automatic
   history **compaction**, output-style personas, and a plugin/skills marketplace.
   See [`docs/skills-and-plugins.md`](docs/skills-and-plugins.md) for authoring skills and plugins.
 - **Programmatic access** — Rust `coda serve` exposes the agent over bidirectional
   JSON-RPC on stdio, streaming progress and requesting permission or clarification.
-  The **legacy C# implementation** additionally supports API-key-authenticated local
-  named pipes/Unix sockets and in-process embedding through `Coda.Sdk`.
+  The .NET [`Coda.Client`](src/Coda.Client) SDK drives it out-of-process.
 
 Coda is its own product, independent of any vendor's official CLI.
 
 > **Platform note:** the Rust engine and TUI use DPAPI credential storage on
-> Windows and encrypted-file storage on other platforms. The legacy C# TUI and
-> `coda serve` retain their Windows DPAPI runtime requirement.
+> Windows and encrypted-file storage on other platforms.
 
 ## Coda — the interactive TUI
 
@@ -146,11 +143,6 @@ Rust binary directly:
 .\rust\target\release\coda.exe
 ```
 
-> **Legacy C# TUI (Terminal.Gui v2):** The original C# front-end is still present
-> in `src/Coda.Tui` and remains buildable/runnable. It is no longer the primary
-> distribution but is retained as a reference implementation. Use
-> `./build.ps1 -Legacy` and `dotnet run --project src/Coda.Tui` to build and run it.
-
 The TUI follows the **Warm Ember** interaction model.
 **Full-screen mode is the default interactive engine on a supported terminal**: a scrollable,
 virtualized transcript fills the **full
@@ -160,28 +152,13 @@ width** of the screen, an **operational status row** (turn, tool, waiting, appro
 (model, effort, permission mode, context, usage, cost, services, git, and cwd) occupies the **final row**;
 fields are shed from the right as the terminal narrows. **Focus** stays on the composer while you
 type — keyboard shortcuts drive the transcript, overlays, and completion menu without pulling focus away
-from your prompt. **Inline mode** uses the same retained, scrollable layout in the terminal's primary
-buffer and remains available as an **explicit compatibility** choice via `--tui=inline`.
-**Spectre.Console remains a migration fallback** for environments where Terminal.Gui is not yet accepted,
-and a **plain** renderer is always available.
+from your prompt. A **plain** renderer is always available.
 
 ```powershell
-# Legacy C# TUI — build (bumps the version) and run:
-./build.ps1 -Legacy
-dotnet run --project src/Coda.Tui -c Release
-
-# Choose the interactive engine explicitly (legacy C#):
-dotnet run --project src/Coda.Tui -- --tui=fullscreen   # retained, virtualized full-screen transcript
-dotnet run --project src/Coda.Tui -- --tui=inline       # optional: same retained transcript, primary buffer (terminal history)
-dotnet run --project src/Coda.Tui -- --tui=auto         # default: full-screen on a supported terminal, else plain
-dotnet run --project src/Coda.Tui -- --plain            # plain output (screen readers, CI, redirection)
-dotnet run --project src/Coda.Tui -- --no-mouse         # keyboard-only; leave the mouse to the terminal
-
 # Start in a permission mode, the same modes /permissions offers. These compose with
 # --continue / --resume <id> / --fork [id] in any order.
-dotnet run --project src/Coda.Tui -- --yolo             # bypass: every tool runs without asking
-dotnet run --project src/Coda.Tui -- --yolo-safe        # bypass + classifier: risky actions still escalate
-dotnet run --project src/Coda.Tui -- --permission-mode plan
+coda --yolo                      # bypass: every tool runs without asking
+coda --permission-mode plan
 ```
 
 ### Exact startup system prompts
@@ -254,7 +231,7 @@ supported. `--no-mouse` leaves selection and copy native to the terminal, and ev
 reachable from the keyboard. Full-screen has **no permanent sidebar**
 and uses a **virtualized transcript** (context, pickers, permissions, help, and diffs all use
 keyboard-driven overlays). **Plain mode** is recommended for screen readers, CI, output/input
-redirection, and terminals that Terminal.Gui does not support.
+redirection, and terminals that the full-screen renderer does not support.
 
 The transcript is either **Following** (pinned to the newest row) or **Detached**. Detaching stores a
 stable `(blockId, wrappedRowOffset)` anchor, so reflow and replacement do not create false unseen counts.
@@ -267,16 +244,12 @@ dragging, and is inert when mouse input is disabled. User timestamps use local `
 reserves one cell before the timestamp and one trailing cell before the scrollbar. Resumed messages
 without a timestamp omit the annotation.
 
-> **Compatibility:** the terminal matrix is a *reproducible checklist*, not a claim that every terminal
-> has already passed. See [`docs/terminal-gui-compatibility.md`](docs/terminal-gui-compatibility.md)
-> for the acceptance thresholds and how to run the spike + PTY smoke script to record results.
-
 Inside the REPL:
 
 ```
 /login [claude|copilot|api-key]   sign in (Claude.ai browser / Copilot device code / API key)
 /status                   sign-in state for every provider
-/tasks                    open the live task browser (prints a textual snapshot in plain/Spectre)
+/tasks                    open the live task browser (prints a textual snapshot in plain mode)
 /provider [id]            show the connected account, or connect a different one
 /setup                    the first-run wizard: choose an account and sign in
 /model [id]               show or set the chat model
@@ -294,10 +267,10 @@ Inside the REPL:
 
 ### `/tasks` — the live task browser
 
-In the full-screen and inline Terminal.Gui shells, `/tasks` opens a **focused, full-overlay
+In the full-screen TUI, `/tasks` opens a **focused, full-overlay
 live browser** over the session's in-process `TaskManager`. The bare `/tasks` submission is
 intercepted **before** the dispatch/startup guard, so the browser opens even while an agent
-turn is running. Plain and Spectre modes instead print a **read-only textual snapshot** of the
+turn is running. Plain mode instead prints a **read-only textual snapshot** of the
 same tasks (no interactive actions). Before the first turn there is no session yet, so the
 browser/snapshot shows an empty list.
 
@@ -346,7 +319,7 @@ in serve.
 
 ### Browsers — `/model`, `/mcp`, `/skills`, `/plugin`, `/tasks`, `/schedule`
 
-In the Terminal.Gui shells these open focused, full-overlay browsers. They share one set of
+In the full-screen TUI these open focused, full-overlay browsers. They share one set of
 bindings, one status vocabulary, and one look.
 
 **Status glyphs.** Each row carries a glyph coloured by state, with an ASCII fallback for terminals
@@ -468,7 +441,7 @@ coda help --json                 # full command list as JSON
 > `{ "name", "aliases", "summary", "usage", "description", "options", "examples" }`
 > for a single command.
 
-All product-facing names live in `src/Coda.Tui/Branding.cs` (one place to rename).
+All product-facing names live in `rust/crates/coda-tui/src/branding.rs` (one place to rename).
 
 ### Setup & chatting
 
@@ -497,10 +470,10 @@ Coda connects MCP servers declared in `.mcp.json` and exposes their tools to the
 user entries by name). All three entry points — the interactive TUI, `coda run`, and
 `coda serve` — load the same merged config.
 
-**Manage servers from the TUI with `/mcp`** — no hand-editing or restart required. In Terminal.Gui
+**Manage servers from the TUI with `/mcp`** — no hand-editing or restart required. In the full-screen TUI
 fullscreen and inline shells, the exact bare `/mcp` is intercepted before dispatch (even while a turn
 is busy) and opens the browser without starting a prompt. `/MCP`, `/mcp list`, and `/mcp x` are not
-intercepted. When no MCP browser provider exists, bare `/mcp` remains textual. Plain and Spectre
+intercepted. When no MCP browser provider exists, bare `/mcp` remains textual. Plain mode
 surfaces use the textual list/detail fallback (`/mcp`, `/mcp info <name>`, and the existing add/edit/
 remove/start/stop/restart/enable/disable forms).
 
@@ -682,82 +655,59 @@ and the provider config classes (`ClaudeAiOAuthConfig`, `GitHubCopilotConfig`).
 
 ## Projects
 
-| Project | TFM | Purpose |
+Coda is Rust. The crates live under [`rust/crates`](rust/README.md); the two
+remaining .NET projects exist to *drive* or *ship* that Rust binary, not to
+reimplement it.
+
+| Project | Language | Purpose |
 |---|---|---|
-| `src/LlmAuth` | `net10.0` | Core: abstractions, PKCE, OAuth engine, loopback listener, identity, `CredentialManager`. |
-| `src/LlmAuth.Providers.ClaudeAi` | `net10.0` | Claude.ai OAuth provider + config + API-key provider. |
-| `src/LlmAuth.Providers.GitHubCopilot` | `net10.0` | GitHub Copilot device-flow provider. |
-| `src/LlmAuth.Storage.Windows` | `net10.0` | DPAPI-encrypted token store (DPAPI is Windows-only at runtime). |
-| `src/LlmClient` | `net10.0` | Anthropic Messages streaming client + client fingerprint. |
-| `src/Coda.Agent` | `net10.0` | Agent loop + tools (read/list/glob/grep/edit/write/run + task/subagents). |
-| `src/Coda.Mcp` | `net10.0` | MCP stdio client (JSON-RPC) + tool bridge. |
-| `src/Coda.Tui` | `net10.0` | The **Coda** interactive TUI (Terminal.Gui v2; Spectre.Console/plain fallbacks). Requires Windows at runtime (DPAPI). |
-| `samples/LlmAuth.Sample` | `net10.0-windows` | Console demo. |
-| `tests/LlmAuth.Tests` | `net10.0` | xUnit unit tests (auth). |
-| `tests/Coda.Tui.Tests` | `net10.0` | xUnit unit tests (TUI). |
-| `tests/Engine.Tests` | `net10.0` | xUnit unit tests (SSE parser, agent loop, tools). |
+| `rust/crates/coda` | Rust | The `coda` binary: interactive TUI, `coda serve`, `coda run`. |
+| `rust/crates/coda-engine` | Rust | Standalone, TUI-free engine binary. |
+| `rust/crates/coda-agent` | Rust | Agent loop, tools, permissions, scheduling, subagents. |
+| `rust/crates/coda-tui` | Rust | The interactive terminal front-end (ratatui). |
+| `rust/crates/coda-auth` | Rust | Providers, OAuth/device flow, credential stores. |
+| `rust/crates/coda-llm` | Rust | Anthropic and Copilot streaming clients. |
+| `src/Coda.Client` | `net10.0` | .NET SDK that drives `coda serve` out-of-process over JSON-RPC. |
+| `src/Coda.Launcher` | `net10.0` | Thin shim that packs the native Rust binary as the `Coda.Cli` global tool. |
+| `tests/Coda.Client.Tests` | `net10.0` | xUnit tests for the .NET client SDK. |
 
-## Usage
+See [`rust/README.md`](rust/README.md) for the full crate list and the dependency
+rules between them.
 
-High layer (batteries-included loopback login):
+## Embedding Coda from .NET
 
-```csharp
-using LlmAuth;
-using LlmAuth.Providers.ClaudeAi;
-using LlmAuth.Storage.Windows;
-
-using var claude = new ClaudeAiProvider();
-var manager = new CredentialManager(new DpapiTokenStore(), [claude, new ApiKeyProvider()]);
-
-// Opens the system browser + a localhost loopback listener, captures the redirect:
-Credential cred = await manager.LoginAsync(ClaudeAiProvider.Id);
-
-// Everyday use — refreshes automatically when near expiry:
-AuthHeaders headers = await manager.GetAuthHeadersAsync(ClaudeAiProvider.Id);
-```
-
-Low layer (host-driven; headless / manual paste):
+`Coda.Client` launches and owns a `coda serve` child process and drives it over
+the JSON-RPC protocol, so a .NET host gets the agent without hosting one:
 
 ```csharp
-ILoginFlow flow = claude.BeginLogin(new LoginOptions { RedirectMode = RedirectMode.Manual });
-Console.WriteLine(flow.AuthorizeUrl);            // host opens this however it likes
-// …host captures the redirect and reads ?code & ?state…
-Credential cred = await flow.CompleteAsync(code, state);
-```
+using Coda.Client;
 
-Custom browser hook (the "calls back to the host" model):
+await using var client = await CodaClient.StartAsync(
+    EngineCommand.Default.WithWorkingDirectory(repoRoot));
 
-```csharp
-await manager.LoginAsync(ClaudeAiProvider.Id, new LoginOptions
+await using var session = await client.CreateSessionAsync();
+await foreach (var evt in session.PromptAsync("Add a retry policy to the HTTP client."))
 {
-    OpenBrowser = (url, ct) => { /* show the URL / open an embedded view */ return Task.CompletedTask; }
-});
+    Console.WriteLine(evt);
+}
 ```
+
+The wire protocol it speaks is specified in
+[`docs/serve-protocol.md`](docs/serve-protocol.md); any language that can spawn a
+process and read stdio can do the same thing.
 
 ## GitHub Copilot (device flow)
 
-Copilot uses the OAuth **Device Authorization Grant** — the library calls back to
-your host with a code to enter at github.com:
+Copilot signs in with the OAuth **Device Authorization Grant**: `coda` prints a
+code, you enter it at github.com, and the short-lived Copilot token is refreshed
+automatically from the stored GitHub token.
 
-```csharp
-using var copilot = new GitHubCopilotProvider();
-var manager = new CredentialManager(new DpapiTokenStore(), [copilot]);
-
-Credential cred = await manager.LoginWithDeviceCodeAsync(
-    GitHubCopilotProvider.Id,
-    (prompt, ct) =>
-    {
-        Console.WriteLine($"Open {prompt.VerificationUri} and enter {prompt.UserCode}");
-        return Task.CompletedTask;
-    });
-
-// Bearer Copilot token + Editor-Version / Copilot-Integration-Id headers; the
-// short-lived Copilot token auto-refreshes from the stored GitHub token.
-AuthHeaders headers = await manager.GetAuthHeadersAsync(GitHubCopilotProvider.Id);
+```powershell
+coda auth login --provider github-copilot
 ```
 
-> Copilot endpoints/headers are configurable (`GitHubCopilotConfig` / `GH_COPILOT_*`
-> env vars). Using the Copilot API outside official editor integrations is subject to
+> Copilot endpoints and headers are configurable through `GH_COPILOT_*` environment
+> variables. Using the Copilot API outside official editor integrations is subject to
 > GitHub's Terms of Service.
 
 ### GitHub Enterprise (data residency)
@@ -796,7 +746,7 @@ into every assembly:
 ./build.ps1 -NoBump         # build without bumping
 ```
 
-Plain `dotnet build LlmAuth.slnx` / `dotnet test tests/LlmAuth.Tests` still work
+Plain `dotnet build Coda.slnx` / `dotnet test Coda.slnx` still work
 (they use the last-stamped version and do **not** bump).
 
 ### Publishing
@@ -1319,7 +1269,7 @@ exceeds `maxFileSizeMb` it rolls to `coda-….<n>.log`. At startup, runs beyond
 Each line is a JSON object:
 
 ```json
-{"ts":"2026-06-04T12:00:00.0000000+00:00","level":"Information","category":"LlmClient","message":"..."}
+{"ts":"2026-06-04T12:00:00.0000000+00:00","level":"Information","category":"coda_llm","message":"..."}
 ```
 
 Fields: `ts` (round-trip UTC), `level`, `category`, `message`. When an exception is
@@ -1343,21 +1293,6 @@ are never logged. Full request/response bodies appear only at `trace`.
 > Even with telemetry **off**, a failed model request now surfaces the API's real
 > reason (e.g. `Model request failed: … (HTTP 400): The requested model is not
 > supported.`) instead of a bare HTTP status code.
-
-## Try the sample
-
-```bash
-# Claude.ai
-dotnet run --project samples/LlmAuth.Sample -- authurl   # print the exact authorize URL (no network)
-dotnet run --project samples/LlmAuth.Sample -- login     # interactive Claude.ai sign-in (opens browser)
-dotnet run --project samples/LlmAuth.Sample -- headers    # show the auth + identity headers
-dotnet run --project samples/LlmAuth.Sample -- logout
-
-# GitHub Copilot (device flow)
-dotnet run --project samples/LlmAuth.Sample -- copilot-login    # prints a code to enter at github.com/login/device
-dotnet run --project samples/LlmAuth.Sample -- copilot-headers   # show the Copilot bearer + editor headers
-dotnet run --project samples/LlmAuth.Sample -- copilot-logout
-```
 
 ## Notes & caveats
 

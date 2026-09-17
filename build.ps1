@@ -1,11 +1,13 @@
 <#
 .SYNOPSIS
-  Build entry point. Defaults to the Rust/ratatui implementation.
-  Pass -Legacy to build the C# / .NET solution instead.
+  Build entry point. Defaults to the Rust implementation, which is the engine
+  and the shipped `coda` binary.
 
-  Bumps the build number in version.json (semantic version) and — for legacy
-  builds — regenerates version.props (imported by Directory.Build.props so every
-  assembly is stamped). Optionally runs tests.
+  Pass -Dotnet to build the remaining .NET surface instead: Coda.Client (the
+  out-of-process SDK for the serve protocol) and Coda.Launcher (which packs the
+  Rust binary as the Coda.Cli global tool). Bumps the build number in
+  version.json and regenerates version.props, which Directory.Build.props
+  imports so every assembly is stamped.
 
 .EXAMPLE
   ./build.ps1                       # bump build number, Rust Release build (default)
@@ -13,9 +15,8 @@
   ./build.ps1 -Test                 # Rust build then run Rust tests
   ./build.ps1 -Configuration Debug  # Rust Debug build (still bumps)
   ./build.ps1 -Deploy               # Rust build, then install shim via dotnet tool update
-  ./build.ps1 -Legacy               # C# / .NET solution build (legacy)
-  ./build.ps1 -Legacy -NoBump       # C# build without incrementing
-  ./build.ps1 -Legacy -Test         # C# build then run .NET tests
+  ./build.ps1 -Dotnet               # build the .NET solution (Coda.Client, Coda.Launcher)
+  ./build.ps1 -Dotnet -Test         # build the .NET solution then run its tests
 #>
 [CmdletBinding()]
 param(
@@ -23,20 +24,20 @@ param(
     [switch]$Test,
     [switch]$NoBump,
     [switch]$Deploy,
-    # Build the legacy C# / .NET solution instead of the default Rust implementation.
-    [switch]$Legacy
+    # Build the .NET solution (client SDK + tool launcher) instead of Rust.
+    [switch]$Dotnet
 )
 
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 
-if ($Legacy) {
+if ($Dotnet) {
     if ($Deploy) {
-        throw "-Deploy is supported only for Rust Coda. Use publish.ps1 -Legacy for the C# package."
+        throw "-Deploy builds and installs the Rust binary. Use ./publish.ps1 to pack the Coda.Cli tool."
     }
     # -------------------------------------------------------------------------
-    # Legacy path: C# / .NET solution build. Retained for reference; the Rust
-    # binary is the primary distribution.
+    # .NET path: the client SDK and the tool launcher. The agent itself is Rust;
+    # nothing here implements one.
     # -------------------------------------------------------------------------
     $versionFile = Join-Path $root 'version.json'
     $version = Get-Content $versionFile -Raw | ConvertFrom-Json
@@ -49,7 +50,7 @@ if ($Legacy) {
 
     $semVer = "{0}.{1}.{2}" -f [int]$version.major, [int]$version.minor, [int]$version.build
     $asmVer = "$semVer.0"
-    Write-Host "Version: $semVer (Legacy C# build, configuration: $Configuration)" -ForegroundColor Cyan
+    Write-Host "Version: $semVer (.NET build, configuration: $Configuration)" -ForegroundColor Cyan
 
     $propsPath = Join-Path $root 'version.props'
     @"
@@ -64,19 +65,19 @@ if ($Legacy) {
 </Project>
 "@ | Set-Content $propsPath -Encoding utf8
 
-    dotnet build (Join-Path $root 'LlmAuth.slnx') -c $Configuration /p:Version=$semVer /p:AssemblyVersion=$asmVer /p:FileVersion=$asmVer
+    dotnet build (Join-Path $root 'Coda.slnx') -c $Configuration /p:Version=$semVer /p:AssemblyVersion=$asmVer /p:FileVersion=$asmVer
     if ($LASTEXITCODE -ne 0) { throw "Build failed." }
 
     if ($Test) {
-        dotnet test (Join-Path $root 'LlmAuth.slnx') -c $Configuration --no-build
+        dotnet test (Join-Path $root 'Coda.slnx') -c $Configuration --no-build
         if ($LASTEXITCODE -ne 0) { throw "Tests failed." }
     }
 
-    Write-Host "Build succeeded (legacy C#): $semVer" -ForegroundColor Green
+    Write-Host "Build succeeded (.NET): $semVer" -ForegroundColor Green
 }
 else {
     # -------------------------------------------------------------------------
-    # Default path: Rust / ratatui build. Delegates to rust/build.ps1.
+    # Default path: Rust build. Delegates to rust/build.ps1.
     # -------------------------------------------------------------------------
     $rustBuild = Join-Path $root 'rust\build.ps1'
     $passthru = @{}

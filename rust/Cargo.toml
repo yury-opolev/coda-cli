@@ -12,7 +12,6 @@ members = [
     "crates/coda-auth",
     "crates/coda-serve",
     "crates/coda",
-    "crates/coda-diff",
     "crates/coda-diagnostics",
     "crates/coda-boot",
     "crates/coda-engine",
