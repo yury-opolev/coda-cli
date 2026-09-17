@@ -378,11 +378,14 @@ fn render_user(text: &str, timestamp: &str, pending: bool, width: usize) -> Vec<
     let role = if pending { Role::PendingUser } else { Role::User };
     let content = width.saturating_sub(MARKER_CELLS).max(1);
 
-    // The timestamp is reserved out of the first row only, with a one-cell gap.
+    // The timestamp is reserved out of the first row only, with a one-cell gap
+    // before it and the draw layer's own margin after it, so the text can never
+    // run into the timestamp and the timestamp can never run into the
+    // scrollbar.
     let stamp_width = if timestamp.is_empty() {
         0
     } else {
-        text::width(timestamp) + 1
+        text::width(timestamp) + 1 + crate::render::draw::RIGHT_TEXT_MARGIN
     };
     let first_budget = content.saturating_sub(stamp_width).max(1);
 

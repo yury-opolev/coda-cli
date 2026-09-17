@@ -1495,6 +1495,7 @@ impl App {
             session_effort: None,
             engine_log_path: initialized.telemetry_log_path.clone(),
             header_id_rect: None,
+            scrollbar: Default::default(),
             header_id_selected: false,
             owned_engine: None,
             engine_connected: true,

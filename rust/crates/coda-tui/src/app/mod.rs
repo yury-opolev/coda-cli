@@ -259,6 +259,8 @@ pub struct App {
     engine_log_path: Option<String>,
     /// Where the header's session id is drawn; shared by drawing and hit-testing.
     header_id_rect: Option<ratatui::layout::Rect>,
+    /// The scrollbar's drawn geometry and any thumb drag over it.
+    scrollbar: clipboard::ScrollbarPointer,
     /// Whether the header's session id is selected (all-or-nothing).
     header_id_selected: bool,
     /// The engine process this application owns — the one it was handed at
@@ -1164,6 +1166,7 @@ impl App {
         self.composer_text_width = composer_text_width;
         // Same rect drawing will use, so a click can never target stale layout.
         self.header_id_rect = regions.header.and_then(|h| draw::header_id_rect(h, &self.state));
+        self.scrollbar.area = regions.scrollbar;
 
         if width != self.laid_out_width {
             let was_following = self.viewport.is_following();
