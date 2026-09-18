@@ -37,6 +37,14 @@ pub enum Phase {
     Thinking,
     /// One or more tool calls are in flight.
     RunningTools,
+    /// The request is with the provider and nothing has come back yet.
+    ///
+    /// Distinct from [`Phase::Working`] because the difference is the whole
+    /// diagnosis when a turn appears stuck: a six-minute wait for response
+    /// headers is the provider being slow, and showing it as `Working` — or
+    /// worse, leaving a stale `Running tools` up — sends the reader looking
+    /// for a hung tool that does not exist.
+    WaitingForModel,
     /// Blocked on the user answering a permission or question prompt.
     AwaitingApproval,
     /// Assistant text is streaming.
@@ -50,6 +58,7 @@ impl Phase {
             Phase::Working => "Working",
             Phase::Thinking => "Thinking",
             Phase::RunningTools => "Running tools",
+            Phase::WaitingForModel => "Waiting for model",
             Phase::AwaitingApproval => "Waiting for you",
             Phase::Responding => "Responding",
         }
@@ -225,6 +234,19 @@ impl TurnProgress {
             return;
         }
         self.phase = Phase::Working;
+    }
+
+    /// The engine is waiting on the provider.
+    ///
+    /// Ends any open reasoning segment for the same reason a tool call does:
+    /// waiting for a response is not reasoning, and leaving the segment open
+    /// would bill the wait as thinking time.
+    pub fn on_waiting_for_model(&mut self, now: Instant) {
+        if self.is_finished() {
+            return;
+        }
+        self.commit_reasoning(now);
+        self.phase = Phase::WaitingForModel;
     }
 
     /// A real `Usage` event arrived, naming the last response's tokens.

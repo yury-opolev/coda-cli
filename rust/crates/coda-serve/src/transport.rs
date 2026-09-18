@@ -326,8 +326,31 @@ fn dispatch_frame(
             let id = resp.id.clone();
             prompt_channel.route_response(&id, resp.into_result());
         }
-        Message::Notification(_) => {
-            // Clients don't send notifications in normal operation; ignore.
+        Message::Notification(note) => {
+            // Clients do not send notifications in normal operation, with one
+            // exception that must not be dropped: a front-end built before
+            // `session/interrupt` became a request still sends it this way,
+            // and silently ignoring it makes the user's stop control do
+            // nothing at all while the UI says "interrupting…".
+            //
+            // Deliberately *not* a general notification dispatcher. Only this
+            // method is honoured, because only this one has a deployed client
+            // that sends it and an effect worth having without a reply.
+            // Routing arbitrary notifications into `dispatch` would give
+            // every method an unacknowledged, unauthenticated second entry
+            // point that no caller can observe the failure of.
+            if note.method == coda_proto::messages::method::INTERRUPT {
+                let backend = Arc::clone(backend);
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        dispatch(&note.method, note.params, backend.as_ref()).await
+                    {
+                        // Nowhere to send a response, so the failure would
+                        // otherwise be invisible on both sides of the wire.
+                        tracing::warn!(code = e.code, "interrupt notification failed");
+                    }
+                });
+            }
         }
     }
 }
@@ -588,7 +611,7 @@ mod tests {
         assert_eq!(msg["result"]["ok"], true);
     }
 
-    // ── Notification from client is silently ignored ──────────────────────────
+    // ── Notification from client is ignored, except the interrupt ────────────
 
     #[tokio::test]
     async fn client_notification_is_ignored() {
@@ -610,6 +633,63 @@ mod tests {
 
         let msg = client.next().await;
         assert_eq!(msg["id"], 3);
+    }
+
+    /// BUG 7, defect 1: the TUI sent `session/interrupt` as a notification and
+    /// this transport dropped every notification, so the stop control did
+    /// nothing while the UI said `interrupting…` indefinitely.
+    ///
+    /// The front-end now sends a request. This pins the *request* path through
+    /// the real dispatcher — testing `session_interrupt()` directly would not
+    /// have caught the defect, because the handler was always correct and
+    /// simply never reached.
+    #[tokio::test]
+    async fn an_interrupt_request_reaches_the_dispatcher_and_is_answered() {
+        let (server_end, client_end) = duplex(64 * 1024);
+        let (server_read, server_write) = split(server_end);
+        let (client_read, mut client_write) = split(client_end);
+        let mut client = TestReader::new(client_read);
+
+        tokio::spawn(serve(server_read, server_write));
+
+        let req = make_request(7, coda_proto::messages::method::INTERRUPT, Some(json!({})));
+        client_write.write_all(&req).await.unwrap();
+
+        let msg = client.next().await;
+        assert_eq!(msg["id"], 7, "the interrupt must be answered, not dropped");
+        assert!(
+            msg.get("error").is_none(),
+            "the dispatcher must route session/interrupt: {msg}",
+        );
+    }
+
+    /// Compatibility only: a front-end built before the interrupt became a
+    /// request still sends it as a notification, and must still stop the turn.
+    ///
+    /// Deliberately narrow — every *other* notification stays ignored, which
+    /// `client_notification_is_ignored` pins. A general notification
+    /// dispatcher would give every method an unacknowledged second entry point.
+    #[tokio::test]
+    async fn an_interrupt_notification_is_still_honoured_for_older_front_ends() {
+        let (server_end, client_end) = duplex(64 * 1024);
+        let (server_read, server_write) = split(server_end);
+        let (client_read, mut client_write) = split(client_end);
+        let mut client = TestReader::new(client_read);
+
+        tokio::spawn(serve(server_read, server_write));
+
+        let notif =
+            Notification::new(coda_proto::messages::method::INTERRUPT, Some(json!({})));
+        let frame = encode_frame(&serde_json::to_vec(&notif).unwrap());
+        client_write.write_all(&frame).await.unwrap();
+
+        // A notification gets no reply by definition, so the assertion is that
+        // the connection stayed healthy and ordered: the following request is
+        // still answered.
+        let req = make_request(8, "shutdown", None);
+        client_write.write_all(&req).await.unwrap();
+        let msg = client.next().await;
+        assert_eq!(msg["id"], 8, "the interrupt notification must not wedge the loop");
     }
 
     // ── Stdin EOF fails every outstanding reverse request closed ──────────
