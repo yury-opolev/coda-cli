@@ -9,7 +9,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::Utc;
 use coda_agent::{
-    AgentError, AgentLoopBuilder, CompactionService, GoalBudget, GoalOutcome, GoalStatus,
+    AgentError, AgentLoopBuilder, CompactionPolicy, CompactionService, GoalBudget, GoalOutcome,
+    GoalStatus,
     AutonomySupervisor, HookContentHash, HookRunner, HookScope, HookTrustGuard, HookTrustStore,
     InMemoryHookTrustStore, NullScheduleLifecycleSink, ScheduleRuntime, SubagentFactory,
     TaskManagerRunner, TodoStore, TokenEstimator, ToolQuarantine, ToolRegistry, UserHook,
@@ -1516,6 +1517,19 @@ impl ServeHost {
         };
         drop(guard);
         capture
+    }
+
+    /// The active model's context window, from the bundled catalogue.
+    ///
+    /// Offline and cheap, so it is safe on the turn path. Used to size the
+    /// auto-compaction threshold: a fixed number cannot suit both a 200k model
+    /// and a 1.1M one.
+    fn active_context_window(&self) -> Option<usize> {
+        let captured = self.capture_runtime().config;
+        crate::catalog::ModelCatalog::load()
+            .find(captured.provider_id.as_deref(), &captured.model)
+            .and_then(|m| m.context_limit)
+            .and_then(|n| usize::try_from(n).ok())
     }
 
     /// Resolves the active model's context window from the bundled catalogue.
@@ -4802,7 +4816,22 @@ impl ServeHost {
         .with_message_bus(Arc::clone(&self.message_bus))
         .with_outage_policy(Arc::clone(&self.outage_policy))
         .with_main_context()
-        .with_hook_runner(Arc::clone(&services.hook_runner));
+        .with_hook_runner(Arc::clone(&services.hook_runner))
+        // Auto-compaction. Without these two the service is `None` for the
+        // whole life of the process, so *no* compaction ever fired — not
+        // proactively, and not on the overflow-retry path either. History grew
+        // until the provider refused the request.
+        //
+        // The summariser is the same `LlmForkedAgent` the manual `/compact`
+        // route builds, so an automatic compaction and a requested one produce
+        // the same thing by construction rather than by two implementations
+        // agreeing.
+        .with_compaction_service(Arc::new(CompactionService::new(Arc::new(
+            LlmForkedAgent { client: Arc::clone(&client), model: captured.config.model.clone() },
+        ) as Arc<dyn ForkedAgent>)))
+        .with_compaction_policy(CompactionPolicy::for_context_window(
+            self.active_context_window(),
+        ));
 
         // Apply the session-only system prompt override the captured record
         // carries. The text is cloned here, outside CONFIG, and only because

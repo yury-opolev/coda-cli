@@ -164,6 +164,18 @@ impl CompactionService {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// When to trigger proactive compaction.
+///
+/// Floor for the auto-compaction threshold, so a tiny or unknown window still
+/// leaves room to work rather than compacting after every exchange.
+pub const MIN_AUTO_COMPACT_THRESHOLD: usize = 8_000;
+
+/// Context window assumed when the model's real one is unknown.
+pub const DEFAULT_CONTEXT_WINDOW: usize = 200_000;
+
+/// Output headroom reserved when the model's real output ceiling is unknown.
+pub const FALLBACK_MAX_OUTPUT_TOKENS: usize = 8_192;
+
+/// When to trigger proactive compaction.
 #[derive(Debug, Clone, Copy)]
 pub struct CompactionPolicy {
     /// Estimated token count above which compaction fires. Default: 50_000.
@@ -183,6 +195,42 @@ impl CompactionPolicy {
     /// Returns `true` when the history has grown past the threshold.
     pub fn should_compact(&self, history: &[Message]) -> bool {
         TokenEstimator::estimate(history) >= self.token_threshold
+    }
+
+    /// Derives the threshold from the active model's context window.
+    ///
+    /// A fixed threshold cannot be right for every model: 50k is reasonable
+    /// against a 200k window and absurd against a 1.1M one, where it would
+    /// summarise a conversation using four per cent of the space available.
+    /// The usable input budget is the window minus the room the reply needs,
+    /// which is what this computes — so the threshold scales with the model
+    /// instead of being a number that happens to suit one of them.
+    ///
+    /// `configured` is an explicit override: any positive value wins, which is
+    /// how a user pins a threshold regardless of the model. `context_window`
+    /// of `None` means the window is genuinely unknown, and falls back to the
+    /// conservative default rather than assuming a large one.
+    ///
+    /// Mirrors C# `ModelLimits.ResolveAutoCompactThreshold`.
+    pub fn resolve_threshold(
+        configured: usize,
+        context_window: Option<usize>,
+        output_reserve: Option<usize>,
+    ) -> usize {
+        if configured > 0 {
+            return configured;
+        }
+        let window = context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW);
+        let reserve = output_reserve.unwrap_or(FALLBACK_MAX_OUTPUT_TOKENS);
+        window.saturating_sub(reserve).max(MIN_AUTO_COMPACT_THRESHOLD)
+    }
+
+    /// A policy whose threshold is derived from the model's context window.
+    pub fn for_context_window(context_window: Option<usize>) -> Self {
+        Self {
+            token_threshold: Self::resolve_threshold(0, context_window, None),
+            ..Self::default()
+        }
     }
 }
 

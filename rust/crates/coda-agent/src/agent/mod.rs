@@ -283,35 +283,42 @@ impl AgentLoop {
                 break;
             }
 
-            // 3. Proactive compaction (goal runs only, C# §AutoCompact).
-            // Fires when: a goal is active, compaction is configured, threshold > 0,
-            // and the estimated token count exceeds the threshold (with suppression
-            // to prevent re-firing until history grows by a full additional threshold).
-            if goal.is_some() {
-                if let Some(svc) = &self.compaction_service {
-                    let threshold = self.compaction_policy.token_threshold;
-                    if threshold > 0 {
-                        let current = TokenEstimator::estimate(history);
-                        let suppressed = blocked_compaction_at
-                            .map(|b| current <= b + threshold)
-                            .unwrap_or(false);
-                        if !suppressed && current > threshold {
-                            match compact_history(
-                                svc,
-                                self.hook_runner.as_deref(),
-                                history,
-                                sink,
-                                "auto",
-                                cancel.clone(),
-                            )
-                            .await
-                            {
-                                Ok(true) => {} // compacted; blocked_compaction_at stays None
-                                Ok(false) => {
-                                    blocked_compaction_at = Some(current);
-                                }
-                                Err(_) => {} // swallow; compaction is best-effort
+            // 3. Proactive compaction (C# §AutoCompact).
+            //
+            // Runs on every iteration of every turn, not only inside a goal
+            // run. It used to be gated on `goal.is_some()`, which meant an
+            // ordinary interactive session never compacted at all: history
+            // grew until the provider rejected the request, and only then did
+            // the overflow-retry path below rescue it. The C# engine ran this
+            // check pre-turn unconditionally, and this restores that.
+            //
+            // Fires when: compaction is configured, the threshold is positive,
+            // and the estimated token count exceeds it — with suppression so a
+            // summariser that declined to shrink anything is not asked again
+            // until history has grown by a further full threshold.
+            if let Some(svc) = &self.compaction_service {
+                let threshold = self.compaction_policy.token_threshold;
+                if threshold > 0 && !history.is_empty() {
+                    let current = TokenEstimator::estimate(history);
+                    let suppressed = blocked_compaction_at
+                        .map(|b| current <= b + threshold)
+                        .unwrap_or(false);
+                    if !suppressed && current > threshold {
+                        match compact_history(
+                            svc,
+                            self.hook_runner.as_deref(),
+                            history,
+                            sink,
+                            "auto",
+                            cancel.clone(),
+                        )
+                        .await
+                        {
+                            Ok(true) => {} // compacted; blocked_compaction_at stays None
+                            Ok(false) => {
+                                blocked_compaction_at = Some(current);
                             }
+                            Err(_) => {} // swallow; compaction is best-effort
                         }
                     }
                 }
@@ -2883,6 +2890,84 @@ mod tests {
         // The summary message contains our mock summary text.
         let has_summary = history.iter().any(|m| m.text().contains("summary text"));
         assert!(has_summary, "history must contain the compaction summary after proactive compaction");
+    }
+
+    /// The bug this replaced: proactive compaction was gated on
+    /// `goal.is_some()`, so an ordinary interactive session never compacted at
+    /// all. History grew until the provider refused the request, and only the
+    /// overflow-retry path rescued it — after a failed round trip.
+    ///
+    /// The C# engine ran this check pre-turn unconditionally; so does this.
+    #[tokio::test]
+    async fn compaction_fires_in_an_ordinary_turn_with_no_goal() {
+        use crate::compaction::CompactionService;
+
+        let svc = Arc::new(CompactionService::new(Arc::new(MockFork("summary text".into()))));
+        let policy = crate::compaction::CompactionPolicy { token_threshold: 1, ..Default::default() };
+
+        let client = MockLlmClient::new(vec![vec![
+            Ok(StreamEvent::TextDelta("ok".into())),
+            Ok(done()),
+        ]]);
+        let tools = Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
+        let sink = NullSink;
+
+        let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
+            .with_compaction_service(svc)
+            .with_compaction_policy(policy)
+            .with_tool_max_duration(None)
+            .build();
+
+        let mut history = vec![
+            Message::user("prompt"),
+            Message::assistant("previous response that is long enough to trigger compaction"),
+        ];
+
+        // No goal — this is the ordinary interactive path.
+        agent.run(&mut history, &sink, None, CancellationToken::new()).await.unwrap();
+
+        assert!(
+            history.iter().any(|m| m.text().contains("summary text")),
+            "an ordinary turn must compact once it is over the threshold: {history:?}",
+        );
+    }
+
+    /// A fixed threshold cannot suit every model: 50k against a 1.1M window
+    /// would summarise a conversation using four per cent of the space it has.
+    #[test]
+    fn the_threshold_scales_with_the_model_context_window() {
+        use crate::compaction::{
+            CompactionPolicy, DEFAULT_CONTEXT_WINDOW, FALLBACK_MAX_OUTPUT_TOKENS,
+            MIN_AUTO_COMPACT_THRESHOLD,
+        };
+
+        // Window minus the room the reply needs.
+        assert_eq!(
+            CompactionPolicy::resolve_threshold(0, Some(1_000_000), Some(128_000)),
+            872_000,
+        );
+        assert_eq!(
+            CompactionPolicy::for_context_window(Some(200_000)).token_threshold,
+            200_000 - FALLBACK_MAX_OUTPUT_TOKENS,
+        );
+
+        // An explicit value wins outright: that is how a threshold is pinned
+        // regardless of which model is active.
+        assert_eq!(CompactionPolicy::resolve_threshold(50_000, Some(1_000_000), None), 50_000);
+
+        // Unknown window falls back conservatively rather than assuming a big
+        // one, which would let history grow past a small model's real limit.
+        assert_eq!(
+            CompactionPolicy::for_context_window(None).token_threshold,
+            DEFAULT_CONTEXT_WINDOW - FALLBACK_MAX_OUTPUT_TOKENS,
+        );
+
+        // A window smaller than the reserve must not produce a zero (which
+        // reads as "disabled") or an underflow.
+        assert_eq!(
+            CompactionPolicy::resolve_threshold(0, Some(4_000), Some(8_192)),
+            MIN_AUTO_COMPACT_THRESHOLD,
+        );
     }
 
     /// When threshold is 0, compaction is disabled.
