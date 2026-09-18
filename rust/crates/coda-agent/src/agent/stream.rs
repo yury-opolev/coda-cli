@@ -389,11 +389,50 @@ pub(crate) async fn stream_with_retries(
         let model_request_id = uuid::Uuid::new_v4().to_string();
         sink.emit(AgentEvent::ModelRequestStarted { request_id: model_request_id.clone() });
 
-        let stream_result = match &attempt_ctx {
-            Some(ctx) => coda_diagnostics::scope(ctx.clone(), client.stream(request.clone())).await,
-            None => client.stream(request.clone()).await,
+        // Race cancellation against stream *creation*, not only against
+        // consumption. `client.stream()` performs credential acquisition, the
+        // HTTP connection, the wait for response headers and the whole
+        // internal retry policy before it returns anything — and none of that
+        // was cancellable. A six-minute wait for headers sat entirely inside
+        // this call, so a correctly delivered interrupt was ignored until the
+        // provider finally answered.
+        //
+        // `biased` so cancellation wins a tie: if the token is already set
+        // when the response lands, the user asked to stop before it arrived,
+        // and starting to consume the stream would be acting on a request that
+        // was withdrawn. Dropping the creation future is what actually stops
+        // the work — the transport sees its future dropped and aborts the
+        // in-flight request.
+        let create = async {
+            match &attempt_ctx {
+                Some(ctx) => coda_diagnostics::scope(ctx.clone(), client.stream(request.clone())).await,
+                None => client.stream(request.clone()).await,
+            }
+        };
+        let stream_result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(LlmError::Cancelled),
+            result = create => result,
         };
         let stream = match stream_result {
+            // Cancellation is not a provider failure. Recording it as one
+            // would make a deliberate stop look like an outage in the
+            // diagnostics and — worse — feed it to the retry arms below, which
+            // would immediately open another request for a turn the user has
+            // just cancelled.
+            Err(LlmError::Cancelled) => {
+                record_model_request_end(
+                    attempt_ctx.as_ref(),
+                    outer_attempt,
+                    attempt_started,
+                    "cancelled",
+                );
+                sink.emit(AgentEvent::ModelRequestEnded {
+                    request_id: model_request_id,
+                    outcome: "cancelled".into(),
+                });
+                return Err(LlmError::Cancelled);
+            }
             Ok(stream) => stream,
             Err(err) => {
                 // Bypasses the retry arms below by design: `client.stream()`
@@ -1088,6 +1127,89 @@ mod tests {
     // 2 and 3.  Without the guard, a context-overflow error that arrives after
     // the model already emitted partial text would clear the accumulator and
     // retry, duplicating the emitted text.  With the guard the error surfaces.
+
+    /// BUG 7, defect 2: a turn could not be interrupted while the provider was
+    /// still deciding whether to answer.
+    ///
+    /// `client.stream()` performs credential acquisition, the connection, the
+    /// wait for response headers and the entire internal retry policy before
+    /// it returns. That whole region used to sit outside the cancellation
+    /// race — only stream *consumption* was cancellable — so a six-minute wait
+    /// for headers ignored the user's stop completely.
+    ///
+    /// The fake here never resolves, which is the point: if creation is not
+    /// raced against the token this test hangs rather than fails.
+    #[tokio::test]
+    async fn cancellation_interrupts_a_provider_that_has_not_answered_yet() {
+        use async_trait::async_trait;
+        use crate::events::NullSink;
+        use crate::tool::ToolQuarantine;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// Reports that it was entered, then never answers — a provider
+        /// holding the connection open without sending headers.
+        struct NeverAnswers {
+            entered: Arc<AtomicBool>,
+        }
+        #[async_trait]
+        impl coda_llm::LlmClient for NeverAnswers {
+            fn provider_id(&self) -> &str { "mock" }
+            async fn stream(
+                &self,
+                _: coda_llm::ChatRequest,
+            ) -> Result<coda_llm::ResponseStream, coda_llm::LlmError> {
+                self.entered.store(true, Ordering::SeqCst);
+                std::future::pending().await
+            }
+        }
+
+        let entered = Arc::new(AtomicBool::new(false));
+        let client = NeverAnswers { entered: Arc::clone(&entered) };
+        let quarantine = ToolQuarantine::new();
+        let mut request = coda_llm::ChatRequest::new("model".to_owned(), vec![]);
+        let retry_cfg = RetryConfig::default();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut blocked = None;
+
+        // Cancel once the request is demonstrably in flight — a synchronisation
+        // signal rather than a sleep, so the test proves cancellation reached a
+        // *waiting* operation and does not merely win a race with startup.
+        let canceller = {
+            let cancel = cancel.clone();
+            let entered = Arc::clone(&entered);
+            tokio::spawn(async move {
+                while !entered.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+                cancel.cancel();
+            })
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            stream_with_retries(
+                &client,
+                &mut request,
+                &quarantine,
+                &NullSink,
+                cancel,
+                &retry_cfg,
+                Some(&|| false),
+                &mut blocked,
+            ),
+        )
+        .await
+        .expect("cancellation must not wait for the provider to answer");
+
+        canceller.await.expect("canceller");
+
+        assert!(
+            matches!(result, Err(LlmError::Cancelled)),
+            "a cancelled request must be reported as cancelled, not as a provider failure \
+             (which the retry arms would then act on by opening another request)",
+        );
+    }
 
     #[tokio::test]
     async fn overflow_arm_does_not_replay_after_partial_emission() {

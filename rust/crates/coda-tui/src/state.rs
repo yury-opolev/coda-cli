@@ -1920,7 +1920,17 @@ impl UiState {
                 progress.on_awaiting_approval(now);
                 self.activity = Activity::Waiting;
             }
-            P::Preparing | P::WaitingForModel | P::Compacting | P::Maintenance => {
+            // The engine is waiting on the provider. Reported unconditionally:
+            // guarding this on the coarse activity meant a `RunningTools ->
+            // WaitingForModel` transition never reset the phase — both map to
+            // `Activity::Working`, so the guard was always false exactly when
+            // it mattered — and a long provider wait kept showing "Running
+            // tools", which reads as a hung tool.
+            P::WaitingForModel => {
+                progress.on_waiting_for_model(now);
+                self.activity = Activity::Working;
+            }
+            P::Preparing | P::Compacting | P::Maintenance => {
                 if self.activity != Activity::Working {
                     progress.on_resumed();
                 }
@@ -4363,9 +4373,61 @@ mod tests {
             assert_eq!(state.turn_progress.as_ref().unwrap().reasoning_ms(now), Some(0));
         }
 
+        /// BUG 7, defect 3: a long provider wait kept reading as `Running
+        /// tools`, so a slow request looked like a hung tool.
+        ///
+        /// Both phases map to `Activity::Working`, and the reducer only reset
+        /// the progress phase when the coarse activity was *not* already
+        /// `Working` — so the guard was false in exactly the case that needed
+        /// it.
         #[test]
-        fn an_authoritative_reasoning_phase_opens_the_row_its_lost_event_would_have() {
-            // The frame that opens a burst can be dropped legitimately — a
+        fn waiting_for_the_model_clears_a_stale_running_tools_label() {
+            use crate::progress::Phase;
+
+            let mut state = state();
+            let now = Instant::now();
+            state.apply_at(UiEvent::Submitted { text: "go".into() }, now);
+            state.apply_at(UiEvent::CoreActivity(ActivityPhase::RunningTools), now);
+            assert_eq!(state.turn_progress.as_ref().unwrap().phase(), Phase::RunningTools);
+
+            state.apply_at(
+                UiEvent::CoreActivity(ActivityPhase::WaitingForModel),
+                now + Duration::from_secs(1),
+            );
+
+            let phase = state.turn_progress.as_ref().unwrap().phase();
+            assert_eq!(
+                phase,
+                Phase::WaitingForModel,
+                "the tool label must not survive the engine moving on to the model",
+            );
+            assert_eq!(phase.label(), "Waiting for model");
+            assert_eq!(state.activity, Activity::Working);
+        }
+
+        /// The same transition arriving through state reconciliation rather
+        /// than a live phase event.
+        #[test]
+        fn a_snapshot_also_clears_a_stale_running_tools_label() {
+            use crate::progress::Phase;
+
+            let mut state = state();
+            let now = Instant::now();
+            state.apply_at(UiEvent::Submitted { text: "go".into() }, now);
+            state.apply_at(UiEvent::CoreActivity(ActivityPhase::RunningTools), now);
+
+            let mut snap = snapshot(EngineLifecycle::Busy);
+            snap.turn = Some(turn(ActivityPhase::WaitingForModel, Some(1_000)));
+            state.apply_at(UiEvent::Snapshot(Box::new(snap)), now + Duration::from_secs(1));
+
+            assert_eq!(
+                state.turn_progress.as_ref().unwrap().phase(),
+                Phase::WaitingForModel,
+            );
+        }
+
+        #[test]
+        fn an_authoritative_reasoning_phase_opens_the_row_its_lost_event_would_have() {            // The frame that opens a burst can be dropped legitimately — a
             // snapshot's cursor covers it, and the snapshot carries no
             // content to replace it with. The phase is then the only thing
             // that says reasoning is happening now.

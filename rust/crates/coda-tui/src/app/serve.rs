@@ -1465,6 +1465,7 @@ impl App {
             dragging: false,
             detached_anchor: None,
             turn: None,
+            interrupt_ack: None,
             view,
             pending: Default::default(),
             needs_resync: true,
@@ -4527,9 +4528,95 @@ pub(in crate::app) mod tests {
         assert_eq!(user_texts(app), ["the only answer", " and more"]);
     }
 
+    /// BUG 7, defect 1. The stop control used to be `connection.notify(...)`.
+    /// A notification has no id, so it gets no reply — and the engine's
+    /// transport discarded incoming notifications outright, so the interrupt
+    /// did nothing at all while the status bar said `interrupting…` forever.
+    ///
+    /// Asserted on the frame the client actually wrote, because that is where
+    /// the defect lived: the handler was always correct and simply never
+    /// reached, so exercising `session_interrupt()` would have proved nothing.
     #[tokio::test]
-    async fn history_fence_preserves_notices_and_usage_not_present_in_history() {
+    async fn the_interrupt_control_emits_an_identified_request_not_a_notification() {
         let mut harness = app_with(crate::local::AccessMode::TrustedLocal, |_, _| json!({}));
+        let app = &mut harness.app;
+        app.apply(UiEvent::Submitted { text: "long running".into() });
+
+        app.interrupt();
+        harness.settle_wire().await;
+
+        let interrupt = harness
+            .frames()
+            .into_iter()
+            .find(|f| f["method"] == coda_proto::messages::method::INTERRUPT)
+            .expect("the interrupt must actually reach the wire");
+
+        assert!(
+            interrupt.get("id").is_some_and(|id| !id.is_null()),
+            "an interrupt without an id is a notification: unacknowledged, and \
+             previously discarded by the engine entirely — {interrupt}",
+        );
+        assert!(harness.app.state.interrupting, "the pending indicator is shown while unanswered");
+    }
+
+    /// Holding the control down must not queue a second cancellation that
+    /// could outlive this turn and land on the next one.
+    #[tokio::test]
+    async fn repeated_interrupts_send_one_request_while_the_first_is_unanswered() {
+        // The engine receives the interrupt and never answers it.
+        let mut harness = app_with_pump(crate::local::AccessMode::TrustedLocal, |method, _| {
+            if method == coda_proto::messages::method::INTERRUPT { None } else { Some(Ok(json!({}))) }
+        });
+        let app = &mut harness.app;
+        app.apply(UiEvent::Submitted { text: "long running".into() });
+
+        app.interrupt();
+        app.interrupt();
+        app.interrupt();
+        harness.settle_wire().await;
+
+        let sent = harness
+            .frames()
+            .iter()
+            .filter(|f| f["method"] == coda_proto::messages::method::INTERRUPT)
+            .count();
+        assert_eq!(sent, 1, "repeated presses must coalesce into the outstanding request");
+    }
+
+    /// A refused or undeliverable interrupt must be visible, and must not
+    /// leave `interrupting…` up implying cancellation is still coming.
+    #[tokio::test]
+    async fn a_refused_interrupt_is_reported_and_clears_the_pending_indicator() {
+        let mut harness = app_answering(crate::local::AccessMode::TrustedLocal, |method, _| {
+            if method == coda_proto::messages::method::INTERRUPT {
+                Err((-32603, "no turn to interrupt".into()))
+            } else {
+                Ok(json!({}))
+            }
+        });
+        let app = &mut harness.app;
+        app.apply(UiEvent::Submitted { text: "long running".into() });
+        app.interrupt();
+        assert!(app.state.interrupting);
+
+        let ack = harness.app.interrupt_ack.take().expect("a request is outstanding");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), ack)
+            .await
+            .expect("the engine answered");
+        crate::app::interrupt::settle(&mut harness.app, result);
+
+        assert!(
+            !harness.app.state.interrupting,
+            "a failed interrupt must not leave the indicator implying cancellation is underway",
+        );
+        assert!(
+            notices(&harness.app).iter().any(|text| text.contains("Interrupt failed")),
+            "the failure must be visible",
+        );
+    }
+
+    #[tokio::test]
+    async fn history_fence_preserves_notices_and_usage_not_present_in_history() {        let mut harness = app_with(crate::local::AccessMode::TrustedLocal, |_, _| json!({}));
         let app = &mut harness.app;
         app.view.note_history_read(10);
         for (method, params) in [

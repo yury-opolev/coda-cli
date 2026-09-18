@@ -28,6 +28,7 @@ mod effort;
 mod engine;
 mod identity;
 mod image;
+mod interrupt;
 mod link;
 mod models;
 mod queue;
@@ -132,6 +133,11 @@ pub struct App {
     detached_anchor: Option<ViewportAnchor>,
     /// Set while a `session/prompt` is outstanding.
     turn: Option<oneshot::Receiver<Result<Value, coda_proto::ResponseError>>>,
+    /// Set while a `session/interrupt` is awaiting acknowledgement.
+    ///
+    /// Held so the engine's answer is observed rather than assumed: see
+    /// [`App::interrupt`].
+    interrupt_ack: Option<oneshot::Receiver<Result<Value, coda_proto::ResponseError>>>,
     /// The event fence: what this client has already seen (§2.5).
     pub(crate) view: crate::api::ServeView,
     /// Outstanding permission/question/plan decisions, from the raw
@@ -421,6 +427,16 @@ impl App {
                 _ = tokio::time::sleep_until(frame_deadline), if self.frame_deadline.is_some() => {
                     self.frame_deadline = None;
                     // Fall through to the redraw logic below.
+                }
+
+                // The engine answered an interrupt request. Polled in the
+                // select for the same reason the turn is: a `try_recv` after
+                // the fact only runs when something *else* wakes the loop, and
+                // an idle session waiting to be told its stop failed would
+                // never produce that something else.
+                Some(result) = OptionFuture::from(self.interrupt_ack.as_mut()) => {
+                    self.interrupt_ack = None;
+                    interrupt::settle(&mut *self, result);
                 }
             }
 
@@ -801,16 +817,7 @@ impl App {
     }
 
     fn interrupt(&mut self) {
-        if !self.engine_connected {
-            return;
-        }
-        self.apply(UiEvent::InterruptRequested);
-        if let Err(error) = self
-            .connection
-            .notify(method::INTERRUPT, Some(serde_json::json!({})))
-        {
-            self.notice(format!("Interrupt failed: {error}"), NoticeLevel::Error);
-        }
+        interrupt::request(self)
     }
 
 
