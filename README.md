@@ -263,6 +263,22 @@ Inside the REPL:
 /version   /clear   /exit
 ```
 
+Run a shell command yourself with a leading `!`:
+
+```
+!git status               runs immediately, output goes in the transcript
+!cargo test -p coda-tui
+!!literal                 a doubled bang escapes, so the text is sent to the model
+```
+
+`!` is *your* command, not the agent's: it runs straight away with no model
+round-trip and costs no tokens, it is not gated by the permission mode — that
+governs what the agent may do on your behalf, and approving a command you just
+typed would be theatre — and its output is shown to you rather than silently
+added to the model's context. The agent has its own `run_command` tool for when
+it needs to run something. The shell matches that tool's: PowerShell on
+Windows, `sh` elsewhere.
+
 > **Tip:** append `--help` (or `-h`) to any command for its usage and examples, e.g. `/model --help`.
 
 ### `/tasks` — the live task browser

@@ -34,6 +34,7 @@ mod models;
 mod queue;
 mod serve;
 mod settings;
+mod shell;
 mod startup_cli;
 mod usage;
 
@@ -758,6 +759,14 @@ impl App {
             // Commands are dispatched without consuming staged images; the images
             // remain for the next real user turn.
             self.run_command(invocation).await;
+            return;
+        }
+
+        // `!cmd` is the user's own shell escape: it runs here, now, without a
+        // model round-trip. Checked after slash commands only because the two
+        // prefixes cannot collide; neither order would change behaviour.
+        if let Some(command) = shell::parse(&text) {
+            shell::run_and_report(self, command).await;
             return;
         }
 
