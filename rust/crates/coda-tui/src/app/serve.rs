@@ -399,6 +399,7 @@ impl App {
     fn apply_state_frame(&mut self, state: StateFrame) {
         match state {
             StateFrame::Activity { phase, .. } => self.apply(UiEvent::CoreActivity(phase)),
+            StateFrame::Usage(usage) => self.apply(UiEvent::UsageTotals(usage)),
             StateFrame::Lifecycle { lifecycle, .. } => {
                 self.apply(UiEvent::CoreLifecycle(lifecycle))
             }
@@ -4543,8 +4544,7 @@ pub(in crate::app) mod tests {
         assert!(visible.iter().any(|text| text.contains("provider unavailable")));
         assert!(visible.iter().any(|text| text.contains("budget exhausted")));
         assert!(visible.iter().any(|text| text.contains("background work")));
-        assert_eq!(app.state.usage.input_tokens, 17);
-        assert_eq!(app.state.usage.output_tokens, 9);
+        assert_eq!(app.state.usage.last_input_tokens, 17);
     }
 
     #[tokio::test]

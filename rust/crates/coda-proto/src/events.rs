@@ -49,13 +49,11 @@ pub mod event_method {
     // Every constant below is wired and published today. Method names the
     // plan reserves but this stage does not emit (`event/engineHello`,
     // `event/steeringOutcome`, `event/turnStarted`, `event/modelRequest`,
-    // `event/toolBatch`, `event/requestPending`, `event/requestResolved`,
-    // `event/usageUpdated`) are deliberately **not** declared here: a named
+    // `event/toolBatch`) are deliberately **not** declared here: a named
     // constant no publisher uses is a promise the engine does not keep.
     // `event/activity` already carries the phase machine (including turn
     // start), `event/steeringQueue` already carries the full queue state
-    // after every outcome, the ungated `event/usage` already carries usage,
-    // and the rest arrive with Stage D.
+    // after every outcome, and the rest arrive with Stage D.
     pub const ACTIVITY: &str = "event/activity";
     /// A turn reached its terminal outcome: the live view was cleared, the
     /// committed-history fence moved and any in-flight tool call was
@@ -92,6 +90,19 @@ pub mod event_method {
     /// `Event::AgentMessageDelivered`. Reflected by history, unlike
     /// `AGENT_MESSAGE`'s passive Stage 2 notification.
     pub const AGENT_MESSAGE_DELIVERED: &str = "event/agentMessageDelivered";
+    /// Session usage moved: one response was accounted for and the running
+    /// session totals changed.
+    ///
+    /// Distinct from the ungated `event/usage`, which reports **one
+    /// response** and nothing else. A client that only watched that frame had
+    /// to keep its own running total, and any frame it replayed, missed or
+    /// double-applied silently corrupted it. This carries the engine's own
+    /// authoritative totals instead, so applying it is idempotent: a client
+    /// assigns rather than accumulates, and a duplicate frame changes
+    /// nothing. It also carries the active model's context window, which is
+    /// the denominator a client needs to show how full the window is and
+    /// which no other event reports.
+    pub const USAGE_UPDATED: &str = "event/usageUpdated";
 }
 
 #[cfg(feature = "schema")]

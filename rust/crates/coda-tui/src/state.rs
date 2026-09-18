@@ -91,6 +91,15 @@ impl Activity {
 pub struct Usage {
     pub input_tokens: i64,
     pub output_tokens: i64,
+    /// Input tokens of the most recent response.
+    ///
+    /// Kept apart from the running total because the two answer different
+    /// questions and share no arithmetic. Every request re-sends the whole
+    /// conversation, so one response's input *is* roughly the context in use;
+    /// the sum of every response's input is how much has been paid for, which
+    /// passes the window size after a handful of turns and would peg a
+    /// context gauge at 100% forever.
+    pub last_input_tokens: i64,
     /// Nominal context window, used to show a percentage.
     pub context_limit: i64,
     /// Dollars per million tokens in and out, when the model's price is known.
@@ -110,11 +119,14 @@ impl Usage {
     }
 
     /// Percentage of the context window consumed, if a limit is known.
+    ///
+    /// Measured from the last response's input, not the session total: see
+    /// [`Usage::last_input_tokens`].
     pub fn percent_used(&self) -> Option<u8> {
-        if self.context_limit <= 0 {
+        if self.context_limit <= 0 || self.last_input_tokens <= 0 {
             return None;
         }
-        let ratio = self.input_tokens as f64 / self.context_limit as f64;
+        let ratio = self.last_input_tokens as f64 / self.context_limit as f64;
         Some((ratio * 100.0).clamp(0.0, 100.0) as u8)
     }
 }
@@ -262,6 +274,12 @@ pub enum UiEvent {
     Cleared,
     /// The active model changed.
     ModelChanged { id: String, context_limit: Option<i64> },
+    /// The engine's own authoritative usage projection
+    /// (`event/usageUpdated`, or the `usage` section of a snapshot).
+    ///
+    /// Assigned, never accumulated: the engine owns the running total, so
+    /// applying this twice is a no-op rather than a doubling.
+    UsageTotals(coda_proto::state::UsageState),
     /// Fold or unfold the reasoning block at this index.
     ///
     /// An event rather than a direct call so it passes through the same
@@ -1240,6 +1258,7 @@ impl UiState {
                     self.usage.context_limit = limit;
                 }
             }
+            UiEvent::UsageTotals(usage) => self.apply_usage(&usage),
             UiEvent::ThinkingFoldToggled { block } => {
                 self.transcript.toggle_fold(block);
             }
@@ -1540,8 +1559,12 @@ impl UiState {
                 input_tokens,
                 output_tokens,
             } => {
-                self.usage.input_tokens = input_tokens;
-                self.usage.output_tokens = output_tokens;
+                // One response, and only that. The running total is owned by
+                // the engine and arrives on `event/usageUpdated`
+                // (`UiEvent::UsageTotals`) — accumulating here instead would
+                // make every replayed or re-delivered frame inflate the total,
+                // and the pinned row wants this response either way.
+                self.usage.last_input_tokens = input_tokens;
                 if let Some(progress) = self.turn_progress.as_mut() {
                     progress.on_usage(input_tokens, output_tokens);
                 }
@@ -1945,13 +1968,7 @@ impl UiState {
 
         // Usage. `session` is the running total; `lastResponse` is one
         // response's cost and must never be presented as a total.
-        if let Some(limit) = snapshot.usage.context_limit {
-            self.usage.context_limit = limit;
-        }
-        if let Some(session) = snapshot.usage.session {
-            self.usage.input_tokens = session.input_tokens;
-            self.usage.output_tokens = session.output_tokens;
-        }
+        self.apply_usage(&snapshot.usage);
 
         self.reconcile_queue(snapshot);
 
@@ -2055,6 +2072,26 @@ impl UiState {
     /// - **no outcome at all** — the outcome ring is bounded, so this is
     ///   genuinely unknown. The text is kept recoverable and the doubt is
     ///   stated; it is never resent, and it is never described as "not sent".
+    /// Applies the engine's authoritative usage projection.
+    ///
+    /// Shared by `event/usageUpdated` and the snapshot's `usage` section
+    /// because they are the same type carrying the same facts — one pushed,
+    /// one polled. Every field is optional and each is applied only when
+    /// present: "the engine did not say" must leave a known value alone
+    /// rather than reset it to a confident zero.
+    fn apply_usage(&mut self, usage: &coda_proto::state::UsageState) {
+        if let Some(limit) = usage.context_limit {
+            self.usage.context_limit = limit;
+        }
+        if let Some(session) = usage.session {
+            self.usage.input_tokens = session.input_tokens;
+            self.usage.output_tokens = session.output_tokens;
+        }
+        if let Some(last) = usage.last_response {
+            self.usage.last_input_tokens = last.input_tokens;
+        }
+    }
+
     fn reconcile_queue(&mut self, snapshot: &coda_proto::state::StateSnapshot) {
         use coda_proto::state::SteeringOutcomeKind as Outcome;
 
@@ -2341,6 +2378,9 @@ pub(crate) fn is_critical_event(event: &UiEvent) -> bool {
         | UiEvent::SteeringRecalled { .. }
         | UiEvent::SteeringDeliveryReflected { .. }
         | UiEvent::InterruptRequested => true,
+        // Usage moves the status line but never the transcript, and it lands
+        // once per response — the streaming throttle is the right home for it.
+        UiEvent::UsageTotals(_) => false,
         UiEvent::Engine(inner) => match inner {
             coda_proto::Event::TurnComplete { .. }
             | Event::Error { .. }
@@ -2748,15 +2788,56 @@ mod tests {
         ));
     }
 
+    /// `event/usage` reports **one response**. It must move the context gauge
+    /// (each request re-sends the conversation, so one response's input is the
+    /// window in use) and must not be mistaken for the session total, which is
+    /// the engine's to report.
     #[test]
-    fn usage_events_update_the_counters() {
+    fn a_usage_event_records_one_response_not_the_session_total() {
         let mut state = state();
         state.apply(UiEvent::Engine(Event::Usage {
             input_tokens: 1200,
             output_tokens: 300,
         }));
-        assert_eq!(state.usage.input_tokens, 1200);
-        assert_eq!(state.usage.output_tokens, 300);
+        assert_eq!(state.usage.last_input_tokens, 1200);
+        assert_eq!(
+            (state.usage.input_tokens, state.usage.output_tokens),
+            (0, 0),
+            "one response is not a running total; the engine owns that"
+        );
+    }
+
+    /// The bug this replaced: every response overwrote the running total with
+    /// its own figures, so the status bar showed the last call rather than the
+    /// session and appeared to jump about at random.
+    #[test]
+    fn session_totals_come_from_the_engine_and_are_assigned_not_accumulated() {
+        use coda_proto::state::{UsagePair, UsageState};
+        let mut state = state();
+
+        let totals = |i, o, last_in| {
+            UiEvent::UsageTotals(UsageState {
+                last_response: Some(UsagePair { input_tokens: last_in, output_tokens: 0 }),
+                session: Some(UsagePair { input_tokens: i, output_tokens: o }),
+                context_limit: Some(200_000),
+                unknown_fields: Vec::new(),
+            })
+        };
+
+        state.apply(totals(1200, 300, 1200));
+        assert_eq!((state.usage.input_tokens, state.usage.output_tokens), (1200, 300));
+
+        state.apply(totals(1500, 380, 300));
+        assert_eq!(
+            (state.usage.input_tokens, state.usage.output_tokens),
+            (1500, 380),
+            "the engine's total is taken as given, never added to the previous one"
+        );
+
+        // Re-delivering a frame must change nothing at all.
+        state.apply(totals(1500, 380, 300));
+        assert_eq!((state.usage.input_tokens, state.usage.output_tokens), (1500, 380));
+        assert_eq!(state.usage.context_limit, 200_000);
     }
 
     #[test]
@@ -2764,6 +2845,7 @@ mod tests {
         let mut usage = Usage {
             input_tokens: 50_000,
             output_tokens: 0,
+            last_input_tokens: 50_000,
             context_limit: 0,
             price_per_million: None,
         };
@@ -2773,11 +2855,39 @@ mod tests {
         assert_eq!(usage.percent_used(), Some(25));
     }
 
+    /// The gauge asks "how full is the window", which is one request's input.
+    /// The session total is every request's input added up; by the fourth turn
+    /// it exceeds the window and would peg the gauge at 100% forever.
+    #[test]
+    fn usage_percentage_measures_the_last_request_not_the_session_total() {
+        let usage = Usage {
+            input_tokens: 900_000,
+            output_tokens: 20_000,
+            last_input_tokens: 40_000,
+            context_limit: 200_000,
+            price_per_million: None,
+        };
+        assert_eq!(usage.percent_used(), Some(20), "the window holds one request, not the sum");
+    }
+
+    #[test]
+    fn usage_percentage_is_unknown_before_any_response() {
+        let usage = Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            last_input_tokens: 0,
+            context_limit: 200_000,
+            price_per_million: None,
+        };
+        assert_eq!(usage.percent_used(), None, "nothing measured is not zero percent");
+    }
+
     #[test]
     fn usage_percentage_is_clamped_at_one_hundred() {
         let usage = Usage {
             input_tokens: 400_000,
             output_tokens: 0,
+            last_input_tokens: 400_000,
             context_limit: 200_000,
             price_per_million: None,
         };
