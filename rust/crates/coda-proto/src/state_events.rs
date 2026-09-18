@@ -127,3 +127,11 @@ pub type AgentMessageEvent = crate::responses::AgentMessageDto;
 /// delivery). See `crate::responses::AgentMessageDeliveredDto` — metadata
 /// only, never the injected body text.
 pub type AgentMessageDeliveredEvent = crate::responses::AgentMessageDeliveredDto;
+
+/// Payload of `event/usageUpdated`.
+///
+/// Deliberately the **same type** the snapshot's `usage` section uses, rather
+/// than a parallel shape: the event and `session/getState` are two views of
+/// one fact, and giving them separate structs is how they drift into
+/// disagreeing about what a field means.
+pub type UsageUpdatedEvent = crate::state::UsageState;

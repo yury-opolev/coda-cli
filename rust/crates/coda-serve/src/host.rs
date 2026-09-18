@@ -1518,6 +1518,25 @@ impl ServeHost {
         capture
     }
 
+    /// Resolves the active model's context window from the bundled catalogue.
+    ///
+    /// Cheap and offline — no client, no network — so it is safe on the turn
+    /// path. `session/models` reports a better answer when a live list is
+    /// available (a provider knows about models the catalogue does not), and
+    /// because `context_limit_resolved` ignores a value equal to the one it
+    /// already holds, the two never fight: whichever ran last with a real
+    /// answer wins, and a repeat publishes nothing.
+    fn note_catalog_context_limit(&self) {
+        let captured = self.capture_runtime().config;
+        let catalog = crate::catalog::ModelCatalog::load();
+        let Some(model) = catalog.find(captured.provider_id.as_deref(), &captured.model) else {
+            return;
+        };
+        if let Some(limit) = model.context_limit {
+            self.engine_state.context_limit_resolved(Some(limit));
+        }
+    }
+
     /// Commits a configuration mutation and publishes the resulting
     /// `config.next` **in the same critical section** (`CONFIG -> STATE ->
     /// BUS`), if the engine is still alive.
@@ -2232,6 +2251,12 @@ impl ServeHost {
         if !admitted {
             return Err(ClaimRefused::Stopped);
         }
+        // Resolve the window the turn is about to fill, from the catalogue
+        // alone. `session/models` also reports it, but a headless client may
+        // never call that — and then nothing in a `coda serve` session would
+        // ever say how big the context window is, which is exactly the
+        // "usage is unknowable in serve mode" gap this closes.
+        self.note_catalog_context_limit();
         *busy = true;
         if kind.accepts_steering() {
             // Only unseals; anything already queued is preserved.
@@ -3057,6 +3082,7 @@ impl ServeBackend for ServeHost {
                 .unwrap_or_else(|| crate::settings::FALLBACK_PROVIDER.to_owned());
             let mut catalog = catalog_models();
             self.annotate_effort(&mut catalog, &captured, &provider_id);
+            note_active_context_limit(&self.engine_state, &catalog, Some(active.as_str()));
             let catalog = serde_json::to_value(&catalog)
                 .map_err(|e| RpcError::internal(e.to_string()))?;
             return Ok(json!({
@@ -3092,6 +3118,7 @@ impl ServeBackend for ServeHost {
                     })
                     .collect();
                 self.annotate_effort(&mut wire, &captured, &provider_id);
+                note_active_context_limit(&self.engine_state, &wire, Some(active.as_str()));
                 let v = serde_json::to_value(&wire)
                     .map_err(|e| RpcError::internal(e.to_string()))?;
                 Ok(json!({
@@ -3107,6 +3134,7 @@ impl ServeBackend for ServeHost {
             _ => {
                 let mut catalog = catalog_models();
                 self.annotate_effort(&mut catalog, &captured, &provider_id);
+                note_active_context_limit(&self.engine_state, &catalog, Some(active.as_str()));
                 let catalog = serde_json::to_value(&catalog)
                     .map_err(|e| RpcError::internal(e.to_string()))?;
                 Ok(json!({
@@ -6055,8 +6083,30 @@ pub(crate) fn load_hooks_from_file(path: &Path) -> Vec<UserHook> {
 /// Was a hand-written list with no prices and context limits typed in beside
 /// the names. The snapshot carries both, and stays right when a provider
 /// changes them.
-fn catalog_models() -> Vec<WireModel> {
-    let catalog = crate::catalog::ModelCatalog::load();
+/// Records the active model's context window on the usage projection.
+///
+/// Model listing is the only place the window is known — the catalogue and the
+/// provider both report it per model, and nothing else the engine does
+/// mentions it. Without this the snapshot reported `contextLimit: null` for the
+/// entire life of the process, so no client could say how full the window was
+/// and the status bar simply omitted the gauge.
+///
+/// Deliberately silent when the active model cannot be found in the list: the
+/// window is only reported when it is actually known, so a list that happens
+/// not to contain the active model leaves the previous, correct value in place
+/// rather than erasing it. When the row *is* found its limit is taken as-is,
+/// `None` included — that model genuinely has no known window, and keeping the
+/// previous model's would understate usage.
+fn note_active_context_limit(
+    state: &crate::state::EngineState,
+    models: &[WireModel],
+    active: Option<&str>,
+) {
+    let Some(id) = active else { return };
+    let Some(row) = models.iter().find(|m| m.id == id) else { return };
+    state.context_limit_resolved(row.context_limit);
+}
+fn catalog_models() -> Vec<WireModel> {    let catalog = crate::catalog::ModelCatalog::load();
     let mut seen: Vec<WireModel> = Vec::new();
     for provider in ["anthropic", "github-copilot"] {
         for model in catalog.models_for(provider) {

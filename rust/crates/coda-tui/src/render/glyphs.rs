@@ -72,6 +72,12 @@ pub const RULE: &str = "\u{2500}"; // ─
 pub const RULE_VERTICAL: &str = "\u{2502}"; // │
 /// Full block, used by the scrollbar thumb.
 pub const BLOCK: &str = "\u{2588}"; // █
+/// Light shade, used as the unfilled remainder of a proportional bar.
+///
+/// Paired with [`BLOCK`] rather than left blank so the bar's full extent —
+/// and therefore what the filled part is a proportion *of* — stays visible on
+/// a monochrome terminal.
+pub const BLOCK_EMPTY: &str = "\u{2591}"; // ░
 
 // --- Attachments -----------------------------------------------------------
 

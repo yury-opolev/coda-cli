@@ -242,6 +242,12 @@ pub(crate) struct StateInner {
 struct UsageStateInner {
     last_response: Option<(i64, i64)>,
     session_total: Option<(i64, i64)>,
+    /// The active model's context window, when the host has resolved one.
+    ///
+    /// `None` is "this engine does not know", which is not the same as a
+    /// window of zero — a client that cannot tell those apart shows a
+    /// confident `0%` for a session that is actually filling up.
+    context_limit: Option<i64>,
 }
 
 /// Counts real `StateInner` copies, per `EngineState` instance so parallel
@@ -479,7 +485,44 @@ impl StateInner {
         self.usage.last_response = Some((input_tokens, output_tokens));
         let (si, so) = self.usage.session_total.unwrap_or((0, 0));
         self.usage.session_total = Some((si + input_tokens, so + output_tokens));
-        Vec::new()
+        self.usage_event()
+    }
+
+    /// Records the active model's context window.
+    ///
+    /// Returns an event only when the value actually changed, so re-resolving
+    /// the same model on every turn does not publish a frame that says
+    /// nothing.
+    pub(crate) fn context_limit_resolved(&mut self, limit: Option<i64>) -> Vec<PendingEvent> {
+        if self.usage.context_limit == limit {
+            return Vec::new();
+        }
+        self.usage.context_limit = limit;
+        self.usage_event()
+    }
+
+    /// The authoritative usage projection, as a gated event.
+    ///
+    /// Built from the same `UsageStateInner` the snapshot projects, so
+    /// `event/usageUpdated` and `session/getState` cannot disagree.
+    fn usage_event(&self) -> Vec<PendingEvent> {
+        let params = serde_json::json!(self.usage_projection());
+        vec![gated(coda_proto::events::event_method::USAGE_UPDATED, params)]
+    }
+
+    fn usage_projection(&self) -> UsageState {
+        UsageState {
+            last_response: self.usage.last_response.map(|(i, o)| coda_proto::state::UsagePair {
+                input_tokens: i,
+                output_tokens: o,
+            }),
+            session: self.usage.session_total.map(|(i, o)| coda_proto::state::UsagePair {
+                input_tokens: i,
+                output_tokens: o,
+            }),
+            context_limit: self.usage.context_limit,
+            unknown_fields: Vec::new(),
+        }
     }
 
     /// Bounds the tool table. Terminal entries are evicted first; an entry
@@ -1045,6 +1088,12 @@ impl EngineState {
         self.transact(move |s| s.usage_updated(input_tokens, output_tokens));
     }
 
+    /// Reports the active model's context window, so the usage projection can
+    /// carry the denominator a client needs to show how full it is.
+    pub fn context_limit_resolved(&self, limit: Option<i64>) {
+        self.transact(move |s| s.context_limit_resolved(limit));
+    }
+
     // ── Steering projection (sole owner of `SteeringQueueState`) ─────────
 
     pub fn steering_enqueued(&self, message_id: &str, text: &str) {
@@ -1320,18 +1369,7 @@ impl EngineState {
             retained: inner.recent_tools_limit as i64,
         };
 
-        let usage = UsageState {
-            last_response: inner.usage.last_response.map(|(i, o)| coda_proto::state::UsagePair {
-                input_tokens: i,
-                output_tokens: o,
-            }),
-            session: inner.usage.session_total.map(|(i, o)| coda_proto::state::UsagePair {
-                input_tokens: i,
-                output_tokens: o,
-            }),
-            context_limit: None,
-            unknown_fields: Vec::new(),
-        };
+        let usage = inner.usage_projection();
 
         let turn = inner.turn.as_ref().map(|t| TurnState {
             turn_id: t.turn_id.clone(),
@@ -2743,8 +2781,50 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn concurrent_counters_are_unknown_not_zero_by_default() {
-        // C4: background/scheduled work runs against a `NullSink`, so this
+    fn a_usage_update_publishes_the_running_total_not_just_the_response() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let bus = Arc::new(EventBus::new(tx, "engine-1"));
+        let state =
+            Arc::new(EngineState::new(Arc::clone(&bus), "s1", "/work", HashMap::new(), active_config()));
+        bus.enable_state_events();
+
+        state.usage_updated(1500, 320);
+        state.usage_updated(200, 40);
+
+        let frames = drain_methods(&mut rx);
+        let last = frames
+            .iter()
+            .filter(|(method, _)| method == coda_proto::events::event_method::USAGE_UPDATED)
+            .map(|(_, params)| params)
+            .next_back()
+            .expect("event/usageUpdated must be published");
+
+        // The running total, so a client that never polls still converges —
+        // and assigning it twice cannot double it.
+        assert_eq!(last["session"]["inputTokens"], 1700);
+        assert_eq!(last["session"]["outputTokens"], 360);
+        assert_eq!(last["lastResponse"]["inputTokens"], 200);
+    }
+
+    #[test]
+    fn a_resolved_context_limit_reaches_the_snapshot_and_the_wire() {
+        let state = test_state();
+        assert!(
+            state.project("v1", limits()).usage.context_limit.is_none(),
+            "unknown is None, never a confident zero"
+        );
+
+        state.context_limit_resolved(Some(200_000));
+        assert_eq!(state.project("v1", limits()).usage.context_limit, Some(200_000));
+
+        // A model with no known window clears it rather than keeping the
+        // previous model's, which would understate how full the window is.
+        state.context_limit_resolved(None);
+        assert!(state.project("v1", limits()).usage.context_limit.is_none());
+    }
+
+    #[test]
+    fn concurrent_counters_are_unknown_not_zero_by_default() {        // C4: background/scheduled work runs against a `NullSink`, so this
         // engine genuinely does not know these counts. `None` says so; a
         // confident `0` would be a lie, and is what this guards against.
         let state = test_state();

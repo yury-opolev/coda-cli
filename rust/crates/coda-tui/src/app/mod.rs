@@ -34,6 +34,7 @@ mod queue;
 mod serve;
 mod settings;
 mod startup_cli;
+mod usage;
 
 use crate::config::{self, Paths};
 use crate::commands;
@@ -858,28 +859,11 @@ impl App {
     }
 
     fn context_text(&self) -> String {
-        let usage = self.state.usage;
-        let mut out = String::from("Context usage\n");
-        out.push_str(&format!("  input   {} tokens\n", usage.input_tokens));
-        out.push_str(&format!("  output  {} tokens\n", usage.output_tokens));
-        match usage.percent_used() {
-            Some(percent) => out.push_str(&format!(
-                "  window  {percent}% of {} tokens",
-                usage.context_limit
-            )),
-            None => out.push_str("  window  (unknown)"),
-        }
-        out
+        usage::context_report(&self.state.usage, self.state.model.as_deref())
     }
 
     fn cost_text(&self) -> String {
-        let usage = self.state.usage;
-        format!(
-            "Token usage\n  input   {}\n  output  {}\n  total   {}",
-            usage.input_tokens,
-            usage.output_tokens,
-            usage.input_tokens + usage.output_tokens
-        )
+        usage::cost_report(&self.state.usage)
     }
 
     fn doctor_text(&self) -> String {

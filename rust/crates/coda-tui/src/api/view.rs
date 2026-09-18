@@ -483,6 +483,9 @@ pub enum StateFrame {
     TurnEnded { turn_id: String, history_epoch: i64, history_length: i64 },
     ConfigChanged { active: Option<ActiveConfig>, next: Option<ActiveConfig> },
     Steering(SteeringQueueState),
+    /// The engine's authoritative usage projection: session totals, the last
+    /// response, and the active model's context window.
+    Usage(coda_proto::state::UsageState),
     SessionChanged { reason: String, session_id: String, history_epoch: i64, history_length: i64 },
     /// A decision the engine is waiting on, with the outstanding list as it
     /// stood when the frame was emitted.
@@ -544,6 +547,9 @@ pub fn parse_state_frame(method: &str, params: &Value) -> Option<StateFrame> {
         }),
         m::STEERING_QUEUE => {
             Some(StateFrame::Steering(serde_json::from_value(params.clone()).ok()?))
+        }
+        m::USAGE_UPDATED => {
+            Some(StateFrame::Usage(serde_json::from_value(params.clone()).ok()?))
         }
         m::SESSION_CHANGED => Some(StateFrame::SessionChanged {
             reason: str_field("reason").unwrap_or_default(),
