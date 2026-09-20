@@ -2920,6 +2920,21 @@ mod tests {
 
         let mut history = vec![
             Message::user("prompt"),
+            // The BUG 8 shape: a tool result whose multi-byte character
+            // straddles the preview's 500-byte cut. This is the end-to-end
+            // case — proactive compaction renders this history for the
+            // summariser, and a byte slice here panicked before any provider
+            // request was made, taking the whole turn down with it.
+            Message::new(
+                coda_llm::Role::User,
+                vec![coda_llm::Content::ToolResult {
+                    tool_use_id: "call-1".into(),
+                    content: format!("{}\u{2500}tail", "a".repeat(499)),
+                    is_error: false,
+                    correlation: Default::default(),
+                    status: None,
+                }],
+            ),
             Message::assistant("previous response that is long enough to trigger compaction"),
         ];
 

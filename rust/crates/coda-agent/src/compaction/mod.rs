@@ -54,8 +54,31 @@ impl TokenEstimator {
 // Compaction prompts
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub struct CompactionPrompts;
+/// Byte budget for a tool-result preview in the summariser transcript.
+const PREVIEW_BUDGET_BYTES: usize = 500;
 
+/// Truncates a tool result for the summariser transcript.
+///
+/// The budget is measured in **bytes**, not characters, and is deliberately
+/// kept that way: this text is assembled into a prompt whose size is what
+/// matters, and switching to `chars().take(500)` would silently retain up to
+/// four times as many bytes for non-Latin output — exactly the conversations
+/// most likely to be near the context limit already.
+///
+/// A plain `&content[..500]` **panics** when byte 500 falls inside a multi-byte
+/// character, which is what BUG 8 reported: a tool result of 499 ASCII bytes
+/// followed by `─` (U+2500, bytes 499..502) killed the summariser before it
+/// ever reached the provider. Auto-compaction then took the whole turn down
+/// with it. So the cut retreats to the nearest character boundary — at most
+/// three bytes for any valid `String` — and never splits a code point.
+fn truncate_preview(content: &str) -> String {
+    match coda_proto::history::truncate_text(content, PREVIEW_BUDGET_BYTES) {
+        (kept, Some(_)) => format!("{kept}\u{2026}"),
+        (kept, None) => kept,
+    }
+}
+
+pub struct CompactionPrompts;
 impl CompactionPrompts {
     pub const SYSTEM_PROMPT: &'static str = "You summarize a software-engineering conversation \
         so it can continue after older messages are dropped. Capture: the user's goal and task, \
@@ -89,13 +112,8 @@ impl CompactionPrompts {
                         out.push_str("]\n");
                     }
                     Content::ToolResult { content, .. } => {
-                        let preview = if content.len() > 500 {
-                            format!("{}…", &content[..500])
-                        } else {
-                            content.clone()
-                        };
                         out.push_str("[tool result: ");
-                        out.push_str(&preview);
+                        out.push_str(&truncate_preview(content));
                         out.push_str("]\n");
                     }
                     _ => {}
@@ -349,6 +367,101 @@ mod tests {
                 status: None,
             }],
         )
+    }
+
+    // ── BUG 8: byte-sliced previews panicked on valid Unicode ────────────────
+
+    /// The exact shape from the report: 499 ASCII bytes then `─`, whose bytes
+    /// straddle offset 500. `&content[..500]` panics here.
+    #[test]
+    fn tool_result_preview_does_not_split_utf8() {
+        let content = format!("{}\u{2500}tail", "a".repeat(499));
+        let history = vec![tool_result_msg("call-1", &content)];
+
+        let rendered = CompactionPrompts::render_transcript(&history);
+
+        assert_eq!(rendered, format!("[tool result: {}\u{2026}]", "a".repeat(499)));
+    }
+
+    /// The boundary matrix. Each case asserts the exact retained prefix, not
+    /// merely that nothing panicked — "did not panic" would pass for a
+    /// truncation that silently kept the wrong amount.
+    #[test]
+    fn the_preview_keeps_a_byte_budget_without_ever_splitting_a_character() {
+        let ascii = |n: usize| "a".repeat(n);
+
+        // Under or at budget: returned whole, with no ellipsis.
+        assert_eq!(truncate_preview(""), "");
+        assert_eq!(truncate_preview("héllo ─ 😀"), "héllo ─ 😀");
+        assert_eq!(truncate_preview(&ascii(500)), ascii(500));
+
+        // A multi-byte character ending exactly on the budget is kept whole
+        // and, being exactly 500 bytes, is not truncated at all.
+        let exact = format!("{}\u{2500}", ascii(497));
+        assert_eq!(exact.len(), 500);
+        assert_eq!(truncate_preview(&exact), exact);
+
+        // Over budget, pure ASCII: the first 500 bytes.
+        assert_eq!(truncate_preview(&ascii(600)), format!("{}\u{2026}", ascii(500)));
+
+        // Over budget with a character straddling the cut: retreat to the
+        // boundary before it. Two-, three- and four-byte characters each
+        // retreat by a different amount, so all three are covered.
+        for (prefix, ch) in [(499, '\u{00E9}'), (499, '\u{2500}'), (497, '\u{1F600}')] {
+            let content = format!("{}{ch}tail", ascii(prefix));
+            assert_eq!(
+                truncate_preview(&content),
+                format!("{}\u{2026}", ascii(prefix)),
+                "a {}-byte character at offset {prefix} must not be split",
+                ch.len_utf8(),
+            );
+        }
+
+        // The other interior boundary of a three-byte character.
+        let content = format!("{}\u{2500}tail", ascii(498));
+        assert_eq!(truncate_preview(&content), format!("{}\u{2026}", ascii(498)));
+
+        // A character that *ends* on the budget is retained in full.
+        for (prefix, ch) in [(497, '\u{2500}'), (496, '\u{1F600}')] {
+            let content = format!("{}{ch}tail", ascii(prefix));
+            assert_eq!(
+                truncate_preview(&content),
+                format!("{}{ch}\u{2026}", ascii(prefix)),
+                "a character ending exactly on the budget must be kept",
+            );
+        }
+    }
+
+    /// Invariants that must hold for *any* input, including the ones the
+    /// matrix above does not enumerate.
+    #[test]
+    fn every_preview_is_a_valid_prefix_within_budget() {
+        let ascii = "a".repeat(600);
+        for tail in ["", "\u{00E9}", "\u{2500}", "\u{1F600}", "日本語"] {
+            for cut in 490..=505 {
+                let content = format!("{}{tail}{tail}", &ascii[..cut]);
+                let preview = truncate_preview(&content);
+
+                let body = preview.strip_suffix('\u{2026}').unwrap_or(&preview);
+                assert!(
+                    body.len() <= PREVIEW_BUDGET_BYTES,
+                    "budget exceeded: {} bytes",
+                    body.len(),
+                );
+                assert!(content.starts_with(body), "the preview must be a prefix of the input");
+                // Exactly one ellipsis, and only when something was dropped.
+                // Asserted on length rather than on the rendered suffix: a
+                // tool result that legitimately *ends* in an ellipsis and fits
+                // the budget is returned verbatim, so `ends_with` is not a
+                // property of the function.
+                if content.len() > PREVIEW_BUDGET_BYTES {
+                    assert!(preview.ends_with('\u{2026}'), "truncated output must be marked");
+                    assert!(body.len() < content.len(), "something must have been dropped");
+                } else {
+                    assert_eq!(preview, content, "an in-budget preview is returned verbatim");
+                }
+            }
+        }
     }
 
     // ── Mock ForkedAgent ─────────────────────────────────────────────────────

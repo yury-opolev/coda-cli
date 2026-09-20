@@ -542,8 +542,20 @@ fn parse_tools_list(result: &serde_json::Value) -> Vec<McpToolInfo> {
     arr.iter().filter_map(parse_one_tool).collect()
 }
 
+/// Truncates to a byte budget without splitting a character.
+///
+/// A raw `&s[..max]` panics when `max` lands inside a multi-byte character.
+/// This renders third-party MCP server output, so that is reachable with an
+/// ordinary non-Latin error body — see BUG 8.
 fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max { s } else { &s[..max] }
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 // ── Error type ────────────────────────────────────────────────────────────────
@@ -661,5 +673,21 @@ mod tests {
     #[test]
     fn truncate_leaves_short_strings_intact() {
         assert_eq!(truncate("hello", 500), "hello");
+    }
+
+    /// BUG 8 class. This preview renders an MCP server's error body, which is
+    /// third-party content: a multi-byte character straddling the cut used to
+    /// panic the caller rather than shortening the message.
+    #[test]
+    fn truncate_never_splits_a_character() {
+        for ch in ['\u{00E9}', '\u{2500}', '\u{1F600}'] {
+            let s = format!("{}{ch}tail", "a".repeat(499));
+            let cut = truncate(&s, 500);
+            assert!(s.starts_with(cut), "must be a prefix");
+            assert!(cut.len() <= 500, "budget exceeded: {}", cut.len());
+        }
+        // A wholly non-Latin body is the ordinary case, not an exotic one.
+        let jp = "日本語のエラーです。".repeat(40);
+        assert!(jp.starts_with(truncate(&jp, 200)));
     }
 }

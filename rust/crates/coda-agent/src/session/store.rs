@@ -214,8 +214,10 @@ fn read_summary_from_path(path: &Path) -> Option<SessionSummary> {
     Some(SessionSummary { id, created_utc, message_count, preview })
 }
 
-fn extract_preview(messages_arr: Option<&Vec<Value>>) -> String {
-    let arr = match messages_arr {
+/// Byte budget for the one-line session preview shown in listings.
+const PREVIEW_BYTES: usize = 80;
+
+fn extract_preview(messages_arr: Option<&Vec<Value>>) -> String {    let arr = match messages_arr {
         Some(a) => a,
         None => return String::new(),
     };
@@ -239,7 +241,12 @@ fn extract_preview(messages_arr: Option<&Vec<Value>>) -> String {
             };
             if bobj.get("type").and_then(|v| v.as_str()) == Some("text") {
                 let text = bobj.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                return if text.len() <= 80 { text.to_owned() } else { text[..80].to_owned() };
+                // Boundary-safe: a raw `text[..80]` panics whenever byte 80
+                // lands inside a multi-byte character, which a Japanese or
+                // Cyrillic prompt does almost immediately. That took down
+                // `session/listSessions` for *every* session, not just the
+                // offending one.
+                return coda_proto::history::truncate_text(text, PREVIEW_BYTES).0;
             }
         }
     }
@@ -279,6 +286,51 @@ pub(super) async fn write_atomic(path: &Path, text: &str) -> std::io::Result<()>
 mod tests {
     use super::*;
     use coda_llm::{Content, Correlation, Message, Role};
+
+    /// BUG 8 class: the preview was cut with a raw byte slice, so a saved
+    /// session whose opening prompt has a multi-byte character straddling
+    /// byte 80 panicked — taking down `session/listSessions` for *every*
+    /// session, not just the offending one, and leaving the user unable to
+    /// list or resume anything until the file was deleted by hand.
+    #[test]
+    fn a_session_preview_never_splits_a_character() {
+        let ascii = "a".repeat(79);
+        for ch in ['\u{00E9}', '\u{2500}', '\u{1F600}', '\u{65E5}'] {
+            let text = format!("{ascii}{ch} and then some more text");
+            let messages = vec![json!({
+                "role": "user",
+                "blocks": [{ "type": "text", "text": text }],
+            })];
+
+            let preview = extract_preview(Some(&messages));
+
+            // Non-empty first: without this the test passes vacuously when the
+            // message shape stops matching, which is exactly how it hid the
+            // bug on its first run.
+            assert!(!preview.is_empty(), "the preview must actually be extracted");
+            assert!(
+                text.starts_with(&preview),
+                "the preview must be a prefix of the prompt",
+            );
+            assert!(preview.len() <= 80, "byte budget exceeded: {}", preview.len());
+        }
+    }
+
+    /// Non-Latin prompts are the common case this broke on, not an exotic one.
+    #[test]
+    fn a_wholly_non_latin_session_preview_is_safe() {
+        let text = "日本語のテキストです。".repeat(20);
+        let messages = vec![json!({
+            "role": "user",
+            "blocks": [{ "type": "text", "text": text }],
+        })];
+
+        let preview = extract_preview(Some(&messages));
+
+        assert!(!preview.is_empty(), "the preview must actually be extracted");
+        assert!(text.starts_with(&preview));
+        assert!(preview.len() <= 80);
+    }
 
     fn make_store(dir: &tempfile::TempDir) -> SessionTranscriptStore {
         SessionTranscriptStore::new(dir.path())
