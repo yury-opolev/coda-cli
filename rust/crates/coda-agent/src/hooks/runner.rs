@@ -802,7 +802,10 @@ async fn dispatch_http_hook(
     let body = response.text().await.unwrap_or_default();
 
     if !status.is_success() {
-        let preview = if body.len() > 200 { &body[..200] } else { &body };
+        // Boundary-safe: the body is endpoint-controlled and a raw
+        // `&body[..200]` panics whenever byte 200 lands inside a multi-byte
+        // character — mid-turn, on the dispatch task.
+        let preview = coda_proto::history::truncate_text(&body, 200).0;
         return Err(format!("HTTP {}: {preview}", status.as_u16()));
     }
 

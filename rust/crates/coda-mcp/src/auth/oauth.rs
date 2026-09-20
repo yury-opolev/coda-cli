@@ -743,8 +743,19 @@ fn build_authorize_url(endpoint: &str, params: &[(String, String)]) -> String {
     url.to_string()
 }
 
+/// Truncates to a byte budget without splitting a character.
+///
+/// A raw `&s[..max]` panics when `max` lands inside a multi-byte character —
+/// reachable here with an ordinary non-Latin response body. See BUG 8.
 fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max { s } else { &s[..max] }
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 fn unix_now() -> i64 {
@@ -792,6 +803,22 @@ fn default_open_browser(url: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::auth::types::{AuthorizationServerMetadata, McpAuthConfig, McpAuthMode};
+
+    /// BUG 8 class: this renders a third-party authorization server's response
+    /// body, so a non-Latin error message used to panic instead of being
+    /// shortened.
+    #[test]
+    fn truncate_never_splits_a_character() {
+        for ch in ['\u{00E9}', '\u{2500}', '\u{1F600}'] {
+            let s = format!("{}{ch}tail", "a".repeat(199));
+            let cut = truncate(&s, 200);
+            assert!(s.starts_with(cut), "must be a prefix");
+            assert!(cut.len() <= 200, "budget exceeded: {}", cut.len());
+        }
+        let jp = "認可サーバーのエラーです。".repeat(40);
+        assert!(jp.starts_with(truncate(&jp, 200)));
+        assert_eq!(truncate("short", 200), "short");
+    }
 
     fn make_as_meta(scopes: Vec<&str>) -> AuthorizationServerMetadata {
         AuthorizationServerMetadata {

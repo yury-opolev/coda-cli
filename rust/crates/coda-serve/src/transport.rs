@@ -10,10 +10,12 @@
 //!
 //! `serve_stdio()` is the public entry point for the binary.
 
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use coda_llm::LlmClient;
 use coda_proto::{FrameDecoder, Message, Response, RequestId, encode_frame};
+use futures::FutureExt;
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -311,7 +313,7 @@ fn dispatch_frame(
             let outgoing = outgoing.clone();
 
             tokio::spawn(async move {
-                let result = dispatch(&method, params, backend.as_ref()).await;
+                let result = guard_panics(&method, dispatch(&method, params, backend.as_ref())).await;
                 let response = rpc_result_to_response(id, result);
                 match serde_json::to_vec(&response) {
                     Ok(bytes) => {
@@ -354,6 +356,53 @@ fn dispatch_frame(
         }
     }
 }
+
+/// Runs a request handler, turning a panic into an ordinary RPC error.
+///
+/// A panic used to unwind the dispatch task before its response was written,
+/// so the caller waited forever on a request the engine had silently
+/// abandoned — while the process stayed alive and `session/getState` kept
+/// reporting `ready`. BUG 8 hit exactly that: a panic in the compaction
+/// preview took the turn down and the front-end sat on `working` with nothing
+/// to show and nothing to retry.
+///
+/// This is **not** a claim that arbitrary panics leave shared state intact.
+/// `AssertUnwindSafe` is scoped to one obligation: the protocol must answer
+/// every request exactly once. A handler that panicked has already failed; the
+/// question is only whether its caller is told. Where a panic may have
+/// poisoned state, the right response is still to fail the caller — silence is
+/// never the safer option.
+async fn guard_panics<F>(method: &str, handler: F) -> Result<Value, RpcError>
+where
+    F: std::future::Future<Output = Result<Value, RpcError>>,
+{
+    match AssertUnwindSafe(handler).catch_unwind().await {
+        Ok(result) => result,
+        Err(_) => {
+            // The payload is deliberately not forwarded: it is
+            // user-controlled text and can carry prompt content, tool output
+            // or credentials. The method name and a fixed classification are
+            // enough to locate this in a diagnostic log. (The default panic
+            // hook has already written the payload to stderr before this
+            // runs; that stream is not persisted.)
+            tracing::error!(
+                method = %method,
+                failure = "internal_panic",
+                "request handler panicked; answering with an internal error",
+            );
+            Err(RpcError::internal(PANIC_RESPONSE_MESSAGE))
+        }
+    }
+}
+
+/// Message returned when a request handler panics.
+///
+/// A fixed string. A panic payload is user-controlled text and can carry
+/// prompt content, tool output or credentials, so none of it reaches the
+/// *response*. It is not a claim that the payload is nowhere: the default
+/// panic hook runs before `catch_unwind` and has already written it to engine
+/// stderr, which this process does not persist.
+pub(crate) const PANIC_RESPONSE_MESSAGE: &str = "Internal error while processing the request";
 
 fn rpc_result_to_response(id: RequestId, result: Result<Value, RpcError>) -> Response {
     match result {
@@ -611,8 +660,59 @@ mod tests {
         assert_eq!(msg["result"]["ok"], true);
     }
 
-    // ── Notification from client is ignored, except the interrupt ────────────
+    // ── A panicking handler must still answer its caller (BUG 8) ─────────────
 
+    /// A panic used to unwind the dispatch task before the response was sent,
+    /// so the caller waited forever on a request the engine had abandoned —
+    /// while the process stayed alive and `session/getState` reported `ready`.
+    #[tokio::test]
+    async fn a_panicking_handler_is_reported_as_an_internal_error() {
+        let result = guard_panics("test/boom", async {
+            panic!("deliberate panic with a secret-canary in it");
+        })
+        .await;
+
+        let error = result.expect_err("a panic must not read as success");
+        assert_eq!(error.code, -32603, "the JSON-RPC internal-error code");
+        assert_eq!(error.message, PANIC_RESPONSE_MESSAGE);
+    }
+
+    /// Panic payloads are user-controlled text and can carry prompt content,
+    /// tool output or credentials. None of it may reach the wire.
+    #[tokio::test]
+    async fn a_panic_payload_never_reaches_the_response() {
+        let result = guard_panics("test/boom", async {
+            panic!("sk-live-CANARY-must-not-leak");
+        })
+        .await;
+
+        let error = result.expect_err("a panic must not read as success");
+        let rendered = format!("{} {}", error.code, error.message);
+        assert!(
+            !rendered.contains("CANARY"),
+            "the panic payload leaked into the response: {rendered}",
+        );
+    }
+
+    /// Containment must not change what a working handler returns, in either
+    /// direction — otherwise the guard would be paid for on every request.
+    #[tokio::test]
+    async fn a_handler_that_does_not_panic_is_passed_through_untouched() {
+        let ok = guard_panics("test/ok", async { Ok(json!({ "ok": true })) })
+            .await
+            .expect("success must pass through");
+        assert_eq!(ok, json!({ "ok": true }));
+
+        let err = guard_panics("test/err", async {
+            Err(RpcError::invalid_params("bad input"))
+        })
+        .await
+        .expect_err("an ordinary error must pass through");
+        assert_eq!(err.code, -32602, "not reclassified as an internal error");
+        assert_eq!(err.message, "bad input");
+    }
+
+    // ── Notification from client is ignored, except the interrupt ────────────
     #[tokio::test]
     async fn client_notification_is_ignored() {
         let (server_end, client_end) = duplex(64 * 1024);

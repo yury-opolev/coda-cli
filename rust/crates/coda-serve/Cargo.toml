@@ -24,6 +24,10 @@ async-trait = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
+# `catch_unwind` on the dispatch future: a panicking handler must still answer
+# its caller rather than leaving the request pending forever. See
+# `transport::guard_panics`.
+futures = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "time"] }
