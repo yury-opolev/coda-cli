@@ -1321,8 +1321,13 @@ impl UiState {
                 // conversation it no longer matches.
                 self.history_coverage = coverage;
                 self.retain_parked_deliveries();
+                // Pushed as history-derived, so the *next* healthy rebuild
+                // replaces them rather than stacking another copy on top.
                 for notice in notices {
-                    self.notice(notice, NoticeLevel::Warning);
+                    self.transcript.push(Block::HistoryNotice {
+                        text: notice,
+                        level: NoticeLevel::Warning,
+                    });
                 }
             }
         }
@@ -2454,17 +2459,7 @@ mod tests {
         })
     }
 
-    fn notice_texts(state: &UiState) -> Vec<String> {
-        state
-            .transcript
-            .blocks()
-            .iter()
-            .filter_map(|b| match b {
-                Block::Notice { text, .. } => Some(text.clone()),
-                _ => None,
-            })
-            .collect()
-    }
+
 
     fn tools(state: &UiState) -> Option<&ToolActivity> {
         state.transcript.blocks().iter().find_map(|b| match b {
@@ -3267,6 +3262,70 @@ mod tests {
         });
         assert_eq!(state.model.as_deref(), Some("gpt-5"));
         assert_eq!(state.usage.context_limit, 400_000);
+    }
+
+    /// BUG 9, defect C. A hydration warning is a statement about a *history
+    /// view*. When a healthy rebuild replaces that view the warning must go
+    /// with it — otherwise it outlives the problem, and every subsequent
+    /// rebuild stacks another copy on top.
+    #[test]
+    fn a_healthy_rebuild_clears_the_previous_history_warning() {
+        let mut state = state();
+
+        // A local notice the user should keep, and a rebuild that warns.
+        state.notice("local thing worth keeping", NoticeLevel::Info);
+        state.apply(UiEvent::Rehydrated {
+            blocks: vec![Block::Assistant { text: "hi".into(), complete: true }],
+            notices: vec!["A stored tool result for call call-A has no matching call.".into()],
+            coverage: None,
+        });
+        assert!(
+            notice_texts(&state).iter().any(|t| t.contains("no matching call")),
+            "the warning must be shown while it is true",
+        );
+
+        // The same view again: one current diagnostic, not an accumulating list.
+        state.apply(UiEvent::Rehydrated {
+            blocks: vec![Block::Assistant { text: "hi".into(), complete: true }],
+            notices: vec!["A stored tool result for call call-A has no matching call.".into()],
+            coverage: None,
+        });
+        assert_eq!(
+            notice_texts(&state).iter().filter(|t| t.contains("no matching call")).count(),
+            1,
+            "a repeated bad view must not accumulate copies",
+        );
+
+        // A healthy rebuild: the warning is obsolete and must go.
+        state.apply(UiEvent::Rehydrated {
+            blocks: vec![Block::Assistant { text: "hi".into(), complete: true }],
+            notices: vec![],
+            coverage: None,
+        });
+        let texts = notice_texts(&state);
+        assert!(
+            !texts.iter().any(|t| t.contains("no matching call")),
+            "an obsolete history warning must not survive a healthy rebuild: {texts:?}",
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("local thing worth keeping")),
+            "unrelated local notices must be preserved: {texts:?}",
+        );
+    }
+
+    /// Every notice the transcript is currently showing, of either ownership.
+    fn notice_texts(state: &UiState) -> Vec<String> {
+        state
+            .transcript
+            .blocks()
+            .iter()
+            .filter_map(|b| match b {
+                Block::Notice { text, .. } | Block::HistoryNotice { text, .. } => {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
