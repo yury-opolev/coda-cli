@@ -29,6 +29,7 @@
 //! interleaving, including a turn completing mid-page.
 
 use coda_llm::{Content, Message};
+use std::collections::HashSet;
 use coda_proto::history::{
     GetHistoryResult, HistoryBlock, HistoryEntry, SessionSummaryDto, truncate_text,
 };
@@ -211,6 +212,77 @@ pub fn page_bounds(p: &crate::dispatch::GetHistoryParams, total: i64) -> (i64, i
     (start, (start + limit).min(total))
 }
 
+/// How far back a page may be expanded to pick up the declarations its
+/// results need.
+///
+/// Bounded on purpose: a pathological history must not turn one page read
+/// into a walk of the whole conversation. When the needed declarations lie
+/// further back than this, the page is served as-is and the client still
+/// reports the results as unexplained — honest, rather than unbounded.
+pub const MAX_DEPENDENCY_EXPANSION: i64 = 64;
+
+/// Moves `start` back so every tool result in `[start, end)` has its
+/// declaring assistant message inside the page too.
+///
+/// A page boundary is a numeric convenience; a tool call and its result are
+/// one indivisible fact. Choosing "the last 200 messages" could land between
+/// them, and the client — correctly refusing to guess which call an orphaned
+/// result belonged to — reported an intact conversation as inconsistent.
+///
+/// Only ever moves backward, never past `MAX_DEPENDENCY_EXPANSION` messages
+/// and never past index 0, so the extra work is bounded and the page stays a
+/// contiguous range whose reported `start` remains exact.
+pub fn dependency_safe_start(messages: &[Message], start: i64, end: i64) -> i64 {
+    if start <= 0 || start >= end {
+        return start;
+    }
+    let page = &messages[start as usize..end as usize];
+
+    // Results whose declaration is not already inside the page.
+    let mut needed: std::collections::HashSet<String> = HashSet::new();
+    for m in page {
+        for block in &m.content {
+            if let Content::ToolResult { tool_use_id, .. } = block {
+                needed.insert(tool_use_id.clone());
+            }
+        }
+    }
+    for m in page {
+        for block in &m.content {
+            if let Content::ToolUse { id, .. } = block {
+                needed.remove(id);
+            }
+        }
+    }
+    if needed.is_empty() {
+        return start;
+    }
+
+    let floor = (start - MAX_DEPENDENCY_EXPANSION).max(0);
+    let mut expanded = start;
+    for index in (floor..start).rev() {
+        let declares: Vec<String> = messages[index as usize]
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                Content::ToolUse { id, .. } if needed.contains(id) => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        if declares.is_empty() {
+            continue;
+        }
+        for id in declares {
+            needed.remove(&id);
+        }
+        expanded = index;
+        if needed.is_empty() {
+            break;
+        }
+    }
+    expanded
+}
+
 /// Builds the live-session response from a *single* consistent read.
 ///
 /// `page` and `view` must have been taken together under the HISTORY lock
@@ -294,6 +366,9 @@ pub fn build_saved_result(
     }
     let total = messages.len() as i64;
     let (start, end) = page_bounds(p, total);
+    // Same rule as the live read: a resumed transcript's page must not begin
+    // on a result whose call it excludes.
+    let start = dependency_safe_start(messages, start, end);
 
     Ok(GetHistoryResult {
         session_id: session_id.to_string(),
@@ -316,6 +391,121 @@ pub fn build_saved_result(
 mod tests {
     use super::*;
     use coda_llm::{Correlation, Role};
+
+    // ── BUG 9 B: a page boundary must not split a call from its result ──────
+
+    fn tool_use(id: &str) -> Message {
+        Message::new(
+            Role::Assistant,
+            vec![Content::ToolUse {
+                id: id.into(),
+                name: "read_file".into(),
+                input_json: "{}".into(),
+                correlation: Correlation::default(),
+            }],
+        )
+    }
+
+    fn tool_result(id: &str) -> Message {
+        Message::new(
+            Role::User,
+            vec![Content::ToolResult {
+                tool_use_id: id.into(),
+                content: "ok".into(),
+                is_error: false,
+                correlation: Correlation::default(),
+                status: None,
+            }],
+        )
+    }
+
+    /// The exact shape from the report: 202 messages with the call at index 1
+    /// and its result at index 2. A last-200 window starts at index 2 — the
+    /// result without its call — and the client then reported an intact
+    /// conversation as inconsistent.
+    #[test]
+    fn a_page_that_would_start_on_an_orphaned_result_reaches_back_for_its_call() {
+        let mut messages = vec![Message::user("prefix"), tool_use("call-A"), tool_result("call-A")];
+        messages.extend((0..199).map(|i| Message::user(format!("filler {i}"))));
+        assert_eq!(messages.len(), 202);
+
+        let start = dependency_safe_start(&messages, 2, 202);
+
+        assert_eq!(start, 1, "the page must reach back to the declaring message");
+    }
+
+    /// A boundary that splits nothing must not move — expanding always would
+    /// quietly enlarge every page.
+    #[test]
+    fn a_page_that_splits_nothing_is_left_alone() {
+        let messages: Vec<Message> =
+            (0..50).map(|i| Message::user(format!("m{i}"))).collect();
+        assert_eq!(dependency_safe_start(&messages, 10, 50), 10);
+
+        // A pair wholly inside the page needs no expansion either.
+        let mut paired = vec![Message::user("a"), Message::user("b")];
+        paired.push(tool_use("call-A"));
+        paired.push(tool_result("call-A"));
+        assert_eq!(dependency_safe_start(&paired, 2, 4), 2);
+    }
+
+    /// One assistant message can declare several tools whose results are not
+    /// adjacent to it. Reaching back by one message is not enough.
+    #[test]
+    fn a_multi_call_batch_is_resolved_for_every_result_not_just_the_nearest() {
+        let messages = vec![
+            Message::user("prefix"),
+            Message::new(
+                Role::Assistant,
+                vec![
+                    Content::ToolUse {
+                        id: "call-A".into(),
+                        name: "read_file".into(),
+                        input_json: "{}".into(),
+                        correlation: Correlation::default(),
+                    },
+                    Content::ToolUse {
+                        id: "call-B".into(),
+                        name: "grep".into(),
+                        input_json: "{}".into(),
+                        correlation: Correlation::default(),
+                    },
+                ],
+            ),
+            tool_result("call-A"),
+            Message::assistant("interleaved commentary"),
+            tool_result("call-B"),
+        ];
+
+        // A window starting at the *second* result still needs the batch.
+        assert_eq!(dependency_safe_start(&messages, 4, 5), 1);
+        // And so does one starting at the first.
+        assert_eq!(dependency_safe_start(&messages, 2, 5), 1);
+    }
+
+    /// Bounded work: a declaration further back than the cap is not chased,
+    /// and the page is served honestly as-is rather than walking the whole
+    /// conversation.
+    #[test]
+    fn expansion_is_bounded_and_never_runs_past_the_start() {
+        let mut messages = vec![tool_use("call-A")];
+        messages.extend(
+            (0..(MAX_DEPENDENCY_EXPANSION + 10)).map(|i| Message::user(format!("m{i}"))),
+        );
+        messages.push(tool_result("call-A"));
+        let end = messages.len() as i64;
+        let start = end - 1;
+
+        let expanded = dependency_safe_start(&messages, start, end);
+
+        assert!(
+            expanded >= start - MAX_DEPENDENCY_EXPANSION,
+            "expansion must stay within its cap: {expanded} vs {start}",
+        );
+        assert!(expanded <= start, "expansion only ever moves backward");
+        // A page already at the beginning cannot expand at all.
+        assert_eq!(dependency_safe_start(&messages, 0, end), 0);
+    }
 
     fn thinking_with_signature() -> Message {
         Message::new(
