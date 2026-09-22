@@ -3870,6 +3870,11 @@ impl ServeBackend for ServeHost {
                     let view = self.engine_state.history_view();
                     let total = guard.len() as i64;
                     let (start, end) = crate::history::page_bounds(&p, total);
+                    // A page boundary is a numeric convenience; a tool call
+                    // and its result are one fact. Reach back far enough that
+                    // no result in this page arrives without the call that
+                    // explains it — bounded, and never past the beginning.
+                    let start = crate::history::dependency_safe_start(&guard, start, end);
                     let messages = guard[start as usize..end as usize].to_vec();
                     (crate::history::CommittedPage { total, start, messages }, view)
                 };
