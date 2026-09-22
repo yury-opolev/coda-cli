@@ -486,6 +486,7 @@ pub fn build_markdown_export(blocks: &[crate::transcript::Block]) -> String {
             }
             // Skip non-content blocks in the export.
             Block::Notice { .. }
+            | Block::HistoryNotice { .. }
             | Block::Permission { .. }
             | Block::Question { .. }
             | Block::CommandOutput { .. }

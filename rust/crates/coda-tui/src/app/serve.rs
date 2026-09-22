@@ -1695,7 +1695,11 @@ pub(in crate::app) mod tests {
             .blocks()
             .iter()
             .filter_map(|block| match block {
-                Block::Notice { text, .. } => Some(text.clone()),
+                // Both ownerships: a test asking "what is the user being
+                // told" does not care which of them is about to be replaced.
+                Block::Notice { text, .. } | Block::HistoryNotice { text, .. } => {
+                    Some(text.clone())
+                }
                 _ => None,
             })
             .collect()

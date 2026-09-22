@@ -157,6 +157,15 @@ pub enum Block {
     },
     /// A status or error line.
     Notice { text: String, level: NoticeLevel },
+    /// A notice *derived from the current history view* — a missing-call
+    /// warning, a range omission, live-history truncation.
+    ///
+    /// Rendered identically to [`Block::Notice`] but owned differently: it is
+    /// a statement about a view, so when that view is replaced by a healthy
+    /// rebuild the statement goes with it. Classifying these as client-owned
+    /// meant a warning outlived the history that justified it, and repeated
+    /// rebuilds stacked up copies of a problem that no longer existed.
+    HistoryNotice { text: String, level: NoticeLevel },
     /// A permission request and its outcome.
     Permission {
         tool: String,
@@ -279,10 +288,14 @@ impl Block {
                 mode,
             ),
             Block::Tools { activity, .. } => activity.render(mode, width),
-            Block::Notice { text, level } => text::wrap(text, width)
-                .into_iter()
-                .map(|chunk| RenderLine::new(chunk, level.role()))
-                .collect(),
+            // Rendered identically: the two differ only in ownership, so
+            // sharing the arm is what keeps them looking the same.
+            Block::Notice { text, level } | Block::HistoryNotice { text, level } => {
+                text::wrap(text, width)
+                    .into_iter()
+                    .map(|chunk| RenderLine::new(chunk, level.role()))
+                    .collect()
+            }
             Block::Permission {
                 tool,
                 preview,
