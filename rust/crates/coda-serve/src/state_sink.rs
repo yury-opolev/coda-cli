@@ -121,6 +121,11 @@ impl AgentSink for StateSink {
                 AgentEvent::ToolBatchEnded { batch_id } => {
                     events.extend(s.tool_batch_ended(batch_id));
                 }
+                AgentEvent::ToolQueued { tool_name, input_json, correlation } => {
+                    let call_id = correlation.source_id.clone().unwrap_or_default();
+                    let batch_id = correlation.activity_id.clone().unwrap_or_default();
+                    events.extend(s.tool_call_queued(&call_id, &batch_id, tool_name, input_json));
+                }
                 AgentEvent::ToolCall { tool_name, input_json, correlation } => {
                     let call_id = correlation.source_id.clone().unwrap_or_default();
                     let batch_id = correlation.activity_id.clone().unwrap_or_default();
@@ -181,6 +186,116 @@ mod tests {
             max_history_page: 500,
             max_session_page: 200,
         }
+    }
+
+    // ── BUG 9 A: a queued declaration must survive into live history ────────
+
+    /// Steering (or a control abort) arriving before a tool starts makes the
+    /// agent emit `ToolQueued` then `ToolResult{Skipped}` — and **no**
+    /// `ToolCall`. Only `ToolCall` registered the declaration, so live history
+    /// carried a result with nothing to match it to, and the TUI reported
+    /// "a stored tool result for call X has no matching call in this history"
+    /// about a conversation that was perfectly intact on disk.
+    #[test]
+    fn a_tool_skipped_before_it_started_keeps_its_declaration() {
+        let mut h = harness();
+        h.state.begin_turn("turn-1", "go", active_config(), ActivityPhase::Preparing);
+
+        let correlation = coda_llm::Correlation {
+            root_turn_id: Some("turn-1".into()),
+            activity_id: Some("batch-1".into()),
+            source_id: Some("call-A".into()),
+        };
+
+        h.sink.emit(AgentEvent::ToolQueued {
+            tool_name: "read_file".into(),
+            input_json: r#"{"path":"a.rs"}"#.into(),
+            correlation: correlation.clone(),
+        });
+        h.sink.emit(AgentEvent::ToolResult {
+            tool_name: "read_file".into(),
+            content: "skipped: steering arrived first".into(),
+            is_error: false,
+            status: coda_proto::events::ToolCallStatus::Skipped,
+            correlation,
+        });
+
+        let snap = h.state.project("v1", limits());
+        let entries = snap.turn.expect("a running turn").live_entries;
+
+        let calls = entries
+            .iter()
+            .filter(|e| e.blocks.iter().any(|b| matches!(b, coda_proto::history::HistoryBlock::ToolCall { .. })))
+            .count();
+        assert_eq!(
+            calls, 1,
+            "the queued declaration must be in live history so its result has something to match: {entries:#?}",
+        );
+
+        let row = snap
+            .tools
+            .recently_completed
+            .iter()
+            .find(|t| t.call_id == "call-A")
+            .expect("the tool must appear in the tool table");
+        assert_eq!(
+            row.status,
+            ToolCallStateStatus::Skipped,
+            "a tool that never ran must read as skipped, not running",
+        );
+        assert!(
+            row.elapsed_ms.is_none() || row.elapsed_ms == Some(0),
+            "a tool that never executed must not report an execution duration: {:?}",
+            row.elapsed_ms,
+        );
+    }
+
+    /// The ordinary path must still produce exactly one row — registering on
+    /// queue as well as on start must not double-declare.
+    #[test]
+    fn a_normally_executed_tool_is_declared_exactly_once() {
+        let mut h = harness();
+        h.state.begin_turn("turn-1", "go", active_config(), ActivityPhase::Preparing);
+
+        let correlation = coda_llm::Correlation {
+            root_turn_id: Some("turn-1".into()),
+            activity_id: Some("batch-1".into()),
+            source_id: Some("call-A".into()),
+        };
+
+        for event in [
+            AgentEvent::ToolQueued {
+                tool_name: "read_file".into(),
+                input_json: "{}".into(),
+                correlation: correlation.clone(),
+            },
+            AgentEvent::ToolCall {
+                tool_name: "read_file".into(),
+                input_json: "{}".into(),
+                correlation: correlation.clone(),
+            },
+            AgentEvent::ToolResult {
+                tool_name: "read_file".into(),
+                content: "ok".into(),
+                is_error: false,
+                status: coda_proto::events::ToolCallStatus::Succeeded,
+                correlation,
+            },
+        ] {
+            h.sink.emit(event);
+        }
+
+        let snap = h.state.project("v1", limits());
+        let entries = snap.turn.expect("a running turn").live_entries;
+        let calls = entries
+            .iter()
+            .filter(|e| e.blocks.iter().any(|b| matches!(b, coda_proto::history::HistoryBlock::ToolCall { .. })))
+            .count();
+        assert_eq!(calls, 1, "queue then start must converge on one declaration");
+
+        let rows: Vec<_> = snap.tools.recently_completed.iter().filter(|t| t.call_id == "call-A").collect();
+        assert_eq!(rows.len(), 1, "one row, not one per lifecycle event");
+        assert_eq!(rows[0].status, ToolCallStateStatus::Completed);
     }
 
     struct Harness {

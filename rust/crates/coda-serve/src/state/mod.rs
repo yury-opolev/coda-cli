@@ -384,6 +384,17 @@ impl StateInner {
         tool_name: &str,
         input_json: &str,
     ) -> Vec<PendingEvent> {
+        // A queued declaration is already in live history and the tool table.
+        // Starting it is a state transition on that same row, not a second
+        // declaration — otherwise every ordinary tool would appear twice.
+        if let Some(index) = self.find_tool_index(call_id, batch_id) {
+            self.tools_recent[index].status = ToolCallStateStatus::Running;
+            if let Some(t) = self.turn.as_mut() {
+                t.tool_call_started_at
+                    .insert((batch_id.to_string(), call_id.to_string()), Instant::now());
+            }
+            return Vec::new();
+        }
         let Some(t) = self.turn.as_mut() else { return Vec::new() };
         let turn_id = t.turn_id.clone();
         t.live.push_tool_call(call_id, batch_id, &turn_id, tool_name, input_json);
@@ -404,6 +415,63 @@ impl StateInner {
         // without bound, and must never disappear silently.
         self.bound_tools();
         Vec::new()
+    }
+
+    /// Registers a tool the agent has *declared* but not yet started.
+    ///
+    /// The declaration and the execution are separate facts. The agent emits
+    /// `ToolQueued` for every tool in a batch up front, then `ToolCall` only
+    /// for the ones that actually run — so a tool skipped before it started
+    /// (operator steering landing first, or a control abort) produced a result
+    /// with no declaration anywhere in live history. The TUI then reported
+    /// "a stored tool result for call X has no matching call in this history"
+    /// about a conversation that was intact on disk.
+    ///
+    /// Registering here closes that gap. `started_at` is the first-observed
+    /// lifecycle time, not proof of execution: the status carries that, and a
+    /// tool that never ran keeps `elapsed_ms: None` so nothing can render a
+    /// duration for work that did not happen.
+    pub(crate) fn tool_call_queued(
+        &mut self,
+        call_id: &str,
+        batch_id: &str,
+        tool_name: &str,
+        input_json: &str,
+    ) -> Vec<PendingEvent> {
+        // Idempotent: a replayed queue event, or a producer that emits both
+        // queue and call, must converge on one row rather than declaring the
+        // same tool twice.
+        if self.find_tool_index(call_id, batch_id).is_some() {
+            return Vec::new();
+        }
+        let Some(t) = self.turn.as_mut() else { return Vec::new() };
+        let turn_id = t.turn_id.clone();
+        t.live.push_tool_call(call_id, batch_id, &turn_id, tool_name, input_json);
+        self.tools_recent.push_back(ToolCallState {
+            call_id: call_id.to_string(),
+            batch_id: batch_id.to_string(),
+            turn_id,
+            tool_name: tool_name.to_string(),
+            status: ToolCallStateStatus::Queued,
+            started_at: now_rfc3339(),
+            elapsed_ms: None,
+            ended_at: None,
+            is_error: None,
+            result_summary: None,
+        });
+        self.bound_tools();
+        Vec::new()
+    }
+
+    /// Index of a non-terminal call for `(batch_id, call_id)`, newest first.
+    ///
+    /// Keyed on the pair, never on `call_id` alone: a provider may reuse
+    /// tool-use ids across batches, and matching loosely would associate a
+    /// result with an unrelated call.
+    fn find_tool_index(&self, call_id: &str, batch_id: &str) -> Option<usize> {
+        self.tools_recent
+            .iter()
+            .rposition(|c| c.call_id == call_id && c.batch_id == batch_id && !is_terminal(c.status))
     }
 
     /// Completes the call identified by `(batch_id, call_id)`.
