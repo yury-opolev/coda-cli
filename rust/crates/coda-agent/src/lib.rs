@@ -37,7 +37,8 @@
 //!   `HookMatcher`, `HookContentHash`, `HookTrustStore`, `HookTrustGuard`,
 //!   and the decision result types.
 //! - **`compaction`**: `CompactionService`, `CompactionPrompts`,
-//!   `TokenEstimator`, `CompactionPolicy`, `compaction_tail_start`.
+//!   `TokenEstimator`, `CompactionPolicy`, `CompactionTrigger`,
+//!   `compaction_tail_start`.
 //! - **`output_styles`**: `OutputStyle`, `BuiltInOutputStyles`.
 
 pub mod agent;
@@ -59,8 +60,10 @@ pub mod tool;
 pub mod tools;
 
 // Convenience re-exports — the most frequently used public surface.
-pub use agent::{AgentError, AgentLoop, AgentLoopBuilder};
-pub use compaction::{CompactionPolicy, CompactionService, TokenEstimator, compaction_tail_start};
+pub use agent::{AgentError, AgentLoop, AgentLoopBuilder, DEFAULT_MAX_TOKENS};
+pub use compaction::{
+    CompactionPolicy, CompactionService, CompactionTrigger, TokenEstimator, compaction_tail_start,
+};
 pub use events::{AgentEvent, AgentSink, CollectingSink, NullSink, ToolCallStatus};
 pub use autonomy::{
     AssumptionLedger, AutonomySupervisor, BlockerKind, CompletionJudgePrompt, Confidence,

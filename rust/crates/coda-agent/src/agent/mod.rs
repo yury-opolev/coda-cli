@@ -895,6 +895,13 @@ async fn compact_history(
     Ok(true)
 }
 
+/// Output tokens the loop requests per response.
+///
+/// Also the headroom auto-compaction reserves for a reply, which is why it is a
+/// named constant rather than a literal: the two must not drift apart, or the
+/// compaction trigger would protect a budget the loop never asks for.
+pub const DEFAULT_MAX_TOKENS: u32 = 4096;
+
 /// Builder for [`AgentLoop`].
 ///
 /// Only `client`, `permission_prompt`, and `tools` are mandatory; everything
@@ -970,7 +977,7 @@ impl AgentLoopBuilder {
             is_main_context: false,
             model: "claude-opus-4-5".into(),
             system_prompt: None,
-            max_tokens: 4096,
+            max_tokens: DEFAULT_MAX_TOKENS,
             max_iterations: 500,
             effort: None,
             working_directory: String::new(),
@@ -2879,10 +2886,14 @@ mod tests {
             .with_tool_max_duration(None)
             .build();
 
-        // Build a history that's large enough to exceed the tiny threshold.
+        // Build a history that's large enough to exceed the tiny threshold,
+        // and long enough to have something ahead of the preserved tail: a
+        // lone exchange is all tail, so there would be nothing to summarise.
         let mut history = vec![
             Message::user("prompt"),
             Message::assistant("previous response that is long enough to trigger compaction"),
+            Message::user("a second prompt"),
+            Message::assistant("a second response, also long enough to matter"),
         ];
         agent.run(&mut history, &sink, Some(goal), CancellationToken::new()).await.unwrap();
 
@@ -2952,18 +2963,19 @@ mod tests {
     #[test]
     fn the_threshold_scales_with_the_model_context_window() {
         use crate::compaction::{
-            CompactionPolicy, DEFAULT_CONTEXT_WINDOW, FALLBACK_MAX_OUTPUT_TOKENS,
-            MIN_AUTO_COMPACT_THRESHOLD,
+            CompactionPolicy, DEFAULT_COMPACT_RATIO, DEFAULT_CONTEXT_WINDOW,
         };
 
-        // Window minus the room the reply needs.
-        assert_eq!(
-            CompactionPolicy::resolve_threshold(0, Some(1_000_000), Some(128_000)),
-            872_000,
-        );
+        // The default is a fraction of the window, not the window less a
+        // reply: the estimator cannot see the system prompt or the tool
+        // schemas, so the trigger has to leave room for what it cannot measure.
         assert_eq!(
             CompactionPolicy::for_context_window(Some(200_000)).token_threshold,
-            200_000 - FALLBACK_MAX_OUTPUT_TOKENS,
+            160_000,
+        );
+        assert_eq!(
+            CompactionPolicy::for_context_window(Some(1_000_000)).token_threshold,
+            800_000,
         );
 
         // An explicit value wins outright: that is how a threshold is pinned
@@ -2974,14 +2986,78 @@ mod tests {
         // one, which would let history grow past a small model's real limit.
         assert_eq!(
             CompactionPolicy::for_context_window(None).token_threshold,
-            DEFAULT_CONTEXT_WINDOW - FALLBACK_MAX_OUTPUT_TOKENS,
+            (DEFAULT_CONTEXT_WINDOW as f64 * DEFAULT_COMPACT_RATIO) as usize,
         );
 
-        // A window smaller than the reserve must not produce a zero (which
-        // reads as "disabled") or an underflow.
+        // A window smaller than the reserve must not underflow, nor produce a
+        // zero (which reads as "disabled"), nor exceed the window itself — a
+        // threshold above the window never fires, so it disables compaction
+        // just as surely as a zero does.
+        let degenerate = CompactionPolicy::resolve_threshold(0, Some(4_000), Some(8_192));
+        assert!(degenerate > 0, "a threshold of zero reads as disabled");
+        assert!(degenerate <= 4_000, "a threshold above the window can never fire");
+    }
+
+    /// The trigger is expressible as a percentage or as headroom, and the
+    /// reply reserve caps both — but only where the window is too small for
+    /// the fraction to leave room to answer.
+    #[test]
+    fn the_threshold_honours_a_configured_ratio_or_free_token_budget() {
+        use crate::compaction::{CompactionPolicy, CompactionTrigger};
+
+        let resolve = |trigger, window, reserve| {
+            CompactionPolicy::resolve_threshold_with(trigger, Some(window), reserve)
+        };
+
+        // A percentage of the window.
+        assert_eq!(resolve(CompactionTrigger::ratio(0.90), 200_000, None), 180_000);
+        assert_eq!(resolve(CompactionTrigger::ratio(0.50), 200_000, None), 100_000);
+
+        // The same decision expressed as headroom.
+        assert_eq!(resolve(CompactionTrigger::free_tokens(40_000), 200_000, None), 160_000);
+
+        // A reply reserve smaller than the headroom the ratio already leaves
+        // changes nothing: 80% of 200k keeps 40k free, far beyond the 4k the
+        // loop asks for, so the configured fraction stands.
+        assert_eq!(resolve(CompactionTrigger::default(), 200_000, Some(4_096)), 160_000);
+
+        // It binds only when the fraction would not leave room to answer: 80%
+        // of 16k keeps 3.2k, less than the 4k reply.
+        assert_eq!(resolve(CompactionTrigger::default(), 16_000, Some(4_096)), 11_904);
+
+        // And when it binds, it genuinely leaves the reply its room — the cap
+        // is not allowed to be overridden by the floor, which would hand back
+        // a threshold at or above the window and so never fire at all.
+        let small = resolve(CompactionTrigger::default(), 8_000, Some(4_096));
+        assert_eq!(small, 3_904, "80% of 8k is 6.4k, which is not a reply");
+        assert!(8_000 - small >= 4_096, "the reply must keep its reserve");
+
+        // Headroom that would leave less than the floor to work in is a
+        // mistake, not a budget: it falls back to the ratio rather than
+        // pinning the threshold low enough to summarise every few exchanges.
+        // Reachable without a silly number — the window is re-derived from the
+        // active model, so a value sized for a 1M window lands on a 128k one.
+        assert_eq!(resolve(CompactionTrigger::free_tokens(150_000), 128_000, None), 102_400);
+        assert_eq!(resolve(CompactionTrigger::free_tokens(199_900), 200_000, None), 160_000);
+
+        // A ratio a percentage cannot mean falls back to the default rather
+        // than disabling compaction or exceeding the window.
+        for nonsense in [0.0, -0.5, 1.5, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                resolve(CompactionTrigger::ratio(nonsense), 200_000, None),
+                160_000,
+                "ratio {nonsense} must fall back to the default",
+            );
+        }
+
+        // An absolute pin outranks both.
         assert_eq!(
-            CompactionPolicy::resolve_threshold(0, Some(4_000), Some(8_192)),
-            MIN_AUTO_COMPACT_THRESHOLD,
+            resolve(
+                CompactionTrigger { tokens: 50_000, ratio: Some(0.9), free_tokens: Some(1) },
+                200_000,
+                None,
+            ),
+            50_000,
         );
     }
 

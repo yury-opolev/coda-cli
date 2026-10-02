@@ -75,6 +75,13 @@ impl ModelCatalog {
     /// not cost the user their model list, so unknown keys are skipped rather
     /// than failing the parse.
     pub fn parse(json: &str) -> Self {
+        // A leading BOM makes serde reject the whole document, and the
+        // `unwrap_or_default` below would turn that into a silently empty
+        // catalogue: no context limits, no pricing, no display names. The
+        // refresh script writes this file, and a UTF-8 BOM is exactly what
+        // Windows PowerShell 5.1 emits. Every other JSON reader in the repo
+        // strips it for the same reason.
+        let json = json.strip_prefix('\u{feff}').unwrap_or(json);
         let raw: HashMap<String, Provider> = serde_json::from_str(json).unwrap_or_default();
         let providers = raw
             .into_iter()
@@ -178,6 +185,25 @@ mod tests {
         assert!(
             !catalog.models_for("github-copilot").is_empty(),
             "no copilot models"
+        );
+    }
+
+    #[test]
+    fn a_byte_order_mark_does_not_empty_the_catalogue() {
+        // The refresh script writes this file, and a UTF-8 BOM is what Windows
+        // PowerShell 5.1 emits. serde rejects the document outright, and the
+        // `unwrap_or_default` in `parse` would turn that into an empty
+        // catalogue: no context limits (so auto-compaction silently falls back
+        // to the default window for every model), no pricing, no names — with
+        // nothing logged to say so.
+        let with_bom = format!("\u{feff}{BUNDLED}");
+        let catalog = ModelCatalog::parse(&with_bom);
+        assert!(!catalog.is_empty(), "a BOM emptied the catalogue");
+        assert_eq!(
+            catalog.find(Some("anthropic"), "claude-opus-4-5").and_then(|m| m.context_limit),
+            ModelCatalog::parse(BUNDLED)
+                .find(Some("anthropic"), "claude-opus-4-5")
+                .and_then(|m| m.context_limit),
         );
     }
 

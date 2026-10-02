@@ -4834,8 +4834,15 @@ impl ServeHost {
         .with_compaction_service(Arc::new(CompactionService::new(Arc::new(
             LlmForkedAgent { client: Arc::clone(&client), model: captured.config.model.clone() },
         ) as Arc<dyn ForkedAgent>)))
-        .with_compaction_policy(CompactionPolicy::for_context_window(
+        // The threshold is a fraction of the model's window (80% by default),
+        // overridable per user via `compactAtPercent` / `compactFreeTokens`.
+        // The reserve is the `max_tokens` the loop actually requests — not the
+        // model's advertised output ceiling, which is an order of magnitude
+        // larger and would pull the trigger far below the configured fraction.
+        .with_compaction_policy(CompactionPolicy::for_context_window_with(
+            crate::settings::compaction_trigger_from(&load_settings_value()),
             self.active_context_window(),
+            Some(coda_agent::DEFAULT_MAX_TOKENS as usize),
         ));
 
         // Apply the session-only system prompt override the captured record

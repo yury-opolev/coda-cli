@@ -11,6 +11,7 @@
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
+use coda_agent::CompactionTrigger;
 use coda_auth::provider::copilot::CopilotConfig as AuthCopilotConfig;
 
 /// The model used when settings say nothing.
@@ -195,6 +196,36 @@ pub fn resolve() -> StartupModel {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Auto-compaction trigger
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Reads the auto-compaction trigger from a settings document.
+///
+/// Two spellings of one decision, because the question is asked both ways:
+/// `compactAtPercent` is how full the context window may get, and
+/// `compactFreeTokens` is how much of it to keep free. The token form wins when
+/// both are present, being the more specific of the two.
+///
+/// A wrongly typed or out-of-range value is ignored rather than rejected. The
+/// engine must start whatever the settings file says, and the fallback here is
+/// the default trigger, which is always safe — unlike the startup model, a bad
+/// value cannot leave compaction in a state that fails every prompt.
+pub fn compaction_trigger_from(value: &Value) -> CompactionTrigger {
+    let ratio = value
+        .get("compactAtPercent")
+        .and_then(Value::as_f64)
+        .filter(|percent| percent.is_finite() && *percent > 0.0 && *percent <= 100.0)
+        .map(|percent| percent / 100.0);
+
+    let free_tokens = value
+        .get("compactFreeTokens")
+        .and_then(Value::as_u64)
+        .and_then(|tokens| usize::try_from(tokens).ok());
+
+    CompactionTrigger { tokens: 0, ratio, free_tokens }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Enterprise Copilot configuration resolver
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -301,6 +332,55 @@ pub(crate) fn load_settings_json(path: &Path) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_compaction_trigger_reads_a_percentage_or_a_free_token_budget() {
+        assert_eq!(
+            compaction_trigger_from(&json!({ "compactAtPercent": 90 })),
+            CompactionTrigger { tokens: 0, ratio: Some(0.9), free_tokens: None },
+        );
+        assert_eq!(
+            compaction_trigger_from(&json!({ "compactFreeTokens": 40_000 })),
+            CompactionTrigger { tokens: 0, ratio: None, free_tokens: Some(40_000) },
+        );
+
+        // Silence means the default, which is the whole point of the default.
+        assert_eq!(compaction_trigger_from(&json!({})), CompactionTrigger::default());
+    }
+
+    #[test]
+    fn an_unusable_compaction_setting_is_ignored_rather_than_fatal() {
+        // A percentage outside the range a percentage can occupy, a string
+        // where a number belongs, and a negative headroom: each would be a
+        // silently broken trigger, so each falls back to the default.
+        for bad in [
+            json!({ "compactAtPercent": 0 }),
+            json!({ "compactAtPercent": 140 }),
+            json!({ "compactAtPercent": -10 }),
+            json!({ "compactAtPercent": "eighty" }),
+            json!({ "compactFreeTokens": -1 }),
+            json!({ "compactFreeTokens": "lots" }),
+        ] {
+            assert_eq!(
+                compaction_trigger_from(&bad),
+                CompactionTrigger::default(),
+                "{bad} must fall back to the default trigger",
+            );
+        }
+    }
+
+    /// The two keys answer the same question, so one of them has to win.
+    #[test]
+    fn the_free_token_budget_outranks_the_percentage() {
+        let trigger =
+            compaction_trigger_from(&json!({ "compactAtPercent": 90, "compactFreeTokens": 40_000 }));
+        assert_eq!(trigger.free_tokens, Some(40_000));
+        assert_eq!(
+            coda_agent::CompactionPolicy::resolve_threshold_with(trigger, Some(200_000), None),
+            160_000,
+            "the headroom form must decide the threshold when both are set",
+        );
+    }
 
     #[test]
     fn provider_aliases_use_the_canonical_saved_model() {
