@@ -1039,7 +1039,7 @@ project files if they exist (it never writes to them).
 
 | What | Location | Notes |
 |---|---|---|
-| User settings | `~/.coda/settings.json` | allow/deny rules, hooks, LSP servers, subagent limits, `mcpSchemaPolicy` |
+| User settings | `~/.coda/settings.json` | allow/deny rules, hooks, LSP servers, subagent limits, auto-compaction threshold, `mcpSchemaPolicy` |
 | Project settings | `<project>/.coda/settings.json` | overrides user settings |
 | Credentials | `~/.coda/credentials/` | DPAPI-encrypted (Windows) / AES-GCM (other OS) |
 | Session transcripts | `<project>/.coda/sessions/<id>.json` | for `/resume` |
@@ -1097,6 +1097,38 @@ filter), that subagent can still run any tool it has — including ones the main
 call directly. This is intentional: `agent.tools` shapes _workflow_ (what the root turn
 does), not _capability_ (what the session can ultimately do). Do not use it as an access
 control mechanism.
+
+### Auto-compaction
+
+When the conversation grows past a threshold, a forked summariser replaces the older
+history with a summary and the session continues. The most recent exchange is carried
+through verbatim rather than summarised, so the message you just sent still reaches the
+model, and no tool call is ever separated from its result. The threshold defaults to **80% of
+the active model's context window**, so it scales with the model rather than being a
+fixed number that suits only one of them.
+
+Why 80% and not higher: the trigger is compared against an estimate of the *message
+history* only — it cannot see the system prompt, the tool definitions, or the MCP tool
+schemas, all of which are charged on every request and can run to tens of thousands of
+tokens. The estimate is therefore a lower bound on the real prompt, and the remaining
+20% is the margin that covers what it cannot measure.
+
+Configurable in `~/.coda/settings.json`:
+
+```json
+{ "compactAtPercent": 80 }
+```
+
+| Field | Default | Effect |
+|---|---|---|
+| `compactAtPercent` | `80` | How full the context window may get, as a percentage, before compaction fires. Values outside `0 < p <= 100` are ignored and the default applies. |
+| `compactFreeTokens` | *(none)* | The same decision expressed as headroom: compact once fewer than this many tokens remain. **Wins over `compactAtPercent`** when both are set, being the more specific of the two. Ignored (falling back to the percentage) if it would leave less than 8,000 tokens to work in — which can happen without you typing a silly number, since the window is re-derived from whichever model is active. |
+
+Both are floored at 8,000 tokens and capped so the trigger always leaves room for a
+reply. The cap matters only on windows small enough that the percentage would not — an
+8k window at 80% leaves 1.6k, which is not a reply, so the threshold drops to 3,904.
+
+`/compact` compacts on demand at any time, regardless of these settings.
 
 ### Subagent limits & prompts
 

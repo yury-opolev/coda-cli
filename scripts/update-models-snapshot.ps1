@@ -6,7 +6,8 @@
   Fetches https://models.dev/api.json, trims it to the providers Coda maps
   (anthropic, github-copilot) and to the fields the catalog uses (name,
   limit.{context,output}, cost.{input,output,cache_read,cache_write}), and writes
-  src/Coda.Sdk/Resources/models-snapshot.json (the offline default for ModelCatalog).
+  rust/crates/coda-serve/resources/models-snapshot.json (the offline default for
+  the model catalog).
 
   Run this periodically to refresh the in-repo default; users also get live
   refreshes at runtime (startup staleness check + `/model refresh`).
@@ -22,7 +23,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path $PSScriptRoot -Parent
-$outFile = Join-Path $repoRoot 'src/Coda.Sdk/Resources/models-snapshot.json'
+$outFile = Join-Path $repoRoot 'rust/crates/coda-serve/resources/models-snapshot.json'
 
 Write-Host "Fetching $Url/api.json ..." -ForegroundColor Cyan
 $data = (Invoke-WebRequest -Uri "$Url/api.json" -UseBasicParsing -TimeoutSec 30).Content | ConvertFrom-Json
@@ -53,6 +54,10 @@ foreach ($pk in @('anthropic', 'github-copilot')) {
     $out[$pk] = [ordered]@{ models = $models }
 }
 
-$out | ConvertTo-Json -Depth 8 | Set-Content $outFile -Encoding utf8
+$json = $out | ConvertTo-Json -Depth 8
+# Not Set-Content -Encoding utf8: under Windows PowerShell 5.1 that writes a
+# UTF-8 BOM, and this file is parsed by a reader that treats a parse failure as
+# an empty catalogue. Write the bytes explicitly so the shell cannot decide.
+[System.IO.File]::WriteAllText($outFile, $json, (New-Object System.Text.UTF8Encoding $false))
 $bytes = (Get-Item $outFile).Length
 Write-Host "Wrote $outFile ($bytes bytes): anthropic=$($out.'anthropic'.models.Count), github-copilot=$($out.'github-copilot'.models.Count)" -ForegroundColor Green
