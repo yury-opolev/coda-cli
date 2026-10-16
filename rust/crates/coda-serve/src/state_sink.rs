@@ -115,6 +115,7 @@ impl AgentSink for StateSink {
                 AgentEvent::AssistantText { delta } => {
                     events.extend(s.observed_text_delta(delta));
                 }
+                AgentEvent::AssistantTextComplete => s.assistant_text_complete(),
                 AgentEvent::ToolBatchStarted { batch_id, call_ids } => {
                     events.extend(s.tool_batch_started(batch_id.clone(), call_ids.clone()));
                 }
@@ -186,6 +187,31 @@ mod tests {
             max_history_page: 500,
             max_session_page: 200,
         }
+    }
+
+    #[test]
+    fn history_refresh_distinguishes_streaming_text_from_completed_live_replies() {
+        let h = harness();
+        h.state.begin_turn("turn-1", "go", active_config(), ActivityPhase::Preparing);
+        h.sink.emit(AgentEvent::AssistantText { delta: "first".into() });
+        let live = serde_json::to_value(
+            h.state.project("v1", limits()).turn.unwrap().live_entries
+        ).unwrap();
+        assert_eq!(live[1]["streamingTextIndex"], 0);
+
+        h.sink.emit(AgentEvent::AssistantTextComplete);
+        let live = serde_json::to_value(
+            h.state.project("v1", limits()).turn.unwrap().live_entries
+        ).unwrap();
+        assert!(live[1].get("streamingTextIndex").is_none());
+
+        h.sink.emit(AgentEvent::AssistantText { delta: "second".into() });
+        let live = serde_json::to_value(
+            h.state.project("v1", limits()).turn.unwrap().live_entries
+        ).unwrap();
+        assert_eq!(live[1]["streamingTextIndex"], 1);
+        assert_eq!(live[1]["blocks"][0]["text"], "first");
+        assert_eq!(live[1]["blocks"][1]["text"], "second");
     }
 
     // ── BUG 9 A: a queued declaration must survive into live history ────────

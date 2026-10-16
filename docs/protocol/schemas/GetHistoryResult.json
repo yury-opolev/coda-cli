@@ -110,6 +110,15 @@
             "$ref": "#/$defs/HistoryBlock"
           }
         },
+        "streamingTextIndex": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "description": "Zero-based index of the text block still receiving assistant deltas.\nLive projection only: a running turn can also contain completed\nreplies, so membership in `liveEntries` alone is not evidence that\nits last text block is open. Omitted for closed or committed text."
+        },
         "steeringMessageId": {
           "type": [
             "string",

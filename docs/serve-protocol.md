@@ -224,6 +224,13 @@ stable **within one `historyEpoch`**. Three optional fences make that exact:
 actually running; it is **omitted**, never an empty array. A saved transcript has no epoch,
 no cursor and no live turn, so those fields are absent rather than reported as `0`.
 
+An assistant live entry may carry `streamingTextIndex`, the zero-based index into
+`blocks` of the text block still receiving deltas at the read's cursor. Completed text
+omits it, even while the turn is still running. Committed entries always omit it.
+A client must not infer that text is open merely because it is in `liveEntries`:
+completion events at or before the read's cursor are already reflected in this metadata.
+Engines predating this field cannot identify an open text block on reconstruction.
+
 `entryKind` (`userPrompt` / `toolResults` / `assistant`) is carried alongside `role`. A
 provider conversation encodes tool results as **user-role** messages: rendering `role: "user"`
 as "something the operator typed" invents prompts that never happened, and `entryKind` is how

@@ -1276,7 +1276,7 @@ impl UiState {
             UiEvent::CoreLifecycle(lifecycle) => self.apply_lifecycle(lifecycle, now),
             UiEvent::CoreActivity(phase) => self.apply_activity_phase(phase, now, None),
             UiEvent::Snapshot(snapshot) => self.reconcile(&snapshot, now),
-            UiEvent::Rehydrated { blocks, notices, coverage } => {
+            UiEvent::Rehydrated { mut blocks, notices, coverage } => {
                 // The engine owns what the *conversation* is. Anything the UI
                 // had of it is a projection of an older answer to the same
                 // question, so it is replaced outright — but the banner, the
@@ -1297,6 +1297,13 @@ impl UiState {
                 // second `Thinking`/`Assistant` block instead of continuing
                 // the first.
                 let carried = self.take_live_thinking();
+                // History warnings belong to this rebuild, but must not hide
+                // its open tail from the next streaming event.
+                let notice_index = blocks.len()
+                    - usize::from(blocks.last().is_some_and(Block::is_open));
+                blocks.splice(notice_index..notice_index, notices.into_iter().map(|text| {
+                    Block::HistoryNotice { text, level: NoticeLevel::Warning }
+                }));
                 self.transcript.replace_conversation(blocks);
                 self.restore_live_thinking(carried, now);
                 // A notification parked behind the block this rebuild just
@@ -1321,14 +1328,6 @@ impl UiState {
                 // conversation it no longer matches.
                 self.history_coverage = coverage;
                 self.retain_parked_deliveries();
-                // Pushed as history-derived, so the *next* healthy rebuild
-                // replaces them rather than stacking another copy on top.
-                for notice in notices {
-                    self.transcript.push(Block::HistoryNotice {
-                        text: notice,
-                        level: NoticeLevel::Warning,
-                    });
-                }
             }
         }
         if !matches!(self.transcript.open_tail(), Some(Block::Thinking { .. })) {
@@ -2542,6 +2541,65 @@ mod tests {
         state.apply(UiEvent::Engine(Event::AssistantText { delta: "two".into() }));
 
         assert_eq!(state.transcript.len(), 2);
+    }
+
+    #[test]
+    fn history_refresh_preserves_streaming_markdown_across_client_blocks() {
+        use coda_proto::history::HistoryEntry;
+
+        for (prefix, suffix) in [
+            ("Here is the link: `https://example.com/docs/ed", "it/example-page`"),
+            ("See [the guide](https://example.com/docs/ed", "it/example-page)"),
+        ] {
+            for with_notices in [false, true] {
+                let mut state = state();
+                state.apply(UiEvent::Engine(Event::AssistantText { delta: prefix.into() }));
+                if with_notices {
+                    state.apply(UiEvent::Notice {
+                        text: "local notice".into(),
+                        level: NoticeLevel::Info,
+                    });
+                }
+                let entry: HistoryEntry = serde_json::from_value(serde_json::json!({
+                    "index": 0,
+                    "role": "assistant",
+                    "entryKind": "assistant",
+                    "blocks": [{ "kind": "text", "text": prefix }],
+                    "streamingTextIndex": 0,
+                })).unwrap();
+                let hydration = crate::api::history::hydrate(&[], &[entry], false);
+                state.apply(UiEvent::Rehydrated {
+                    blocks: hydration.blocks,
+                    notices: if with_notices { vec!["history notice".into()] } else { vec![] },
+                    coverage: None,
+                });
+                state.apply(UiEvent::Engine(Event::AssistantText { delta: suffix.into() }));
+                state.apply(UiEvent::Engine(Event::AssistantTextComplete));
+
+                let expected = format!("{prefix}{suffix}");
+                let replies: Vec<_> = state.transcript.blocks().iter().filter_map(|b| match b {
+                    Block::Assistant { text, complete } => Some((text.as_str(), *complete)),
+                    _ => None,
+                }).collect();
+                assert_eq!(replies, [(expected.as_str(), true)]);
+                let actual_rows = state.transcript.blocks().iter().find_map(|b| match b {
+                    Block::Assistant { .. } => Some(b.render(120, ToolDisplayMode::Summary)),
+                    _ => None,
+                }).unwrap();
+                let expected_rows = Block::Assistant { text: expected, complete: true }
+                    .render(120, ToolDisplayMode::Summary);
+                assert_eq!(actual_rows, expected_rows);
+                assert!(actual_rows.iter().all(|row| !row.text.contains('`')));
+                if with_notices {
+                    assert!(state.transcript.blocks().iter().any(
+                        |b| matches!(b, Block::Notice { text, .. } if text == "local notice")
+                    ));
+                    assert!(state.transcript.blocks().iter().any(
+                        |b| matches!(b, Block::HistoryNotice { text, .. } if text == "history notice")
+                    ));
+                }
+            }
+        }
     }
 
     #[test]

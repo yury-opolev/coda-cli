@@ -690,8 +690,9 @@ impl Transcript {
     ///
     /// Position is preserved as far as it can honestly be: client blocks that
     /// preceded the whole conversation still precede it, and the rest keep
-    /// their order after it, because where they sat *within* a conversation
-    /// that has just been rebuilt is no longer knowable.
+    /// their order after it, but before a still-streaming tail so subsequent
+    /// deltas can reach it. Where they sat *within* a conversation that has
+    /// just been rebuilt is no longer knowable.
     ///
     /// Fold and group state is dropped with the old blocks, exactly as
     /// [`Self::clear`] does: both are recorded by block index, and carrying
@@ -699,19 +700,18 @@ impl Transcript {
     /// those indices next.
     pub fn replace_conversation(&mut self, conversation: Vec<Block>) {
         let mut conversation = conversation;
-        // Closed here rather than by the caller: once the client's own
-        // trailing blocks are appended, the conversation's last block is no
-        // longer the transcript's last block, and a caller reaching for
-        // `close_open` would finalise a banner instead of a tool batch.
-        if let Some(last) = conversation.last_mut() {
-            // A reasoning burst the engine is still streaming is the one
-            // thing a rebuild may hand over open: the read describes it as
-            // in-flight, and finalising it here would freeze a live row and
-            // stop its clock the moment the conversation was re-read.
-            if !matches!(last, Block::Thinking { complete: false, .. }) {
+        let streaming_tail = if matches!(
+            conversation.last(),
+            Some(Block::Assistant { complete: false, .. } | Block::Thinking { complete: false, .. })
+        ) {
+            conversation.pop()
+        } else {
+            // Finalise a historical tool batch before client blocks obscure it.
+            if let Some(last) = conversation.last_mut() {
                 close_block(last);
             }
-        }
+            None
+        };
         let previous = std::mem::take(&mut self.blocks);
         let first_conversation = previous.iter().position(|block| !block.is_client_owned());
         let split = first_conversation.unwrap_or(previous.len());
@@ -726,6 +726,7 @@ impl Transcript {
         }
         rebuilt.extend(conversation);
         rebuilt.extend(trailing);
+        rebuilt.extend(streaming_tail);
 
         self.blocks = rebuilt;
         self.expanded_tool_groups.clear();
