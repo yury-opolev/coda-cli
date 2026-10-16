@@ -362,6 +362,12 @@ impl StateInner {
         self.set_phase(ActivityPhase::Responding)
     }
 
+    pub(crate) fn assistant_text_complete(&mut self) {
+        if let Some(t) = self.turn.as_mut() {
+            t.live.close_open_text();
+        }
+    }
+
     pub(crate) fn tool_batch_started(
         &mut self,
         batch_id: String,

@@ -4071,6 +4071,98 @@ pub(in crate::app) mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn history_refresh_preserves_text_continuity_without_replaying_covered_events() {
+        const PREFIX: &str = "Here is `https://example.com/docs/ed";
+        const SUFFIX: &str = "it/page`";
+        for streaming in [true, false] {
+            let mut harness = app_with(
+                crate::local::AccessMode::TrustedLocal,
+                move |method, _| match method {
+                    "session/getHistory" => {
+                        let mut entry = json!({
+                            "index": 0, "role": "assistant", "entryKind": "assistant",
+                            "blocks": [
+                                { "kind": "text", "text": "earlier reply" },
+                                { "kind": "text", "text": PREFIX },
+                            ],
+                        });
+                        if streaming {
+                            entry["streamingTextIndex"] = json!(1);
+                        }
+                        json!({
+                            "sessionId": "s1", "engineInstanceId": "e1",
+                            "isLiveSession": true, "historyEpoch": 0, "cursor": 10,
+                            "historyLength": 0, "entries": [], "nextIndex": 0,
+                            "totalKnown": 0, "truncated": false,
+                            "liveEntries": [entry],
+                        })
+                    }
+                    _ => json!({}),
+                },
+            );
+            let app = &mut harness.app;
+            app.apply(UiEvent::Engine(coda_proto::Event::AssistantText { delta: PREFIX.into() }));
+            app.apply(UiEvent::Engine(coda_proto::Event::AgentMessage {
+                id: "m1".into(), cursor: 1, label: "main".into(), text: "parked note".into(),
+                context: None, source: "main".into(), task_id: None,
+                schedule_definition_id: None,
+            }));
+            app.apply(UiEvent::Notice { text: "local note".into(), level: NoticeLevel::Info });
+            for _ in 0..2 {
+                app.rehydrate_at(std::time::Instant::now()).await;
+            }
+
+            // This completion belongs to the earlier reply. The read already
+            // reflects it and the following text, so neither may be reapplied.
+            app.dispatch_frame(Frame::new(
+                "event/assistantTextComplete",
+                Some(json!({ "seq": 9, "engineInstanceId": "e1" })),
+            ));
+            app.dispatch_frame(Frame::new(
+                "event/assistantText",
+                Some(json!({ "seq": 10, "engineInstanceId": "e1", "delta": PREFIX })),
+            ));
+            assert_eq!(
+                app.state.transcript.blocks().iter().filter(
+                    |b| matches!(b, Block::AgentMessage { .. })
+                ).count(),
+                usize::from(!streaming),
+            );
+            app.dispatch_frame(Frame::new(
+                "event/assistantText",
+                Some(json!({
+                    "seq": 11, "engineInstanceId": "e1",
+                    "delta": if streaming { SUFFIX } else { "new reply" },
+                })),
+            ));
+            app.dispatch_frame(Frame::new(
+                "event/assistantTextComplete",
+                Some(json!({ "seq": 12, "engineInstanceId": "e1" })),
+            ));
+
+            let replies: Vec<_> = app.state.transcript.blocks().iter().filter_map(|b| match b {
+                Block::Assistant { text, complete } => {
+                    assert!(complete);
+                    Some(text.as_str())
+                }
+                _ => None,
+            }).collect();
+            let continued = format!("{PREFIX}{SUFFIX}");
+            if streaming {
+                assert_eq!(replies, ["earlier reply", continued.as_str()]);
+            } else {
+                assert_eq!(replies, ["earlier reply", PREFIX, "new reply"]);
+            }
+            assert_eq!(
+                app.state.transcript.blocks().iter().filter(
+                    |b| matches!(b, Block::AgentMessage { text, .. } if text == "parked note")
+                ).count(),
+                1,
+            );
+        }
+    }
+
     /// The acceptance-critical end-to-end proof: a notification parked
     /// behind a still-open `Assistant` block survives a REAL
     /// `session/getHistory` rehydration through the real `App`/`Connection`

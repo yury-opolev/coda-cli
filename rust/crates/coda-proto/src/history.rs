@@ -176,6 +176,12 @@ pub struct HistoryEntry {
     #[serde(default = "default_entry_kind")]
     pub entry_kind: HistoryEntryKind,
     pub blocks: Vec<HistoryBlock>,
+    /// Zero-based index of the text block still receiving assistant deltas.
+    /// Live projection only: a running turn can also contain completed
+    /// replies, so membership in `liveEntries` alone is not evidence that
+    /// its last text block is open. Omitted for closed or committed text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streaming_text_index: Option<usize>,
     /// The steering queue id this entry *is*, when the engine delivered a
     /// queued operator message into the running turn.
     ///
@@ -209,7 +215,14 @@ impl HistoryEntry {
         } else {
             HistoryEntryKind::UserPrompt
         };
-        Self { index, role: role.to_string(), entry_kind, blocks, steering_message_id: None }
+        Self {
+            index,
+            role: role.to_string(),
+            entry_kind,
+            blocks,
+            streaming_text_index: None,
+            steering_message_id: None,
+        }
     }
 
     /// Tags this entry as the delivered steering message `message_id`.

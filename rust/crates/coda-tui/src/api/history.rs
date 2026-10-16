@@ -199,7 +199,9 @@ fn push_assistant_entry(
                 if body.is_empty() {
                     continue;
                 }
-                out.blocks.push(Block::Assistant { text: body, complete: true });
+                let streaming =
+                    live_tail && index == last_block && entry.streaming_text_index == Some(index);
+                out.blocks.push(Block::Assistant { text: body, complete: !streaming });
             }
             HistoryBlock::ReasoningSummary { text, redacted, omitted_reason, full_length } => {
                 let mut body = text.clone();
@@ -547,6 +549,35 @@ mod tests {
             "{:?}",
             hydration.notices
         );
+    }
+
+    #[test]
+    fn only_the_explicit_streaming_text_at_the_live_tail_is_open() {
+        let mut entry = HistoryEntry::new(
+            0, "assistant", vec![text("finished"), text("still streaming")],
+        );
+        entry.streaming_text_index = Some(1);
+        for (entries, live, expected) in [
+            (vec![], vec![entry.clone()], vec![true, false]),
+            (vec![entry.clone()], vec![], vec![true, true]),
+            (
+                vec![],
+                vec![entry.clone(), HistoryEntry::new(1, "user", vec![text("next")])],
+                vec![true, true],
+            ),
+        ] {
+            let hydration = hydrate(&entries, &live, false);
+            let completed: Vec<_> = hydration.blocks.iter().filter_map(|b| match b {
+                Block::Assistant { complete, .. } => Some(*complete),
+                _ => None,
+            }).collect();
+            assert_eq!(completed, expected);
+        }
+        entry.streaming_text_index = None;
+        let hydration = hydrate(&[], &[entry], false);
+        assert!(hydration.blocks.iter().all(
+            |b| matches!(b, Block::Assistant { complete: true, .. })
+        ));
     }
 
     #[test]

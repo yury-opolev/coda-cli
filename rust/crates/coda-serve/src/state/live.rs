@@ -301,7 +301,7 @@ impl LiveTurnAccumulator {
         self.open_blocks.push(Arc::new(block));
     }
 
-    fn close_open_text(&mut self) {
+    pub(super) fn close_open_text(&mut self) {
         let Some(block) = self.pending_text_block() else { return };
         self.open_text.clear();
         self.open_text_omitted = 0;
@@ -427,9 +427,16 @@ impl LiveTurnAccumulator {
             return out;
         }
         let mut blocks: Vec<HistoryBlock> = self.open_blocks.iter().map(|b| (**b).clone()).collect();
+        let streaming_text_index = if pending_text.is_some() && pending_thinking.is_none() {
+            Some(blocks.len())
+        } else {
+            None
+        };
         blocks.extend(pending_text);
         blocks.extend(pending_thinking);
-        out.push(HistoryEntry::new(self.next_index, "assistant", blocks));
+        let mut entry = HistoryEntry::new(self.next_index, "assistant", blocks);
+        entry.streaming_text_index = streaming_text_index;
+        out.push(entry);
         out
     }
 
