@@ -110,6 +110,7 @@ pub struct ManagedTask {
     /// Steering inbox for subagent tasks; `None` for shell tasks.
     pub steering: Option<Arc<SteeringInbox>>,
     output: OutputRing,
+    pub(super) redacted_output: Arc<OutputRing>,
     state: Mutex<TaskState>,
     /// Signalled (notify_waiters) when the task first transitions to terminal.
     completion: Arc<Notify>,
@@ -144,6 +145,7 @@ impl ManagedTask {
             resolved_model: None,
             steering: None,
             output: OutputRing::new(output_ring_bytes),
+            redacted_output: Arc::new(OutputRing::new(16 * 1024)),
             state: Mutex::new(TaskState {
                 status: TaskRunStatus::Running,
                 mode,

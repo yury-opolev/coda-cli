@@ -1,0 +1,67 @@
+{
+  "type": "object",
+  "properties": {
+    "sessionId": {
+      "type": "string"
+    },
+    "tasks": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/TaskSummaryDto"
+      }
+    }
+  },
+  "required": [
+    "sessionId",
+    "tasks"
+  ],
+  "title": "TaskListResult",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "TaskSummaryDto": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "parentId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "mode": {
+          "type": "string"
+        },
+        "outputTail": {
+          "type": "string",
+          "description": "Non-consuming, secret-redacted tail (at most 4,000 Unicode characters)."
+        },
+        "report": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Completion result or failure, capped at 16 KiB with an explicit marker."
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "description",
+        "status",
+        "mode",
+        "outputTail"
+      ]
+    }
+  }
+}

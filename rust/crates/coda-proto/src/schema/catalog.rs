@@ -85,6 +85,7 @@ pub(super) fn document() -> Value {
         rpc(m::GET_EVENTS, Some("GetEventsParams"), Some("GetEventsResult"), S, S),
         rpc(m::GET_HISTORY, Some("GetHistoryParams"), Some("GetHistoryResult"), S, S),
         rpc(m::LIST_SESSIONS, Some("ListSessionsParams"), Some("ListSessionsResult"), S, S),
+        rpc(m::LIST_TASKS, None, Some("TaskListResult"), S, S),
         rpc(m::GET_PENDING_REQUESTS, None, Some("GetPendingRequestsResult"), S, S),
         rpc(m::RESOLVE_REQUEST, Some("ResolveRequestParams"), Some("ResolveRequestResult"), S, S),
         rpc(m::CANCEL_REQUEST, Some("CancelRequestParams"), Some("CancelRequestResult"), S, S),

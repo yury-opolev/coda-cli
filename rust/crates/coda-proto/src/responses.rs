@@ -2,6 +2,30 @@
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TaskListResult {
+    pub session_id: String,
+    pub tasks: Vec<TaskSummaryDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TaskSummaryDto {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub kind: String,
+    pub description: String,
+    pub status: String,
+    pub mode: String,
+    /// Non-consuming, secret-redacted tail (at most 4,000 Unicode characters).
+    pub output_tail: String,
+    /// Completion result or failure, capped at 16 KiB with an explicit marker.
+    pub report: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

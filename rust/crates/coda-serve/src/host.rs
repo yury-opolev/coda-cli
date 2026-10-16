@@ -3983,6 +3983,48 @@ impl ServeBackend for ServeHost {
         serde_json::to_value(&result).map_err(|e| RpcError::internal(e.to_string()))
     }
 
+    async fn session_list_tasks(&self) -> Result<Value, RpcError> {
+        use coda_agent::tasks::{TaskExecutionMode, TaskKind, TaskRunStatus};
+        use coda_proto::responses::{TaskListResult, TaskSummaryDto};
+
+        let tasks = self.task_manager.list_with_output(4_000).into_iter()
+            .map(|(task, output_tail)| {
+                let report = task.result.or(task.error).map(|text| {
+                    let (mut text, original_bytes) = coda_proto::history::truncate_text(&text, 16 * 1024);
+                    if original_bytes.is_some() {
+                        text.push_str("\n[report truncated]");
+                    }
+                    text
+                });
+                TaskSummaryDto {
+                    id: task.id,
+                    parent_id: task.parent_id,
+                    kind: match task.kind {
+                        TaskKind::Subagent => "subagent",
+                        TaskKind::Shell => "shell",
+                        TaskKind::Scheduled => "scheduled",
+                    }.into(),
+                    description: task.description,
+                    status: match task.status {
+                        TaskRunStatus::Running => "running",
+                        TaskRunStatus::Completed => "completed",
+                        TaskRunStatus::Failed => "failed",
+                        TaskRunStatus::Stopped => "stopped",
+                    }.into(),
+                    mode: match task.mode {
+                        TaskExecutionMode::Foreground => "foreground",
+                        TaskExecutionMode::Background => "background",
+                    }.into(),
+                    output_tail,
+                    report,
+                }
+            }).collect();
+        serde_json::to_value(TaskListResult {
+            session_id: self.task_manager.session_id.clone(),
+            tasks,
+        }).map_err(|e| RpcError::internal(e.to_string()))
+    }
+
     /// Non-destructive recovery of engine-owned user notifications.
     /// `afterCursor` addresses the message bus's own cursor, never the
     /// `EventBus` seq — see `coda_agent::message` module docs.
@@ -10861,6 +10903,37 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn task_listing_includes_silent_running_tasks_and_reads_output_without_consuming_it() {
+        use coda_agent::tasks::{TaskExecutionMode, TaskKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (host, _rx) = host_with_events(dir.path());
+        let task = host.task_manager.register(
+            TaskKind::Subagent, "waiting for the model", None, TaskExecutionMode::Background,
+        ).unwrap();
+        assert!(!task.log_path.exists(), "the task has not produced a log");
+        let listing = crate::dispatch::dispatch("session/listTasks", None, host.as_ref())
+            .await.unwrap();
+        assert_eq!(listing["tasks"][0]["id"], task.id);
+        assert_eq!(listing["tasks"][0]["status"], "running");
+        assert_eq!(listing["tasks"][0]["description"], "waiting for the model");
+        assert_eq!(listing["tasks"][0]["outputTail"], "");
+
+        host.task_manager.append_output(&task.id, "progress\n");
+        host.task_manager.complete(&task.id, Some("finished".into()));
+        for _ in 0..2 {
+            let listing = crate::dispatch::dispatch("session/listTasks", None, host.as_ref())
+                .await.unwrap();
+            assert_eq!(listing["tasks"][0]["status"], "completed");
+            assert_eq!(listing["tasks"][0]["report"], "finished");
+            assert_eq!(listing["tasks"][0]["outputTail"], "progress\n");
+        }
+        let (found, output, _, _) = host.task_manager.read_output(&task.id, None);
+        assert!(found);
+        assert_eq!(output, "progress\n", "browsing must not steal the agent's output");
+    }
+
     /// End-to-end: a notification published via the `notify_user` tool
     /// (using the session's own message bus and task manager) is recovered
     /// through `session/pendingMessages`, independent of any prompt/provider.
@@ -15198,4 +15271,3 @@ mod tests {
         }
     }
 }
-
