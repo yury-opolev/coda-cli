@@ -161,6 +161,7 @@ re-fetches the catalog from models.dev first.
 |---|---|---|
 | `session/getHistory` | `{ sessionId?, historyEpoch?, expectedHistoryLength?, engineInstanceId?, sinceIndex?, limit?, includeLive? }` | `{ sessionId, engineInstanceId, isLiveSession, historyEpoch?, cursor?, historyLength, entries[], nextIndex, totalKnown, truncated, liveEntries?, liveTruncated?, liveOmittedBytes? }` |
 | `session/listSessions` | `{ limit? }` | `{ sessions: [{ sessionId, createdUtc, messageCount, preview, previewTruncated, isCurrent }], totalKnown, truncated }` |
+| `session/listTasks` | `{}` | `{ sessionId, tasks: [{ id, parentId, kind, description, status, mode, outputTail, report }] }` |
 | `session/getPendingRequests` | `{}` | `{ requests: PendingRequest[], engineInstanceId }` |
 | `session/resolveRequest` | `{ requestId, outcome }` | `{ ok, state, requestId, outcome }` |
 | `session/cancelRequest` | `{ requestId, reason? }` | `{ ok, requestId, appliedDefault, outcome }` |
@@ -172,9 +173,27 @@ re-fetches the catalog from models.dev first.
 **Initialization gate.** `session/getHistory`, `session/getPendingRequests`,
 `session/resolveRequest`, `session/cancelRequest` and `config/set` require a completed
 `initialize` and otherwise return `-32011`. Read-only discovery — `session/listSessions`,
-`config/describe`, `mcp/list`, `session/getState`, `session/getEvents` — is valid **before**
+`session/listTasks`, `config/describe`, `mcp/list`, `session/getState`, `session/getEvents` — is valid **before**
 `initialize`, so a client can choose a session before resuming one. Every route that shipped
 before this contract keeps exactly the behaviour it had; the gate is not retrofitted.
+
+**Task discovery.** `session/listTasks` reads the current Rust engine's authoritative
+registry in registration order, including silent running tasks and retained terminal
+tasks. It is shared by local and API-only `/tasks` browsers, including `serve` mode;
+clients must not infer task existence or status from local log files or completion
+notifications. `kind` is `subagent`, `shell`, or `scheduled`; `status` is `running`,
+`completed`, `failed`, or `stopped`; `mode` is `foreground` or `background`.
+The session id namespaces the registry's task ids. This is runtime discovery, not an
+archive of task logs from earlier engine processes.
+
+`outputTail` contains at most 4,000 Unicode characters of buffered, secret-redacted
+output, using the same per-channel streaming redaction as task logs. Browsing does
+not consume agent output cursors or completion notifications and does not require
+working log storage. Incomplete secret candidates remain withheld until confirmed
+or flushed at completion. `report` is the optional completion result or error,
+capped at 16 KiB of UTF-8 text followed by `[report truncated]` when necessary.
+Reload the browser to read updated state. RPC failures remain explicit errors;
+older engines without this method are not treated as having no tasks.
 
 **`session/import` does not touch the live session.** It is the inverse of export: `path`
 names a portable `*.coda-session.json` bundle (see `coda_agent::session::bundle`), which the

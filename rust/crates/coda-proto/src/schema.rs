@@ -24,6 +24,7 @@ pub fn documents() -> BTreeMap<&'static str, Value> {
         ("EventEnvelope.json", schemars::schema_for!(crate::events::EventEnvelope).to_value()),
         ("GetHistoryResult.json", schemars::schema_for!(crate::history::GetHistoryResult).to_value()),
         ("ListSessionsResult.json", schemars::schema_for!(crate::history::ListSessionsResult).to_value()),
+        ("TaskListResult.json", schemars::schema_for!(crate::responses::TaskListResult).to_value()),
         ("ConfigDescribeResult.json", schemars::schema_for!(crate::config::ConfigDescribeResult).to_value()),
         ("ConfigSetResult.json", schemars::schema_for!(crate::config::ConfigSetResult).to_value()),
         ("McpListResult.json", schemars::schema_for!(crate::mcp::McpListResult).to_value()),

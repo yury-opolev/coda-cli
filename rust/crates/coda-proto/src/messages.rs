@@ -68,6 +68,8 @@ pub mod method {
     /// Saved transcripts in the current workspace. Read-only; valid before
     /// `initialize` so a client can choose a session before resuming one.
     pub const LIST_SESSIONS: &str = "session/listSessions";
+    /// Current engine's registered tasks, including silent running tasks.
+    pub const LIST_TASKS: &str = "session/listTasks";
     /// Outstanding server-initiated requests.
     pub const GET_PENDING_REQUESTS: &str = "session/getPendingRequests";
     /// Answer a pending request out of band (i.e. not by replying to the

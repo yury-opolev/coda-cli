@@ -4163,6 +4163,58 @@ pub(in crate::app) mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn task_browser_reads_the_engines_registry_without_any_local_log() {
+        let mut harness = app_with(crate::local::AccessMode::ApiOnly, |method, _| match method {
+            "session/listTasks" => json!({
+                "sessionId": "remote-session",
+                "tasks": [{
+                    "id": "task-0001", "parentId": null, "kind": "subagent",
+                    "description": "waiting for the model", "status": "running",
+                    "mode": "background", "outputTail": "", "report": null,
+                }],
+            }),
+            _ => json!({}),
+        });
+        let browser = harness.app.build_browser(
+            crate::surface::browser::BrowserKind::Tasks,
+        ).await.expect("the task browser");
+        let items = browser.visible_items();
+        assert_eq!(items.len(), 1, "a task needs no local log to be visible");
+        assert_eq!(items[0].id, "remote-session/task-0001");
+        assert!(items[0].cells.iter().any(|cell| cell == "running"));
+        assert!(items[0].detail.iter().any(|line| line.contains("no output yet")));
+        assert!(harness.calls.lock().unwrap().iter().any(|method| method == "session/listTasks"));
+    }
+
+    #[tokio::test]
+    async fn task_browser_reports_rpc_errors_instead_of_showing_an_empty_local_listing() {
+        for mode in [crate::local::AccessMode::TrustedLocal, crate::local::AccessMode::ApiOnly] {
+            let mut harness = app_answering(mode, |method, _| match method {
+                "session/listTasks" => Err((-32601, "task registry is unavailable".into())),
+                _ => Ok(json!({})),
+            });
+            assert!(harness.app.build_browser(crate::surface::browser::BrowserKind::Tasks)
+                .await.is_none());
+            assert!(notices(&harness.app).iter().any(|notice|
+                notice.contains("Could not load tasks") && notice.contains("unavailable")));
+        }
+    }
+
+    #[tokio::test]
+    async fn task_browser_times_out_when_the_engine_stays_silent() {
+        let mut harness = app_pump(crate::local::AccessMode::ApiOnly, |method, _| {
+            if method == "session/listTasks" { None } else { Some(Ok(json!({}))) }
+        });
+        harness.app.metadata_timeout = std::time::Duration::from_millis(20);
+        let browser = tokio::time::timeout(std::time::Duration::from_secs(1),
+            harness.app.build_browser(crate::surface::browser::BrowserKind::Tasks),
+        ).await.expect("the task browser must not hang the UI");
+        assert!(browser.is_none());
+        assert!(notices(&harness.app).iter().any(|notice|
+            notice.contains("Could not load tasks") && notice.contains("did not answer")));
+    }
+
     /// The acceptance-critical end-to-end proof: a notification parked
     /// behind a still-open `Assistant` block survives a REAL
     /// `session/getHistory` rehydration through the real `App`/`Connection`

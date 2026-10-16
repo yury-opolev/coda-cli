@@ -15,8 +15,9 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use super::output_ring::OutputRing;
 use super::streaming_secret_redactor::StreamingSecretRedactor;
 
 /// 50 MiB default — matches C# `DefaultMaxBytes`.
@@ -47,6 +48,7 @@ pub struct TaskLogWriter {
     path: PathBuf,
     max_bytes: u64,
     state: Mutex<WriterState>,
+    output_tail: Arc<OutputRing>,
 }
 
 impl TaskLogWriter {
@@ -55,9 +57,18 @@ impl TaskLogWriter {
     }
 
     pub fn with_max_bytes(path: impl Into<PathBuf>, max_bytes: u64) -> Self {
+        Self::with_tail(path, max_bytes, Arc::new(OutputRing::new(16 * 1024)))
+    }
+
+    pub(super) fn with_tail(
+        path: impl Into<PathBuf>,
+        max_bytes: u64,
+        output_tail: Arc<OutputRing>,
+    ) -> Self {
         Self {
             path: path.into(),
             max_bytes: max_bytes.max(1),
+            output_tail,
             state: Mutex::new(WriterState {
                 file: None,
                 bytes_written: 0,
@@ -86,13 +97,17 @@ impl TaskLogWriter {
             return;
         }
         let mut s = self.state.lock().unwrap();
-        if s.faulted || s.disposed {
+        if s.disposed {
             return;
         }
         // Run through the per-channel redactor into a scratch buffer.
         let mut redacted = String::with_capacity(text.len());
         s.redactors[channel as usize].process(text, &mut redacted);
         if redacted.is_empty() {
+            return;
+        }
+        self.output_tail.append(&redacted);
+        if s.faulted {
             return;
         }
         let redacted_clone = redacted.clone(); // keep before fault path
@@ -115,12 +130,13 @@ impl TaskLogWriter {
             return;
         }
         s.disposed = true;
-        if !s.faulted {
-            // Flush each channel's trailing unconfirmed candidate.
-            for idx in 0..3usize {
-                let mut flushed = String::new();
-                s.redactors[idx].flush(&mut flushed);
-                if !flushed.is_empty() {
+        // Flush each channel's trailing unconfirmed candidate.
+        for idx in 0..3usize {
+            let mut flushed = String::new();
+            s.redactors[idx].flush(&mut flushed);
+            if !flushed.is_empty() {
+                self.output_tail.append(&flushed);
+                if !s.faulted {
                     let _ = emit(&mut s, &self.path, &flushed, self.max_bytes);
                 }
             }

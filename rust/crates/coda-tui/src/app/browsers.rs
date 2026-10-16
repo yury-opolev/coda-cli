@@ -175,11 +175,19 @@ impl App {
                     }
                 }
             }
-            // Tasks are engine state, but the runtime persists a log per task
-            // and reports outcomes over the event stream.
             BrowserKind::Tasks => {
-                let logs = config::list_task_logs(&self.paths, self.state.session_id.as_deref());
-                rows::tasks(&logs, &self.task_outcomes)
+                if !self.require_engine("The tasks browser") {
+                    return None;
+                }
+                match self.ask::<coda_proto::responses::TaskListResult>(
+                    method::LIST_TASKS, None,
+                ).await {
+                    Ok(result) => rows::tasks(&result),
+                    Err(error) => {
+                        self.notice(format!("Could not load tasks: {error}"), NoticeLevel::Error);
+                        return None;
+                    }
+                }
             }
             // Sessions come from the engine's own read-only listing, not from
             // a directory this front-end reads: the engine is the only thing

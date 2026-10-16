@@ -302,6 +302,15 @@
       "availability": "reusable"
     },
     {
+      "method": "session/listTasks",
+      "paramsSchema": null,
+      "resultSchema": "schemas/TaskListResult.json",
+      "paramsContract": null,
+      "resultContract": "sharedServerDto",
+      "requiresInitialize": false,
+      "availability": "reusable"
+    },
+    {
       "method": "session/getPendingRequests",
       "paramsSchema": null,
       "resultSchema": "schemas/GetPendingRequestsResult.json",

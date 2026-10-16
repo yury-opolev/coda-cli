@@ -177,7 +177,11 @@ impl TaskManager {
         );
 
         // Log writer stored as Arc so it can be cloned out before file I/O.
-        let log = Arc::new(TaskLogWriter::new(log_path));
+        let log = Arc::new(TaskLogWriter::with_tail(
+            log_path,
+            super::log_writer::DEFAULT_MAX_BYTES,
+            task.redacted_output.clone(),
+        ));
 
         let created_version = task.version();
         let change = TaskChange {
@@ -214,6 +218,15 @@ impl TaskManager {
             .order
             .iter()
             .map(|t| t.to_snapshot())
+            .collect()
+    }
+
+    /// Registration-ordered snapshots and redacted output tails. Cloning the
+    /// task handles makes concurrent removal safe without consuming cursors.
+    pub fn list_with_output(&self, max_chars: usize) -> Vec<(TaskSnapshot, String)> {
+        let tasks = self.state.lock().unwrap().order.clone();
+        tasks.into_iter()
+            .map(|task| (task.to_snapshot(), task.redacted_output.peek(max_chars)))
             .collect()
     }
 
@@ -693,6 +706,30 @@ mod tests {
     }
 
     // ── register ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn browser_output_is_redacted_bounded_and_survives_log_failure_and_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked_root = dir.path().join("not-a-directory");
+        std::fs::write(&blocked_root, "file").unwrap();
+        let m = TaskManager::new("s", Some(blocked_root), 4096, 10);
+        let task = m.register(
+            TaskKind::Shell, "output", None, TaskExecutionMode::Background,
+        ).unwrap();
+        m.append_output(&task.id, "sk-ab");
+        assert_eq!(m.list_with_output(4000)[0].1, "");
+        m.append_output(&task.id, "cdefghijk ");
+        m.append_output(&task.id, "visible ");
+        let (_, output) = m.list_with_output(4000).pop().unwrap();
+        assert_eq!(output, "sk-*** visible ");
+        assert!(!task.log_path.exists(), "disk failure must not hide in-memory output");
+        m.append_output(&task.id, &"界".repeat(5000));
+        assert_eq!(m.list_with_output(4000)[0].1, "界".repeat(4000));
+        m.append_output(&task.id, " sk-ab");
+        m.complete(&task.id, None);
+        assert!(m.list_with_output(4000)[0].1.ends_with(" sk-ab"),
+            "completion must flush an unconfirmed candidate into the retained tail");
+    }
 
     #[test]
     fn register_creates_task_in_running_state() {
@@ -1194,4 +1231,3 @@ mod tests {
         assert_eq!(text, "child output");
     }
 }
-
