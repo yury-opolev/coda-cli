@@ -29,6 +29,7 @@ mod engine;
 mod identity;
 mod image;
 mod interrupt;
+mod layout;
 mod link;
 mod models;
 mod queue;
@@ -103,6 +104,9 @@ pub struct App {
     block_starts: Vec<usize>,
     /// Width the cached rows were laid out for.
     laid_out_width: usize,
+    /// Full frame width and row count before reserving a scrollbar column.
+    frame_width: usize,
+    full_width_row_count: usize,
     dirty: bool,
     /// Set when a critical event arrived since the last frame.  Critical frames
     /// are not throttled.  Matches C# `UiActor.IsCritical`.
@@ -1141,59 +1145,18 @@ impl App {
 
     fn redraw(&mut self, guard: &mut TerminalGuard) -> Result<()> {
         let size = guard.terminal().size()?;
-        // Captured once and reused below for both sizing the panel and
-        // mapping a click into it, so the two can never disagree about how
-        // wide a row of composer text is.
-        let composer_text_width = draw::composer_text_width(size.width);
-        let regions = draw::layout_with_pending(
-            ratatui::layout::Rect::new(0, 0, size.width, size.height),
-            self.composer.visual_line_count(composer_text_width),
-            self.viewport.is_scrollable(),
-            self.state.is_busy(),
-            self.state.queued.len() + self.state.unsent.len(),
-        );
+        let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+        let regions = self.layout_frame(area);
         let width = regions.transcript.width as usize;
-        let height = regions.transcript.height as usize;
 
-        // Where the composer's first text cell sits, so a click can be turned
-        // into a caret position. Captured from the same layout that is about
-        // to be drawn, rather than recomputed in the event handler where it
-        // would silently drift the first time the chrome changed.
+        // Drawing and pointer hit-testing must use the same frame geometry.
         self.composer_origin = (
             regions.composer.x + draw::COMPOSER_TEXT_COLUMN,
             regions.composer.y + 1,
         );
-        self.composer_text_width = composer_text_width;
-        // Same rect drawing will use, so a click can never target stale layout.
+        self.composer_text_width = draw::composer_text_width(size.width);
         self.header_id_rect = regions.header.and_then(|h| draw::header_id_rect(h, &self.state));
         self.scrollbar.area = regions.scrollbar;
-
-        if width != self.laid_out_width {
-            let was_following = self.viewport.is_following();
-            let style = crate::transcript::TranscriptStyle::Cards;
-            let (rows, starts) =
-                self.state.transcript.render_with_block_starts_styled(width, self.state.display_mode, style);
-            self.rows = rows;
-            self.block_starts = starts;
-            self.laid_out_width = width;
-
-            // Anchor-aware reflow: restore the detached position rather than
-            // clamping, so the user's reading position survives a resize or
-            // streaming growth above the viewport.
-            if was_following {
-                self.viewport.update(self.rows.len(), height);
-            } else {
-                let anchor_row = self.detached_anchor.and_then(|a| {
-                    self.block_starts
-                        .get(a.block_index)
-                        .map(|&s| s + a.row_within_block)
-                });
-                self.viewport
-                    .update_with_anchor(self.rows.len(), height, anchor_row.unwrap_or(0));
-            }
-        } else {
-            self.viewport.update(self.rows.len(), height);
-        }
 
         // Compose the pin row when the user prompt has scrolled out of view.
         let pin_text = self.compose_pin(width);
@@ -1225,8 +1188,8 @@ impl App {
         // field in a surface — shows it again at the end of the frame.
         guard.terminal().hide_cursor()?;
         guard.terminal().draw(|frame| {
-            origin = draw::draw_with_pin(
-                frame, state, composer, viewport, rows, theme, pin, selection, self.hovered_link, self.header_id_selected, std::time::Instant::now(),
+            origin = draw::draw_with_layout(
+                frame, regions, state, composer, viewport, rows, theme, pin, selection, self.hovered_link, self.header_id_selected, std::time::Instant::now(),
             );
             // Surfaces draw last and bottom-up, so a detail sits over its list
             // and the whole stack sits over the shell. Rendered as a second

@@ -338,11 +338,6 @@ pub fn draw_with_pin(
     now: Instant,
 ) -> (u16, u16) {
     let area = frame.area();
-    frame.render_widget(
-        Block::default().style(theme.surface()),
-        area,
-    );
-
     // Width-aware: a long line grows the panel by the *visual* rows it wraps
     // into, not by its count of `'\n'`s, or the fix below just trades a
     // horizontal clip for a vertical one.
@@ -353,7 +348,28 @@ pub fn draw_with_pin(
         state.is_busy(),
         state.queued.len() + state.unsent.len(),
     );
+    draw_with_layout(
+        frame, regions, state, composer, viewport, rows, theme, pin_text,
+        selection, hovered, header_id_selected, now,
+    )
+}
 
+/// Uses the same settled geometry as transcript reflow and pointer hit-testing.
+pub(crate) fn draw_with_layout(
+    frame: &mut Frame,
+    regions: Regions,
+    state: &UiState,
+    composer: &Composer,
+    viewport: &Viewport,
+    rows: &[RenderLine],
+    theme: &Theme,
+    pin_text: Option<&str>,
+    selection: Option<&crate::selection::TranscriptSelection>,
+    hovered: Option<HoveredLink>,
+    header_id_selected: bool,
+    now: Instant,
+) -> (u16, u16) {
+    frame.render_widget(Block::default().style(theme.surface()), frame.area());
     let content = draw_transcript_with_pin(
         frame,
         regions.transcript,
@@ -809,9 +825,8 @@ pub fn draw_transcript(
 
 fn draw_scrollbar(frame: &mut Frame, area: Rect, viewport: &Viewport, theme: &Theme) {
     let track = area.height as usize;
-    let Some((position, size)) = viewport.thumb(track) else {
-        return;
-    };
+    // Adaptive table reflow can fit after the scrollbar column is reserved.
+    let (position, size) = viewport.thumb(track).unwrap_or((0, track));
 
     let track_style = theme.style(Role::ScrollbarTrack);
     let thumb_style = theme.style(Role::ScrollbarThumb);
