@@ -1456,6 +1456,8 @@ impl App {
             rows: Vec::new(),
             block_starts: Vec::new(),
             laid_out_width: 0,
+            frame_width: 0,
+            full_width_row_count: 0,
             dirty: true,
             critical_dirty: false,
             frame_deadline: None,
@@ -4213,6 +4215,62 @@ pub(in crate::app) mod tests {
         assert!(browser.is_none());
         assert!(notices(&harness.app).iter().any(|notice|
             notice.contains("Could not load tasks") && notice.contains("did not answer")));
+    }
+
+    #[tokio::test]
+    async fn table_reflow_keeps_the_scrollbar_geometry_stable() {
+        use crate::render::{draw, glyphs};
+        use ratatui::layout::Rect;
+
+        let small_table = "| A | B | C |\n|---|---|---|\n| x | y | z |";
+        let table_width = coda_render::markdown::render(small_table, 100).iter()
+            .map(|row| coda_render::text::width(&row.text)).max().unwrap();
+        let area = Rect::new(0, 0, (table_width + coda_render::MARKER_CELLS) as u16, 40);
+        let mut harness = app_with(crate::local::AccessMode::ApiOnly, |_, _| json!({}));
+        let app = &mut harness.app;
+        app.state.transcript.push(crate::transcript::Block::Assistant {
+            text: format!("| A | B | C |\n|---|---|---|\n| {} | y | z |", "x".repeat(200)),
+            complete: true,
+        });
+        let mut scrollbar_states = Vec::new();
+        let mut terminal = ratatui::Terminal::new(
+            ratatui::backend::TestBackend::new(area.width, area.height),
+        ).unwrap();
+        for _ in 0..4 {
+            let regions = app.layout_frame(area);
+            scrollbar_states.push((regions.scrollbar.is_some(), app.rows.len()));
+            assert_eq!(app.laid_out_width, regions.transcript.width as usize);
+            assert!(app.rows.iter().all(|row|
+                coda_render::text::width(&row.text) <= regions.transcript.width as usize));
+            terminal.draw(|frame| {
+                draw::draw_with_layout(frame, regions, &app.state, &app.composer, &app.viewport,
+                    &app.rows, &app.theme, None, None, None, false, std::time::Instant::now());
+            }).unwrap();
+            let track = regions.scrollbar.unwrap();
+            for y in track.y..track.bottom() {
+                let symbol = terminal.backend().buffer()[(track.x, y)].symbol();
+                assert!(symbol == glyphs::RULE_VERTICAL || symbol == glyphs::BLOCK,
+                    "the scrollbar has a gap at row {y}: {symbol:?}");
+            }
+        }
+        assert!(scrollbar_states.iter().all(|(shown, _)| *shown),
+            "table reflow must not alternate scrollbar visibility: {scrollbar_states:?}");
+        let taller = Rect::new(0, 0, area.width, 300);
+        assert!(app.layout_frame(taller).scrollbar.is_none(), "a taller frame can fit the full table");
+        assert!(app.layout_frame(area).scrollbar.is_some(), "shrinking restores the scrollbar");
+        app.state.transcript = crate::transcript::Transcript::default();
+        app.laid_out_width = 0;
+        let regions = app.layout_frame(area);
+        assert!(regions.scrollbar.is_none(), "removing the table releases the column");
+        assert_eq!(regions.transcript.width, area.width);
+        terminal.draw(|frame| {
+            draw::draw_with_layout(frame, regions, &app.state, &app.composer, &app.viewport,
+                &app.rows, &app.theme, None, None, None, false, std::time::Instant::now());
+        }).unwrap();
+        for y in regions.transcript.y..regions.transcript.bottom() {
+            assert_eq!(terminal.backend().buffer()[(area.right() - 1, y)].symbol(), " ",
+                "the old scrollbar must be cleared");
+        }
     }
 
     /// The acceptance-critical end-to-end proof: a notification parked

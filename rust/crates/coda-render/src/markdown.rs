@@ -6,8 +6,9 @@
 //! emphasis is *stripped* rather than styled, and only structural elements
 //! (headings, code, callouts, links) change colour.
 //! Tables are buffered to share terminal-cell column widths and wrap each cell
-//! independently. If even minimal columns cannot fit, cells are stacked in
-//! order; a wide grapheme in a one-cell viewport is shown as an ellipsis.
+//! independently inside ASCII `+`, `-`, and `|` borders. If minimal columns
+//! cannot fit, cells are stacked in order; a wide grapheme in a one-cell
+//! viewport is shown as an ellipsis.
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use unicode_segmentation::UnicodeSegmentation;
@@ -490,7 +491,7 @@ impl Renderer {
             }
         }
 
-        let separators = columns.saturating_sub(1) * 3;
+        let separators = columns.saturating_sub(1) * 3 + 4;
         if minimums.iter().sum::<usize>() + separators > available {
             // Columns cannot fit even one grapheme each. Keep cells in order
             // vertically rather than overflow or silently drop a column.
@@ -501,7 +502,7 @@ impl Renderer {
                         self.push_row_with_links(line.text, role, line.spans, line.links);
                     }
                 }
-                self.push_row("\u{2500}".repeat(available), Role::DiffContext, Vec::new());
+                self.push_row("-".repeat(available), Role::DiffContext, Vec::new());
             }
             return;
         }
@@ -515,13 +516,16 @@ impl Renderer {
             widths[column] -= 1;
         }
 
+        let rule = format!("+{}+", widths.iter().map(|&width| "-".repeat(width + 2))
+            .collect::<Vec<_>>().join("+"));
+        self.push_row(rule.clone(), Role::DiffContext, Vec::new());
         for (index, row) in table.rows.iter().enumerate() {
             let role = if index == 0 { Role::Heading } else { Role::Assistant };
             let cells: Vec<_> = row.iter().zip(&widths)
                 .map(|(cell, &width)| table_cell_rows(cell, width)).collect();
             let height = cells.iter().map(Vec::len).max().unwrap_or(1);
             for line_index in 0..height {
-                let mut value = String::new();
+                let mut value = String::from("| ");
                 let mut spans = Vec::new();
                 let mut links = Vec::new();
                 for (column, cell) in cells.iter().enumerate() {
@@ -545,13 +549,10 @@ impl Renderer {
                         links.extend(line.links.iter().map(|link| link.shifted(offset)));
                     }
                 }
+                value.push_str(" |");
                 self.push_row_with_links(value, role, spans, links);
             }
-            if index == 0 {
-                let rule = widths.iter().map(|&width| "\u{2500}".repeat(width))
-                    .collect::<Vec<_>>().join("\u{2500}\u{253c}\u{2500}");
-                self.push_row(rule, Role::DiffContext, Vec::new());
-            }
+            self.push_row(rule.clone(), Role::DiffContext, Vec::new());
         }
     }
 
@@ -1115,16 +1116,34 @@ mod tests {
     }
 
     #[test]
+    fn tables_have_straight_ascii_borders_with_connected_corners_and_junctions() {
+        assert_eq!(
+            texts("| A | B |\n|---|---|\n| one | two |\n| x | y |", 40),
+            vec![
+                "+-----+-----+",
+                "| A   | B   |",
+                "+-----+-----+",
+                "| one | two |",
+                "+-----+-----+",
+                "| x   | y   |",
+                "+-----+-----+",
+            ],
+        );
+    }
+
+    #[test]
     fn tables_share_terminal_cell_widths_and_preserve_empty_cells() {
         let markdown = "| Name | Value |\n|---|---|\n| 界 | e\u{301} |\n| abcdef | 👨‍👩‍👧 |\n| | last |";
         let rows = render(markdown, 40);
         let cells: Vec<_> = rows.iter().filter(|row| row.role != Role::DiffContext)
             .map(|row| {
-                let (first, _) = row.text.split_once(" | ").expect("both columns");
+                let (first, _) = row.text.strip_prefix("| ").unwrap()
+                    .split_once(" | ").expect("both columns");
                 text::width(first)
             }).collect();
         assert_eq!(cells, vec![6, 6, 6, 6]);
-        assert!(rows.last().unwrap().text.starts_with("       | "));
+        assert!(rows.iter().filter(|row| row.role == Role::Assistant).last().unwrap()
+            .text.starts_with(&format!("| {} | ", " ".repeat(6))));
         assert!(rows.iter().any(|row| row.text.contains("👨‍👩‍👧")));
     }
 
@@ -1132,22 +1151,23 @@ mod tests {
     fn tables_honor_column_alignment() {
         let rows = render("| left | middle | right |\n|:---|:---:|---:|\n| a | b | c |", 40);
         let body = rows.iter().find(|row| row.role == Role::Assistant).unwrap();
-        assert_eq!(body.text.split(" | ").collect::<Vec<_>>(),
+        assert_eq!(body.text.strip_prefix("| ").unwrap().strip_suffix(" |").unwrap()
+            .split(" | ").collect::<Vec<_>>(),
             vec!["a   ", "  b   ", "    c"]);
     }
 
     #[test]
     fn tables_wrap_cells_without_moving_separators_or_losing_links() {
         let rows = render(
-            "| Wide | Link |\n|---|---|\n| 界界界界 | [abcdefghijk](https://example.com) |", 15,
+            "| Wide | Link |\n|---|---|\n| 界界界界 | [abcdefghijk](https://example.com) |", 19,
         );
-        assert!(rows.iter().all(|row| text::width(&row.text) <= 15));
+        assert!(rows.iter().all(|row| text::width(&row.text) <= 19));
         let body: Vec<_> = rows.iter().filter(|row| row.role == Role::Assistant).collect();
         assert_eq!(body.len(), 2);
-        assert_eq!(body[0].text, "界界界 | abcdef");
-        assert_eq!(body[1].text, "界     | ghijk ");
-        assert_eq!(body[0].links, vec![LinkSpan::new(9, 15, "https://example.com")]);
-        assert_eq!(body[1].links, vec![LinkSpan::new(9, 14, "https://example.com")]);
+        assert_eq!(body[0].text, "| 界界界 | abcdef |");
+        assert_eq!(body[1].text, "| 界     | ghijk  |");
+        assert_eq!(body[0].links, vec![LinkSpan::new(11, 17, "https://example.com")]);
+        assert_eq!(body[1].links, vec![LinkSpan::new(11, 16, "https://example.com")]);
     }
 
     #[test]
@@ -1166,26 +1186,26 @@ mod tests {
     #[test]
     fn tables_keep_word_wrapped_links_attached_after_sanitizing_text() {
         let rows = render(
-            "| Link |\n|---|\n| \u{1b}[31m界\u{1b}[0m [ab cd ef](https://example.com) |", 6,
+            "| Link |\n|---|\n| \u{1b}[31m界\u{1b}[0m [ab cd ef](https://example.com) |", 10,
         );
         let body: Vec<_> = rows.iter().filter(|row| row.role == Role::Assistant).collect();
         assert_eq!(body.len(), 2);
-        assert_eq!(body[0].text, "界 ab ");
-        assert_eq!(body[1].text, "cd ef ");
-        assert_eq!(body[0].links, vec![LinkSpan::new(3, 5, "https://example.com")]);
-        assert_eq!(body[1].links, vec![LinkSpan::new(0, 5, "https://example.com")]);
+        assert_eq!(body[0].text, "| 界 ab  |");
+        assert_eq!(body[1].text, "| cd ef  |");
+        assert_eq!(body[0].links, vec![LinkSpan::new(5, 7, "https://example.com")]);
+        assert_eq!(body[1].links, vec![LinkSpan::new(2, 7, "https://example.com")]);
         assert!(rows.iter().all(|row| !row.text.contains('\u{1b}')));
     }
 
     #[test]
     fn tables_preserve_source_offsets_across_repeated_spaces_and_multibyte_links() {
-        let rows = render("| H |\n|---|\n| a  b [界界](https://example.com) |", 4);
+        let rows = render("| H |\n|---|\n| a  b [界界](https://example.com) |", 8);
         let body: Vec<_> = rows.iter().filter(|row| row.role == Role::Assistant).collect();
         assert_eq!(body.len(), 2);
-        assert_eq!(body[0].text, "a  b");
-        assert_eq!(body[1].text, "界界");
+        assert_eq!(body[0].text, "| a  b |");
+        assert_eq!(body[1].text, "| 界界 |");
         assert!(body[0].links.is_empty());
-        assert_eq!(body[1].links, vec![LinkSpan::new(0, 4, "https://example.com")]);
+        assert_eq!(body[1].links, vec![LinkSpan::new(2, 6, "https://example.com")]);
     }
 
     #[test]
