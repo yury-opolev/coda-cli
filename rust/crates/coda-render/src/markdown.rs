@@ -5,8 +5,12 @@
 //! colour comes from the block context, matching the C# formatter: inline
 //! emphasis is *stripped* rather than styled, and only structural elements
 //! (headings, code, callouts, links) change colour.
+//! Tables are buffered to share terminal-cell column widths and wrap each cell
+//! independently. If even minimal columns cannot fit, cells are stacked in
+//! order; a wide grapheme in a one-cell viewport is shown as an ellipsis.
 
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::diff;
 use crate::line::{LinkSpan, RenderLine, Span};
@@ -90,6 +94,11 @@ struct InlineBuffer {
     links: Vec<InlineLink>,
 }
 
+struct Table {
+    alignments: Vec<Alignment>,
+    rows: Vec<Vec<InlineBuffer>>,
+}
+
 impl InlineBuffer {
     fn push(&mut self, text: &str) {
         self.text.push_str(text);
@@ -116,6 +125,7 @@ struct Renderer {
     width: usize,
     out: Vec<RenderLine>,
     inline: InlineBuffer,
+    table: Option<Table>,
     /// Current left indent in cells.
     indent: usize,
     /// One entry per open list: `Some(next_number)` for ordered lists.
@@ -148,6 +158,7 @@ impl Renderer {
             width: width.max(1),
             out: Vec::new(),
             inline: InlineBuffer::default(),
+            table: None,
             indent: 0,
             lists: Vec::new(),
             pending_marker: None,
@@ -193,7 +204,11 @@ impl Renderer {
             Event::Code(code) => self.inline.push(&code),
             Event::SoftBreak => self.inline.push(" "),
             Event::HardBreak => {
-                self.flush_inline();
+                if self.table.is_some() {
+                    self.inline.push(" ");
+                } else {
+                    self.flush_inline();
+                }
             }
             Event::Rule => {
                 self.blank_line();
@@ -274,14 +289,16 @@ impl Renderer {
             Tag::Image { .. } => {
                 self.in_image = true;
             }
-            Tag::Table(_) | Tag::TableHead | Tag::TableRow => {
+            Tag::Table(alignments) => {
                 self.flush_inline();
+                self.table = Some(Table { alignments, rows: vec![Vec::new()] });
             }
-            Tag::TableCell => {
-                if !self.inline.text.is_empty() {
-                    self.inline.push(" | ");
+            Tag::TableRow => {
+                if let Some(table) = &mut self.table {
+                    table.rows.push(Vec::new());
                 }
             }
+            Tag::TableHead | Tag::TableCell => {}
             // Emphasis carries no terminal styling; only its text is kept.
             Tag::Emphasis
             | Tag::Strong
@@ -327,12 +344,13 @@ impl Renderer {
             TagEnd::Image => {
                 self.in_image = false;
             }
-            TagEnd::TableHead => {
-                self.flush_table_row(Role::Heading);
-                let rule = "\u{2500}".repeat(self.available_width().min(self.width));
-                self.push_row(rule, Role::DiffContext, Vec::new());
+            TagEnd::TableCell => {
+                if let Some(table) = &mut self.table {
+                    table.rows.last_mut().expect("tables start with a header row")
+                        .push(sanitized_table_cell(std::mem::take(&mut self.inline)));
+                }
             }
-            TagEnd::TableRow => self.flush_table_row(Role::Assistant),
+            TagEnd::Table => self.flush_table(),
             _ => {}
         }
     }
@@ -457,18 +475,84 @@ impl Renderer {
         }
     }
 
-    fn flush_table_row(&mut self, role: Role) {
-        if self.inline.is_blank() {
-            self.inline.take();
+    fn flush_table(&mut self) {
+        let Some(table) = self.table.take() else { return };
+        let available = self.available_width();
+        let columns = table.alignments.len();
+        let mut widths = vec![1; columns];
+        let mut minimums = vec![1; columns];
+        for row in &table.rows {
+            for (column, cell) in row.iter().enumerate() {
+                widths[column] = widths[column].max(text::width(cell.text.trim()).min(available));
+                minimums[column] = minimums[column].max(
+                    cell.text.graphemes(true).map(text::grapheme_width).max().unwrap_or(1),
+                );
+            }
+        }
+
+        let separators = columns.saturating_sub(1) * 3;
+        if minimums.iter().sum::<usize>() + separators > available {
+            // Columns cannot fit even one grapheme each. Keep cells in order
+            // vertically rather than overflow or silently drop a column.
+            for (index, row) in table.rows.iter().enumerate() {
+                let role = if index == 0 { Role::Heading } else { Role::Assistant };
+                for cell in row {
+                    for line in table_cell_rows(cell, available) {
+                        self.push_row_with_links(line.text, role, line.spans, line.links);
+                    }
+                }
+                self.push_row("\u{2500}".repeat(available), Role::DiffContext, Vec::new());
+            }
             return;
         }
-        let (text, _) = self.inline.take();
-        let previous = self.role;
-        self.role = role;
-        for chunk in text::wrap(text.trim(), self.available_width()) {
-            self.push_row(chunk, role, Vec::new());
+
+        let budget = available - separators;
+        while widths.iter().sum::<usize>() > budget {
+            let column = (0..columns)
+                .filter(|&column| widths[column] > minimums[column])
+                .max_by_key(|&column| widths[column])
+                .expect("minimum column widths fit the budget");
+            widths[column] -= 1;
         }
-        self.role = previous;
+
+        for (index, row) in table.rows.iter().enumerate() {
+            let role = if index == 0 { Role::Heading } else { Role::Assistant };
+            let cells: Vec<_> = row.iter().zip(&widths)
+                .map(|(cell, &width)| table_cell_rows(cell, width)).collect();
+            let height = cells.iter().map(Vec::len).max().unwrap_or(1);
+            for line_index in 0..height {
+                let mut value = String::new();
+                let mut spans = Vec::new();
+                let mut links = Vec::new();
+                for (column, cell) in cells.iter().enumerate() {
+                    if column > 0 {
+                        value.push_str(" | ");
+                    }
+                    let line = cell.get(line_index);
+                    let text = line.map(|line| line.text.as_str()).unwrap_or("");
+                    let padding = widths[column] - text::width(text);
+                    let left = match table.alignments[column] {
+                        Alignment::Right => padding,
+                        Alignment::Center => padding / 2,
+                        Alignment::Left | Alignment::None => 0,
+                    };
+                    let offset = text::width(&value) + left;
+                    value.push_str(&" ".repeat(left));
+                    value.push_str(text);
+                    value.push_str(&" ".repeat(padding - left));
+                    if let Some(line) = line {
+                        spans.extend(line.spans.iter().map(|span| span.shifted(offset)));
+                        links.extend(line.links.iter().map(|link| link.shifted(offset)));
+                    }
+                }
+                self.push_row_with_links(value, role, spans, links);
+            }
+            if index == 0 {
+                let rule = widths.iter().map(|&width| "\u{2500}".repeat(width))
+                    .collect::<Vec<_>>().join("\u{2500}\u{253c}\u{2500}");
+                self.push_row(rule, Role::DiffContext, Vec::new());
+            }
+        }
     }
 
     fn flush_code_block(&mut self) {
@@ -535,6 +619,73 @@ impl Renderer {
         self.out.push(line);
         self.wrote_any = true;
     }
+}
+
+fn sanitized_table_cell(mut cell: InlineBuffer) -> InlineBuffer {
+    for link in &mut cell.links {
+        let start: String = cell.text.chars().take(link.start).collect();
+        let end: String = cell.text.chars().take(link.end).collect();
+        link.start = text::sanitize(&start).chars().count();
+        link.end = text::sanitize(&end).chars().count();
+    }
+    cell.text = text::sanitize(&cell.text).replace('\n', " ");
+    cell
+}
+
+fn table_cell_rows(cell: &InlineBuffer, width: usize) -> Vec<RenderLine> {
+    let mut remaining = cell.text.trim();
+    let mut consumed = cell.text.chars().take_while(|c| c.is_whitespace()).count();
+    let mut rows = Vec::new();
+    while !remaining.is_empty() {
+        let mut end = 0;
+        let mut used = 0;
+        let mut last_space = None;
+        for (index, grapheme) in remaining.grapheme_indices(true) {
+            let cells = text::grapheme_width(grapheme);
+            if used + cells > width {
+                // Always consume one grapheme, even if it needs an ellipsis.
+                if end == 0 {
+                    end = grapheme.len();
+                }
+                break;
+            }
+            if grapheme == " " && index > 0 {
+                last_space = Some(index);
+            }
+            end = index + grapheme.len();
+            used += cells;
+        }
+        if end < remaining.len() && !remaining[end..].starts_with(' ') {
+            if let Some(space) = last_space {
+                end = space;
+            }
+        }
+        let source = &remaining[..end];
+        let chunk = source.trim_end_matches(' ');
+        let (mut spans, mut links) = row_link_spans(chunk, &cell.links, consumed, 0);
+        // Advance through source bytes, never through normalized display text.
+        consumed += source.chars().count();
+        remaining = &remaining[end..];
+        let skipped = remaining.graphemes(true).take_while(|g| *g == " ").count();
+        remaining = &remaining[skipped..];
+        consumed += skipped;
+        // A two-cell grapheme cannot be shown in a one-cell viewport.
+        let visible = text::truncate_with_ellipsis(chunk, width);
+        let cells = text::width(&visible);
+        for span in &mut spans {
+            span.start = span.start.min(cells);
+            span.end = span.end.min(cells);
+        }
+        for link in &mut links {
+            link.start = link.start.min(cells);
+            link.end = link.end.min(cells);
+        }
+        rows.push(RenderLine::new(visible, Role::Assistant).with_spans(spans).with_links(links));
+    }
+    if rows.is_empty() {
+        rows.push(RenderLine::new(String::new(), Role::Assistant));
+    }
+    rows
 }
 
 /// Whether a link's display text honestly represents its destination.
@@ -961,6 +1112,80 @@ mod tests {
         let rows = render(markdown, 40);
         assert!(rows.iter().any(|r| r.role == Role::Heading));
         assert!(rows.iter().any(|r| r.text.contains('1')));
+    }
+
+    #[test]
+    fn tables_share_terminal_cell_widths_and_preserve_empty_cells() {
+        let markdown = "| Name | Value |\n|---|---|\n| 界 | e\u{301} |\n| abcdef | 👨‍👩‍👧 |\n| | last |";
+        let rows = render(markdown, 40);
+        let cells: Vec<_> = rows.iter().filter(|row| row.role != Role::DiffContext)
+            .map(|row| {
+                let (first, _) = row.text.split_once(" | ").expect("both columns");
+                text::width(first)
+            }).collect();
+        assert_eq!(cells, vec![6, 6, 6, 6]);
+        assert!(rows.last().unwrap().text.starts_with("       | "));
+        assert!(rows.iter().any(|row| row.text.contains("👨‍👩‍👧")));
+    }
+
+    #[test]
+    fn tables_honor_column_alignment() {
+        let rows = render("| left | middle | right |\n|:---|:---:|---:|\n| a | b | c |", 40);
+        let body = rows.iter().find(|row| row.role == Role::Assistant).unwrap();
+        assert_eq!(body.text.split(" | ").collect::<Vec<_>>(),
+            vec!["a   ", "  b   ", "    c"]);
+    }
+
+    #[test]
+    fn tables_wrap_cells_without_moving_separators_or_losing_links() {
+        let rows = render(
+            "| Wide | Link |\n|---|---|\n| 界界界界 | [abcdefghijk](https://example.com) |", 15,
+        );
+        assert!(rows.iter().all(|row| text::width(&row.text) <= 15));
+        let body: Vec<_> = rows.iter().filter(|row| row.role == Role::Assistant).collect();
+        assert_eq!(body.len(), 2);
+        assert_eq!(body[0].text, "界界界 | abcdef");
+        assert_eq!(body[1].text, "界     | ghijk ");
+        assert_eq!(body[0].links, vec![LinkSpan::new(9, 15, "https://example.com")]);
+        assert_eq!(body[1].links, vec![LinkSpan::new(9, 14, "https://example.com")]);
+    }
+
+    #[test]
+    fn tables_fit_even_when_the_viewport_is_too_narrow_for_all_columns() {
+        let markdown = "| A | B | C |\n|---|---|---|\n| 界界 | abcdefgh | |";
+        for width in 1..=20 {
+            let rows = render(markdown, width);
+            assert!(rows.iter().all(|row| text::width(&row.text) <= width),
+                "table overflow at width {width}: {rows:?}");
+            if width >= 2 {
+                assert!(rows.iter().any(|row| row.text.contains('界')));
+            }
+        }
+    }
+
+    #[test]
+    fn tables_keep_word_wrapped_links_attached_after_sanitizing_text() {
+        let rows = render(
+            "| Link |\n|---|\n| \u{1b}[31m界\u{1b}[0m [ab cd ef](https://example.com) |", 6,
+        );
+        let body: Vec<_> = rows.iter().filter(|row| row.role == Role::Assistant).collect();
+        assert_eq!(body.len(), 2);
+        assert_eq!(body[0].text, "界 ab ");
+        assert_eq!(body[1].text, "cd ef ");
+        assert_eq!(body[0].links, vec![LinkSpan::new(3, 5, "https://example.com")]);
+        assert_eq!(body[1].links, vec![LinkSpan::new(0, 5, "https://example.com")]);
+        assert!(rows.iter().all(|row| !row.text.contains('\u{1b}')));
+    }
+
+    #[test]
+    fn tables_preserve_source_offsets_across_repeated_spaces_and_multibyte_links() {
+        let rows = render("| H |\n|---|\n| a  b [界界](https://example.com) |", 4);
+        let body: Vec<_> = rows.iter().filter(|row| row.role == Role::Assistant).collect();
+        assert_eq!(body.len(), 2);
+        assert_eq!(body[0].text, "a  b");
+        assert_eq!(body[1].text, "界界");
+        assert!(body[0].links.is_empty());
+        assert_eq!(body[1].links, vec![LinkSpan::new(0, 4, "https://example.com")]);
     }
 
     #[test]
