@@ -1349,6 +1349,29 @@ mod tests {
     }
 
     #[test]
+    fn assistant_tables_keep_the_grid_inside_the_transcript_gutter() {
+        let rows = Block::Assistant {
+            text: "| A | B |\n|---|---|\n| one | two |".to_string(),
+            complete: true,
+        }
+        .render(13 + MARKER_CELLS, ToolDisplayMode::Summary);
+
+        assert_eq!(
+            texts(&rows),
+            vec![
+                " ● ┌─────┬─────┐",
+                "   │  A  │  B  │",
+                "   ├─────┼─────┤",
+                "   │ one │ two │",
+                "   └─────┴─────┘",
+            ],
+        );
+        assert_eq!(rows[0].gutter, Gutter::AgentComplete);
+        assert!(rows[1..].iter().all(|row| row.gutter == Gutter::Continuation));
+        assert!(rows.iter().all(|row| text::width(&row.text) == 13 + MARKER_CELLS));
+    }
+
+    #[test]
     fn wrapped_assistant_rows_use_the_continuation_gutter() {
         let rows = Block::Assistant {
             text: "alpha beta gamma delta epsilon zeta".to_string(),
