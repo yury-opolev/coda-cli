@@ -114,6 +114,11 @@ values — text plus colour roles in *cell* coordinates — and `draw` maps thos
 onto ratatui spans. Width is measured per grapheme cluster and clamped to
 `[1, 2]`, because summing per-character widths mismeasures ZWJ emoji.
 
+Markdown tables use a connected single-line grid with centered headers by
+default and left-aligned body cells. Explicit Markdown column alignment takes
+precedence. Cells wrap independently within shared column widths; terminals
+too narrow for the grid show the cells stacked in order instead.
+
 **Colour is named, never literal.** Rendering code names a `Role`; the theme
 resolves it to 24-bit or 16-colour depending on terminal capability.
 
