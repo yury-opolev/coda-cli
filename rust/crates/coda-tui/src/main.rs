@@ -22,6 +22,9 @@ fn main() -> Result<()> {
         .context("failed to start the async runtime")?;
 
     let result = runtime.block_on(coda_diagnostics::scope(ctx.clone(), run(cli, ctx.clone(), forward_dir)));
+    ctx.record(coda_diagnostics::Event::EntrypointCompleted {
+        exit_code: if result.is_ok() { 0 } else { 1 },
+    });
     ctx.record(coda_diagnostics::Event::ProcessEnd {
         exit_code: if result.is_ok() { 0 } else { 1 },
     });
@@ -80,12 +83,7 @@ async fn run(cli: Cli, diagnostics: coda_diagnostics::DiagnosticContext, engine_
 
     let result = app.run(&mut guard, inbound, engine, started_at).await;
 
-    // Restore the terminal before shutting the engine down so any engine
-    // diagnostics land on a normal screen. The engine itself is the loop's:
-    // an authentication transition has to stop and await it before writing a
-    // credential, which a caller holding it could only be told about after
-    // the fact.
-    drop(guard);
+    let result = guard.finish(result);
     if let Ok(summary) = &result {
         coda_tui::branding::print_exit(summary);
     }

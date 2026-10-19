@@ -663,6 +663,12 @@ impl Transcript {
         self.blocks.push(block);
     }
 
+    /// Shows a local notice immediately without hiding the streaming tail.
+    pub fn push_notice(&mut self, text: String, level: NoticeLevel) {
+        let index = self.blocks.len() - usize::from(self.blocks.last().is_some_and(Block::is_open));
+        self.blocks.insert(index, Block::Notice { text, level });
+    }
+
     pub fn last_mut(&mut self) -> Option<&mut Block> {
         self.blocks.last_mut()
     }

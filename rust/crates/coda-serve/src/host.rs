@@ -2921,8 +2921,21 @@ impl ServeBackend for ServeHost {
             svc.schedule_runtime.shutdown().await;
         }
         // Shut down any connected MCP servers so child processes do not leak.
-        if let Some(manager) = &self.mcp_manager {
-            manager.shutdown().await;
+        let started = std::time::Instant::now();
+        let mcp_result = match &self.mcp_manager {
+            Some(manager) => manager.shutdown().await,
+            None => Ok(()),
+        };
+        if let Some(ctx) = &self.diagnostics {
+            ctx.record(coda_diagnostics::Event::ShutdownPhase {
+                phase: "integrations",
+                duration_ms: started.elapsed().as_millis() as u64,
+                outcome: if mcp_result.is_ok() {
+                    "completed"
+                } else {
+                    "failed"
+                },
+            });
         }
         // Close the engine-owned notification bus: no further `notify_user`
         // publication is meaningful once the engine itself has begun
@@ -2931,6 +2944,7 @@ impl ServeBackend for ServeHost {
         // bus nothing will ever read from again.
         self.message_bus.close();
         self.engine_state.shutdown_completed();
+        mcp_result.map_err(RpcError::internal)?;
         Ok(json!({ "ok": true }))
     }
 

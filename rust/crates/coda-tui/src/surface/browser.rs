@@ -211,6 +211,9 @@ impl Surface for BrowserSurface {
     }
 
     fn placement(&self) -> super::Placement {
+        if self.kind == BrowserKind::Tasks {
+            return super::Placement::FitContent { preferred_width: u16::MAX };
+        }
         // Browsers are tables; they earn more of the screen than a short form.
         super::Placement::Modal {
             width_pct: 90,
@@ -280,7 +283,13 @@ impl Surface for BrowserSurface {
                 // The column fitting lives on Browser and is already tested
                 // there; duplicating it here would give two answers to the
                 // same question and no way to notice when they diverged.
-                let widths = self.browser.fit_columns(width);
+                let mut widths = self.browser.fit_columns(width);
+                if self.kind == BrowserKind::Tasks {
+                    let used = widths.iter().sum::<usize>() + widths.len().saturating_sub(1);
+                    if let Some(description) = widths.last_mut() {
+                        *description += width.saturating_sub(used);
+                    }
+                }
 
                 let headings: Vec<String> = self
                     .browser
@@ -365,6 +374,47 @@ mod tests {
             Item::new("c", vec!["gamma".into(), "third".into()]),
         ]);
         BrowserSurface::new(BrowserKind::Skills, browser)
+    }
+
+    #[test]
+    fn tasks_use_spare_width_for_the_description() {
+        let description = "a task description that is longer than forty-four cells and should remain visible";
+        let mut browser = Browser::new("Tasks", vec![
+            Column::new("", 1),
+            Column::new("id", 16),
+            Column::new("status", 10),
+            Column::new("kind", 10),
+            Column::new("description", 44),
+        ]);
+        browser.set_items(vec![Item::new("task", vec![
+            "*".into(), "task".into(), "running".into(), "agent".into(), description.into(),
+        ])]);
+        let s = BrowserSurface::new(BrowserKind::Tasks, browser);
+        let lines = s.render(Rect::new(0, 0, 140, 5), &Theme::default());
+        assert!(lines[1].to_string().contains(description));
+        for width in [10, 40, 85, 140] {
+            assert!(s.render(Rect::new(0, 0, width, 5), &Theme::default())
+                .iter().all(|line| line.width() <= width as usize));
+        }
+    }
+
+    #[test]
+    fn tasks_fit_the_filtered_list_and_wrapped_details() {
+        let mut s = surface();
+        s.kind = BrowserKind::Tasks;
+        let mut items = s.browser.items().to_vec();
+        items[0].detail = vec!["long output ".repeat(20)];
+        s.browser.set_items(items);
+        assert!(matches!(s.placement(), super::super::Placement::FitContent { .. }));
+        assert_eq!(s.desired_size(80, &Theme::default()), (80, 4));
+        s.handle_key(key(KeyCode::Char('/')));
+        for c in "alpha".chars() {
+            s.handle_key(key(KeyCode::Char(c)));
+        }
+        s.handle_key(key(KeyCode::Enter));
+        assert_eq!(s.desired_size(80, &Theme::default()), (80, 2));
+        s.handle_key(key(KeyCode::Enter));
+        assert!(s.desired_size(40, &Theme::default()).1 > 1);
     }
 
     #[test]

@@ -214,6 +214,13 @@ runs — `/model` then `Enter` submits straight away, while `/mo` or `/MODEL` is
 command before it runs. Only a command at the **start** of the prompt is executed as a command; one accepted
 mid-sentence stays literal text and is sent to the model together with the prose around it.
 
+**Shutdown:** once `/exit`, `/quit`, or the second exit-arming `Ctrl+C` is accepted,
+the TUI shows an animated shutdown status until cleanup finishes. Further `Ctrl+C`
+acknowledges cleanup; it does not abandon an in-flight credential commit or start
+new work. Cleanup failures and forced engine stops are reported after restoring
+the terminal, rather than followed by a success summary. See the
+[shutdown and Windows acceptance notes](rust/README.md#interactive-shutdown).
+
 **Mouse:** in the **transcript**, **left-drag** selects text; `Ctrl+C` **or a right-click** copies the
 selection (the role markers and tree connectors in the gutter are never copied). A selection is kept if
 the clipboard is unavailable, so you can retry. In the **composer**, **left-drag** selects text; when a
@@ -283,7 +290,7 @@ Windows, `sh` elsewhere.
 
 ### `/tasks` — the live task browser
 
-In the full-screen TUI, `/tasks` opens a **focused, full-overlay
+In the full-screen TUI, `/tasks` opens a **focused, content-sized
 live browser** over the session's in-process `TaskManager`. The bare `/tasks` submission is
 intercepted **before** the dispatch/startup guard, so the browser opens even while an agent
 turn is running. Plain mode instead prints a **read-only textual snapshot** of the
@@ -293,6 +300,8 @@ browser/snapshot shows an empty list.
 The list shows **active tasks first as a parent/child hierarchy**, then **recent completed,
 failed, and stopped** tasks, each with a status glyph, description, kind (subagent/shell),
 foreground/background mode, and duration. Selection is stable by task id.
+The browser height follows the visible list or wrapped detail content, within
+the terminal bounds; spare list width goes to the description column.
 
 - **List:** `Up`/`Down` or `k`/`j`, `PageUp`/`PageDown`, `Home`/`End` navigate · `Enter` opens the
   detail page · `/` filters by name · `x` twice within ~1.5 s stops a running task · `d` dismisses a
