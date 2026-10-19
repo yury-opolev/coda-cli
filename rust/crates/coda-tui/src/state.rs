@@ -1755,18 +1755,14 @@ impl UiState {
     }
 
     fn notice(&mut self, text: impl Into<String>, level: NoticeLevel) {
-        self.transcript.push(Block::Notice {
-            text: text.into(),
-            level,
-        });
+        self.transcript.push_notice(text.into(), level);
     }
 
     /// Materialises one `event/agentMessage` notification, deduplicated by
     /// its stable id.
     ///
-    /// Parked behind an open block rather than appended unconditionally —
-    /// the same "safe append, never split" rule `notice()` relies on does
-    /// **not** hold for a whole new block: `Transcript::open_tail` only ever
+    /// Parked behind an open block rather than appended unconditionally:
+    /// `Transcript::open_tail` only ever
     /// looks at the literal last block, so pushing straight through would
     /// stop being that tail and the next streamed delta would open a *second*
     /// `Assistant`/`Thinking` block instead of continuing the first. See
@@ -2531,6 +2527,56 @@ mod tests {
         state.apply(UiEvent::Engine(Event::AssistantTextComplete));
 
         assert!(state.transcript.open_tail().is_none());
+    }
+
+    #[test]
+    fn a_local_notice_does_not_split_streamed_text_or_reasoning() {
+        for thinking in [false, true] {
+            let mut state = state();
+            let delta = |text: &str| if thinking {
+                Event::Thinking { delta: text.into() }
+            } else {
+                Event::AssistantText { delta: text.into() }
+            };
+            state.apply(UiEvent::Engine(delta("See [the guide](https://example.com/")));
+            state.apply(UiEvent::Notice { text: "local notice".into(), level: NoticeLevel::Warning });
+            assert!(state.transcript.blocks().iter().any(
+                |block| matches!(block, Block::Notice { text, .. } if text == "local notice")
+            ), "a local warning must remain immediately visible");
+            state.apply(UiEvent::Engine(delta("docs)")));
+            let blocks: Vec<_> = state.transcript.blocks().iter().filter_map(|block| match block {
+                Block::Assistant { text, .. } | Block::Thinking { text, .. } => Some(text.as_str()),
+                _ => None,
+            }).collect();
+            assert_eq!(blocks, ["See [the guide](https://example.com/docs)"]);
+            state.apply(UiEvent::Engine(Event::TurnComplete {
+                stop_reason: Some("end_turn".into()), interrupted: false,
+                root_turn_id: None, activity_id: None,
+            }));
+            assert_eq!(state.transcript.blocks().iter().filter(
+                |block| matches!(block, Block::Notice { text, .. } if text == "local notice")
+            ).count(), 1);
+        }
+    }
+
+    #[test]
+    fn engine_replacement_preserves_local_notices_but_not_parked_agent_messages() {
+        let mut state = state();
+        state.apply(UiEvent::Engine(Event::AssistantText { delta: "reply".into() }));
+        state.apply(UiEvent::Notice { text: "local warning".into(), level: NoticeLevel::Warning });
+        state.apply(UiEvent::Engine(Event::AgentMessage {
+            id: "old".into(), cursor: 1, label: "old engine".into(),
+            text: "old notification".into(), context: None, source: "main".into(),
+            task_id: None, schedule_definition_id: None,
+        }));
+        state.reset_agent_message_dedup();
+        state.apply(UiEvent::Engine(Event::AssistantTextComplete));
+        assert_eq!(state.transcript.blocks().iter().filter(
+            |block| matches!(block, Block::Notice { text, .. } if text == "local warning")
+        ).count(), 1);
+        assert!(!state.transcript.blocks().iter().any(
+            |block| matches!(block, Block::AgentMessage { .. })
+        ));
     }
 
     #[test]
