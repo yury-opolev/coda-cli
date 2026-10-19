@@ -139,6 +139,9 @@ impl<'a> BatchContext<'a> {
 /// §1.6: "Tools run strictly SERIALLY, in the model's requested order — a
 /// single `for i in 0..tool_uses.len()`.  Nothing parallelizes."
 ///
+/// Cancellation returns completed/cancelled/skipped results, not an early
+/// error: the loop must commit them before propagating `AgentError::Cancelled`.
+///
 /// Emits `ToolBatchStarted`/`ToolBatchEnded` around the whole batch — the
 /// `coda-serve` state sink uses this pair to enter/leave `runningTools`.
 /// `ToolBatchEnded` fires exactly once, on every exit path (success, error,
@@ -188,6 +191,10 @@ async fn run_tools_body(
     }
 
     for (i, block) in tool_uses.iter().enumerate() {
+        if cancel.is_cancelled() {
+            cancel_remaining(&tool_uses[i..], false, sink, &mut results);
+            break;
+        }
         let (id, name, input_json, correlation) = match block {
             Content::ToolUse { id, name, input_json, correlation } => {
                 (id, name, input_json, correlation)
@@ -262,7 +269,8 @@ async fn run_tools_body(
             let allowed = ctx.permission_prompt.request(&*tool, &effective_input, cancel.clone()).await;
 
             if cancel.is_cancelled() {
-                return Err(AgentError::Cancelled);
+                cancel_remaining(&tool_uses[i..], true, sink, &mut results);
+                break;
             }
 
             if !allowed {
@@ -297,7 +305,23 @@ async fn run_tools_body(
             correlation: correlation.clone(),
         });
 
-        let tool_result = execute_with_ceiling(&*tool, &input_value, &tool_ctx, cancel.clone(), ctx.tool_max_duration, name).await?;
+        let tool_result = match execute_with_ceiling(
+            &*tool,
+            &input_value,
+            &tool_ctx,
+            cancel.clone(),
+            ctx.tool_max_duration,
+            name,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(AgentError::Cancelled) => {
+                cancel_remaining(&tool_uses[i..], true, sink, &mut results);
+                break;
+            }
+            Err(error) => return Err(error),
+        };
 
         let terminal_status = if tool_result.is_error { ToolCallStatus::Failed } else { ToolCallStatus::Succeeded };
 
@@ -337,6 +361,98 @@ async fn run_tools_body(
     }
 
     Ok(ToolBatchResult { result_blocks: results, abort_reason, control_abort })
+}
+
+fn cancel_remaining(
+    tool_uses: &[Content],
+    current_started: bool,
+    sink: &dyn AgentSink,
+    results: &mut Vec<Content>,
+) {
+    for (index, block) in tool_uses.iter().enumerate() {
+        if let Content::ToolUse {
+            id,
+            name,
+            correlation,
+            ..
+        } = block
+        {
+            let (status, message) = if index == 0 && current_started {
+                (
+                    ToolCallStatus::Cancelled,
+                    "Cancelled: no final result was recorded for this tool call.",
+                )
+            } else {
+                (
+                    ToolCallStatus::Skipped,
+                    "Skipped: not executed because the run was cancelled.",
+                )
+            };
+            sink.emit(AgentEvent::ToolResult {
+                tool_name: name.clone(),
+                content: message.into(),
+                is_error: true,
+                status,
+                correlation: correlation.clone(),
+            });
+            results.push(make_result_block(
+                id,
+                message,
+                true,
+                status,
+                correlation.clone(),
+            ));
+        }
+    }
+}
+
+/// Restore only missing results, without replaying tools or guessing their outcomes.
+pub(super) fn recover_interrupted_history(history: &mut Vec<coda_llm::Message>) -> usize {
+    use coda_llm::{Message, Role};
+
+    let mut recovered = 0;
+    let mut index = 0;
+    while index < history.len() {
+        if history[index].role != Role::Assistant {
+            index += 1;
+            continue;
+        }
+        let next = history
+            .get(index + 1)
+            .filter(|message| message.role == Role::User);
+        let recorded: std::collections::HashSet<&str> = next
+            .into_iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|block| match block {
+                Content::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let missing: Vec<Content> = history[index].tool_uses().filter_map(|block| match block {
+            Content::ToolUse { id, correlation, .. } if !recorded.contains(id.as_str()) => {
+                Some(Content::ToolResult {
+                    tool_use_id: id.clone(),
+                    content: "Tool result unavailable: the outcome of this previous call is unknown. \
+                              Check its effects before deciding whether to retry; it was not re-executed \
+                              during history recovery.".into(),
+                    is_error: true,
+                    correlation: correlation.clone(),
+                    status: None,
+                })
+            }
+            _ => None,
+        }).collect();
+        if !missing.is_empty() {
+            recovered += missing.len();
+            if next.is_some() {
+                history[index + 1].content.splice(0..0, missing);
+            } else {
+                history.insert(index + 1, Message::new(Role::User, missing));
+            }
+        }
+        index += 1;
+    }
+    recovered
 }
 
 /// Execute a tool with an optional wall-clock ceiling.
