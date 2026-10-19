@@ -340,6 +340,9 @@ fn main() -> Result<()> {
                 &args.log_filter,
             )?;
             let result = runtime.block_on(coda_diagnostics::scope(ctx.clone(), run_serve(args)));
+            ctx.record(coda_diagnostics::Event::EntrypointCompleted {
+                exit_code: if result.is_ok() { 0 } else { 1 },
+            });
             ctx.record(coda_diagnostics::Event::ProcessEnd {
                 exit_code: if result.is_ok() { 0 } else { 1 },
             });
@@ -381,6 +384,9 @@ fn main() -> Result<()> {
                 ctx.clone(),
                 run_interactive(cli.interactive, ctx.clone(), forward_dir),
             ));
+            ctx.record(coda_diagnostics::Event::EntrypointCompleted {
+                exit_code: if result.is_ok() { 0 } else { 1 },
+            });
             ctx.record(coda_diagnostics::Event::ProcessEnd {
                 exit_code: if result.is_ok() { 0 } else { 1 },
             });
@@ -582,11 +588,8 @@ async fn run_interactive(
 
     let result = app.run(&mut guard, inbound, engine_process, started_at).await;
 
-    // Restore the terminal before shutting the engine down so any engine
-    // diagnostics land on a normal screen. The engine belongs to the loop
-    // from here: signing in has to stop and *await* it before a credential is
-    // written, which only its owner can do.
-    drop(guard);
+    // Cleanup has finished and no input reader survives the loop.
+    let result = guard.finish(result);
 
     // The summary is written after the alternate screen is released, so it
     // survives in the scrollback. It reports what the session cost and how to

@@ -9,7 +9,7 @@
 //! held to a line ceiling by `tests/conventions.rs`. "How this client stays in
 //! step with the engine" is its own responsibility, not more of the loop's.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use coda_client::{Engine, EngineCommand, Inbound};
 use coda_proto::Event;
 use coda_render::Theme;
@@ -1225,25 +1225,45 @@ impl App {
     /// flush the session rather than being killed after a grace period.
     /// Bounded, because a client that hangs on exit is worse than one that
     /// gives up on a graceful stop.
-    pub(crate) async fn close_out(&mut self) {
+    pub(crate) async fn close_out(&mut self, deadline: tokio::time::Instant) -> Result<()> {
         // The authentication flow first: a preparation has written nothing and
         // is dropped, but a commit in flight is awaited, because a transaction
         // abandoned half-written would leave a profile this process then
         // reported as unchanged.
+        let started = std::time::Instant::now();
         self.close_auth_out().await;
+        coda_diagnostics::record(coda_diagnostics::Event::ShutdownPhase {
+            phase: "authentication",
+            duration_ms: started.elapsed().as_millis() as u64,
+            outcome: "completed",
+        });
         if !self.engine_connected {
             // Already stopped and awaited by whatever disconnected. Asking a
             // closed connection to shut down would only wait out a timeout on
             // the way to the exit.
-            return;
+            return Ok(());
         }
         let instance = self.view.engine_instance_id().map(str::to_string);
         self.pending.decline_live(instance.as_deref());
-        let _ = tokio::time::timeout(
-            super::SHUTDOWN_GRACE,
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout_at(
+            deadline,
             self.connection.request(coda_proto::messages::method::SHUTDOWN, Some(serde_json::json!({}))),
         )
-        .await;
+        .await
+        .context("shutdown RPC timed out")
+        .and_then(|result| result.context("shutdown RPC failed"))
+        .map(|_| ());
+        coda_diagnostics::record(coda_diagnostics::Event::ShutdownPhase {
+            phase: "shutdown_rpc",
+            duration_ms: started.elapsed().as_millis() as u64,
+            outcome: if result.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            },
+        });
+        result
     }
 
     /// Stops every engine process this application owns, and waits for each.
@@ -1260,12 +1280,28 @@ impl App {
     ///
     /// Called after [`close_out`](Self::close_out), never before: the session
     /// is answered and asked to stop over the connection first.
-    pub(crate) async fn stop_owned_engines(&mut self, grace: std::time::Duration) {
+    pub(crate) async fn stop_owned_engines(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
         let staged = self.restarted.take().map(|(engine, _)| engine);
         let owned = self.owned_engine.take();
-        for engine in [staged, owned].into_iter().flatten() {
-            let _ = engine.shutdown(grace).await;
+        let results = futures::future::join_all(
+            [staged, owned]
+                .into_iter()
+                .flatten()
+                .map(|engine| engine.shutdown_until(deadline)),
+        )
+        .await;
+        let errors: Vec<String> = results
+            .into_iter()
+            .filter_map(Result::err)
+            .map(|error| error.to_string())
+            .collect();
+        if !errors.is_empty() {
+            anyhow::bail!("engine cleanup failed: {}", errors.join("; "));
         }
+        Ok(())
     }
 
     /// Whether this client may maintain the engine-adjacent files itself.
@@ -2350,6 +2386,52 @@ pub(in crate::app) mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_rpc_failure_is_not_a_successful_exit() {
+        let mut harness = app_answering(crate::local::AccessMode::TrustedLocal, |method, _| {
+            if method == "shutdown" {
+                Err((-32603, "shutdown failed".into()))
+            } else {
+                Ok(json!({}))
+            }
+        });
+        let result = harness.app.finish(Ok(()), std::time::Instant::now()).await;
+        assert!(
+            result.is_err(),
+            "shutdown RPC failures must not be discarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_rpc_and_both_owned_engines_share_one_shutdown_budget() {
+        let command = || {
+            if cfg!(windows) {
+                EngineCommand::new("powershell.exe").args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Start-Sleep -Seconds 30",
+                ])
+            } else {
+                EngineCommand::new("sleep").arg("30")
+            }
+        };
+        let (owned, _) = Engine::spawn(command()).expect("owned engine");
+        let owned_connection = owned.connection();
+        let (staged, inbound) = Engine::spawn(command()).expect("staged engine");
+        let staged_connection = staged.connection();
+        let mut harness = silent_engine();
+        harness.app.owned_engine = Some(owned);
+        harness.app.restarted = Some((staged, inbound));
+        harness.app.shutdown_grace = std::time::Duration::from_millis(150);
+        let started = std::time::Instant::now();
+        let error = harness.app.finish(Ok(()), started).await.unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_millis(1150));
+        assert!(format!("{error:#}").contains("shutdown RPC timed out"));
+        assert!(owned_connection.is_closed() && staged_connection.is_closed());
+        assert!(harness.app.owned_engine.is_none() && harness.app.restarted.is_none());
+    }
+
+    #[tokio::test]
     async fn closing_the_session_talks_to_a_live_engine_and_leaves_it_talking() {
         // The graceful half of the teardown, and the thing a fail-fast
         // connection must not break. `close_out` says goodbye *over the
@@ -2366,7 +2448,14 @@ pub(in crate::app) mod tests {
             }
         });
 
-        within("the graceful close-out", harness.app.close_out()).await;
+        within(
+            "the graceful close-out",
+            harness
+                .app
+                .close_out(tokio::time::Instant::now() + super::super::SHUTDOWN_GRACE),
+        )
+        .await
+        .expect("close-out");
         harness.settle_wire().await;
 
         assert!(
@@ -2404,9 +2493,12 @@ pub(in crate::app) mod tests {
         // Only now do the processes go away.
         within(
             "stopping the engines",
-            harness.app.stop_owned_engines(std::time::Duration::from_millis(250)),
+            harness.app.stop_owned_engines(
+                tokio::time::Instant::now() + std::time::Duration::from_millis(250),
+            ),
         )
-        .await;
+        .await
+        .expect("stop engines");
     }
 
     #[tokio::test]

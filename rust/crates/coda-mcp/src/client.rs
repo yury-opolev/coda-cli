@@ -11,8 +11,8 @@
 //! - The entire handshake (`initialize` + `notifications/initialized` +
 //!   `tools/list`) is wrapped in `connect_timeout`.
 //! - Each `tools/call` is wrapped in its own timeout.
-//! - Shutdown sends `shutdown` then drops the connection; the process kill
-//!   is handled by the caller (McpClientManager / McpProcess).
+//! - Shutdown closes stdin and drains stdout through the caller's concurrent
+//!   process wait (McpClientManager / McpProcess).
 //!
 //! A server that hangs, sends garbage, dies, or floods output is handled
 //! gracefully: the timeout fires, the `Connection` is dropped (which closes
@@ -197,20 +197,48 @@ impl McpClient {
         }
     }
 
-    /// Sends the MCP `shutdown` notification and drops the connection.
-    /// MCP's stdio shutdown is simpler than LSP's: closing stdin tells the
-    /// server we are done. We send a courtesy `shutdown` request first (best-
-    /// effort, bounded at 2 s) then let the connection drop, which closes the
-    /// write channel and signals the server via stdin EOF.
-    pub async fn shutdown(self) {
-        // Best-effort shutdown request; ignore errors and timeout.
-        let _ = tokio::time::timeout(
-            Duration::from_secs(2),
-            self.connection.request("shutdown", None),
-        )
-        .await;
-        // Dropping `self.connection` closes the outgoing channel → write_loop
-        // ends → stdin EOF reaches the server.
+    /// MCP defines no shutdown RPC: close stdin and drain stdout while the
+    /// owner concurrently waits for process exit.
+    pub async fn shutdown(self, deadline: tokio::time::Instant) -> Result<(), String> {
+        let Self {
+            connection,
+            mut _tasks,
+            ..
+        } = self;
+        drop(connection);
+        let writer_deadline = deadline.min(tokio::time::Instant::now() + Duration::from_secs(1));
+        let writer = match tokio::time::timeout_at(writer_deadline, &mut _tasks.writer).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err("MCP writer failed during shutdown".into()),
+            Err(_) => {
+                _tasks.writer.abort();
+                let _ = tokio::time::timeout_at(
+                    deadline + Duration::from_millis(500),
+                    &mut _tasks.writer,
+                )
+                .await;
+                Err("MCP writer timed out during shutdown".into())
+            }
+        };
+        let reader_deadline = deadline + Duration::from_millis(500);
+        let reader = match tokio::time::timeout_at(reader_deadline, &mut _tasks.reader).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(format!("MCP reader failed during shutdown: {error}")),
+            Err(_) => {
+                _tasks.reader.abort();
+                let _ = tokio::time::timeout_at(reader_deadline, &mut _tasks.reader).await;
+                Err("MCP stdout did not close within the shutdown allowance".to_string())
+            }
+        };
+        let errors: Vec<String> = [writer, reader]
+            .into_iter()
+            .filter_map(Result::err)
+            .collect();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
     }
 
     /// Resolve the tool-call timeout from the environment variable.
@@ -553,7 +581,8 @@ mod tests {
     // Concurrent env::set_var / remove_var calls on different tests cause flaky failures.
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
-    use tokio::io::{duplex, AsyncWriteExt};
+    use tokio::io::{duplex, AsyncWriteExt
+};
     /// A minimal MCP server simulated with an in-memory duplex stream.
     struct FakeServer {
         /// The side the server writes to (client reads from this).
@@ -626,6 +655,66 @@ mod tests {
 
     fn one_timeout() -> Duration {
         Duration::from_secs(5)
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_stdin_without_waiting_for_an_undefined_rpc() {
+        use tokio::io::AsyncReadExt;
+        let (mut server, client_in, client_out) = FakeServer::new();
+        let connect = tokio::spawn(async move {
+            McpClient::connect(client_in, client_out, one_timeout(), one_timeout()).await
+        });
+        server.run_handshake(json!([])).await;
+        let client = connect.await.unwrap().unwrap();
+        let server = async move {
+            let mut remaining = String::new();
+            server
+                .client_writes
+                .read_to_string(&mut remaining)
+                .await
+                .unwrap();
+            assert!(
+                remaining.is_empty(),
+                "unexpected protocol data on shutdown: {remaining}"
+            );
+            drop(server);
+        };
+        let shutdown = client.shutdown(tokio::time::Instant::now() + one_timeout());
+        let (result, ()) = tokio::time::timeout(Duration::from_millis(350), async {
+            tokio::join!(shutdown, server)
+        })
+        .await
+        .expect("MCP shutdown must use stdin EOF, not an unimplemented RPC");
+        result.expect("writer closes");
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_final_server_output_after_stdin_eof() {
+        use tokio::io::AsyncReadExt;
+        let (mut server, client_in, client_out) = FakeServer::new();
+        let connect = tokio::spawn(async move {
+            McpClient::connect(client_in, client_out, one_timeout(), one_timeout()).await
+        });
+        server.run_handshake(json!([])).await;
+        let client = connect.await.unwrap().unwrap();
+        let server = async move {
+            server
+                .client_writes
+                .read_to_end(&mut Vec::new())
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let notification = json!({
+                "jsonrpc": "2.0", "method": "notifications/message",
+                "params": { "level": "info", "data": "x".repeat(128 * 1024) }
+            });
+            server.write(notification).await;
+        };
+        let (result, ()) = tokio::join!(
+            client.shutdown(tokio::time::Instant::now() + one_timeout()),
+            server,
+        );
+        result.expect("final stdout must stay open throughout graceful shutdown");
     }
 
     #[tokio::test]

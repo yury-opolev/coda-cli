@@ -278,9 +278,7 @@ pub trait WizardInput: Send {
 }
 
 /// The production input: this process's terminal.
-pub struct TerminalInput {
-    events: crossterm::event::EventStream,
-}
+pub struct TerminalInput;
 
 impl Default for TerminalInput {
     fn default() -> Self {
@@ -290,21 +288,18 @@ impl Default for TerminalInput {
 
 impl TerminalInput {
     pub fn new() -> Self {
-        Self { events: crossterm::event::EventStream::new() }
+        Self
     }
 }
 
 #[async_trait]
 impl WizardInput for TerminalInput {
     async fn next(&mut self) -> Option<Event> {
-        use futures_lite::StreamExt;
-        loop {
-            match self.events.next().await {
-                Some(Ok(event)) => return Some(event),
-                // A single bad read is not a reason to abandon a sign-in that
-                // has not been answered yet.
-                Some(Err(_)) => continue,
-                None => return None,
+        match crate::terminal::read_event().await {
+            Ok(event) => Some(event),
+            Err(error) => {
+                eprintln!("failed to read terminal input: {error}");
+                None
             }
         }
     }
@@ -1331,4 +1326,3 @@ mod tests {
         assert!(healthy.keeps_model_intent());
     }
 }
-

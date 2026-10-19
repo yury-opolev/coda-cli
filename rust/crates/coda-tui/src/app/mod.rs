@@ -11,11 +11,8 @@ use anyhow::{Context, Result};
 use coda_client::{ClientError, Connection, Engine, EngineCommand, Inbound};
 use coda_proto::messages::{self, method};
 use coda_render::{RenderLine, Theme};
-use crossterm::event::{
-    Event as TerminalEvent, EventStream, KeyCode, KeyEvent, KeyEventKind,
-};
+use crossterm::event::{Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind};
 use futures::future::OptionFuture;
-use futures_lite::StreamExt;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -36,6 +33,7 @@ mod queue;
 mod serve;
 mod settings;
 mod shell;
+mod shutdown;
 mod startup_cli;
 mod usage;
 
@@ -328,7 +326,8 @@ impl App {
         // `finish` is the whole teardown, engines included: the session is
         // closed out over the connection first, and only then do the
         // processes this loop owns go away.
-        self.finish(outcome, started_at).await
+        let theme = self.theme.clone();
+        shutdown::feedback(self.finish(outcome, started_at), guard, &theme).await
     }
 
     /// Tears the session down and reports what the run produced.
@@ -345,8 +344,11 @@ impl App {
         outcome: Result<()>,
         started_at: std::time::Instant,
     ) -> Result<crate::branding::ExitSummary> {
-        self.close_out().await;
-        self.stop_owned_engines(SHUTDOWN_GRACE).await;
+        let deadline = tokio::time::Instant::now() + self.shutdown_grace;
+        let close_result = self.close_out(deadline).await;
+        let stop_result = self.stop_owned_engines(deadline).await;
+        let outcome = shutdown::combine(outcome, close_result);
+        let outcome = shutdown::combine(outcome, stop_result);
         outcome?;
         Ok(self.exit_summary(started_at.elapsed()))
     }
@@ -356,7 +358,6 @@ impl App {
         guard: &mut TerminalGuard,
         mut inbound: mpsc::UnboundedReceiver<Inbound>,
     ) -> Result<()> {
-        let mut terminal_events = EventStream::new();
         let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<TurnOutcome>();
         let mut auth_events = self.auth.take_events();
 
@@ -401,10 +402,9 @@ impl App {
                 Some(event) = auth_events.recv() => self.on_auth_event(event).await,
 
                 // Terminal input.
-                event = terminal_events.next() => match event {
-                    Some(Ok(event)) => self.on_terminal(event, guard).await?,
-                    Some(Err(error)) => return Err(error).context("terminal input failed"),
-                    None => break,
+                event = crate::terminal::read_event() => match event {
+                    Ok(event) => self.on_terminal(event, guard).await?,
+                    Err(error) => return Err(error).context("terminal input failed"),
                 },
 
                 // A turn finished (delivered via the mpsc relay from the turn branch below).

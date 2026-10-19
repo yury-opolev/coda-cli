@@ -27,6 +27,16 @@ pub enum Event {
     /// The process is about to exit. Recorded explicitly before
     /// `process::exit` in headless paths, where `Drop` never runs.
     ProcessEnd { exit_code: i32 },
+    /// Async work returned; runtime teardown and OS process exit can follow.
+    EntrypointCompleted {
+        exit_code: i32,
+    },
+    ShutdownStart,
+    ShutdownPhase {
+        phase: &'static str,
+        duration_ms: u64,
+        outcome: &'static str,
+    },
 
     /// The frontend launched an engine child process.
     EngineStart { pid: Option<u32> },

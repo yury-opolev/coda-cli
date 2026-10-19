@@ -201,19 +201,74 @@ impl Engine {
     /// what was already queued — the reply to a reverse request the engine is
     /// blocked on is still written — before it closes the engine's stdin,
     /// which is what a healthy engine exits on.
-    pub async fn shutdown(mut self, grace: std::time::Duration) -> std::io::Result<()> {
-        self.connection.close();
-        // Bounded by the same grace: the writer is draining into a pipe whose
-        // reader may already be gone, and a stop that hangs here is the very
-        // thing this is preventing elsewhere.
-        let _ = tokio::time::timeout(grace, &mut self.tasks.writer).await;
-        self.tasks.reader.abort();
+    pub async fn shutdown(self, grace: std::time::Duration) -> std::io::Result<()> {
+        self.shutdown_until(tokio::time::Instant::now() + grace)
+            .await
+    }
 
-        let result = match tokio::time::timeout(grace, self.child.wait()).await {
-            Ok(result) => result.map(|_| ()),
+    /// Shares one deadline across writer drain and process exit. Forced
+    /// termination and reaping have at most one additional second, measured
+    /// from that same deadline even when several owned engines are stopped.
+    pub async fn shutdown_until(mut self, deadline: tokio::time::Instant) -> std::io::Result<()> {
+        let started = std::time::Instant::now();
+        let termination_deadline = deadline + std::time::Duration::from_secs(1);
+        self.connection.close();
+        let writer_result = match tokio::time::timeout_at(deadline, &mut self.tasks.writer).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(std::io::Error::other(format!(
+                "engine writer failed: {error}"
+            ))),
+            Err(_) => {
+                self.tasks.writer.abort();
+                let _ = tokio::time::timeout_at(termination_deadline, &mut self.tasks.writer).await;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "engine writer timed out",
+                ))
+            }
+        };
+        self.tasks.reader.abort();
+        if let Some(ctx) = coda_diagnostics::current() {
+            ctx.record(coda_diagnostics::Event::ShutdownPhase {
+                phase: "engine_writer",
+                duration_ms: started.elapsed().as_millis() as u64,
+                outcome: if writer_result.is_ok() {
+                    "completed"
+                } else {
+                    "failed"
+                },
+            });
+        }
+
+        let result = match tokio::time::timeout_at(deadline, self.child.wait()).await {
+            Ok(Ok(status)) if status.success() => writer_result,
+            Ok(Ok(status)) => Err(std::io::Error::other(format!(
+                "engine exited with {status}"
+            ))),
+            Ok(Err(error)) => Err(error),
             Err(_) => {
                 tracing::warn!("engine did not exit within the grace period; killing it");
-                self.child.kill().await
+                if let Some(ctx) = coda_diagnostics::current() {
+                    ctx.record(coda_diagnostics::Event::ShutdownPhase {
+                        phase: "engine_process",
+                        duration_ms: started.elapsed().as_millis() as u64,
+                        outcome: "forced",
+                    });
+                }
+                match self.child.start_kill() {
+                    Err(error) => Err(error),
+                    Ok(()) => match tokio::time::timeout_at(termination_deadline, self.child.wait()).await {
+                    Ok(Ok(_)) => Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "engine shutdown timed out; process was forcibly stopped",
+                    )),
+                    Ok(Err(error)) => Err(error),
+                    Err(_) => Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "engine termination could not be confirmed within the shutdown allowance",
+                    )),
+                    },
+                }
             }
         };
 
@@ -221,8 +276,20 @@ impl Engine {
             // Exit code and correlation only — never the stderr ring, however
             // plausible its contents look; that stays a narrowly-scoped,
             // explicit crash-diagnostic feature, not routine logging.
-            let exit_code = self.child.try_wait().ok().flatten().and_then(|s| s.code());
-            ctx.record(coda_diagnostics::Event::EngineEnd { exit_code });
+            if let Ok(Some(status)) = self.child.try_wait() {
+                ctx.record(coda_diagnostics::Event::EngineEnd {
+                    exit_code: status.code(),
+                });
+            }
+            ctx.record(coda_diagnostics::Event::ShutdownPhase {
+                phase: "engine_exit_observed",
+                duration_ms: started.elapsed().as_millis() as u64,
+                outcome: if result.is_ok() {
+                    "completed"
+                } else {
+                    "failed"
+                },
+            });
         }
 
         result
@@ -312,6 +379,36 @@ mod tests {
         } else {
             EngineCommand::new("sleep").arg("30")
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_reports_a_nonzero_child_exit() {
+        let command = if cfg!(windows) {
+            EngineCommand::new("cmd.exe").args(["/c", "exit 7"])
+        } else {
+            EngineCommand::new("sh").args(["-c", "exit 7"])
+        };
+        let (engine, _) = Engine::spawn(command).expect("spawn");
+        let result = engine.shutdown(std::time::Duration::from_secs(3)).await;
+        assert!(
+            result.is_err(),
+            "a failed engine exit must not look successful"
+        );
+    }
+
+    #[tokio::test]
+    async fn writer_and_child_share_the_shutdown_budget() {
+        let (mut engine, _) = Engine::spawn(idle_child()).expect("spawn");
+        engine.tasks.writer.abort();
+        engine.tasks.writer = tokio::spawn(std::future::pending());
+        let writer = engine.tasks.writer.abort_handle();
+        let started = std::time::Instant::now();
+        let _ = engine.shutdown(std::time::Duration::from_millis(200)).await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(350),
+            "writer and child were each granted a fresh grace period"
+        );
+        assert!(writer.is_finished(), "the blocked writer survived shutdown");
     }
 
     #[tokio::test]

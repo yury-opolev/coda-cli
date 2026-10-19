@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 use coda_auth::store::CredentialStore;
 use coda_tool::Tool;
@@ -36,7 +37,7 @@ use crate::process::McpProcess;
 use crate::tool::McpTool;
 
 /// Default shutdown grace period when the manager is dropped.
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 
 /// Unified client handle: either a stdio or HTTP MCP client.
 enum AnyClient {
@@ -74,10 +75,13 @@ impl AnyClient {
         }
     }
 
-    async fn shutdown(self) {
+    async fn shutdown(self, deadline: tokio::time::Instant) -> Result<(), String> {
         match self {
-            Self::Stdio(c) => c.shutdown().await,
-            Self::Http(c) => c.shutdown().await,
+            Self::Stdio(c) => c.shutdown(deadline).await,
+            Self::Http(c) => {
+                c.shutdown().await;
+                Ok(())
+            }
         }
     }
 
@@ -124,6 +128,30 @@ struct ServerEntry {
     spec: ServerSpec,
 }
 
+impl ServerEntry {
+    async fn shutdown(self, deadline: tokio::time::Instant) -> Result<(), String> {
+        let process = async {
+            match self._process {
+                Some(process) => process
+                    .shutdown(deadline)
+                    .await
+                    .map_err(|error| error.to_string()),
+                None => Ok(()),
+            }
+        };
+        let (client, process) = tokio::join!(self.client.shutdown(deadline), process);
+        let errors: Vec<String> = [client, process]
+            .into_iter()
+            .filter_map(Result::err)
+            .collect();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+}
+
 /// Enough to reconnect a server after a restart.
 #[derive(Clone)]
 enum ServerSpec {
@@ -145,12 +173,25 @@ pub struct McpClientManager {
     /// manager is stable and only serialised during connect/disconnect.
     servers: RwLock<HashMap<String, ServerEntry>>,
     tool_timeout: Duration,
+    stopping: CancellationToken,
 }
 
 impl McpClientManager {
     /// Create an empty manager.
     pub fn new() -> Self {
-        Self { servers: RwLock::new(HashMap::new()), tool_timeout: McpClient::resolve_tool_timeout() }
+        Self {
+            servers: RwLock::new(HashMap::new()),
+            tool_timeout: McpClient::resolve_tool_timeout(),
+            stopping: CancellationToken::new(),
+        }
+    }
+
+    async fn until_shutdown<T>(&self, work: impl std::future::Future<Output = T>) -> Result<T, String> {
+        tokio::select! {
+            biased;
+            _ = self.stopping.cancelled() => Err("MCP manager is shutting down".into()),
+            result = work => Ok(result),
+        }
     }
 
     /// Connect all enabled stdio and HTTP servers from the given `.mcp.json` paths.
@@ -341,7 +382,7 @@ impl McpClientManager {
             }
         };
 
-        match entry.client.call_tool(tool_name, arguments).await {
+        match self.until_shutdown(entry.client.call_tool(tool_name, arguments)).await? {
             Ok(pair) => Ok(pair),
             Err(McpToolCallError::Timeout) => Err(format!(
                 "MCP tool '{tool_name}' on server '{server_name}' timed out. \
@@ -363,7 +404,14 @@ impl McpClientManager {
         let guard = self.servers.read().await;
         let mut out = Vec::new();
         for (name, entry) in guard.iter() {
-            for prompt in entry.client.list_prompts().await {
+            let prompts = match self.until_shutdown(entry.client.list_prompts()).await {
+                Ok(prompts) => prompts,
+                Err(error) => {
+                    tracing::warn!(%error, "MCP prompt listing interrupted");
+                    break;
+                }
+            };
+            for prompt in prompts {
                 out.push((name.clone(), prompt));
             }
         }
@@ -376,7 +424,14 @@ impl McpClientManager {
         let guard = self.servers.read().await;
         let mut out = Vec::new();
         for (name, entry) in guard.iter() {
-            for resource in entry.client.list_resources().await {
+            let resources = match self.until_shutdown(entry.client.list_resources()).await {
+                Ok(resources) => resources,
+                Err(error) => {
+                    tracing::warn!(%error, "MCP resource listing interrupted");
+                    break;
+                }
+            };
+            for resource in resources {
                 out.push((name.clone(), resource));
             }
         }
@@ -393,7 +448,7 @@ impl McpClientManager {
                  Check /mcp status and restart it if needed."
             ));
         };
-        entry.client.get_prompt(prompt_name).await
+        self.until_shutdown(entry.client.get_prompt(prompt_name)).await?
     }
 
     /// Reads one resource from a named server.
@@ -405,7 +460,7 @@ impl McpClientManager {
                  Check /mcp status and restart it if needed."
             ));
         };
-        entry.client.read_resource(uri).await
+        self.until_shutdown(entry.client.read_resource(uri)).await?
     }
 
     /// Restarts one server, reconnecting and refreshing its tool list.
@@ -426,7 +481,10 @@ impl McpClientManager {
         let spec = entry.spec.clone();
         // Shut the old process down before starting a new one, so a server
         // holding an exclusive resource (a port, a lock file) can rebind.
-        entry.client.shutdown().await;
+        entry
+            .shutdown(tokio::time::Instant::now() + SHUTDOWN_GRACE)
+            .await
+            .map_err(|error| format!("failed to stop '{server_name}' before restart: {error}"))?;
 
         let connect_timeout = DEFAULT_CONNECT_TIMEOUT;
         let tool_timeout = self.tool_timeout;
@@ -452,17 +510,26 @@ impl McpClientManager {
     }
 
     /// Gracefully shut down all servers.
-    pub async fn shutdown(&self) {
+    pub async fn shutdown(&self) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+        self.stopping.cancel();
         let mut guard = self.servers.write().await;
         let entries: Vec<_> = guard.drain().collect();
         drop(guard);
 
-        for (name, entry) in entries {
-            tracing::debug!(server = %name, "shutting down MCP server");
-            entry.client.shutdown().await;
-            if let Some(proc) = entry._process {
-                proc.kill(SHUTDOWN_GRACE).await;
-            }
+        let results =
+            futures::future::join_all(entries.into_iter().map(|(name, entry)| async move {
+                entry
+                    .shutdown(deadline)
+                    .await
+                    .map_err(|error| format!("{name}: {error}"))
+            }))
+            .await;
+        let errors: Vec<String> = results.into_iter().filter_map(Result::err).collect();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
         }
     }
 }
@@ -790,6 +857,12 @@ mod tests {
 
     /// Builds a minimal McpClient from in-memory streams with the given tools.
     async fn make_client(tools: serde_json::Value) -> McpClient {
+        make_client_with_streams(tools).await.0
+    }
+
+    async fn make_client_with_streams(
+        tools: serde_json::Value,
+    ) -> (McpClient, tokio::io::DuplexStream, tokio::io::DuplexStream) {
         let (server_out, client_in) = duplex(64 * 1024);
         let (client_out, server_in) = duplex(64 * 1024);
 
@@ -842,7 +915,124 @@ mod tests {
         let tl = read_line!(srv_in);
         write_line!(srv_out, json!({ "jsonrpc": "2.0", "id": tl["id"], "result": { "tools": tools } }));
 
-        connect.await.unwrap().unwrap()
+        (connect.await.unwrap().unwrap(), srv_in, srv_out)
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_every_server_before_waiting_for_any_exit() {
+        use tokio::io::AsyncReadExt;
+        let manager = McpClientManager::new();
+        let barrier = Arc::new(tokio::sync::Barrier::new(9));
+        let mut servers = Vec::new();
+        for i in 0..9 {
+            let (client, mut input, mut output) = make_client_with_streams(json!([])).await;
+            inject_client(&manager, &format!("server-{i}"), client).await;
+            let barrier = barrier.clone();
+            servers.push(tokio::spawn(async move {
+                input.read_to_end(&mut Vec::new()).await.unwrap();
+                barrier.wait().await;
+                output
+                    .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/done\"}\n")
+                    .await
+                    .expect("stdout must remain open through EOF cleanup");
+            }));
+        }
+        tokio::time::timeout(Duration::from_millis(500), async {
+            let (result, servers) =
+                tokio::join!(manager.shutdown(), futures::future::join_all(servers),);
+            result.expect("all servers must receive the same graceful shutdown window");
+            for server in servers {
+                server.expect("server cleanup");
+            }
+        })
+        .await
+        .expect("EOF delivery must not queue behind other servers' exits");
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_requests_holding_the_server_registry_lock() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+        let manager = Arc::new(McpClientManager::new());
+        let (client, input, output) = make_client_with_streams(json!([])).await;
+        inject_client(&manager, "server", client).await;
+        let caller = manager.clone();
+        let request = tokio::spawn(async move { caller.get_prompt("server", "pending").await });
+        let mut input = BufReader::new(input);
+        let mut line = String::new();
+        input.read_line(&mut line).await.unwrap();
+        assert!(line.contains("prompts/get"));
+        let server = async move {
+            input.read_to_end(&mut Vec::new()).await.unwrap();
+            drop(output);
+        };
+        tokio::time::timeout(Duration::from_millis(500), async {
+            let (result, ()) = tokio::join!(manager.shutdown(), server);
+            result.expect("active calls must release the registry before process cleanup");
+            let error = request.await.unwrap().unwrap_err();
+            assert!(error.contains("shutting down"), "{error}");
+        }).await.expect("a slow MCP call must not delay stdin EOF");
+    }
+
+    #[tokio::test]
+    async fn restart_waits_for_old_process_cleanup_before_reconnecting() {
+        let marker =
+            std::env::temp_dir().join(format!("coda-mcp-restart-{}", uuid::Uuid::new_v4()));
+        let (process, stdin, stdout) = if cfg!(windows) {
+            let script = format!(
+                "[IO.File]::WriteAllText('{}', 'running'); $null = [Console]::In.ReadToEnd(); \
+                 Start-Sleep -Milliseconds 200; [IO.File]::Delete('{}')",
+                marker.display(),
+                marker.display(),
+            );
+            McpProcess::spawn_raw(
+                "powershell.exe",
+                vec![
+                    "-NoProfile".to_string(),
+                    "-NonInteractive".into(),
+                    "-Command".into(),
+                    script,
+                ],
+            )
+        } else {
+            McpProcess::spawn_raw(
+                "sh",
+                vec![
+                    "-c".to_string(),
+                    "touch \"$1\"; cat >/dev/null; sleep 0.2; rm \"$1\"".into(),
+                    "fixture".into(),
+                    marker.to_string_lossy().into_owned(),
+                ],
+            )
+        }
+        .expect("spawn old server");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("old server starts");
+        let manager = McpClientManager::new();
+        inject_client(&manager, "old", make_client(json!([])).await).await;
+        manager
+            .servers
+            .write()
+            .await
+            .get_mut("old")
+            .unwrap()
+            ._process = Some(process);
+        drop(stdin);
+        drop(stdout);
+        let error = manager.restart_server("old").await.unwrap_err();
+        assert!(error.contains("failed to restart"), "{error}");
+        let cleaned_up = !marker.exists();
+        if !cleaned_up {
+            std::fs::remove_file(&marker).unwrap();
+        }
+        assert!(
+            cleaned_up,
+            "replacement started before old process released its resource"
+        );
     }
 
     #[tokio::test]

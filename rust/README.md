@@ -103,11 +103,64 @@ writes a bounded, privacy-safe operational diagnostic log by default, with no
 flags required; see [Operational diagnostics](#operational-diagnostics) below
 for the full contract.
 
+## Interactive shutdown
+
+Accepted quit keeps the existing renderer alive with immediate shutdown feedback
+and an 80 ms spinner cadence. Input cannot start new work; another `Ctrl+C`
+only acknowledges that cleanup is in progress. The first-press copy/exit-arming
+behaviour is unchanged. An in-flight credential commit is awaited, not cancelled.
+Pending permission decisions are declined; questions receive no invented answers.
+
+The shutdown RPC, engine writer drain, and current/staged engine waits share a
+five-second deadline, with at most one additional second for forced termination
+and reaping. Protected credential commits can exceed this normal budget, so it
+is not a universal process-exit bound. MCP stdio shutdown follows the
+[MCP lifecycle specification](https://modelcontextprotocol.io/specification/2025-06-18/basic/lifecycle#shutdown):
+there is no shutdown RPC. Every server receives stdin EOF concurrently, stdout
+continues draining, and process waits share three seconds plus a 500 ms forced
+termination/reaping allowance. Restart also awaits the old server before
+reconnecting. Pending MCP requests are cancelled before taking the registry's
+shutdown write lock, so a slow call cannot defer stdin closure. Forced stops,
+nonzero child exits, timeouts, and cleanup failures
+are errors rather than success-shaped fallbacks.
+
+Console input polling stays on the owning task, with no detached event reader
+left competing with the returned shell. Restoration attempts mouse, focus,
+bracketed-paste, alternate-screen, cursor, raw-mode, and flush cleanup even if
+an earlier step fails. The success summary is printed only after explicit
+terminal restoration succeeds.
+
+Diagnostics distinguish `shutdown_start`, timed `shutdown_phase` records
+(authentication, RPC, integrations, writer/process, cleanup, and restoration),
+and `entrypoint_completed`. The last means async entrypoint work returned,
+**not** that runtime teardown or OS process exit has completed. `engine_end`
+records an actual observed child exit.
+
+For reproducible Windows acceptance, `scripts\test-windows-shutdown.py` requires
+Python, `pywinpty`, `psutil`, and Windows PowerShell. From the repository root,
+pass a built native executable or a launcher with its bundled native payload:
+
+```powershell
+python scripts\test-windows-shutdown.py .\rust\target\debug\coda.exe --runs 30
+python scripts\test-windows-shutdown.py .\rust\target\debug\coda.exe --runs 1 --quit exit
+python scripts\test-windows-shutdown.py .\rust\target\debug\coda.exe --runs 1 --mcp-count 3
+python scripts\test-windows-shutdown.py .\rust\target\debug\coda.exe --runs 1 --mcp-count 3 --hang-mcp
+```
+
+The probe uses isolated configuration and fixture credentials, an actual ConPTY,
+console modes before/after, an executed next-shell command, observed owned-child
+exit, feedback within 100 ms, and healthy shutdown below 500 ms. It reports
+nearest-rank p95 and checks that hung integrations fail explicitly without
+multiplying budgets. It neither installs Coda nor uses the user's credentials.
+
 ## Design notes
 
 **All state changes go through one reducer** (`state::UiState::apply`). UI
 behaviour is therefore testable without a terminal, an engine, or any async
 machinery: feed events in, assert on the state that comes out.
+Local notices are inserted immediately before an open streamed reply, keeping
+the notice visible without splitting subsequent text or reasoning deltas into
+another message.
 
 **Rendering is separated from layout.** `coda-render` produces `RenderLine`
 values — text plus colour roles in *cell* coordinates — and `draw` maps those
