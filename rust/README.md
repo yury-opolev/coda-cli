@@ -856,6 +856,15 @@ protocol does not imply them, and getting them wrong is silently wrong:
 - Finalising a batch **resolves unfinished calls** (pending becomes skipped,
   running becomes cancelled), otherwise an interrupted turn shows tools
   apparently still running.
+- Cancellation also preserves **conversation history**: completed tool results
+  are retained, the active call receives a cancelled result, and unstarted
+  calls receive skipped results before the interruption is returned. Every
+  declared tool call has a matching result before a later prompt is sent.
+- Previously interrupted histories with missing results are repaired on the
+  **next prompt**, with a visible warning. Missing outcomes are explicitly
+  unknown, not invented successes or permission answers; tools are never
+  re-executed during recovery. Existing results, user text, and signed reasoning
+  are preserved, including when resuming a saved session.
 - In Summary mode, adjacent completed tool batches within a UI turn share
   one **Ran N tools** header. Click it to expand their individual arguments
   and results. Failed, cancelled and skipped calls remain visible in the

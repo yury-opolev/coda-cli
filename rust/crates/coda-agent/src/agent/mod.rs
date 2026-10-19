@@ -203,6 +203,15 @@ impl AgentLoop {
         goal: Option<AutonomySupervisor>,
         cancel: CancellationToken,
     ) -> Result<GoalStatus, AgentError> {
+        let recovered = tools::recover_interrupted_history(history);
+        if recovered > 0 {
+            sink.emit(AgentEvent::Warning {
+                message: format!(
+                    "Recovered {recovered} missing tool result(s) from an interrupted conversation. \
+                     Their outcomes are unknown; tools were not re-executed."
+                ),
+            });
+        }
         // Reopen the steering inbox so messages enqueued between runs (or
         // concurrently during this run) are accepted.  A prior natural stop
         // will have sealed it via try_seal_empty; without this call a second
@@ -714,6 +723,9 @@ impl AgentLoop {
                 }
 
                 history.push(Message::new(Role::User, result_blocks));
+                if cancel.is_cancelled() {
+                    return Err(AgentError::Cancelled);
+                }
 
                 // The autonomy gate, on the path that actually loops.
                 //
@@ -1227,12 +1239,14 @@ mod tests {
     struct MockLlmClient {
         /// Each call to `stream` pops the next scripted sequence.
         sequences: Mutex<VecDeque<Vec<Result<StreamEvent, LlmError>>>>,
+        requests: Mutex<Vec<ChatRequest>>,
     }
 
     impl MockLlmClient {
         fn new(sequences: Vec<Vec<Result<StreamEvent, LlmError>>>) -> Arc<Self> {
             Arc::new(Self {
                 sequences: Mutex::new(sequences.into_iter().collect()),
+                requests: Mutex::new(Vec::new()),
             })
         }
     }
@@ -1242,7 +1256,8 @@ mod tests {
         fn provider_id(&self) -> &str {
             "mock"
         }
-        async fn stream(&self, _: ChatRequest) -> Result<coda_llm::ResponseStream, LlmError> {
+        async fn stream(&self, request: ChatRequest) -> Result<coda_llm::ResponseStream, LlmError> {
+            self.requests.lock().unwrap().push(request);
             let events = self
                 .sequences
                 .lock()
@@ -1396,6 +1411,36 @@ mod tests {
             .with_max_iterations(20)
             .with_tool_max_duration(None)
             .build()
+    }
+
+    fn assert_complete_tool_exchanges(messages: &[Message]) {
+        for (index, message) in messages.iter().enumerate() {
+            let mut expected: Vec<_> = message
+                .tool_uses()
+                .filter_map(|block| match block {
+                    Content::ToolUse { id, .. } => Some(id.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if expected.is_empty() {
+                continue;
+            }
+            let next = messages
+                .get(index + 1)
+                .expect("tool calls need a following result message");
+            assert_eq!(next.role, Role::User);
+            let mut actual: Vec<_> = next
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    Content::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                    _ => None,
+                })
+                .collect();
+            expected.sort_unstable();
+            actual.sort_unstable();
+            assert_eq!(actual, expected, "unpaired tool calls in message {index}");
+        }
     }
 
     // ── §8 item 1: tools execute serially ───────────────────────────────────
@@ -1756,6 +1801,314 @@ mod tests {
     }
 
     // ── §8 item 8: cancellation and ceiling ──────────────────────────────────
+
+    #[tokio::test]
+    async fn interrupted_tool_batch_preserves_results_before_resend() {
+        struct BlockingTool {
+            started: Arc<tokio::sync::Notify>,
+            log: Arc<Mutex<Vec<String>>>,
+        }
+        #[async_trait]
+        impl crate::tool::Tool for BlockingTool {
+            fn name(&self) -> &str {
+                "blocked"
+            }
+            fn description(&self) -> &str {
+                "waits until interrupted"
+            }
+            fn input_schema_json(&self) -> &str {
+                "{}"
+            }
+            fn is_read_only(&self) -> bool {
+                true
+            }
+            async fn execute(
+                &self,
+                _: &serde_json::Value,
+                _: &ToolContext,
+                _: CancellationToken,
+            ) -> ToolOutcome {
+                self.log.lock().unwrap().push("blocked".into());
+                self.started.notify_one();
+                std::future::pending().await
+            }
+        }
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let tools = Arc::new(ToolRegistry::new([
+            dyn_tool(
+                MockTool::new("first", true, log.clone())
+                    .with_result(ToolResult::ok("already finished")),
+            ),
+            dyn_tool(Arc::new(BlockingTool {
+                started: started.clone(),
+                log: log.clone(),
+            })),
+            dyn_tool(MockTool::new("last", true, log.clone())),
+        ]));
+        let client = MockLlmClient::new(vec![
+            vec![
+                Ok(tool_use_event("a", "first")),
+                Ok(tool_use_event("b", "blocked")),
+                Ok(tool_use_event("c", "last")),
+                Ok(done()),
+            ],
+            vec![Ok(StreamEvent::TextDelta("resumed".into())), Ok(done())],
+        ]);
+        let agent = make_loop(client.clone(), Arc::new(AllowAll), tools);
+        let cancel = CancellationToken::new();
+        let mut history = vec![Message::user("run the batch")];
+        let sink = CollectingSink::new();
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                agent.run(&mut history, &sink, None, cancel.clone()),
+                async {
+                    started.notified().await;
+                    cancel.cancel();
+                },
+            )
+        })
+        .await
+        .expect("interrupt must not wait for the sleeping tool");
+        assert!(matches!(result, Err(AgentError::Cancelled)));
+        assert_complete_tool_exchanges(&history);
+        let results = &history[2].content;
+        assert!(matches!(&results[0], Content::ToolResult {
+            tool_use_id, content, is_error: false, status, ..
+        } if tool_use_id == "a" && content == "already finished" && status.as_deref() == Some("Succeeded")));
+        assert!(matches!(&results[1], Content::ToolResult {
+            tool_use_id, is_error: true, status, ..
+        } if tool_use_id == "b" && status.as_deref() == Some("Cancelled")));
+        assert!(matches!(&results[2], Content::ToolResult {
+            tool_use_id, is_error: true, status, ..
+        } if tool_use_id == "c" && status.as_deref() == Some("Skipped")));
+        assert_eq!(*log.lock().unwrap(), ["first", "blocked"]);
+        assert_eq!(client.requests.lock().unwrap().len(), 1);
+        for (id, expected) in [
+            ("b", ToolCallStatus::Cancelled),
+            ("c", ToolCallStatus::Skipped),
+        ] {
+            assert_eq!(
+                sink.snapshot()
+                    .iter()
+                    .filter(|event| matches!(event,
+                        AgentEvent::ToolResult { correlation, status, .. }
+                            if correlation.source_id.as_deref() == Some(id) && *status == expected
+                    ))
+                    .count(),
+                1
+            );
+        }
+
+        history.push(Message::user("continue"));
+        agent
+            .run(&mut history, &NullSink, None, CancellationToken::new())
+            .await
+            .unwrap();
+        let requests = client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_complete_tool_exchanges(&requests[1].messages);
+        assert_eq!(last_assistant_text(&history), "resumed");
+        assert_eq!(*log.lock().unwrap(), ["first", "blocked"]);
+    }
+
+    #[tokio::test]
+    async fn interrupted_permission_records_all_results_without_executing_tools() {
+        struct CancelPermission(CancellationToken);
+        #[async_trait]
+        impl PermissionPrompt for CancelPermission {
+            async fn request(
+                &self,
+                _: &dyn crate::tool::Tool,
+                _: &str,
+                _: CancellationToken,
+            ) -> bool {
+                self.0.cancel();
+                false
+            }
+        }
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let cancel = CancellationToken::new();
+        let tools = Arc::new(ToolRegistry::new([
+            dyn_tool(MockTool::new("first", false, log.clone())),
+            dyn_tool(MockTool::new("last", false, log.clone())),
+        ]));
+        let client = MockLlmClient::new(vec![vec![
+            Ok(tool_use_event("a", "first")),
+            Ok(tool_use_event("b", "last")),
+            Ok(done()),
+        ]]);
+        let agent = make_loop(client, Arc::new(CancelPermission(cancel.clone())), tools);
+        let mut history = vec![Message::user("run")];
+        let result = agent.run(&mut history, &NullSink, None, cancel).await;
+        assert!(matches!(result, Err(AgentError::Cancelled)));
+        assert_complete_tool_exchanges(&history);
+        assert!(log.lock().unwrap().is_empty());
+        assert!(matches!(&history[2].content[0], Content::ToolResult {
+            status, is_error: true, ..
+        } if status.as_deref() == Some("Cancelled")));
+        assert!(matches!(&history[2].content[1], Content::ToolResult {
+            status, is_error: true, ..
+        } if status.as_deref() == Some("Skipped")));
+    }
+
+    #[tokio::test]
+    async fn interrupted_saved_history_is_repaired_before_the_next_request() {
+        let client = MockLlmClient::new(vec![
+            vec![Ok(StreamEvent::TextDelta("recovered".into())), Ok(done())],
+            vec![Ok(StreamEvent::TextDelta("still valid".into())), Ok(done())],
+        ]);
+        let tools = Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
+        let agent = make_loop(client.clone(), Arc::new(AllowAll), tools);
+        let assistant = Message::new(
+            Role::Assistant,
+            vec![
+                Content::Thinking {
+                    text: "preserve".into(),
+                    signature: Some("signed".into()),
+                },
+                Content::ToolUse {
+                    id: "a".into(),
+                    name: "first".into(),
+                    input_json: "{}".into(),
+                    correlation: LlmCorrelation::default(),
+                },
+                Content::ToolUse {
+                    id: "b".into(),
+                    name: "missing".into(),
+                    input_json: "{}".into(),
+                    correlation: LlmCorrelation::default(),
+                },
+            ],
+        );
+        let completed = Content::ToolResult {
+            tool_use_id: "a".into(),
+            content: "actual output".into(),
+            is_error: false,
+            correlation: LlmCorrelation::default(),
+            status: Some("Succeeded".into()),
+        };
+        let history = vec![
+            Message::user("old prompt"),
+            assistant.clone(),
+            Message::new(
+                Role::User,
+                vec![completed.clone(), Content::text("resent question")],
+            ),
+        ];
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::session::SessionTranscriptStore::new(directory.path());
+        let session_id = uuid::Uuid::new_v4().to_string();
+        store.save(&session_id, &history, None).await.unwrap();
+        let mut history = store
+            .load(&session_id)
+            .await
+            .expect("load interrupted session");
+        let sink = CollectingSink::new();
+        agent
+            .run(&mut history, &sink, None, CancellationToken::new())
+            .await
+            .unwrap();
+        let repaired = client.requests.lock().unwrap()[0].messages.clone();
+        assert_complete_tool_exchanges(&repaired);
+        assert_eq!(
+            repaired[1], assistant,
+            "signed assistant content must remain untouched"
+        );
+        assert!(repaired[2].content.contains(&completed));
+        assert!(repaired[2]
+            .content
+            .contains(&Content::text("resent question")));
+        assert!(repaired[2].content.iter().any(|block| matches!(block,
+            Content::ToolResult { tool_use_id, is_error: true, content, status: None, .. }
+                if tool_use_id == "b" && content.contains("unknown")
+        )));
+        assert_eq!(sink.snapshot().iter().filter(|event| matches!(event,
+            AgentEvent::Warning { message } if message.contains("recover") || message.contains("Recover")
+        )).count(), 1);
+        store.save(&session_id, &history, None).await.unwrap();
+        let mut history = store
+            .load(&session_id)
+            .await
+            .expect("reload recovered session");
+        history.push(Message::user("again"));
+        agent
+            .run(&mut history, &NullSink, None, CancellationToken::new())
+            .await
+            .unwrap();
+        let requests = client.requests.lock().unwrap();
+        assert_complete_tool_exchanges(&requests[1].messages);
+        assert_eq!(
+            &requests[1].messages[..repaired.len()],
+            repaired.as_slice(),
+            "recovery must be idempotent"
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_saved_batch_without_any_results_recovers_on_resume() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::session::SessionTranscriptStore::new(directory.path());
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let calls = ["a", "b", "c"]
+            .into_iter()
+            .map(|id| Content::ToolUse {
+                id: id.into(),
+                name: "previous_tool".into(),
+                input_json: "{}".into(),
+                correlation: LlmCorrelation::default(),
+            })
+            .collect();
+        let damaged = vec![
+            Message::user("old prompt"),
+            Message::new(Role::Assistant, calls),
+        ];
+        store.save(&session_id, &damaged, None).await.unwrap();
+        let mut history = store
+            .load(&session_id)
+            .await
+            .expect("resume damaged session");
+        history.push(Message::user("how is it going?"));
+        let client = MockLlmClient::new(vec![vec![
+            Ok(StreamEvent::TextDelta("recovered".into())),
+            Ok(done()),
+        ]]);
+        let tools = Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
+        let agent = make_loop(client.clone(), Arc::new(AllowAll), tools);
+        agent
+            .run(&mut history, &NullSink, None, CancellationToken::new())
+            .await
+            .unwrap();
+        {
+            let requests = client.requests.lock().unwrap();
+            assert_eq!(
+                requests.len(),
+                1,
+                "recovery must not replay the requested tools"
+            );
+            assert_complete_tool_exchanges(&requests[0].messages);
+            assert!(requests[0].messages[2]
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    Content::ToolResult {
+                        is_error,
+                        content,
+                        status,
+                        ..
+                    } => Some(*is_error && content.contains("unknown") && status.is_none()),
+                    _ => None,
+                })
+                .all(|unknown| unknown));
+        }
+        store.save(&session_id, &history, None).await.unwrap();
+        let recovered = store
+            .load(&session_id)
+            .await
+            .expect("persist repaired transcript");
+        assert_complete_tool_exchanges(&recovered);
+        assert_eq!(last_assistant_text(&recovered), "recovered");
+    }
 
     #[tokio::test]
     async fn caller_cancel_propagates_and_unwinds_turn() {
