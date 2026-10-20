@@ -57,7 +57,24 @@ pub enum Event {
     /// enum), so [`Event::normalized`] rewrites it down to
     /// [`KNOWN_STOP_REASONS`] before this ever reaches the writer — a
     /// malicious/unexpected provider value can never become a raw log field.
-    TurnEnd { stop_reason: Option<String> },
+    TurnEnd {
+        stop_reason: Option<String>,
+        /// Output tokens of the turn's last response — the one whose
+        /// `stop_reason` this is, so a truncation can be read against the
+        /// budget recorded in [`Event::OutputBudget`].
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output_tokens: Option<u32>,
+    },
+    /// The output budget a turn requests and where it came from. `source` is
+    /// a closed label: `setting`, `live`, `catalog` or `fallback`.
+    OutputBudget {
+        max_tokens: u32,
+        source: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model_output_limit: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context_window: Option<u64>,
+    },
     /// A prompt turn ended in failure. `category` is a fixed, closed
     /// classification — never the provider's own error text.
     TurnFailed {
@@ -215,9 +232,10 @@ impl Event {
     /// fixed unknown/omitted state before it can reach disk.
     pub(crate) fn normalized(self) -> Event {
         match self {
-            Event::TurnEnd { stop_reason } => {
-                Event::TurnEnd { stop_reason: normalize_stop_reason(stop_reason.as_deref()) }
-            }
+            Event::TurnEnd { stop_reason, output_tokens } => Event::TurnEnd {
+                stop_reason: normalize_stop_reason(stop_reason.as_deref()),
+                output_tokens,
+            },
             Event::HttpFailureDetails { dispatch, attempt, status, detail } => {
                 Event::HttpFailureDetails { dispatch, attempt, status, detail: detail.normalized() }
             }
@@ -344,8 +362,12 @@ mod tests {
     #[test]
     fn event_normalized_rewrites_turn_end_stop_reason_but_leaves_other_variants_untouched() {
         let malicious = "https://user:sk-live-secret9999@internal.example.com/leak";
-        let normalized = Event::TurnEnd { stop_reason: Some(malicious.into()) }.normalized();
-        assert_eq!(normalized, Event::TurnEnd { stop_reason: Some("unknown".into()) });
+        let normalized =
+            Event::TurnEnd { stop_reason: Some(malicious.into()), output_tokens: Some(7) }.normalized();
+        assert_eq!(
+            normalized,
+            Event::TurnEnd { stop_reason: Some("unknown".into()), output_tokens: Some(7) }
+        );
 
         let untouched = Event::TurnFailed { category: "transport", status: Some(500) };
         assert_eq!(untouched.clone().normalized(), untouched);

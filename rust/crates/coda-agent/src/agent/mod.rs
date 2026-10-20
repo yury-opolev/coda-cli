@@ -35,6 +35,7 @@ use crate::tasks::TaskManager;
 use crate::todos::TodoStore;
 use crate::tool::{PlanApprover, ScheduleOrigin, ToolQuarantine, ToolRegistry, UserQuestion};
 
+pub mod output_budget;
 pub mod stop;
 pub mod stream;
 pub mod tools;
@@ -171,6 +172,9 @@ pub struct AgentLoop {
     model: String,
     system_prompt: Option<String>,
     max_tokens: u32,
+    /// The model's context window, used to shrink `max_tokens` when the prompt
+    /// is close enough to the window that the full budget would not fit.
+    context_window: Option<usize>,
     max_iterations: usize,
     effort: Option<Effort>,
     working_directory: String,
@@ -188,6 +192,19 @@ pub struct AgentLoop {
 }
 
 impl AgentLoop {
+    /// The `max_tokens` for the next request: the configured budget, shrunk
+    /// only when the estimated prompt leaves less room than that in the
+    /// model's context window.
+    fn request_max_tokens(&self, history: &[Message], tools: &[coda_llm::ToolDefinition]) -> u32 {
+        let fixed_chars = self.system_prompt.as_deref().map_or(0, str::len)
+            + tools
+                .iter()
+                .map(|t| t.name.len() + t.description.len() + t.input_schema_json.len())
+                .sum::<usize>();
+        let estimate = TokenEstimator::estimate(history) + fixed_chars / 4;
+        output_budget::clamp_to_context_window(self.max_tokens, self.context_window, estimate)
+    }
+
     /// Begin an agent turn.
     ///
     /// - `history` is mutated in place (assistant turns, tool results, and
@@ -376,7 +393,7 @@ impl AgentLoop {
 
             // 6. Build ChatRequest.
             let mut request = ChatRequest::new(self.model.clone(), history.clone())
-                .with_max_tokens(self.max_tokens)
+                .with_max_tokens(self.request_max_tokens(history, &tool_defs))
                 .with_effort(self.effort)
                 .with_tools(tool_defs.clone());
             if let Some(sys) = &self.system_prompt {
@@ -435,7 +452,9 @@ impl AgentLoop {
                                             self.model.clone(),
                                             history.clone(),
                                         )
-                                        .with_max_tokens(self.max_tokens)
+                                        .with_max_tokens(
+                                            self.request_max_tokens(history, &tool_defs),
+                                        )
                                         .with_effort(self.effort)
                                         .with_tools(tool_defs.clone());
                                         if let Some(sys) = &self.system_prompt {
@@ -907,12 +926,9 @@ async fn compact_history(
     Ok(true)
 }
 
-/// Output tokens the loop requests per response.
-///
-/// Also the headroom auto-compaction reserves for a reply, which is why it is a
-/// named constant rather than a literal: the two must not drift apart, or the
-/// compaction trigger would protect a budget the loop never asks for.
-pub const DEFAULT_MAX_TOKENS: u32 = 4096;
+/// Output tokens a loop requests per response when its host does not resolve
+/// a model-aware budget (see [`output_budget::resolve_max_output_tokens`]).
+pub const DEFAULT_MAX_TOKENS: u32 = output_budget::FALLBACK_MAX_OUTPUT_TOKENS;
 
 /// Builder for [`AgentLoop`].
 ///
@@ -946,6 +962,7 @@ pub struct AgentLoopBuilder {
     model: String,
     system_prompt: Option<String>,
     max_tokens: u32,
+    context_window: Option<usize>,
     max_iterations: usize,
     effort: Option<Effort>,
     working_directory: String,
@@ -990,6 +1007,7 @@ impl AgentLoopBuilder {
             model: "claude-opus-4-5".into(),
             system_prompt: None,
             max_tokens: DEFAULT_MAX_TOKENS,
+            context_window: None,
             max_iterations: 500,
             effort: None,
             working_directory: String::new(),
@@ -1026,6 +1044,18 @@ impl AgentLoopBuilder {
     pub fn with_max_tokens(mut self, n: u32) -> Self {
         self.max_tokens = n;
         self
+    }
+
+    /// The model's context window, so a request whose prompt nearly fills it
+    /// asks for a smaller reply instead of being rejected.
+    pub fn with_context_window(mut self, window: Option<usize>) -> Self {
+        self.context_window = window;
+        self
+    }
+
+    /// Applies a resolved per-model budget: `max_tokens` and context window.
+    pub fn with_model_budget(self, budget: output_budget::ModelBudget) -> Self {
+        self.with_max_tokens(budget.max_tokens).with_context_window(budget.context_window)
     }
 
     /// Overrides the default 500-iteration per-turn runaway-loop backstop.
@@ -1199,6 +1229,7 @@ impl AgentLoopBuilder {
             model: self.model,
             system_prompt: self.system_prompt,
             max_tokens: self.max_tokens,
+            context_window: self.context_window,
             max_iterations: self.max_iterations,
             effort: self.effort,
             working_directory: self.working_directory,
@@ -2382,6 +2413,46 @@ mod tests {
             matches!(e, AgentEvent::LimitReached { kind, .. } if kind == "max_tokens")
         });
         assert!(limit, "max_tokens LimitReached must be emitted");
+    }
+
+    // ── Output budget ────────────────────────────────────────────────────────
+
+    async fn run_once(builder: AgentLoopBuilder, history: Vec<Message>) {
+        let agent = builder.with_tool_max_duration(None).build();
+        let mut history = history;
+        agent.run(&mut history, &NullSink, None, CancellationToken::new()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_configured_budget_is_sent_and_shrinks_only_near_the_window() {
+        let tools = || Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
+        let script = || vec![vec![Ok(StreamEvent::TextDelta("ok".into())), Ok(done())]];
+
+        // Plenty of room: the configured budget goes out unchanged.
+        let roomy = MockLlmClient::new(script());
+        run_once(
+            AgentLoopBuilder::new(roomy.clone(), Arc::new(AllowAll), tools())
+                .with_max_tokens(32_000)
+                .with_context_window(Some(200_000)),
+            vec![Message::user("go")],
+        )
+        .await;
+        assert_eq!(roomy.requests.lock().unwrap()[0].max_tokens, 32_000);
+
+        // A prompt of ~180k tokens in a 200k window: only what fits is asked.
+        let tight = MockLlmClient::new(script());
+        run_once(
+            AgentLoopBuilder::new(tight.clone(), Arc::new(AllowAll), tools())
+                .with_max_tokens(32_000)
+                .with_context_window(Some(200_000)),
+            vec![Message::user("x".repeat(180_000 * 4))],
+        )
+        .await;
+        let sent = tight.requests.lock().unwrap()[0].max_tokens;
+        assert!(
+            sent < 32_000 && sent >= output_budget::MIN_MAX_OUTPUT_TOKENS,
+            "the budget must shrink to fit the window but not below the floor, got {sent}"
+        );
     }
 
     // ── §8 item 27: pending hook tasks drained on every exit path ───────────

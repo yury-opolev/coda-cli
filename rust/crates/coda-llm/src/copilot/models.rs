@@ -214,6 +214,14 @@ pub fn parse_models(value: &Value) -> Vec<ModelInfo> {
             .and_then(Value::as_u64)
             .map(|n| n as u32);
 
+        let output_limit = item
+            .get("capabilities")
+            .and_then(|c| c.get("limits"))
+            .and_then(|l| l.get("max_output_tokens"))
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n > 0);
+
         let supported_endpoints = item
             .get("supported_endpoints")
             .and_then(Value::as_array)
@@ -247,6 +255,7 @@ pub fn parse_models(value: &Value) -> Vec<ModelInfo> {
             id,
             display_name,
             context_limit,
+            output_limit,
             supported_endpoints,
             reasoning_levels,
         });
@@ -375,6 +384,21 @@ mod tests {
         let models = parse_models(&value);
         assert_eq!(models[0].display_name.as_deref(), Some("GPT-4o"));
         assert_eq!(models[0].context_limit, Some(128_000));
+        assert_eq!(models[0].output_limit, None);
+    }
+
+    #[test]
+    fn parse_models_reads_max_output_tokens() {
+        let value = json!({
+            "data": [{
+                "id": "claude-opus-4.8",
+                "capabilities": { "limits": {
+                    "max_context_window_tokens": 200000,
+                    "max_output_tokens": 64000
+                } }
+            }]
+        });
+        assert_eq!(parse_models(&value)[0].output_limit, Some(64_000));
     }
 
     #[test]

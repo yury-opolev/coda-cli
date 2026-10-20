@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use coda_llm::Message;
 
+use crate::agent::output_budget::ModelBudget;
 use crate::agent::{AgentError, AgentLoopBuilder};
 use crate::events::{AgentSink, CollectingSink};
 use crate::hooks::HookRunner;
@@ -65,6 +66,9 @@ pub struct SubagentHost {
     message_bus: Option<Arc<crate::message::MessageBus>>,
     base_model: Arc<dyn Fn() -> String + Send + Sync>,
     base_max_tokens: u32,
+    /// Resolves the output budget for the model a child actually runs on.
+    /// `None` uses `base_max_tokens` with no context window.
+    budget_source: Option<Arc<dyn Fn(&str) -> ModelBudget + Send + Sync>>,
     base_max_iterations: usize,
     working_directory: String,
     hook_runner: Option<Arc<HookRunner>>,
@@ -100,6 +104,7 @@ impl SubagentHost {
             message_bus: None,
             base_model: Arc::new(move || base_model.clone()),
             base_max_tokens,
+            budget_source: None,
             base_max_iterations,
             working_directory: working_directory.into(),
             hook_runner,
@@ -115,6 +120,17 @@ impl SubagentHost {
     ) -> Arc<Self> {
         let mut host = self.clone_for_background();
         host.base_model = source;
+        Arc::new(host)
+    }
+
+    /// Resolve the output budget per child model, so a subagent on a model
+    /// different from the parent's gets that model's limits.
+    pub fn with_budget_source(
+        self: Arc<Self>,
+        source: Arc<dyn Fn(&str) -> ModelBudget + Send + Sync>,
+    ) -> Arc<Self> {
+        let mut host = self.clone_for_background();
+        host.budget_source = Some(source);
         Arc::new(host)
     }
 
@@ -179,7 +195,7 @@ impl SubagentHost {
             Arc::new(ToolQuarantine::new()),
             task_manager,
             "claude-opus-4-5",
-            4096,
+            crate::agent::DEFAULT_MAX_TOKENS,
             500,
             working_directory,
             None,
@@ -232,6 +248,10 @@ impl SubagentHost {
 
         // Determine the model to use.
         let model = request.model.clone().unwrap_or_else(|| (self.base_model)());
+        let budget = match &self.budget_source {
+            Some(resolve) => resolve(&model),
+            None => ModelBudget { max_tokens: self.base_max_tokens, context_window: None },
+        };
 
         // Resolve the tool set for this depth/definition.
         let child_tools = resolve_child_tools(&self.tools, definition.read_only_tools_only, request.depth);
@@ -327,7 +347,7 @@ impl SubagentHost {
         .with_permission_mode_state(Arc::clone(&self.permission_mode))
         .with_model(model)
         .with_system_prompt(final_system)
-        .with_max_tokens(self.base_max_tokens)
+        .with_model_budget(budget)
         .with_max_iterations(self.base_max_iterations)
         .with_working_directory(self.working_directory.clone())
         .with_quarantine(self.quarantine.clone())
@@ -514,6 +534,7 @@ impl SubagentHost {
             message_bus: self.message_bus.clone(),
             base_model: self.base_model.clone(),
             base_max_tokens: self.base_max_tokens,
+            budget_source: self.budget_source.clone(),
             base_max_iterations: self.base_max_iterations,
             working_directory: self.working_directory.clone(),
             hook_runner: self.hook_runner.clone(),
@@ -876,6 +897,80 @@ mod tests {
         );
         // Nothing should have been registered in the task manager.
         assert_eq!(mgr.list().len(), 0, "no task must be registered when refused");
+    }
+
+    /// A subagent requests the budget resolved for the model it runs on, not
+    /// the host's base value, and the source sees the child's actual model.
+    #[tokio::test]
+    async fn subagent_sends_resolved_max_tokens() {
+        use coda_llm::anthropic::StreamEvent;
+        use coda_llm::{LlmError, Usage};
+        use async_trait::async_trait as at;
+        use crate::permission::PermissionPrompt;
+
+        struct Capture(std::sync::Mutex<Vec<(String, u32)>>);
+        #[at]
+        impl coda_llm::LlmClient for Capture {
+            fn provider_id(&self) -> &str { "mock" }
+            async fn stream(&self, r: coda_llm::ChatRequest) -> Result<coda_llm::ResponseStream, LlmError> {
+                self.0.lock().unwrap().push((r.model.clone(), r.max_tokens));
+                let events = vec![
+                    Ok(StreamEvent::TextDelta("done".into())),
+                    Ok(StreamEvent::Done { stop_reason: Some("end_turn".into()), usage: Usage::ZERO }),
+                ];
+                let (tx, rx) = tokio::sync::mpsc::channel(8);
+                tokio::spawn(async move { for e in events { let _ = tx.send(e).await; } });
+                Ok(coda_llm::ResponseStream::new(rx))
+            }
+        }
+        struct AllowAll;
+        #[at]
+        impl PermissionPrompt for AllowAll {
+            async fn request(&self, _: &dyn crate::tool::Tool, _: &str, _: CancellationToken) -> bool { true }
+        }
+
+        let client = Arc::new(Capture(std::sync::Mutex::new(Vec::new())));
+        let mgr = crate::tasks::TaskManager::new(
+            "budget-session",
+            Some(std::env::temp_dir().join("coda-host-budget-tests")),
+            4096,
+            10,
+        );
+        let host = SubagentHost::new(
+            Arc::clone(&client) as Arc<dyn coda_llm::LlmClient>,
+            Arc::new(AllowAll),
+            Arc::new(PermissionModeState::new(crate::permission::PermissionMode::Default)),
+            Arc::new(crate::tool::ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0])),
+            Arc::new(crate::tool::ToolQuarantine::new()),
+            mgr,
+            "parent-model",
+            4096,
+            5,
+            ".",
+            None,
+            2,
+        )
+        .with_budget_source(Arc::new(|model: &str| ModelBudget {
+            max_tokens: if model == "child-model" { 48_000 } else { 12_000 },
+            context_window: Some(200_000),
+        }));
+
+        let inherit = SubagentRequest::foreground("general-purpose", "go", "t1", 1);
+        host.run_foreground(inherit, Arc::new(crate::events::NullSink), CancellationToken::new())
+            .await
+            .expect("inherited-model run completes");
+        let mut overridden = SubagentRequest::foreground("general-purpose", "go", "t2", 1);
+        overridden.model = Some("child-model".into());
+        host.run_foreground(overridden, Arc::new(crate::events::NullSink), CancellationToken::new())
+            .await
+            .expect("overridden-model run completes");
+
+        let seen = client.0.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![("parent-model".to_owned(), 12_000), ("child-model".to_owned(), 48_000)],
+            "each child must request its own model's budget, never the 4096 base"
+        );
     }
 
     /// Background subagent: when all slots are taken, spawn returns an error

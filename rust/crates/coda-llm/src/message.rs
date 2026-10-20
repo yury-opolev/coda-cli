@@ -302,6 +302,9 @@ pub struct ModelInfo {
     pub id: String,
     pub display_name: Option<String>,
     pub context_limit: Option<u32>,
+    /// The most output tokens one response may request, when the provider
+    /// advertises it.
+    pub output_limit: Option<u32>,
     /// Endpoints the model supports, when the provider advertises them.
     pub supported_endpoints: Vec<String>,
     /// Reasoning-effort levels the model advertises, lowest to highest.
@@ -321,6 +324,7 @@ impl ModelInfo {
             id: id.into(),
             display_name: None,
             context_limit: None,
+            output_limit: None,
             supported_endpoints: Vec::new(),
             reasoning_levels: Vec::new(),
         }

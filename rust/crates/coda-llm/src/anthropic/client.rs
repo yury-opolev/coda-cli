@@ -309,6 +309,11 @@ pub fn parse_models(value: &serde_json::Value) -> Vec<ModelInfo> {
                             .get("context_window")
                             .and_then(serde_json::Value::as_u64)
                             .map(|n| n as u32),
+                        output_limit: item
+                            .get("max_tokens")
+                            .and_then(serde_json::Value::as_u64)
+                            .and_then(|n| u32::try_from(n).ok())
+                            .filter(|n| *n > 0),
                         supported_endpoints: Vec::new(),
                         // Anthropic does not advertise reasoning levels; the
                         // capability is derived from static rules on the id.

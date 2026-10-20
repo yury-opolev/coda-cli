@@ -91,6 +91,14 @@ pub struct RequestShape {
     pub max_tokens_present: bool,
     pub max_output_tokens_present: bool,
     pub max_completion_tokens_present: bool,
+    /// The output budget actually sent (`max_tokens`, `max_output_tokens` or
+    /// `max_completion_tokens`, whichever the protocol uses). A number the
+    /// engine chose, never user content — needed to diagnose a truncation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens_value: Option<u32>,
+    /// The Anthropic `thinking.budget_tokens` actually sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_budget_value: Option<u32>,
     pub temperature_present: bool,
     pub tool_choice_present: bool,
     pub parallel_tool_calls_present: bool,
@@ -110,6 +118,12 @@ impl RequestShape {
             .or_else(|| body.get("input").and_then(serde_json::Value::as_array).map(Vec::len))
             .unwrap_or(0);
         let tools_count = body.get("tools").and_then(serde_json::Value::as_array).map(Vec::len).unwrap_or(0);
+        let as_u32 = |v: &serde_json::Value| v.as_u64().and_then(|n| u32::try_from(n).ok());
+        let max_tokens_value = ["max_tokens", "max_output_tokens", "max_completion_tokens"]
+            .iter()
+            .find_map(|key| body.get(*key).and_then(as_u32));
+        let thinking_budget_value =
+            body.get("thinking").and_then(|t| t.get("budget_tokens")).and_then(as_u32);
 
         Self {
             message_count: bounded_count(message_count),
@@ -126,6 +140,8 @@ impl RequestShape {
             max_tokens_present: body.get("max_tokens").is_some(),
             max_output_tokens_present: body.get("max_output_tokens").is_some(),
             max_completion_tokens_present: body.get("max_completion_tokens").is_some(),
+            max_tokens_value,
+            thinking_budget_value,
             temperature_present: body.get("temperature").is_some(),
             tool_choice_present: body.get("tool_choice").is_some(),
             parallel_tool_calls_present: body.get("parallel_tool_calls").is_some(),
@@ -384,6 +400,22 @@ mod tests {
         let long = "x".repeat(200);
         let body = json!({ "type": long });
         assert_eq!(recognized_field(body.get("type"), ERROR_TYPE_ALLOWLIST), FieldState::Omitted);
+    }
+
+    #[test]
+    fn request_shape_records_the_budget_values_sent() {
+        let shape = RequestShape::from_wire_json(&json!({
+            "max_tokens": 32000,
+            "thinking": { "type": "enabled", "budget_tokens": 16384 },
+        }));
+        assert_eq!(shape.max_tokens_value, Some(32_000));
+        assert_eq!(shape.thinking_budget_value, Some(16_384));
+
+        let responses = RequestShape::from_wire_json(&json!({ "max_output_tokens": 8000 }));
+        assert_eq!(responses.max_tokens_value, Some(8_000));
+        assert_eq!(responses.thinking_budget_value, None);
+
+        assert_eq!(RequestShape::from_wire_json(&json!({})).max_tokens_value, None);
     }
 
     #[test]
