@@ -618,6 +618,8 @@ mod tests {
         assert_eq!(shape["route_source"], "fixed_provider_default");
         assert_eq!(shape["message_count"], 1);
         assert_eq!(shape["max_tokens_present"], true);
+        assert_eq!(shape["max_tokens_value"], 100);
+        assert!(shape.get("thinking_budget_value").is_none());
         assert_eq!(shape["stream_requested"], true);
         // The exact serialized wire body length, not a second `to_string()`.
         let expected_bytes =

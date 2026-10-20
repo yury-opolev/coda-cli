@@ -1134,10 +1134,38 @@ Configurable in `~/.coda/settings.json`:
 | `compactFreeTokens` | *(none)* | The same decision expressed as headroom: compact once fewer than this many tokens remain. **Wins over `compactAtPercent`** when both are set, being the more specific of the two. Ignored (falling back to the percentage) if it would leave less than 8,000 tokens to work in — which can happen without you typing a silly number, since the window is re-derived from whichever model is active. |
 
 Both are floored at 8,000 tokens and capped so the trigger always leaves room for a
-reply. The cap matters only on windows small enough that the percentage would not — an
-8k window at 80% leaves 1.6k, which is not a reply, so the threshold drops to 3,904.
+reply (the [output budget](#output-budget) the turn requests). The cap matters only on
+windows small enough that the percentage would not — an 8k window at 80% leaves 1.6k,
+which is not a reply, so with a 4,096-token budget the threshold drops to 3,904.
 
 `/compact` compacts on demand at any time, regardless of these settings.
+
+### Output budget
+
+Each response may be up to `max_tokens` long. The engine derives that from the active
+model's real output limit — the provider's live model list when it reports one, otherwise
+the bundled models.dev catalogue — and requests **the model's limit, capped at 32,000**
+(32,000 when the limit is unknown). Subagents get the budget of the model they actually
+run on. Near the end of the context window the budget shrinks so prompt plus reply still
+fit, but never below 4,096.
+
+Configurable in `~/.coda/settings.json`:
+
+```json
+{
+  "maxOutputTokens": 64000,
+  "maxOutputTokensByModel": { "github-copilot/claude-opus-4.8": 64000 }
+}
+```
+
+| Field | Default | Effect |
+|---|---|---|
+| `maxOutputTokens` | *(none)* | Output budget for every model. Clamped to the model's own limit and raised to at least 4,096. |
+| `maxOutputTokensByModel` | *(none)* | Per-model budget keyed `"<provider>/<model>"` (as `effortByModel`). Wins over `maxOutputTokens`. |
+
+Values that are not positive integers are ignored. The budget used and where it came from
+(`setting`, `live`, `catalog` or `fallback`) are recorded as `output_budget` in the
+diagnostics log, and `turn_end` records the last response's `output_tokens`.
 
 ### Subagent limits & prompts
 

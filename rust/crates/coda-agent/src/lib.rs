@@ -61,6 +61,10 @@ pub mod tools;
 
 // Convenience re-exports — the most frequently used public surface.
 pub use agent::{AgentError, AgentLoop, AgentLoopBuilder, DEFAULT_MAX_TOKENS};
+pub use agent::output_budget::{
+    clamp_to_context_window, resolve_max_output_tokens, ModelBudget, OutputBudgetSource,
+    FALLBACK_MAX_OUTPUT_TOKENS, MIN_MAX_OUTPUT_TOKENS,
+};
 pub use compaction::{
     CompactionPolicy, CompactionService, CompactionTrigger, TokenEstimator, compaction_tail_start,
 };

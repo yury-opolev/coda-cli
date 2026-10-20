@@ -895,7 +895,7 @@ mod tests {
         // A fake stop reason smuggling a real-looking credential/URL — this
         // must never survive to disk verbatim, only a fixed "unknown" may.
         let malicious = "https://user:sk-live-secret9999@internal.example.com/leak";
-        ctx.record(Event::TurnEnd { stop_reason: Some(malicious.into()) });
+        ctx.record(Event::TurnEnd { stop_reason: Some(malicious.into()), output_tokens: None });
 
         let path = logger.status().path.unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
@@ -914,11 +914,31 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let logger = Arc::new(Logger::open(options(dir.path()), Limits::default()).expect("opens"));
         let ctx = DiagnosticContext::root(Arc::clone(&logger), "run-1");
-        ctx.record(Event::TurnEnd { stop_reason: Some("end_turn".into()) });
+        ctx.record(Event::TurnEnd { stop_reason: Some("end_turn".into()), output_tokens: Some(1234) });
 
         let path = logger.status().path.unwrap();
         let lines = read_lines(&path);
         assert_eq!(lines[0]["stop_reason"], "end_turn");
+        assert_eq!(lines[0]["output_tokens"], 1234);
+    }
+
+    #[test]
+    fn an_output_budget_is_recorded_with_its_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let logger = Arc::new(Logger::open(options(dir.path()), Limits::default()).expect("opens"));
+        let ctx = DiagnosticContext::root(Arc::clone(&logger), "run-1");
+        ctx.record(Event::OutputBudget {
+            max_tokens: 32_000,
+            source: "catalog",
+            model_output_limit: Some(64_000),
+            context_window: Some(200_000),
+        });
+
+        let lines = read_lines(&logger.status().path.unwrap());
+        assert_eq!(lines[0]["kind"], "output_budget");
+        assert_eq!(lines[0]["max_tokens"], 32_000);
+        assert_eq!(lines[0]["source"], "catalog");
+        assert_eq!(lines[0]["model_output_limit"], 64_000);
     }
 
     #[test]

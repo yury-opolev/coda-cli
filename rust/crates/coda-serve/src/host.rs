@@ -278,22 +278,35 @@ struct GoalParams {
 struct TurnSink {
     inner: Arc<dyn AgentSink>,
     stop_reason: Mutex<Option<String>>,
+    /// Output tokens of the most recent response, for the `turn_end` record.
+    last_output_tokens: Mutex<Option<u32>>,
 }
 
 impl TurnSink {
     fn new(inner: Arc<dyn AgentSink>) -> Arc<Self> {
-        Arc::new(Self { inner, stop_reason: Mutex::new(None) })
+        Arc::new(Self { inner, stop_reason: Mutex::new(None), last_output_tokens: Mutex::new(None) })
     }
 
     fn take_stop_reason(&self) -> Option<String> {
         self.stop_reason.lock().expect("turn sink poisoned").clone()
     }
+
+    fn last_output_tokens(&self) -> Option<u32> {
+        *self.last_output_tokens.lock().expect("turn sink poisoned")
+    }
 }
 
 impl AgentSink for TurnSink {
     fn emit(&self, event: AgentEvent) {
-        if let AgentEvent::Stop { ref stop_reason } = event {
-            *self.stop_reason.lock().expect("turn sink poisoned") = stop_reason.clone();
+        match &event {
+            AgentEvent::Stop { stop_reason } => {
+                *self.stop_reason.lock().expect("turn sink poisoned") = stop_reason.clone();
+            }
+            AgentEvent::Usage { usage } => {
+                *self.last_output_tokens.lock().expect("turn sink poisoned") =
+                    Some(usage.output_tokens);
+            }
+            _ => {}
         }
         self.inner.emit(event);
     }
@@ -937,6 +950,10 @@ pub struct ServeHost {
     /// stored `Effort` is the level the user *requested*, re-resolved against
     /// each model's capability so switching models never carries a stale level.
     effort_overrides: Mutex<HashMap<String, Option<Effort>>>,
+    /// Context and output limits the provider's live model list reported,
+    /// recorded whenever `session/models` fetches it. Preferred over the
+    /// catalogue when sizing a turn's output budget.
+    live_model_limits: Arc<Mutex<crate::output_budget::LiveLimitMap>>,
     /// Serialises configuration mutations so a commit that awaits a provider
     /// capability lookup cannot interleave with another one.
     ///
@@ -1417,6 +1434,7 @@ impl ServeHost {
                 override_ => Some(override_),
             }),
             effort_overrides: Mutex::new(HashMap::new()),
+            live_model_limits: Arc::new(Mutex::new(HashMap::new())),
             config_commit: tokio::sync::Mutex::new(()),
             goal_params: Mutex::new(startup_goals),
             configured_endpoint,
@@ -2083,6 +2101,13 @@ impl ServeHost {
         let model_source: Arc<dyn Fn() -> String + Send + Sync> = Arc::new(move || {
             runtime.lock().expect("runtime config poisoned").model.clone()
         });
+        // Each child resolves the budget for the model it actually runs on,
+        // which a request may set to something other than the parent's.
+        let budget_source: Arc<dyn Fn(&str) -> coda_agent::ModelBudget + Send + Sync> = {
+            let live = Arc::clone(&self.live_model_limits);
+            let provider = client.provider_id().to_owned();
+            Arc::new(move |model: &str| resolve_output_budget_now(&live, &provider, model).budget)
+        };
         // 1. Hook-free subagent (prevents hook re-entrancy for agent-type hooks).
         //    It receives the SAME in-memory schedule store as the main agent
         //    loop and the hooked host, so a definition created anywhere in the
@@ -2096,6 +2121,7 @@ impl ServeHost {
             self.working_dir.clone(),
         )
         .with_model_source(Arc::clone(&model_source))
+        .with_budget_source(Arc::clone(&budget_source))
         .with_schedule_store(Arc::clone(&self.schedule_store))
         .with_message_bus(Arc::clone(&self.message_bus))
         .with_outage_policy(Arc::clone(&self.outage_policy));
@@ -2128,13 +2154,14 @@ impl ServeHost {
             Arc::new(ToolQuarantine::new()),
             Arc::clone(&self.task_manager),
             self.current_model(),
-            4096,
+            coda_agent::DEFAULT_MAX_TOKENS,
             500,
             self.working_dir.clone(),
             Some(Arc::clone(&hook_runner)),
             MAX_CONCURRENT_SUBAGENTS,
         )
         .with_model_source(model_source)
+        .with_budget_source(budget_source)
         .with_schedule_store(Arc::clone(&self.schedule_store))
         .with_message_bus(Arc::clone(&self.message_bus));
 
@@ -3125,6 +3152,19 @@ impl ServeBackend for ServeHost {
             if p.refresh { client.refresh_models().await } else { client.list_models().await };
         match result {
             Ok(models) if !models.is_empty() => {
+                {
+                    let mut limits =
+                        self.live_model_limits.lock().expect("live model limits poisoned");
+                    for m in &models {
+                        limits.insert(
+                            crate::output_budget::live_key(&provider_id, &m.id),
+                            crate::output_budget::LiveLimits {
+                                context: m.context_limit,
+                                output: m.output_limit,
+                            },
+                        );
+                    }
+                }
                 // A live list says what the provider offers; the catalogue
                 // says what it costs. The provider does not report prices, so
                 // without this join a live list has none and the cost quietly
@@ -4856,6 +4896,14 @@ impl ServeHost {
         // builder would let a setter landing in between make the public
         // `activeConfig` describe an agent that was never run.
         let captured = self.capture_runtime();
+        // The output budget for this turn's model. The same value is the
+        // `max_tokens` on the wire and the reply reserve auto-compaction keeps
+        // free, so the trigger protects exactly the room the loop asks for.
+        let output_budget = resolve_output_budget_now(
+            &self.live_model_limits,
+            client.provider_id(),
+            &captured.config.model,
+        );
 
         let agent = AgentLoopBuilder::new(
             Arc::clone(&client),
@@ -4864,6 +4912,7 @@ impl ServeHost {
         )
         .with_permission_mode_state(Arc::clone(&self.permission_mode))
         .with_model(captured.config.model.clone())
+        .with_model_budget(output_budget.budget)
         .with_working_directory(&self.working_dir)
         .with_effort(captured.config.effort)
         .with_steering(Arc::clone(&self.session.steering))
@@ -4892,13 +4941,12 @@ impl ServeHost {
         ) as Arc<dyn ForkedAgent>)))
         // The threshold is a fraction of the model's window (80% by default),
         // overridable per user via `compactAtPercent` / `compactFreeTokens`.
-        // The reserve is the `max_tokens` the loop actually requests — not the
-        // model's advertised output ceiling, which is an order of magnitude
-        // larger and would pull the trigger far below the configured fraction.
+        // The reserve is the `max_tokens` the loop actually requests. It only
+        // caps the threshold, so on a large window the fraction still rules.
         .with_compaction_policy(CompactionPolicy::for_context_window_with(
             crate::settings::compaction_trigger_from(&load_settings_value()),
             self.active_context_window(),
-            Some(coda_agent::DEFAULT_MAX_TOKENS as usize),
+            Some(output_budget.budget.max_tokens as usize),
         ));
 
         // Apply the session-only system prompt override the captured record
@@ -4935,6 +4983,14 @@ impl ServeHost {
                 Some(captured.config.model.clone()),
             )
         });
+        if let Some(ctx) = &turn_ctx {
+            ctx.record(coda_diagnostics::Event::OutputBudget {
+                max_tokens: output_budget.budget.max_tokens,
+                source: output_budget.source.as_str(),
+                model_output_limit: output_budget.model_output_limit,
+                context_window: output_budget.budget.context_window.map(|n| n as u64),
+            });
+        }
 
         // Activity phase machine (Slice 0 / Stage C): the public turn was
         // already opened when the single-flight slot was claimed (C6), so
@@ -4983,6 +5039,7 @@ impl ServeHost {
             }
         }
         let stop_reason = turn_sink.take_stop_reason();
+        let output_tokens = turn_sink.last_output_tokens();
 
         // Clear cancel token.
         *self.current_cancel.lock().expect("cancel poisoned") = None;
@@ -4996,10 +5053,14 @@ impl ServeHost {
 
         if let Some(ctx) = &turn_ctx {
             match &run_result {
-                Ok(_) => ctx.record(coda_diagnostics::Event::TurnEnd { stop_reason: stop_reason.clone() }),
-                Err(AgentError::Cancelled) => {
-                    ctx.record(coda_diagnostics::Event::TurnEnd { stop_reason: Some("cancelled".into()) })
-                }
+                Ok(_) => ctx.record(coda_diagnostics::Event::TurnEnd {
+                    stop_reason: stop_reason.clone(),
+                    output_tokens,
+                }),
+                Err(AgentError::Cancelled) => ctx.record(coda_diagnostics::Event::TurnEnd {
+                    stop_reason: Some("cancelled".into()),
+                    output_tokens,
+                }),
                 Err(AgentError::Llm(llm_err)) => ctx.record(coda_diagnostics::Event::TurnFailed {
                     category: coda_llm::diagnostics::category(llm_err),
                     status: coda_llm::diagnostics::status(llm_err),
@@ -6063,6 +6124,24 @@ fn validate_base64(s: &str) -> Result<(), String> {
 // Settings / config helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// The output budget for `model` on `provider`, from the user's settings, the
+/// live limits recorded so far and the catalogue. Offline and cheap, so it is
+/// safe on the turn path and per subagent spawn.
+fn resolve_output_budget_now(
+    live: &Mutex<crate::output_budget::LiveLimitMap>,
+    provider: &str,
+    model: &str,
+) -> crate::output_budget::ResolvedBudget {
+    let live = live.lock().expect("live model limits poisoned").clone();
+    crate::output_budget::resolve(
+        &crate::catalog::ModelCatalog::load(),
+        &live,
+        &load_settings_value(),
+        provider,
+        model,
+    )
+}
+
 /// Read the user's settings.json as a JSON value (best-effort; empty object on failure).
 /// Honors the `CODA_HOME` profile-root override. Tolerates a leading BOM.
 fn load_settings_value() -> Value {
@@ -6711,7 +6790,10 @@ mod tests {
         let ctx = test_diagnostics(dir.path());
         let client = ScriptedClient::new(vec![vec![
             StreamEvent::TextDelta("hi".into()),
-            StreamEvent::Done { stop_reason: Some("end_turn".into()), usage: Usage::ZERO },
+            StreamEvent::Done {
+                stop_reason: Some("end_turn".into()),
+                usage: Usage { output_tokens: 42, ..Usage::ZERO },
+            },
         ]]);
 
         let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -6742,7 +6824,13 @@ mod tests {
         assert!(start["turn_id"].as_str().is_some());
         assert_eq!(start["turn_id"], end["turn_id"], "start/end share the same turn id");
         assert_eq!(end["stop_reason"], "end_turn");
+        assert_eq!(end["output_tokens"], 42, "turn_end carries the last response's output tokens");
         assert_eq!(start["provider"], "scripted");
+
+        // The budget the turn requested, and where it came from, are logged.
+        let budget = lines.iter().find(|l| l["kind"] == "output_budget").expect("output_budget recorded");
+        assert!(budget["max_tokens"].as_u64().unwrap() >= u64::from(coda_agent::MIN_MAX_OUTPUT_TOKENS));
+        assert!(["setting", "live", "catalog", "fallback"].contains(&budget["source"].as_str().unwrap()));
     }
 
     /// Poison canary: a real turn in which the model calls `notify_user` with
@@ -11989,6 +12077,10 @@ mod tests {
         fn last_effort(&self) -> Option<Effort> {
             self.last_request.lock().unwrap().as_ref()?.effort
         }
+
+        fn last_max_tokens(&self) -> Option<u32> {
+            Some(self.last_request.lock().unwrap().as_ref()?.max_tokens)
+        }
     }
 
     #[async_trait]
@@ -12044,6 +12136,33 @@ mod tests {
             opts,
         );
         (host, client)
+    }
+
+    /// The main loop sends the budget resolved for the active model — here a
+    /// live limit the provider reported — rather than a fixed 4096.
+    #[tokio::test]
+    async fn main_loop_sends_resolved_max_tokens() {
+        use crate::output_budget::{live_key, LiveLimits};
+
+        let (host, client) = make_capturing_host();
+        let model = host.current_model();
+        host.live_model_limits.lock().unwrap().insert(
+            live_key("capturing", &model),
+            LiveLimits { context: Some(150_000), output: Some(12_345) },
+        );
+
+        host.session_prompt(PromptParams { text: Some("hello".into()), images: None })
+            .await
+            .unwrap();
+
+        let expected = resolve_output_budget_now(&host.live_model_limits, "capturing", &model);
+        assert_eq!(client.last_max_tokens(), Some(expected.budget.max_tokens));
+        // A user's own `maxOutputTokens` legitimately wins over the live limit.
+        if expected.source == coda_agent::OutputBudgetSource::Live {
+            assert_eq!(client.last_max_tokens(), Some(12_345));
+        } else {
+            assert_eq!(expected.source, coda_agent::OutputBudgetSource::Setting);
+        }
     }
 
     /// `session/setSystemPrompt` stores the text and it reaches the LLM.

@@ -35,6 +35,8 @@ pub struct ModelCost {
 struct Limit {
     #[serde(default)]
     context: Option<i64>,
+    #[serde(default)]
+    output: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -59,6 +61,8 @@ pub struct CatalogModel {
     pub id: String,
     pub display_name: Option<String>,
     pub context_limit: Option<i64>,
+    /// The most output tokens one response may request (`limit.output`).
+    pub output_limit: Option<i64>,
     pub cost: Option<ModelCost>,
 }
 
@@ -93,6 +97,7 @@ impl ModelCatalog {
                         let described = CatalogModel {
                             display_name: model.name,
                             context_limit: model.limit.and_then(|l| l.context),
+                            output_limit: model.limit.and_then(|l| l.output),
                             cost: model.cost,
                             id: id.clone(),
                         };
@@ -224,6 +229,15 @@ mod tests {
     }
 
     #[test]
+    fn a_known_model_carries_its_output_limit() {
+        let catalog = ModelCatalog::parse(BUNDLED);
+        let model = catalog
+            .find(Some("github-copilot"), "claude-opus-4.8")
+            .expect("claude-opus-4.8 is in the snapshot");
+        assert_eq!(model.output_limit, Some(64_000));
+    }
+
+    #[test]
     fn a_model_is_found_without_naming_its_provider() {
         // The id the engine reports and the provider it connected with do not
         // always agree: a Copilot-hosted Claude model keeps its Anthropic id.
@@ -254,6 +268,7 @@ mod tests {
         let model = catalog.find(Some("acme"), "cheap").expect("model dropped");
         assert_eq!(model.display_name.as_deref(), Some("Cheap"));
         assert_eq!(model.context_limit, Some(1000));
+        assert!(model.output_limit.is_none());
         assert!(model.cost.is_none());
     }
 
