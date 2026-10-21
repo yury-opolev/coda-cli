@@ -6723,6 +6723,37 @@ pub(in crate::app) mod tests {
             "a bounded read must say the engine went quiet: {notices:?}"
         );
     }
+
+    /// A fast stream backs frames up in `inbound`, and the transport queues
+    /// every notification of a turn before it resolves `session/prompt`. The
+    /// loop's unbiased select could take the turn outcome while the reply's
+    /// last deltas were still queued: the reply was closed early and the
+    /// remaining text opened a second assistant block, split mid-word.
+    #[tokio::test]
+    async fn queued_stream_frames_land_in_the_reply_before_the_turn_finishes() {
+        let mut harness = app_with(crate::local::AccessMode::TrustedLocal, |_, _| json!({}));
+        let app = &mut harness.app;
+        app.apply(UiEvent::Submitted { text: "go".into() });
+
+        let delta = |text: &str, seq: i64| Inbound::Notification {
+            method: "event/assistantText".into(),
+            params: Some(json!({ "delta": text, "seq": seq, "engineInstanceId": "e1" })),
+        };
+        app.on_inbound(delta("with these spec", 1));
+
+        let (queue, mut queued) = mpsc::unbounded_channel();
+        queue.send(delta("ifics", 2)).expect("queued");
+        queue.send(delta("?", 3)).expect("queued");
+
+        app.finish_turn(&mut queued, super::super::TurnOutcome { result: Ok(json!({})) });
+
+        assert_eq!(
+            user_texts(app),
+            ["go", "with these specifics?"],
+            "the reply was split across two assistant blocks"
+        );
+        assert_eq!(app.state.activity, crate::state::Activity::Ready);
+    }
 }
 
 // ---------------------------------------------------------------------------
