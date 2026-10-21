@@ -55,6 +55,10 @@ pub struct ExitSummary {
     pub working_directory: String,
     /// Where the provider and model above came from.
     pub settings_host: SettingsHost,
+    /// Shutdown cleanup (closing the session or stopping its engines) failed,
+    /// so the session may not have been fully saved. A run that failed on its
+    /// own but shut down cleanly leaves this `false`.
+    pub persistence_unconfirmed: bool,
 }
 
 impl ExitSummary {
@@ -195,7 +199,8 @@ fn exit_provider_line(summary: &ExitSummary) -> String {
 }
 
 /// The exit summary, as plain lines ready to print.
-pub fn exit_lines(summary: &ExitSummary) -> Vec<String> {    let mut lines: Vec<String> = WORDMARK.iter().map(|l| (*l).to_string()).collect();
+pub fn exit_lines(summary: &ExitSummary) -> Vec<String> {
+    let mut lines: Vec<String> = WORDMARK.iter().map(|l| (*l).to_string()).collect();
     lines.push(String::new());
     lines.push("Session summary".to_string());
     lines.push(format!(
@@ -215,7 +220,15 @@ pub fn exit_lines(summary: &ExitSummary) -> Vec<String> {    let mut lines: Vec<
     lines.push(String::new());
     match &summary.session_id {
         Some(id) => {
-            lines.push("Resume from this directory:".to_string());
+            if summary.persistence_unconfirmed {
+                lines.push(
+                    "Session shutdown did not complete cleanly; the latest changes may not have been saved."
+                        .to_string(),
+                );
+                lines.push("Known session - resume from this directory:".to_string());
+            } else {
+                lines.push("Resume from this directory:".to_string());
+            }
             lines.push(format!("cd {}", quote_argument(&summary.working_directory)));
             lines.push(format!("coda --resume {}", quote_argument(id)));
         }
@@ -224,6 +237,29 @@ pub fn exit_lines(summary: &ExitSummary) -> Vec<String> {    let mut lines: Vec<
         None => lines.push("This session was not saved.".to_string()),
     }
     lines
+}
+
+/// The exit summary on a single plain-text line, for error reports made
+/// when the formatted card cannot safely be printed.
+pub fn exit_summary_line(summary: &ExitSummary) -> String {
+    let field = |value: &str| if value.trim().is_empty() { "-".to_string() } else { value.to_string() };
+    let session = match &summary.session_id {
+        Some(id) if summary.persistence_unconfirmed => format!("{id} (save unconfirmed)"),
+        Some(id) => id.clone(),
+        None => "not saved".to_string(),
+    };
+    format!(
+        "duration {}, {} messages, {}/{}, tokens {} in / {} out / {} total, session {}, directory {}",
+        format_duration(summary.duration),
+        summary.message_count,
+        field(&summary.provider_id),
+        field(&summary.model),
+        summary.input_tokens,
+        summary.output_tokens,
+        summary.total_tokens(),
+        session,
+        field(&summary.working_directory),
+    )
 }
 
 /// Writes the exit summary, after the alternate screen has been left.
@@ -340,6 +376,7 @@ mod tests {
             session_id: Some("abc123".into()),
             working_directory: r"C:\work".into(),
             settings_host: SettingsHost::Local,
+            persistence_unconfirmed: false,
         };
         let joined = exit_lines(&summary).join("\n");
         assert!(joined.contains("1m 15s"), "{joined}");
@@ -354,6 +391,33 @@ mod tests {
         let joined = exit_lines(&summary).join("\n");
         assert!(joined.contains("not saved"), "{joined}");
         assert!(!joined.contains("--resume"), "must not offer a resume that cannot work");
+    }
+
+    #[test]
+    fn an_unconfirmed_save_still_offers_the_known_resume_command_but_says_so() {
+        let summary = ExitSummary {
+            session_id: Some("abc123".into()),
+            working_directory: r"C:\work".into(),
+            persistence_unconfirmed: true,
+            ..Default::default()
+        };
+        let joined = exit_lines(&summary).join("\n");
+        assert!(joined.contains("did not complete cleanly"), "{joined}");
+        assert!(joined.contains("Known session - resume from this directory:"), "{joined}");
+        assert!(!joined.contains("\nResume from this directory:"), "{joined}");
+        assert!(joined.contains("coda --resume abc123"), "{joined}");
+    }
+
+    #[test]
+    fn an_unsaved_session_never_offers_a_resume_even_when_shutdown_failed() {
+        let summary = ExitSummary {
+            session_id: None,
+            persistence_unconfirmed: true,
+            ..Default::default()
+        };
+        let joined = exit_lines(&summary).join("\n");
+        assert!(joined.contains("This session was not saved."), "{joined}");
+        assert!(!joined.contains("--resume"), "{joined}");
     }
 
     #[test]

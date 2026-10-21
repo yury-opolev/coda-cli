@@ -2394,11 +2394,43 @@ pub(in crate::app) mod tests {
                 Ok(json!({}))
             }
         });
-        let result = harness.app.finish(Ok(()), std::time::Instant::now()).await;
+        let exit = harness.app.finish(Ok(()), std::time::Instant::now()).await;
         assert!(
-            result.is_err(),
+            exit.outcome.is_err(),
             "shutdown RPC failures must not be discarded"
         );
+        let summary = exit.summary.expect("a failed cleanup still reports the session");
+        assert_eq!(summary.session_id.as_deref(), Some("s1"));
+        assert!(summary.persistence_unconfirmed, "the save cannot be confirmed");
+    }
+
+    #[tokio::test]
+    async fn a_failed_run_with_clean_shutdown_still_confirms_the_save() {
+        let mut harness =
+            app_answering(crate::local::AccessMode::TrustedLocal, |_, _| Ok(json!({ "ok": true })));
+        let exit = harness
+            .app
+            .finish(Err(anyhow::anyhow!("terminal input failed")), std::time::Instant::now())
+            .await;
+        let error = exit.outcome.expect_err("the run's own failure is still reported");
+        assert!(format!("{error:#}").contains("terminal input failed"));
+        let summary = exit.summary.expect("a failed run still reports the session");
+        assert_eq!(summary.session_id.as_deref(), Some("s1"));
+        assert!(
+            !summary.persistence_unconfirmed,
+            "cleanup succeeded, so the save is confirmed despite the run's failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clean_shutdown_reports_a_confirmed_summary() {
+        let mut harness =
+            app_answering(crate::local::AccessMode::TrustedLocal, |_, _| Ok(json!({ "ok": true })));
+        let exit = harness.app.finish(Ok(()), std::time::Instant::now()).await;
+        exit.outcome.expect("a clean exit");
+        let summary = exit.summary.expect("a clean exit reports the session");
+        assert_eq!(summary.session_id.as_deref(), Some("s1"));
+        assert!(!summary.persistence_unconfirmed);
     }
 
     #[tokio::test]
@@ -2424,7 +2456,9 @@ pub(in crate::app) mod tests {
         harness.app.restarted = Some((staged, inbound));
         harness.app.shutdown_grace = std::time::Duration::from_millis(150);
         let started = std::time::Instant::now();
-        let error = harness.app.finish(Ok(()), started).await.unwrap_err();
+        let exit = harness.app.finish(Ok(()), started).await;
+        assert!(exit.summary.is_some_and(|summary| summary.persistence_unconfirmed));
+        let error = exit.outcome.unwrap_err();
         assert!(started.elapsed() < std::time::Duration::from_millis(1150));
         assert!(format!("{error:#}").contains("shutdown RPC timed out"));
         assert!(owned_connection.is_closed() && staged_connection.is_closed());
@@ -2519,11 +2553,9 @@ pub(in crate::app) mod tests {
         harness.app.on_inbound(message);
         assert_eq!(harness.app.pending.len(), 1, "the request is outstanding to begin with");
 
-        let summary = harness
-            .app
-            .finish(Ok(()), std::time::Instant::now())
-            .await
-            .expect("a clean exit still produces a summary");
+        let exit = harness.app.finish(Ok(()), std::time::Instant::now()).await;
+        exit.outcome.expect("a clean exit");
+        let summary = exit.summary.expect("a clean exit still produces a summary");
         assert_eq!(summary.session_id.as_deref(), Some("s1"));
         harness.settle_wire().await;
 
@@ -2577,7 +2609,7 @@ pub(in crate::app) mod tests {
             responder,
         );
 
-        harness.app.finish(Ok(()), std::time::Instant::now()).await.expect("summary");
+        harness.app.finish(Ok(()), std::time::Instant::now()).await.outcome.expect("clean exit");
         harness.settle_wire().await;
         assert!(
             response_for(&harness.frames(), 42).is_none(),
@@ -2613,12 +2645,14 @@ pub(in crate::app) mod tests {
         let message = harness.next_inbound().await;
         harness.app.on_inbound(message);
 
-        let error = harness
+        let exit = harness
             .app
             .finish(Err(anyhow::anyhow!("terminal input failed")), std::time::Instant::now())
-            .await
-            .expect_err("the failure is still reported");
+            .await;
+        let error = exit.outcome.expect_err("the failure is still reported");
         assert!(error.to_string().contains("terminal input failed"));
+        let summary = exit.summary.expect("a failed run still reports the session");
+        assert_eq!(summary.session_id.as_deref(), Some("s1"));
         harness.settle_wire().await;
 
         let frames = harness.frames();
@@ -6593,6 +6627,7 @@ pub(in crate::app) mod tests {
 
         within("the teardown", harness.app.finish(Ok(()), std::time::Instant::now()))
             .await
+            .outcome
             .expect("the run's own outcome");
 
         assert!(harness.app.restarted.is_none(), "the staged engine was left behind");

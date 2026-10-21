@@ -43,22 +43,13 @@ pub struct TerminalGuard {
 }
 
 impl TerminalGuard {
-    /// Restores before returning either the run outcome or its cleanup error.
-    pub fn finish<T>(self, outcome: anyhow::Result<T>) -> anyhow::Result<T> {
-        let restoration = if TERMINAL_ACTIVE.swap(false, Ordering::SeqCst) {
-            restore(self.mouse_captured)
+    /// Leaves raw mode and the alternate screen, reporting only whether that
+    /// worked, so the caller knows if anything printed next will be visible.
+    pub fn restore_for_exit(self) -> anyhow::Result<()> {
+        if TERMINAL_ACTIVE.swap(false, Ordering::SeqCst) {
+            restore(self.mouse_captured).map_err(anyhow::Error::new)
         } else {
             Ok(())
-        };
-        match (outcome, restoration) {
-            (outcome, Ok(())) => outcome,
-            (Ok(_), Err(error)) => {
-                Err(anyhow::Error::new(error).context("terminal restoration failed"))
-            }
-            (Err(error), Err(restoration)) => {
-                let message = format!("{error}; terminal restoration failed: {restoration}");
-                Err(error.context(message))
-            }
         }
     }
 

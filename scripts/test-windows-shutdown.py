@@ -156,6 +156,18 @@ def run_case(binary, mcp_count, hang, quit_mode):
                 until("Shutdown", 2)
             until("__CODA_RETURNED__", 10)
             returned = time.monotonic()
+            output = "".join(chunks)
+            end = output.find("__CODA_RETURNED__:")
+            if end == -1:
+                raise AssertionError("The return marker was not found in the output")
+            left = output.rfind("\x1b[?1049l", 0, end)
+            if left == -1:
+                raise AssertionError("The alternate screen was never left before Coda returned")
+            card = output[left:end]
+            assert "Session summary" in card, f"No session summary after the alternate screen: {card[-2000:]!r}"
+            assert "--resume" in card, f"No resume reference after the alternate screen: {card[-2000:]!r}"
+            if hang:
+                assert "did not complete cleanly" in card, "A failed shutdown was not labelled unconfirmed"
             until("__SHELL_READY__", 5)
             p.write("Write-Output ('__HANDOFF_'+'OK__')\r")
             until("__HANDOFF_OK__", 3)
