@@ -186,6 +186,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_input_failure_does_not_abandon_cleanup_and_keeps_the_summary() {
+        let completed = std::cell::Cell::new(false);
+        let exit = tokio::time::timeout(
+            Duration::from_secs(2),
+            drive(
+                async {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    completed.set(true);
+                    InteractiveExit {
+                        summary: Some(ExitSummary {
+                            session_id: Some("s1".into()),
+                            ..Default::default()
+                        }),
+                        outcome: Ok(()),
+                    }
+                },
+                futures::stream::iter([Err(io::Error::other("console read failed"))]),
+                |_, _| Ok(()),
+            ),
+        )
+        .await
+        .expect("shutdown must finish");
+        assert!(completed.get());
+        assert_eq!(exit.summary.and_then(|s| s.session_id).as_deref(), Some("s1"));
+        let message = format!("{:#}", exit.outcome.unwrap_err());
+        assert!(message.contains("shutdown input failed"), "{message}");
+        assert!(message.contains("console read failed"), "{message}");
+    }
+
+    #[tokio::test]
     async fn a_render_failure_after_clean_cleanup_is_reported_but_keeps_the_summary() {
         let exit = drive(
             async {

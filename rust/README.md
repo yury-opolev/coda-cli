@@ -135,7 +135,8 @@ RPC — followed by the explicit error on stderr and a nonzero exit code; in tha
 case the resume command is labelled as a known session whose latest changes
 may not have been saved. If terminal restoration itself fails, no summary card
 is printed; the error reports the restoration failure, any cleanup failure, and
-the known session id. Startup failures before the session runs print no summary.
+the summary on one plain line (duration, messages, provider/model, token
+totals, session id or "not saved", and working directory). Startup failures before the session runs print no summary.
 
 Diagnostics distinguish `shutdown_start`, timed `shutdown_phase` records
 (authentication, RPC, integrations, writer/process, cleanup, and restoration),

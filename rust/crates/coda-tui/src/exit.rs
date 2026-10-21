@@ -28,18 +28,17 @@ pub fn conclude(
 ) -> anyhow::Result<()> {
     if let Err(restoration) = restoration {
         // The terminal may still be in the alternate screen, where the card
-        // would be wiped or garble the shell; the session id stays findable.
-        let session = exit
+        // would be wiped or garble the shell; the summary rides in the error.
+        let recorded = exit
             .summary
             .as_ref()
-            .and_then(|summary| summary.session_id.as_deref())
-            .map(|id| format!(" (session {id})"))
+            .map(|summary| format!(" [{}]", crate::branding::exit_summary_line(summary)))
             .unwrap_or_default();
         return Err(match exit.outcome {
-            Ok(()) => restoration.context(format!("terminal restoration failed{session}")),
+            Ok(()) => restoration.context(format!("terminal restoration failed{recorded}")),
             Err(original) => {
                 let message =
-                    format!("{original:#}; terminal restoration failed{session}: {restoration:#}");
+                    format!("{original:#}; terminal restoration failed{recorded}: {restoration:#}");
                 original.context(message)
             }
         });
@@ -98,6 +97,45 @@ mod tests {
         })
         .unwrap_err();
         assert!(format!("{error:#}").contains("terminal restoration failed"));
+    }
+
+    #[test]
+    fn a_failed_restoration_keeps_the_whole_summary_in_the_error() {
+        let summary = ExitSummary {
+            message_count: 4,
+            provider_id: "openai".into(),
+            model: "gpt-x".into(),
+            input_tokens: 1200,
+            output_tokens: 345,
+            session_id: Some("abc123".into()),
+            working_directory: "C:\\work".into(),
+            ..Default::default()
+        };
+        for outcome in [Ok(()), Err(anyhow::anyhow!("cleanup failed"))] {
+            let exit = InteractiveExit { summary: Some(summary.clone()), outcome };
+            let error = conclude(exit, Err(anyhow::anyhow!("console gone")), |_| {
+                panic!("must not print")
+            })
+            .unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("1200 in"), "{message}");
+            assert!(message.contains("345 out"), "{message}");
+            assert!(message.contains("1545 total"), "{message}");
+            assert!(message.contains("abc123"), "{message}");
+            assert!(message.contains("openai/gpt-x"), "{message}");
+            assert!(message.contains("C:\\work"), "{message}");
+            assert!(!message.contains('\n'), "the summary stays on one line: {message}");
+        }
+
+        let unsaved = InteractiveExit {
+            summary: Some(ExitSummary { session_id: None, ..Default::default() }),
+            outcome: Ok(()),
+        };
+        let error = conclude(unsaved, Err(anyhow::anyhow!("console gone")), |_| {
+            panic!("must not print")
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("not saved"));
     }
 
     #[test]

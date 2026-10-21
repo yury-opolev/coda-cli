@@ -197,7 +197,8 @@ fn exit_provider_line(summary: &ExitSummary) -> String {
 }
 
 /// The exit summary, as plain lines ready to print.
-pub fn exit_lines(summary: &ExitSummary) -> Vec<String> {    let mut lines: Vec<String> = WORDMARK.iter().map(|l| (*l).to_string()).collect();
+pub fn exit_lines(summary: &ExitSummary) -> Vec<String> {
+    let mut lines: Vec<String> = WORDMARK.iter().map(|l| (*l).to_string()).collect();
     lines.push(String::new());
     lines.push("Session summary".to_string());
     lines.push(format!(
@@ -234,6 +235,29 @@ pub fn exit_lines(summary: &ExitSummary) -> Vec<String> {    let mut lines: Vec<
         None => lines.push("This session was not saved.".to_string()),
     }
     lines
+}
+
+/// The exit summary on a single plain-text line, for error reports made
+/// when the formatted card cannot safely be printed.
+pub fn exit_summary_line(summary: &ExitSummary) -> String {
+    let field = |value: &str| if value.trim().is_empty() { "—".to_string() } else { value.to_string() };
+    let session = match &summary.session_id {
+        Some(id) if summary.persistence_unconfirmed => format!("{id} (save unconfirmed)"),
+        Some(id) => id.clone(),
+        None => "not saved".to_string(),
+    };
+    format!(
+        "duration {}, {} messages, {}/{}, tokens {} in / {} out / {} total, session {}, directory {}",
+        format_duration(summary.duration),
+        summary.message_count,
+        field(&summary.provider_id),
+        field(&summary.model),
+        summary.input_tokens,
+        summary.output_tokens,
+        summary.total_tokens(),
+        session,
+        field(&summary.working_directory),
+    )
 }
 
 /// Writes the exit summary, after the alternate screen has been left.
