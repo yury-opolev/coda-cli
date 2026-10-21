@@ -485,29 +485,30 @@ impl App {
 
     // -- Engine -------------------------------------------------------------
 
-
-
-    /// Ends the turn, but only after every engine frame already queued has
+    /// Ends the turn, but only after the engine frames already queued have
     /// been applied.
     ///
     /// The transport queues all of a turn's notifications *before* it
-    /// resolves `session/prompt`, so anything sitting in `inbound` when the
-    /// outcome arrives belongs to the turn being finished. The event loop's
-    /// select is unbiased and applies one inbound frame per iteration, so on a
-    /// fast stream it can pick the outcome while the reply's last deltas are
-    /// still queued; finishing first closes the reply and those deltas open a
+    /// resolves `session/prompt`, so the turn's trailing frames are all
+    /// already in `inbound` when the outcome arrives. The event loop's select
+    /// is unbiased and applies one inbound frame per iteration, so on a fast
+    /// stream it can pick the outcome while the reply's last deltas are still
+    /// queued; finishing first closes the reply and those deltas open a
     /// second assistant block, splitting one reply mid-word.
     ///
     /// Drained here rather than by biasing the select: a biased select would
-    /// starve keyboard input for as long as a backlog lasts. The drain is
-    /// bounded by what is queued *now*. A disconnection just stops it; the
-    /// next iteration's `recv` reports it as it always has. Guarded like the
-    /// loop's own `recv`, because a deliberately disconnected channel is not
-    /// to be read. A staged restart stops it too: the loop swaps the stream
-    /// between iterations, and frames from the engine being replaced are not
-    /// applied after that point.
+    /// starve keyboard input for as long as a backlog lasts. The drain takes
+    /// at most the frames queued on entry; anything arriving meanwhile goes
+    /// through the loop's normal `recv`, so a steady stream of unrelated
+    /// notifications cannot stall the UI. Stops early on a disconnection (the
+    /// loop's `recv` reports it) or a staged restart (frames from the engine
+    /// being replaced are never applied).
     fn finish_turn(&mut self, inbound: &mut mpsc::UnboundedReceiver<Inbound>, outcome: TurnOutcome) {
-        while self.engine_connected && self.restarted.is_none() {
+        let queued = inbound.len();
+        for _ in 0..queued {
+            if !self.engine_connected || self.restarted.is_some() {
+                break;
+            }
             let Ok(message) = inbound.try_recv() else { break };
             self.on_inbound(message);
         }

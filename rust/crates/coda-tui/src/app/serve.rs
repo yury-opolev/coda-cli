@@ -6754,6 +6754,56 @@ pub(in crate::app) mod tests {
         );
         assert_eq!(app.state.activity, crate::state::Activity::Ready);
     }
+
+    fn queued_delta() -> (mpsc::UnboundedSender<Inbound>, mpsc::UnboundedReceiver<Inbound>) {
+        let (queue, queued) = mpsc::unbounded_channel();
+        queue
+            .send(Inbound::Notification {
+                method: "event/assistantText".into(),
+                params: Some(json!({ "delta": "late", "seq": 1, "engineInstanceId": "e1" })),
+            })
+            .expect("queued");
+        (queue, queued)
+    }
+
+    #[tokio::test]
+    async fn the_pre_finish_drain_does_not_read_a_disconnected_engine() {
+        let mut harness = app_with(crate::local::AccessMode::TrustedLocal, |_, _| json!({}));
+        let app = &mut harness.app;
+        app.apply(UiEvent::Submitted { text: "go".into() });
+        app.engine_connected = false;
+        let (_queue, mut queued) = queued_delta();
+
+        app.finish_turn(&mut queued, super::super::TurnOutcome { result: Ok(json!({})) });
+
+        assert_eq!(user_texts(app), ["go"]);
+        assert!(queued.try_recv().is_ok(), "the queued frame was consumed");
+    }
+
+    #[tokio::test]
+    async fn the_pre_finish_drain_does_not_apply_frames_from_an_engine_being_replaced() {
+        let command = if cfg!(windows) {
+            EngineCommand::new("powershell.exe").args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ])
+        } else {
+            EngineCommand::new("sleep").arg("30")
+        };
+        let (staged, staged_inbound) = Engine::spawn(command).expect("staged engine");
+        let mut harness = app_with(crate::local::AccessMode::TrustedLocal, |_, _| json!({}));
+        let app = &mut harness.app;
+        app.apply(UiEvent::Submitted { text: "go".into() });
+        app.restarted = Some((staged, staged_inbound));
+        let (_queue, mut queued) = queued_delta();
+
+        app.finish_turn(&mut queued, super::super::TurnOutcome { result: Ok(json!({})) });
+
+        assert_eq!(user_texts(app), ["go"]);
+        assert!(queued.try_recv().is_ok(), "the queued frame was consumed");
+    }
 }
 
 // ---------------------------------------------------------------------------
