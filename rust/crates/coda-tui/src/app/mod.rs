@@ -415,7 +415,7 @@ impl App {
                 },
 
                 // A turn finished (delivered via the mpsc relay from the turn branch below).
-                Some(outcome) = turn_rx.recv() => self.on_turn_finished(outcome),
+                Some(outcome) = turn_rx.recv() => self.finish_turn(&mut inbound, outcome),
 
                 // The outstanding session/prompt oneshot resolves.
                 //
@@ -485,7 +485,35 @@ impl App {
 
     // -- Engine -------------------------------------------------------------
 
-
+    /// Ends the turn, but only after the engine frames already queued have
+    /// been applied.
+    ///
+    /// The transport queues all of a turn's notifications *before* it
+    /// resolves `session/prompt`, so the turn's trailing frames are all
+    /// already in `inbound` when the outcome arrives. The event loop's select
+    /// is unbiased and applies one inbound frame per iteration, so on a fast
+    /// stream it can pick the outcome while the reply's last deltas are still
+    /// queued; finishing first closes the reply and those deltas open a
+    /// second assistant block, splitting one reply mid-word.
+    ///
+    /// Drained here rather than by biasing the select: a biased select would
+    /// starve keyboard input for as long as a backlog lasts. The drain takes
+    /// at most the frames queued on entry; anything arriving meanwhile goes
+    /// through the loop's normal `recv`, so a steady stream of unrelated
+    /// notifications cannot stall the UI. Stops early on a disconnection (the
+    /// loop's `recv` reports it) or a staged restart (frames from the engine
+    /// being replaced are never applied).
+    fn finish_turn(&mut self, inbound: &mut mpsc::UnboundedReceiver<Inbound>, outcome: TurnOutcome) {
+        let queued = inbound.len();
+        for _ in 0..queued {
+            if !self.engine_connected || self.restarted.is_some() {
+                break;
+            }
+            let Ok(message) = inbound.try_recv() else { break };
+            self.on_inbound(message);
+        }
+        self.on_turn_finished(outcome);
+    }
 
     fn on_turn_finished(&mut self, outcome: TurnOutcome) {
         match outcome.result {
