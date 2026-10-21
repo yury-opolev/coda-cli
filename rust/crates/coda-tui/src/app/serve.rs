@@ -2405,6 +2405,24 @@ pub(in crate::app) mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_run_with_clean_shutdown_still_confirms_the_save() {
+        let mut harness =
+            app_answering(crate::local::AccessMode::TrustedLocal, |_, _| Ok(json!({ "ok": true })));
+        let exit = harness
+            .app
+            .finish(Err(anyhow::anyhow!("terminal input failed")), std::time::Instant::now())
+            .await;
+        let error = exit.outcome.expect_err("the run's own failure is still reported");
+        assert!(format!("{error:#}").contains("terminal input failed"));
+        let summary = exit.summary.expect("a failed run still reports the session");
+        assert_eq!(summary.session_id.as_deref(), Some("s1"));
+        assert!(
+            !summary.persistence_unconfirmed,
+            "cleanup succeeded, so the save is confirmed despite the run's failure"
+        );
+    }
+
+    #[tokio::test]
     async fn a_clean_shutdown_reports_a_confirmed_summary() {
         let mut harness =
             app_answering(crate::local::AccessMode::TrustedLocal, |_, _| Ok(json!({ "ok": true })));

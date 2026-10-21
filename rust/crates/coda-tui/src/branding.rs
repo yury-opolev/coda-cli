@@ -55,7 +55,9 @@ pub struct ExitSummary {
     pub working_directory: String,
     /// Where the provider and model above came from.
     pub settings_host: SettingsHost,
-    /// Shutdown cleanup failed, so the session may not have been fully saved.
+    /// Shutdown cleanup (closing the session or stopping its engines) failed,
+    /// so the session may not have been fully saved. A run that failed on its
+    /// own but shut down cleanly leaves this `false`.
     pub persistence_unconfirmed: bool,
 }
 
@@ -240,7 +242,7 @@ pub fn exit_lines(summary: &ExitSummary) -> Vec<String> {
 /// The exit summary on a single plain-text line, for error reports made
 /// when the formatted card cannot safely be printed.
 pub fn exit_summary_line(summary: &ExitSummary) -> String {
-    let field = |value: &str| if value.trim().is_empty() { "—".to_string() } else { value.to_string() };
+    let field = |value: &str| if value.trim().is_empty() { "-".to_string() } else { value.to_string() };
     let session = match &summary.session_id {
         Some(id) if summary.persistence_unconfirmed => format!("{id} (save unconfirmed)"),
         Some(id) => id.clone(),

@@ -10,25 +10,43 @@ use crate::terminal::TerminalGuard;
 /// reporting them must never hide the failure.
 #[derive(Debug)]
 pub struct InteractiveExit {
+    /// The session to report, or `None` when there is nothing to report.
+    /// `App::run` always produces one today; `None` exists for
+    /// callers with no session, and simply prints nothing.
     pub summary: Option<ExitSummary>,
     pub outcome: anyhow::Result<()>,
 }
 
-/// Restores the terminal, then prints the summary and returns the outcome.
+/// Ends an interactive session: restores the terminal, then reports.
+///
+/// Consumes the guard so restoration happens exactly once, before anything is
+/// written to the normal screen. The decision of what to print and return is
+/// left to [`conclude`].
 pub fn finish_interactive(guard: TerminalGuard, exit: InteractiveExit) -> anyhow::Result<()> {
     let restoration = guard.restore_for_exit();
     conclude(exit, restoration, crate::branding::print_exit)
 }
 
-/// Prints the summary only once the terminal is known to be restored.
+/// Decides what to print and return once terminal restoration was attempted.
+///
+/// When restoration succeeded, the summary (if any) is handed to `print` and
+/// the run's outcome is returned unchanged. When it failed, nothing is
+/// printed; the restoration failure is returned instead, carrying the run's
+/// own failure (if any) and the summary on one plain line.
+///
+/// `print` is a callback rather than a direct call to
+/// [`crate::branding::print_exit`] so tests can observe whether — and how
+/// often — the card is printed without writing to stdout.
 pub fn conclude(
     exit: InteractiveExit,
     restoration: anyhow::Result<()>,
     print: impl FnOnce(&ExitSummary),
 ) -> anyhow::Result<()> {
     if let Err(restoration) = restoration {
-        // The terminal may still be in the alternate screen, where the card
-        // would be wiped or garble the shell; the summary rides in the error.
+        // The terminal may still be in the alternate screen or raw mode:
+        // printing the card there could wipe or garble the shell's layout.
+        // Carried in the error instead, it reaches stderr as one plain line
+        // that can be redirected and logged.
         let recorded = exit
             .summary
             .as_ref()
@@ -36,11 +54,8 @@ pub fn conclude(
             .unwrap_or_default();
         return Err(match exit.outcome {
             Ok(()) => restoration.context(format!("terminal restoration failed{recorded}")),
-            Err(original) => {
-                let message =
-                    format!("{original:#}; terminal restoration failed{recorded}: {restoration:#}");
-                original.context(message)
-            }
+            Err(original) => original
+                .context(format!("terminal restoration failed{recorded}: {restoration:#}")),
         });
     }
     if let Some(summary) = &exit.summary {
@@ -90,6 +105,7 @@ mod tests {
         assert!(message.contains("cleanup failed"), "{message}");
         assert!(message.contains("terminal restoration failed"), "{message}");
         assert!(message.contains("console gone"), "{message}");
+        assert_eq!(message.matches("cleanup failed").count(), 1, "no repeated cause: {message}");
         assert!(message.contains("s1"), "the known session must stay findable: {message}");
 
         let error = conclude(exit(Ok(())), Err(anyhow::anyhow!("console gone")), |_| {

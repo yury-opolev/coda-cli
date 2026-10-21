@@ -136,7 +136,8 @@ case the resume command is labelled as a known session whose latest changes
 may not have been saved. If terminal restoration itself fails, no summary card
 is printed; the error reports the restoration failure, any cleanup failure, and
 the summary on one plain line (duration, messages, provider/model, token
-totals, session id or "not saved", and working directory). Startup failures before the session runs print no summary.
+totals, session id or "not saved", and working directory). Startup failures
+before the session runs print no summary.
 
 Diagnostics distinguish `shutdown_start`, timed `shutdown_phase` records
 (authentication, RPC, integrations, writer/process, cleanup, and restoration),
@@ -160,7 +161,8 @@ console modes before/after, an executed next-shell command, observed owned-child
 exit, feedback within 100 ms, healthy shutdown below 500 ms, and a session
 summary with a resume reference after the alternate screen is left. It reports
 nearest-rank p95 and checks that hung integrations fail explicitly without
-multiplying budgets or losing the summary. It neither installs Coda nor uses the user's credentials.
+multiplying budgets or losing the summary. It neither installs Coda nor uses
+the user's credentials.
 
 ## Design notes
 

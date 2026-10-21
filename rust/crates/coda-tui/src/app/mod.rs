@@ -295,9 +295,9 @@ pub struct App {
 
 
 impl App {
-    /// Runs until the user quits or the engine disconnects.
-    /// Runs the UI loop, returning the summary the caller prints on exit
-    /// alongside the run's outcome — the summary survives a failed cleanup.
+    /// Runs the UI loop until the user quits or the engine disconnects,
+    /// returning the summary the caller prints on exit alongside the run's
+    /// outcome — the summary survives a failed cleanup.
     ///
     /// The summary is produced here rather than by the caller because the loop
     /// consumes `self`: usage and session id are only final once it returns.
@@ -348,13 +348,15 @@ impl App {
         let deadline = tokio::time::Instant::now() + self.shutdown_grace;
         let close_result = self.close_out(deadline).await;
         let stop_result = self.stop_owned_engines(deadline).await;
+        // Only a failed cleanup leaves the save unconfirmed; a run that failed
+        // on its own but shut down cleanly still saved its session.
+        let cleanup_failed = close_result.is_err() || stop_result.is_err();
         let outcome = shutdown::combine(outcome, close_result);
         let outcome = shutdown::combine(outcome, stop_result);
-        // Built whether or not cleanup succeeded: usage and the session id
-        // are worth reporting either way, and a failure only means the save
-        // cannot be confirmed — the error itself is still returned.
+        // Built whether or not anything failed: usage and the session id are
+        // worth reporting either way, and the error itself is still returned.
         let mut summary = self.exit_summary(started_at.elapsed());
-        summary.persistence_unconfirmed = outcome.is_err();
+        summary.persistence_unconfirmed = cleanup_failed;
         crate::exit::InteractiveExit { summary: Some(summary), outcome }
     }
 
