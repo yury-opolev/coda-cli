@@ -81,12 +81,7 @@ async fn run(cli: Cli, diagnostics: coda_diagnostics::DiagnosticContext, engine_
     let started_at = std::time::Instant::now();
     let mut guard = TerminalGuard::enter(!cli.no_mouse).context("failed to set up the terminal")?;
 
-    let result = app.run(&mut guard, inbound, engine, started_at).await;
+    let exit = app.run(&mut guard, inbound, engine, started_at).await;
 
-    let result = guard.finish(result);
-    if let Ok(summary) = &result {
-        coda_tui::branding::print_exit(summary);
-    }
-
-    result.map(|_| ())
+    coda_tui::exit::finish_interactive(guard, exit)
 }

@@ -11,6 +11,7 @@ use ratatui::layout::{Alignment, Rect};
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 
+use crate::exit::InteractiveExit;
 use crate::render::glyphs;
 use crate::terminal::TerminalGuard;
 use coda_render::theme::{Role, Theme};
@@ -26,11 +27,11 @@ pub(super) fn combine<T>(outcome: Result<T>, cleanup: Result<()>) -> Result<T> {
     }
 }
 
-pub(super) async fn feedback<T>(
-    cleanup: impl Future<Output = Result<T>>,
+pub(super) async fn feedback(
+    cleanup: impl Future<Output = InteractiveExit>,
     guard: &mut TerminalGuard,
     theme: &Theme,
-) -> Result<T> {
+) -> InteractiveExit {
     let events = futures::stream::unfold((), |_| async {
         Some((crate::terminal::read_event().await, ()))
     })
@@ -62,11 +63,11 @@ pub(super) async fn feedback<T>(
     .await
 }
 
-async fn drive<T>(
-    cleanup: impl Future<Output = Result<T>>,
+async fn drive(
+    cleanup: impl Future<Output = InteractiveExit>,
     mut events: impl Stream<Item = io::Result<Event>> + Unpin,
     mut draw: impl FnMut(usize, bool) -> io::Result<()>,
-) -> Result<T> {
+) -> InteractiveExit {
     let started = std::time::Instant::now();
     coda_diagnostics::record(coda_diagnostics::Event::ShutdownStart);
     let mut feedback_error = draw(0, false).context("shutdown rendering failed").err();
@@ -79,13 +80,14 @@ async fn drive<T>(
     tokio::pin!(cleanup);
     loop {
         tokio::select! {
-            result = &mut cleanup => {
+            mut exit = &mut cleanup => {
                 coda_diagnostics::record(coda_diagnostics::Event::ShutdownPhase {
                     phase: "cleanup",
                     duration_ms: started.elapsed().as_millis() as u64,
-                    outcome: if result.is_ok() { "completed" } else { "failed" },
+                    outcome: if exit.outcome.is_ok() { "completed" } else { "failed" },
                 });
-                return combine(result, feedback_error.map_or(Ok(()), Err));
+                exit.outcome = combine(exit.outcome, feedback_error.map_or(Ok(()), Err));
+                return exit;
             }
             event = events.next(), if input_open => match event {
                 Some(Ok(Event::Key(key))) if key.kind != KeyEventKind::Release
@@ -115,6 +117,7 @@ async fn drive<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::branding::ExitSummary;
     use crossterm::event::KeyEvent;
 
     #[tokio::test]
@@ -132,8 +135,13 @@ mod tests {
                 KeyModifiers::CONTROL,
             ))),
         ]);
-        let cleanup = async { rx.await.context("cleanup was abandoned") };
-        let result = tokio::time::timeout(
+        let cleanup = async {
+            InteractiveExit {
+                summary: Some(ExitSummary::default()),
+                outcome: rx.await.context("cleanup was abandoned"),
+            }
+        };
+        let exit = tokio::time::timeout(
             Duration::from_secs(2),
             drive(cleanup, input, |frame, ack| {
                 frames.push((frame, ack));
@@ -145,7 +153,8 @@ mod tests {
         )
         .await
         .expect("shutdown must finish");
-        result.expect("cleanup");
+        exit.outcome.expect("cleanup");
+        assert!(exit.summary.is_some());
         assert_eq!(frames[0], (0, false), "feedback precedes cleanup polling");
         assert_eq!(frames.last(), Some(&(3, true)));
     }
@@ -153,19 +162,41 @@ mod tests {
     #[tokio::test]
     async fn a_render_failure_does_not_abandon_cleanup_or_hide_its_original_error() {
         let completed = std::cell::Cell::new(false);
-        let result: Result<()> = drive(
+        let exit = drive(
             async {
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 completed.set(true);
-                Err(anyhow::anyhow!("original application failure"))
+                InteractiveExit {
+                    summary: Some(ExitSummary {
+                        session_id: Some("s1".into()),
+                        ..Default::default()
+                    }),
+                    outcome: Err(anyhow::anyhow!("original application failure")),
+                }
             },
             futures::stream::pending(),
             |_, _| Err(io::Error::other("draw failed")),
         )
         .await;
         assert!(completed.get());
-        let message = result.unwrap_err().to_string();
+        let message = exit.outcome.unwrap_err().to_string();
         assert!(message.contains("original application failure"));
         assert!(message.contains("draw failed"));
+        assert_eq!(exit.summary.and_then(|s| s.session_id).as_deref(), Some("s1"));
+    }
+
+    #[tokio::test]
+    async fn a_render_failure_after_clean_cleanup_is_reported_but_keeps_the_summary() {
+        let exit = drive(
+            async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                InteractiveExit { summary: Some(ExitSummary::default()), outcome: Ok(()) }
+            },
+            futures::stream::pending(),
+            |_, _| Err(io::Error::other("draw failed")),
+        )
+        .await;
+        assert!(exit.summary.is_some());
+        assert!(format!("{:#}", exit.outcome.unwrap_err()).contains("draw failed"));
     }
 }

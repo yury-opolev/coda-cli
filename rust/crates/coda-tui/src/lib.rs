@@ -10,6 +10,7 @@ pub mod composer;
 pub mod config;
 pub mod coverage;
 pub mod diagnostics;
+pub mod exit;
 pub mod hint;
 pub mod keymap;
 pub mod local;

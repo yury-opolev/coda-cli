@@ -296,7 +296,8 @@ pub struct App {
 
 impl App {
     /// Runs until the user quits or the engine disconnects.
-    /// Runs the UI loop, returning the summary the caller prints on exit.
+    /// Runs the UI loop, returning the summary the caller prints on exit
+    /// alongside the run's outcome — the summary survives a failed cleanup.
     ///
     /// The summary is produced here rather than by the caller because the loop
     /// consumes `self`: usage and session id are only final once it returns.
@@ -319,7 +320,7 @@ impl App {
         inbound: mpsc::UnboundedReceiver<Inbound>,
         engine: Engine,
         started_at: std::time::Instant,
-    ) -> Result<crate::branding::ExitSummary> {
+    ) -> crate::exit::InteractiveExit {
         // One owner for the original and for every replacement after it.
         self.owned_engine = Some(engine);
         let outcome = self.event_loop(guard, inbound).await;
@@ -336,21 +337,25 @@ impl App {
     /// failing ones: the engine's outstanding requests are answered or
     /// discarded *before* anything is dropped, then every process this
     /// application owns is asked to stop and awaited, and only then is the
-    /// run's own outcome propagated. Bound to that order rather than to
-    /// `?`-propagation, so a failing run still stops its engines instead of
-    /// leaking them.
+    /// run's own outcome reported, next to a summary that is built either way.
+    /// Bound to that order rather than to `?`-propagation, so a failing run
+    /// still stops its engines instead of leaking them.
     pub(crate) async fn finish(
         &mut self,
         outcome: Result<()>,
         started_at: std::time::Instant,
-    ) -> Result<crate::branding::ExitSummary> {
+    ) -> crate::exit::InteractiveExit {
         let deadline = tokio::time::Instant::now() + self.shutdown_grace;
         let close_result = self.close_out(deadline).await;
         let stop_result = self.stop_owned_engines(deadline).await;
         let outcome = shutdown::combine(outcome, close_result);
         let outcome = shutdown::combine(outcome, stop_result);
-        outcome?;
-        Ok(self.exit_summary(started_at.elapsed()))
+        // Built whether or not cleanup succeeded: usage and the session id
+        // are worth reporting either way, and a failure only means the save
+        // cannot be confirmed — the error itself is still returned.
+        let mut summary = self.exit_summary(started_at.elapsed());
+        summary.persistence_unconfirmed = outcome.is_err();
+        crate::exit::InteractiveExit { summary: Some(summary), outcome }
     }
 
     async fn event_loop(

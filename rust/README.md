@@ -127,8 +127,15 @@ are errors rather than success-shaped fallbacks.
 Console input polling stays on the owning task, with no detached event reader
 left competing with the returned shell. Restoration attempts mouse, focus,
 bracketed-paste, alternate-screen, cursor, raw-mode, and flush cleanup even if
-an earlier step fails. The success summary is printed only after explicit
-terminal restoration succeeds.
+an earlier step fails. The session summary (usage totals and the resume
+command) is printed only after explicit terminal restoration succeeds, so it
+lands in the normal scrollback rather than the alternate screen. It is printed
+even when shutdown cleanup fails — a hung MCP integration, a failed shutdown
+RPC — followed by the explicit error on stderr and a nonzero exit code; in that
+case the resume command is labelled as a known session whose latest changes
+may not have been saved. If terminal restoration itself fails, no summary card
+is printed; the error reports the restoration failure, any cleanup failure, and
+the known session id. Startup failures before the session runs print no summary.
 
 Diagnostics distinguish `shutdown_start`, timed `shutdown_phase` records
 (authentication, RPC, integrations, writer/process, cleanup, and restoration),
@@ -149,9 +156,10 @@ python scripts\test-windows-shutdown.py .\rust\target\debug\coda.exe --runs 1 --
 
 The probe uses isolated configuration and fixture credentials, an actual ConPTY,
 console modes before/after, an executed next-shell command, observed owned-child
-exit, feedback within 100 ms, and healthy shutdown below 500 ms. It reports
+exit, feedback within 100 ms, healthy shutdown below 500 ms, and a session
+summary with a resume reference after the alternate screen is left. It reports
 nearest-rank p95 and checks that hung integrations fail explicitly without
-multiplying budgets. It neither installs Coda nor uses the user's credentials.
+multiplying budgets or losing the summary. It neither installs Coda nor uses the user's credentials.
 
 ## Design notes
 

@@ -586,21 +586,14 @@ async fn run_interactive(
     let started_at = std::time::Instant::now();
     let mut guard = TerminalGuard::enter(!args.no_mouse).context("failed to set up the terminal")?;
 
-    let result = app.run(&mut guard, inbound, engine_process, started_at).await;
+    let exit = app.run(&mut guard, inbound, engine_process, started_at).await;
 
-    // Cleanup has finished and no input reader survives the loop.
-    let result = guard.finish(result);
-
-    // The summary is written after the alternate screen is released, so it
-    // survives in the scrollback. It reports what the session cost and how to
-    // get back to it — both lost entirely if it is skipped.
-    match &result {
-        Ok(summary) => coda_tui::branding::print_exit(summary),
-        // A failed run has no meaningful summary; the error is the message.
-        Err(_) => {}
-    }
-
-    result.map(|_| ())
+    // Cleanup has finished and no input reader survives the loop. The summary
+    // is written after the alternate screen is released, so it survives in
+    // the scrollback: it reports what the session cost and how to get back to
+    // it — even when cleanup failed, in which case the error still follows on
+    // stderr and the process exits nonzero.
+    coda_tui::exit::finish_interactive(guard, exit)
 }
 
 /// Runs a single task without a terminal UI and returns the process exit code.

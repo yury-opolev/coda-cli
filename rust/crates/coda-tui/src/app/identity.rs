@@ -97,6 +97,7 @@ impl App {
             session_id: self.state.session_id.clone(),
             working_directory: self.paths.project_root.to_string_lossy().into_owned(),
             settings_host: snapshot.settings_host,
+            persistence_unconfirmed: false,
         }
     }
 }
