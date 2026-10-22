@@ -77,6 +77,36 @@ at a specific build with `CODA_ENGINE`:
 $env:CODA_ENGINE = "C:\path\to\coda.exe"; cargo test -p coda-tui --test engine_contract
 ```
 
+### Build disk usage
+
+Development builds keep only line-table debug information and disable the
+incremental compiler cache. Tests inherit these settings from the `dev` profile.
+File/line backtraces remain available, but inspecting local variables in a
+debugger requires full debug information. Rebuilding changed crates may take
+longer; release settings are unchanged.
+
+For a debugging session, opt back into full symbols and incremental compilation
+for one command (Cargo configuration and environment overrides take precedence
+over the workspace defaults):
+
+```powershell
+cargo --config profile.dev.debug=2 --config profile.dev.incremental=true test -p coda-proto
+```
+
+Old artifacts are not removed when profiles change. Periodically, for example
+weekly or after large branch/toolchain changes, stop builds, tests, and programs
+running from this workspace's `target` directory, then run from `rust`:
+
+```powershell
+cargo clean --target-dir .\target --dry-run
+cargo clean --target-dir .\target
+```
+
+This removes all generated profiles in that directory, not source files,
+installed tools, or downloaded dependencies. The next build regenerates what it
+needs. For a custom target directory, substitute its explicit path; clean
+obsolete worktrees' build artifacts from their own Rust workspace as well.
+
 ## Running
 
 ```powershell

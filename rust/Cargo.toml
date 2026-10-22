@@ -87,6 +87,10 @@ tempfile = "3"
 insta = { version = "1", features = ["yaml"] }
 pretty_assertions = "1"
 
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
 [profile.release]
 opt-level = 3
 lto = "thin"
