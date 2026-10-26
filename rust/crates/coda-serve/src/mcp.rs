@@ -28,7 +28,9 @@ use coda_tool::Tool;
 
 /// Everything the host needs to wire MCP into a session.
 pub(crate) struct McpBundle {
-    /// Deferred MCP tools plus the management tools, ready for the registry.
+    /// The management tools (`restart_mcp_server` …) for the registry. The
+    /// `mcp__…` tools are deliberately absent: they are resolved live through
+    /// the manager's tool source so they follow restarts.
     pub tools: Vec<Arc<dyn Tool>>,
     /// The live manager, retained for `tools/call` routing and shutdown.
     pub manager: Option<Arc<McpClientManager>>,
@@ -153,8 +155,7 @@ pub(crate) async fn connect_mcp_with_store(
     let mut errors = manager.connect_many(stdio, None).await;
     errors.extend(manager.connect_http_many(http, None, Some(Arc::clone(&store))).await);
 
-    let mut tools = manager.tools().await;
-    tools.extend(coda_mcp::management_tools::mcp_management_tools(Arc::clone(&manager)));
+    let tools = coda_mcp::management_tools::mcp_management_tools(Arc::clone(&manager));
 
     let connect_notices = errors.into_iter().map(|e| {
         format!(

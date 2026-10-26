@@ -22,8 +22,14 @@
 //! |---|---|---|
 //! | enabled | has a client | `enabled` + `connected` |
 //! | enabled | no client | `enabled` + `notConnected` (failed, or added after startup) |
+//! | enabled | no client | `enabled` + `notConnected` (failed, or added after startup); `lastError` when the manager recorded a fault |
 //! | disabled / shadowed | — | `disabled`/`shadowed` + `notAttempted` |
 //! | — | has a client | still `connected` (deleted from the file after startup) |
+//!
+//! `lastError` is only ever set on an enabled, unshadowed, not-connected
+//! server, and is run through [`sanitise_error`] first: URLs in it lose
+//! userinfo/query/fragment, control characters are flattened and the length is
+//! capped.
 //!
 //! With MCP switched off for the process there is no manager at all, so every
 //! runtime status is `unknown` and `toolCount` is omitted — never a
@@ -32,8 +38,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use coda_mcp::McpServerStatus;
 use coda_mcp::config::{McpRawServer, McpScope};
+use coda_mcp::{McpServerFault, McpServerStatus};
 use coda_proto::mcp::{
     McpConfiguredState, McpListResult, McpRuntimeStatus, McpSecretRefDto, McpServerDto,
     sanitise_url,
@@ -43,14 +49,19 @@ use coda_proto::mcp::{
 /// than a literal (`coda-tui/src/config.rs`).
 const SECRET_PREFIX: &str = "coda-secret:";
 
+/// Longest `lastError` published, in characters, before the ellipsis.
+const MAX_ERROR_CHARS: usize = 200;
+
 /// Builds the wire inventory from the file layer plus whatever the running
 /// manager knows.
 ///
 /// `runtime` is `None` when there is no manager (MCP disabled for this
-/// process, or no server ever connected).
+/// process, or no server ever connected). `faults` are the manager's recorded
+/// connection failures.
 pub fn build(
     configured: &[McpRawServer],
     runtime: Option<&[McpServerStatus]>,
+    faults: &[McpServerFault],
     mcp_enabled: bool,
 ) -> McpListResult {
     // Project entries shadow user entries of the same name (`load_all` sorts
@@ -92,6 +103,11 @@ pub fn build(
                 (Some(_), None, _) => McpRuntimeStatus::NotAttempted,
             };
 
+            let last_error = (runtime_status == McpRuntimeStatus::NotConnected)
+                .then(|| faults.iter().find(|f| f.name == raw.name))
+                .flatten()
+                .map(|f| sanitise_error(&f.last_error));
+
             McpServerDto {
                 name: raw.name.clone(),
                 scope: raw.scope.label().to_string(),
@@ -103,6 +119,7 @@ pub fn build(
                 tool_count: live.map(|s| s.tool_count as i64),
                 env_var_names: sorted_names(raw.env.keys()),
                 secret_refs: secret_refs(raw),
+                last_error,
             }
         })
         .collect();
@@ -127,11 +144,35 @@ pub fn build(
             tool_count: Some(status.tool_count as i64),
             env_var_names: Vec::new(),
             secret_refs: Vec::new(),
+            last_error: None,
         });
     }
 
     servers.sort_by(|a, b| (&a.scope, &a.name).cmp(&(&b.scope, &b.name)));
     McpListResult { servers, enabled: mcp_enabled, manager_available: runtime.is_some() }
+}
+
+/// Makes a connection error safe to publish: URLs are reduced to scheme + host
+/// + path, control characters become spaces, whitespace is collapsed and the
+/// length capped.
+fn sanitise_error(raw: &str) -> String {
+    const TRAILING: &[char] = &[',', '.', ';', ')', '\'', '"'];
+    let flat: String = raw.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let cleaned = flat
+        .split_whitespace()
+        .map(|token| {
+            if !token.contains("://") {
+                return token.to_string();
+            }
+            let core = token.trim_end_matches(TRAILING);
+            format!("{}{}", sanitise_url(core), &token[core.len()..])
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    match cleaned.char_indices().nth(MAX_ERROR_CHARS) {
+        Some((end, _)) => format!("{}…", &cleaned[..end]),
+        None => cleaned,
+    }
 }
 
 /// A display label that cannot leak a credential.
@@ -226,7 +267,7 @@ mod tests {
         let mut server = raw("fs", McpScope::Project);
         server.env = env;
 
-        let result = build(&[server], None, true);
+        let result = build(&[server], None, &[], true);
         let dto = find(&result, "fs");
         assert_eq!(dto.secret_refs.len(), 1);
         assert_eq!(dto.secret_refs[0].name, "API_TOKEN");
@@ -247,7 +288,7 @@ mod tests {
 
     #[test]
     fn a_command_argument_carrying_a_token_is_never_echoed() {
-        let result = build(&[raw("fs", McpScope::Project)], None, true);
+        let result = build(&[raw("fs", McpScope::Project)], None, &[], true);
         let json = serde_json::to_string(&result).unwrap();
         assert!(!json.contains("SUPER-SECRET"), "SECURITY: arguments must not be echoed: {json}");
         assert_eq!(find(&result, "fs").target_display, "mcp-server-filesystem");
@@ -258,6 +299,7 @@ mod tests {
         let result = build(
             &[http("remote", "https://bot:hunter2@mcp.example.com/sse?apiKey=LEAKED#frag")],
             None,
+            &[],
             true,
         );
         let json = serde_json::to_string(&result).unwrap();
@@ -271,7 +313,7 @@ mod tests {
         let mut server = raw("fs", McpScope::User);
         server.env.insert("API_TOKEN".into(), "tok_live_DO_NOT_LEAK".into());
         server.env.insert("PLAIN".into(), "hello".into());
-        let result = build(&[server], None, true);
+        let result = build(&[server], None, &[], true);
         let json = serde_json::to_string(&result).unwrap();
         assert!(!json.contains("tok_live_DO_NOT_LEAK"), "SECURITY: {json}");
         assert!(!json.contains("hello"), "SECURITY: even a benign-looking env value is not ours to publish: {json}");
@@ -282,7 +324,7 @@ mod tests {
     fn a_secret_reference_reports_its_variable_name_never_its_storage_target() {
         let mut server = raw("fs", McpScope::User);
         server.env.insert("API_TOKEN".into(), "coda-secret:mcp/fs/token".into());
-        let result = build(&[server], None, true);
+        let result = build(&[server], None, &[], true);
         let json = serde_json::to_string(&result).unwrap();
         assert!(!json.contains("mcp/fs/token"), "SECURITY: the keyring locator is not a label: {json}");
         assert_eq!(
@@ -295,7 +337,7 @@ mod tests {
     fn a_command_with_a_home_directory_path_reports_only_its_file_name() {
         let mut server = raw("fs", McpScope::User);
         server.command = Some("/home/alice/.local/bin/mcp-fs".into());
-        let result = build(&[server], None, true);
+        let result = build(&[server], None, &[], true);
         assert_eq!(find(&result, "fs").target_display, "mcp-fs");
     }
 
@@ -303,7 +345,7 @@ mod tests {
 
     #[test]
     fn an_enabled_server_the_manager_never_started_is_not_connected_not_unknown() {
-        let result = build(&[raw("fs", McpScope::User)], Some(&[]), true);
+        let result = build(&[raw("fs", McpScope::User)], Some(&[]), &[], true);
         let dto = find(&result, "fs");
         assert_eq!(dto.configured, McpConfiguredState::Enabled);
         assert_eq!(dto.runtime_status, McpRuntimeStatus::NotConnected);
@@ -313,7 +355,7 @@ mod tests {
     #[test]
     fn a_connected_server_reports_its_real_tool_count() {
         let runtime = vec![McpServerStatus { name: "fs".into(), tool_count: 5 }];
-        let result = build(&[raw("fs", McpScope::User)], Some(&runtime), true);
+        let result = build(&[raw("fs", McpScope::User)], Some(&runtime), &[], true);
         let dto = find(&result, "fs");
         assert_eq!(dto.runtime_status, McpRuntimeStatus::Connected);
         assert_eq!(dto.tool_count, Some(5));
@@ -321,7 +363,7 @@ mod tests {
 
     #[test]
     fn with_no_manager_every_runtime_status_is_unknown() {
-        let result = build(&[raw("fs", McpScope::User)], None, false);
+        let result = build(&[raw("fs", McpScope::User)], None, &[], false);
         assert_eq!(find(&result, "fs").runtime_status, McpRuntimeStatus::Unknown);
         assert!(find(&result, "fs").tool_count.is_none());
         assert!(!result.manager_available);
@@ -332,7 +374,7 @@ mod tests {
     fn a_disabled_server_is_listed_as_disabled_and_never_attempted() {
         let mut server = raw("fs", McpScope::User);
         server.disabled = true;
-        let result = build(&[server], Some(&[]), true);
+        let result = build(&[server], Some(&[]), &[], true);
         let dto = find(&result, "fs");
         assert_eq!(dto.configured, McpConfiguredState::Disabled);
         assert_eq!(dto.runtime_status, McpRuntimeStatus::NotAttempted);
@@ -344,6 +386,7 @@ mod tests {
         let result = build(
             &[raw("fs", McpScope::User), raw("fs", McpScope::Project)],
             Some(&runtime),
+            &[],
             true,
         );
         let user = result
@@ -370,7 +413,7 @@ mod tests {
     #[test]
     fn a_server_deleted_from_the_file_after_startup_is_still_reported_as_running() {
         let runtime = vec![McpServerStatus { name: "ghost".into(), tool_count: 2 }];
-        let result = build(&[], Some(&runtime), true);
+        let result = build(&[], Some(&runtime), &[], true);
         let dto = find(&result, "ghost");
         assert_eq!(dto.runtime_status, McpRuntimeStatus::Connected);
         assert_eq!(dto.tool_count, Some(2));
@@ -379,9 +422,62 @@ mod tests {
 
     #[test]
     fn no_configured_servers_and_no_manager_is_an_honest_empty_list() {
-        let result = build(&[], None, true);
+        let result = build(&[], None, &[], true);
         assert!(result.servers.is_empty());
         assert!(result.enabled);
         assert!(!result.manager_available);
+    }
+
+    fn fault(name: &str, error: &str) -> McpServerFault {
+        McpServerFault { name: name.into(), last_error: error.into() }
+    }
+
+    #[test]
+    fn a_disconnected_server_reports_its_sanitised_last_error() {
+        let faults = [fault(
+            "fs",
+            "spawning failed\nsee https://u:p@h.example/x?token=SECRET, retry",
+        )];
+        let result = build(&[raw("fs", McpScope::User)], Some(&[]), &faults, true);
+        let error = find(&result, "fs").last_error.clone().expect("last error");
+        assert!(!error.contains("SECRET"), "SECURITY: {error}");
+        assert!(!error.contains("u:p"), "SECURITY: {error}");
+        assert!(!error.contains('\n'), "{error:?}");
+        assert!(error.contains("https://h.example/x"), "{error}");
+        assert!(error.contains("retry"), "{error}");
+    }
+
+    #[test]
+    fn a_long_last_error_is_capped() {
+        let faults = [fault("fs", &"é".repeat(500))];
+        let result = build(&[raw("fs", McpScope::User)], Some(&[]), &faults, true);
+        let error = find(&result, "fs").last_error.clone().expect("last error");
+        assert!(error.chars().count() <= 201, "{}", error.chars().count());
+        assert!(error.ends_with('…'));
+    }
+
+    #[test]
+    fn a_connected_server_has_no_last_error() {
+        let runtime = vec![McpServerStatus { name: "fs".into(), tool_count: 1 }];
+        let faults = [fault("fs", "stale failure"), fault("other", "boom")];
+        let result = build(&[raw("fs", McpScope::User)], Some(&runtime), &faults, true);
+        assert!(find(&result, "fs").last_error.is_none());
+        assert!(result.servers.iter().all(|s| s.last_error.is_none()));
+    }
+
+    #[test]
+    fn a_disabled_or_shadowed_server_never_shows_a_last_error() {
+        let mut off = raw("off", McpScope::User);
+        off.disabled = true;
+        let faults = [fault("off", "boom"), fault("fs", "boom")];
+        let result = build(
+            &[off, raw("fs", McpScope::User), raw("fs", McpScope::Project)],
+            Some(&[]),
+            &faults,
+            true,
+        );
+        let user_fs = result.servers.iter().find(|s| s.scope == "user" && s.name == "fs").unwrap();
+        assert!(find(&result, "off").last_error.is_none());
+        assert!(user_fs.last_error.is_none());
     }
 }

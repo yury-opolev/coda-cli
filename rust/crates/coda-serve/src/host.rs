@@ -1298,14 +1298,18 @@ impl ServeHost {
         let user_question = Arc::new(WireUserQuestion { channel: Arc::clone(&prompt_channel) });
         let plan_approver = Arc::new(WirePlanApprover { channel: Arc::clone(&prompt_channel) });
 
-        // Built-ins first, then MCP tools + management tools. The registry is
-        // last-write-wins on name collision; MCP names are `mcp__…`-prefixed so
-        // they cannot shadow a built-in. This same shared registry is handed to
-        // the subagent host, so subagents see the MCP tools too.
+        // Built-ins first, then the management tools. The registry is
+        // last-write-wins on name collision. MCP tools themselves are
+        // resolved live through the manager's tool source (so they follow
+        // restarts), and are `mcp__…`-prefixed so they cannot shadow a
+        // built-in. This same shared registry is handed to the subagent host,
+        // so subagents see the MCP tools too.
         let McpBundle { tools: mcp_tools, manager: mcp_manager, notices: mcp_notices } = mcp;
-        let tools = Arc::new(ToolRegistry::new(
-            built_in_tools().into_iter().chain(mcp_tools),
-        ));
+        let mut registry = ToolRegistry::new(built_in_tools().into_iter().chain(mcp_tools));
+        if let Some(manager) = &mcp_manager {
+            registry = registry.with_source(manager.tool_source());
+        }
+        let tools = Arc::new(registry);
 
         // Resolve startup model from the connected provider (Finding 3).
         let startup = crate::settings::resolve_for_provider(connected_provider);
@@ -4355,9 +4359,10 @@ impl ServeHost {
         match &self.mcp_manager {
             Some(manager) => {
                 let status = manager.connected_status().await;
-                crate::mcp_list::build(&configured, Some(&status), enabled)
+                let faults = manager.server_faults().await;
+                crate::mcp_list::build(&configured, Some(&status), &faults, enabled)
             }
-            None => crate::mcp_list::build(&configured, None, enabled),
+            None => crate::mcp_list::build(&configured, None, &[], enabled),
         }
     }
 
@@ -11840,8 +11845,7 @@ mod tests {
         }]);
         let handle = connect_fake_server(&manager, "fake-server", tools_json, result_text).await;
 
-        let mut tools = manager.tools().await;
-        tools.extend(coda_mcp::management_tools::mcp_management_tools(Arc::clone(&manager)));
+        let tools = coda_mcp::management_tools::mcp_management_tools(Arc::clone(&manager));
 
         let bundle = McpBundle {
             tools,
