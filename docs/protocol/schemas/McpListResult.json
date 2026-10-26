@@ -72,6 +72,13 @@
           "items": {
             "$ref": "#/$defs/McpSecretRefDto"
           }
+        },
+        "lastError": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Sanitised last connection error of a configured server that is not\nconnected. Never a secret."
         }
       },
       "required": [

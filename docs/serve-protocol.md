@@ -322,7 +322,8 @@ store, so `secretRefs[].resolved` is **omitted entirely**: the field is a tri-st
 absence means "this call did not determine it". Reporting `false` would assert as fact that the
 reference does not resolve, which is a different — and unverified — claim. Only a fact the
 engine already holds may ever populate it; a read must not probe an auth store or wake a keyring
-prompt to find out.
+prompt to find out. `lastError` is optional: the sanitised last connection error for an enabled
+server that is not connected; restart it via the agent's `restart_mcp_server` tool.
 
 **`config/describe` names the authority for open value sets.** Where the accepted values are
 provider- or model-dependent, the entry carries `allowedValuesFrom` — the RPC that owns the live

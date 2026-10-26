@@ -10,13 +10,18 @@
 //! regardless of `HashMap`'s internal ordering. On a name collision the value
 //! is updated in-place in the `Vec`, preserving the original slot position of
 //! the first occurrence (matching C# `Dictionary` behaviour).
+//!
+//! # Live sources
+//!
+//! A registry may also hold `ToolSource`s (e.g. MCP servers that reconnect).
+//! Their tools are queried on every lookup and never shadow static tools.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use coda_llm::ToolDefinition;
 
-use crate::tool::Tool;
+use crate::tool::{Tool, ToolSource};
 
 pub struct ToolRegistry {
     /// Name → index into `tools`.
@@ -24,6 +29,8 @@ pub struct ToolRegistry {
     /// Tools in first-insertion order; on collision the value at the existing
     /// index is replaced.
     tools: Vec<Arc<dyn Tool>>,
+    /// Live tool sets queried on every lookup, after the static tools.
+    sources: Vec<Arc<dyn ToolSource>>,
 }
 
 impl ToolRegistry {
@@ -32,11 +39,17 @@ impl ToolRegistry {
     /// If the same name appears more than once, the later tool wins but keeps
     /// its predecessor's slot in the ordering.
     pub fn new(tools: impl IntoIterator<Item = Arc<dyn Tool>>) -> Self {
-        let mut registry = Self { names: HashMap::new(), tools: Vec::new() };
+        let mut registry = Self { names: HashMap::new(), tools: Vec::new(), sources: Vec::new() };
         for tool in tools {
             registry.insert(tool);
         }
         registry
+    }
+
+    /// Attach a live tool source. Its tools never shadow static tools.
+    pub fn with_source(mut self, source: Arc<dyn ToolSource>) -> Self {
+        self.sources.push(source);
+        self
     }
 
     /// Insert a tool. If a tool with the same name already exists it is
@@ -52,28 +65,69 @@ impl ToolRegistry {
         }
     }
 
-    /// Look up a tool by its exact name.
+    /// Look up a tool by its exact name. Static tools win over source tools.
     pub fn resolve(&self, name: &str) -> Option<Arc<dyn Tool>> {
-        self.names.get(name).map(|&idx| Arc::clone(&self.tools[idx]))
+        if let Some(&idx) = self.names.get(name) {
+            return Some(Arc::clone(&self.tools[idx]));
+        }
+        self.sources
+            .iter()
+            .find_map(|source| source.tools().into_iter().find(|t| t.name() == name))
     }
 
-    /// All registered tools in first-insertion order.
-    pub fn all(&self) -> &[Arc<dyn Tool>] {
-        &self.tools
+    /// All tools: static ones in first-insertion order, then source tools whose
+    /// names are not already taken.
+    pub fn all(&self) -> Vec<Arc<dyn Tool>> {
+        let mut seen: HashSet<String> = self.names.keys().cloned().collect();
+        let mut all = self.tools.clone();
+        for source in &self.sources {
+            for tool in source.tools() {
+                if seen.insert(tool.name().to_owned()) {
+                    all.push(tool);
+                }
+            }
+        }
+        all
     }
 
-    /// Wire definitions for all tools, in first-insertion order.
+    /// Wire definitions for all tools, in `all()` order.
     pub fn definitions(&self) -> Vec<ToolDefinition> {
-        self.tools.iter().map(|t| t.to_definition()).collect()
+        self.all().iter().map(|t| t.to_definition()).collect()
     }
 
-    /// A new registry containing only the read-only tools, preserving their
-    /// relative order from this registry.
+    /// A new static registry containing a snapshot of the read-only tools,
+    /// preserving their relative order from this registry.
     pub fn read_only(&self) -> Self {
-        Self::new(self.tools.iter().filter(|t| t.is_read_only()).cloned())
+        Self::new(self.all().into_iter().filter(|t| t.is_read_only()))
+    }
+
+    /// A new registry keeping only the tools `keep` accepts. Static tools are
+    /// filtered now; source tools are filtered lazily on every query.
+    pub fn filtered(&self, keep: impl Fn(&dyn Tool) -> bool + Send + Sync + 'static) -> Self {
+        let keep: Arc<dyn Fn(&dyn Tool) -> bool + Send + Sync> = Arc::new(keep);
+        let mut registry = Self::new(self.tools.iter().filter(|t| keep(t.as_ref())).cloned());
+        registry.sources = self
+            .sources
+            .iter()
+            .map(|source| {
+                Arc::new(FilteredSource { inner: Arc::clone(source), keep: Arc::clone(&keep) })
+                    as Arc<dyn ToolSource>
+            })
+            .collect();
+        registry
     }
 }
 
+struct FilteredSource {
+    inner: Arc<dyn ToolSource>,
+    keep: Arc<dyn Fn(&dyn Tool) -> bool + Send + Sync>,
+}
+
+impl ToolSource for FilteredSource {
+    fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        self.inner.tools().into_iter().filter(|t| (self.keep)(t.as_ref())).collect()
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,5 +231,61 @@ mod tests {
         assert_eq!(defs.len(), 2);
         assert_eq!(defs[0].name, "a");
         assert_eq!(defs[1].name, "b");
+    }
+
+    struct VecSource(std::sync::Mutex<Vec<Arc<dyn Tool>>>);
+
+    impl ToolSource for VecSource {
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    fn source(tools: Vec<Arc<dyn Tool>>) -> Arc<VecSource> {
+        Arc::new(VecSource(std::sync::Mutex::new(tools)))
+    }
+
+    #[test]
+    fn a_source_tool_resolves_and_appears_in_all_and_definitions() {
+        let reg = ToolRegistry::new([tool("a", false)])
+            .with_source(source(vec![tool("live", true)]));
+        assert!(reg.resolve("live").is_some());
+        let names: Vec<_> = reg.all().iter().map(|t| t.name().to_owned()).collect();
+        assert_eq!(names, ["a", "live"]);
+        let defs: Vec<_> = reg.definitions().into_iter().map(|d| d.name).collect();
+        assert_eq!(defs, ["a", "live"]);
+    }
+
+    #[test]
+    fn a_static_tool_shadows_a_source_tool_of_the_same_name() {
+        let reg = ToolRegistry::new([tool("dup", true)])
+            .with_source(source(vec![tool("dup", false)]));
+        assert!(reg.resolve("dup").unwrap().is_read_only());
+        assert_eq!(reg.all().len(), 1);
+    }
+
+    #[test]
+    fn source_changes_are_visible_without_rebuilding() {
+        let src = source(vec![tool("one", false)]);
+        let reg = ToolRegistry::new([]).with_source(src.clone());
+        assert!(reg.resolve("two").is_none());
+        *src.0.lock().unwrap() = vec![tool("two", false)];
+        assert!(reg.resolve("one").is_none());
+        assert!(reg.resolve("two").is_some());
+        assert_eq!(reg.definitions().len(), 1);
+    }
+
+    #[test]
+    fn filtered_applies_to_source_tools_lazily() {
+        let src = source(vec![tool("ro1", true), tool("rw1", false)]);
+        let reg = ToolRegistry::new([tool("s_ro", true), tool("s_rw", false)])
+            .with_source(src.clone());
+        let ro = reg.filtered(|t| t.is_read_only());
+        let names = |r: &ToolRegistry| -> Vec<String> {
+            r.all().iter().map(|t| t.name().to_owned()).collect()
+        };
+        assert_eq!(names(&ro), ["s_ro", "ro1"]);
+        *src.0.lock().unwrap() = vec![tool("rw2", false), tool("ro2", true)];
+        assert_eq!(names(&ro), ["s_ro", "ro2"]);
     }
 }

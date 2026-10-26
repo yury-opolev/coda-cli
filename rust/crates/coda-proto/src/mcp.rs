@@ -100,6 +100,10 @@ pub struct McpServerDto {
     pub env_var_names: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secret_refs: Vec<McpSecretRefDto>,
+    /// Sanitised last connection error of a configured server that is not
+    /// connected. Never a secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -181,7 +185,8 @@ mod tests {
             tool_count: Some(4),
             env_var_names: vec!["API_TOKEN".into()],
             secret_refs: vec![McpSecretRefDto { name: "API_TOKEN".into(), resolved: Some(true) }],
-        };
+                        last_error: Some("connection refused".into()),
+                    };
         let v = serde_json::to_value(&dto).unwrap();
         let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
         keys.sort_unstable();
@@ -190,6 +195,7 @@ mod tests {
             vec![
                 "configured",
                 "envVarNames",
+                "lastError",
                 "name",
                 "runtimeStatus",
                 "scope",
@@ -218,9 +224,11 @@ mod tests {
             tool_count: None,
             env_var_names: Vec::new(),
             secret_refs: Vec::new(),
+            last_error: None,
         };
         let v = serde_json::to_value(&dto).unwrap();
         assert!(v.get("toolCount").is_none());
+        assert!(v.get("lastError").is_none());
         assert_eq!(v["runtimeStatus"], "notAttempted");
     }
 }

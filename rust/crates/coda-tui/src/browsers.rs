@@ -437,11 +437,14 @@ pub fn mcp_from_engine(result: &coda_proto::mcp::McpListResult) -> Browser {
             .servers
             .iter()
             .map(|server| {
-                let runtime = match server.runtime_status {
-                    McpRuntimeStatus::Connected => "connected",
-                    McpRuntimeStatus::NotConnected => "not connected",
-                    McpRuntimeStatus::NotAttempted => "not started",
-                    McpRuntimeStatus::Unknown => "unknown",
+                let runtime = match (&server.runtime_status, &server.last_error) {
+                    (McpRuntimeStatus::NotConnected, Some(error)) => {
+                        format!("disconnected (last error: {error})")
+                    }
+                    (McpRuntimeStatus::Connected, _) => "connected".to_string(),
+                    (McpRuntimeStatus::NotConnected, None) => "not connected".to_string(),
+                    (McpRuntimeStatus::NotAttempted, _) => "not started".to_string(),
+                    (McpRuntimeStatus::Unknown, _) => "unknown".to_string(),
                 };
                 let configured = match server.configured {
                     McpConfiguredState::Enabled => "enabled",
@@ -461,6 +464,14 @@ pub fn mcp_from_engine(result: &coda_proto::mcp::McpListResult) -> Browser {
                     // "Not known" is not "none"; the engine says so and this
                     // must not flatten it into a confident zero.
                     None => detail.push("tools      unknown".to_string()),
+                }
+                if server.configured == McpConfiguredState::Enabled
+                    && server.runtime_status == McpRuntimeStatus::NotConnected
+                {
+                    detail.push(format!(
+                        "restart    ask the agent to run restart_mcp_server for '{}'",
+                        server.name
+                    ));
                 }
                 if !server.env_var_names.is_empty() {
                     // Names only: values routinely hold tokens.
@@ -1236,10 +1247,11 @@ mod tests {
                 tool_count: None,
                 env_var_names: vec!["TOKEN_NAME".into()],
                 secret_refs: vec![McpSecretRefDto { name: "TOKEN_NAME".into(), resolved: None }],
-            }],
-        };
+                                last_error: None,
+                            }],
+                        };
 
-        let browser = mcp_from_engine(&result);
+                        let browser = mcp_from_engine(&result);
         // Not silently disabled: the surface exists, and says who owns it.
         assert!(browser.footer().contains("managed on the engine host"), "{:?}", browser.footer());
         // And offers no editing keys that would write the wrong machine's files.
@@ -1260,6 +1272,44 @@ mod tests {
             "an unverified reference must not claim to be unresolved: {joined}"
         );
         assert!(!joined.contains("coda-secret:"), "a secret target reached the UI");
+    }
+
+    #[test]
+    fn a_disconnected_mcp_server_shows_its_last_error_and_how_to_restart_it() {
+        use coda_proto::mcp::{McpConfiguredState, McpListResult, McpRuntimeStatus, McpServerDto};
+
+        let dto = |name: &str, status, last_error: Option<&str>| McpServerDto {
+            name: name.into(),
+            scope: "user".into(),
+            transport: "stdio".into(),
+            target_kind: "command".into(),
+            target_display: "npx".into(),
+            configured: McpConfiguredState::Enabled,
+            runtime_status: status,
+            tool_count: None,
+            env_var_names: Vec::new(),
+            secret_refs: Vec::new(),
+            last_error: last_error.map(str::to_string),
+        };
+        let result = McpListResult {
+            enabled: true,
+            manager_available: true,
+            servers: vec![
+                dto("down", McpRuntimeStatus::NotConnected, Some("spawn failed")),
+                dto("up", McpRuntimeStatus::Connected, None),
+            ],
+        };
+
+        let browser = mcp_from_engine(&result);
+        let items = browser.visible_items();
+        let down = items.iter().find(|i| i.cells[1] == "down").unwrap().detail.join("\n");
+        assert!(down.contains("runtime    disconnected (last error: spawn failed)"), "{down}");
+        assert!(
+            down.contains("restart    ask the agent to run restart_mcp_server for 'down'"),
+            "{down}"
+        );
+        let up = items.iter().find(|i| i.cells[1] == "up").unwrap().detail.join("\n");
+        assert!(!up.contains("restart "), "{up}");
     }
 
     #[test]

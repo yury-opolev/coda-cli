@@ -10,7 +10,7 @@ pub mod quarantine;
 pub mod registry;
 
 // ── Re-exports from coda-tool ─────────────────────────────────────────────────
-pub use coda_tool::{AnswerOutcome, NoAnswerReason, Tool, ToolControl, ToolOutcome, ToolResult};
+pub use coda_tool::{AnswerOutcome, NoAnswerReason, Tool, ToolControl, ToolOutcome, ToolResult, ToolSource};
 pub use context::{
     OpaqueServiceHandle, PlanApprover, ScheduleOrigin, TodoItem, TodoStatus, TodoStore, ToolContext,
     ToolContextServiceExt, ToolDescriptor, UserQuestion,

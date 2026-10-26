@@ -26,14 +26,14 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use coda_auth::store::CredentialStore;
-use coda_tool::Tool;
+use coda_tool::{Tool, ToolSource};
 
 use crate::auth::{McpAuthMode, McpAuthProvider, McpOAuthProvider, StaticBearerAuthProvider};
 use crate::client::{McpClient, McpServerInfo, McpToolCallError, McpToolInfo, DEFAULT_CONNECT_TIMEOUT};
 use crate::config::{self, McpConnectable, McpHttpConnectable};
 use crate::error::{McpConnectError, McpError};
 use crate::http_client::{McpHttpClient, DEFAULT_HTTP_CONNECT_TIMEOUT};
-use crate::process::McpProcess;
+use crate::process::{McpProcess, ProcessExit, TerminationReport};
 use crate::tool::McpTool;
 
 /// Default shutdown grace period when the manager is dropped.
@@ -119,13 +119,6 @@ struct ServerEntry {
     client: AnyClient,
     /// Child process kept alive as long as the entry exists; `None` for HTTP.
     _process: Option<McpProcess>,
-    /// How to reconnect this server.
-    ///
-    /// Retained so a restart can relaunch without re-reading and re-resolving
-    /// the config, which would silently pick up an edit the user has not
-    /// approved — and would fail entirely for a server that is connected but
-    /// no longer present in the file.
-    spec: ServerSpec,
 }
 
 impl ServerEntry {
@@ -150,9 +143,32 @@ impl ServerEntry {
             Err(errors.join("; "))
         }
     }
+
+    /// Stops the server for a restart. `None` when there was no process to
+    /// observe (HTTP, or an injected client).
+    async fn terminate(self, deadline: tokio::time::Instant) -> Option<TerminationReport> {
+        let process = async {
+            match self._process {
+                Some(process) => Some(process.terminate(deadline).await),
+                None => None,
+            }
+        };
+        let client = async {
+            if let Err(error) = self.client.shutdown(deadline).await {
+                tracing::debug!(%error, "MCP client shutdown reported an error");
+            }
+        };
+        let ((), report) = tokio::join!(client, process);
+        report
+    }
 }
 
 /// Enough to reconnect a server after a restart.
+///
+/// Retained for the life of the manager so a restart can relaunch without
+/// re-reading and re-resolving the config, which would silently pick up an
+/// edit the user has not approved — and would fail entirely for a server that
+/// is no longer present in the file.
 #[derive(Clone)]
 enum ServerSpec {
     Stdio(Box<McpConnectable>),
@@ -167,11 +183,103 @@ pub struct McpServerStatus {
     pub tool_count: usize,
 }
 
+/// A configured server that is not currently connected, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServerFault {
+    pub name: String,
+    pub last_error: String,
+}
+
+/// What happened to the old process during a restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OldProcessOutcome {
+    NotRunning,
+    /// HTTP server: there is no process, only a session.
+    NoProcess,
+    ExitedCleanly { leftovers_killed: Option<usize> },
+    AlreadyExited(String),
+    ForceKilled { grace: Duration, leftovers_killed: Option<usize> },
+    Unconfirmed(String),
+}
+
+impl OldProcessOutcome {
+    fn from_report(report: Option<TerminationReport>) -> Self {
+        let Some(report) = report else {
+            return Self::NoProcess;
+        };
+        match report.exit {
+            ProcessExit::Graceful => Self::ExitedCleanly { leftovers_killed: report.leftovers_killed },
+            ProcessExit::Exited(status) => Self::AlreadyExited(status),
+            ProcessExit::ForceKilled => Self::ForceKilled {
+                grace: report.grace,
+                leftovers_killed: report.leftovers_killed,
+            },
+            ProcessExit::Unconfirmed(error) => Self::Unconfirmed(error),
+        }
+    }
+}
+
+/// Result of a successful restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestartReport {
+    pub tool_count: usize,
+    pub old_process: OldProcessOutcome,
+}
+
+impl RestartReport {
+    pub fn summary(&self, server: &str) -> String {
+        fn leftovers(count: Option<usize>) -> String {
+            match count {
+                Some(k) if k > 0 => format!("; {k} leftover process(es) terminated"),
+                _ => String::new(),
+            }
+        }
+        let old = match &self.old_process {
+            OldProcessOutcome::NotRunning => "server was not running".to_string(),
+            OldProcessOutcome::NoProcess => "HTTP session reopened".to_string(),
+            OldProcessOutcome::ExitedCleanly { leftovers_killed } => {
+                format!("old process exited cleanly{}", leftovers(*leftovers_killed))
+            }
+            OldProcessOutcome::AlreadyExited(status) => {
+                format!("old process had already exited: {status}")
+            }
+            OldProcessOutcome::ForceKilled { grace, leftovers_killed } => format!(
+                "old process force-killed after {}s{}",
+                grace.as_secs(),
+                leftovers(*leftovers_killed)
+            ),
+            OldProcessOutcome::Unconfirmed(error) => {
+                format!("warning: termination of the old process could not be confirmed: {error}")
+            }
+        };
+        format!(
+            "Restarted MCP server '{server}' ({old}). {} tool(s) available.",
+            self.tool_count
+        )
+    }
+}
+
+/// One configured server: how to launch it, its live connection (if any) and
+/// what is known about its last failure.
+struct ServerSlot {
+    spec: ServerSpec,
+    live: Option<ServerEntry>,
+    last_error: Option<String>,
+    /// Last known tools, kept while disconnected.
+    tools: Vec<McpToolInfo>,
+    /// Bumped on every successful (re)connect so a stale failure report
+    /// cannot undo a newer connection.
+    generation: u64,
+}
+
 /// Connects configured MCP servers and exposes their tools.
 pub struct McpClientManager {
-    /// Per-server client, protected so `call_tool` is lock-free while the
+    /// Per-server slot, protected so `call_tool` is lock-free while the
     /// manager is stable and only serialised during connect/disconnect.
-    servers: RwLock<HashMap<String, ServerEntry>>,
+    servers: RwLock<HashMap<String, ServerSlot>>,
+    restart_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// `(server, tool)` for every slot, sorted; rebuilt whenever `servers` changes.
+    tool_snapshot: std::sync::RwLock<Vec<(String, McpToolInfo)>>,
     tool_timeout: Duration,
     stopping: CancellationToken,
 }
@@ -181,8 +289,87 @@ impl McpClientManager {
     pub fn new() -> Self {
         Self {
             servers: RwLock::new(HashMap::new()),
+            restart_locks: std::sync::Mutex::new(HashMap::new()),
+            tool_snapshot: std::sync::RwLock::new(Vec::new()),
             tool_timeout: McpClient::resolve_tool_timeout(),
             stopping: CancellationToken::new(),
+        }
+    }
+
+    fn rebuild_snapshot(&self, map: &HashMap<String, ServerSlot>) {
+        let mut snapshot: Vec<(String, McpToolInfo)> = map
+            .iter()
+            .flat_map(|(name, slot)| slot.tools.iter().map(|tool| (name.clone(), tool.clone())))
+            .collect();
+        snapshot.sort_by(|a, b| (&a.0, &a.1.name).cmp(&(&b.0, &b.1.name)));
+        *self.tool_snapshot.write().unwrap_or_else(|e| e.into_inner()) = snapshot;
+    }
+
+    fn record_connected(map: &mut HashMap<String, ServerSlot>, name: String, spec: ServerSpec, entry: ServerEntry) {
+        let generation = map.get(&name).map_or(0, |slot| slot.generation) + 1;
+        let tools = entry.client.tools().to_vec();
+        map.insert(
+            name,
+            ServerSlot { spec, live: Some(entry), last_error: None, tools, generation },
+        );
+    }
+
+    fn record_failed(map: &mut HashMap<String, ServerSlot>, name: String, spec: ServerSpec, error: String) {
+        let generation = map.get(&name).map_or(0, |slot| slot.generation);
+        map.insert(
+            name,
+            ServerSlot { spec, live: None, last_error: Some(error), tools: Vec::new(), generation },
+        );
+    }
+
+    fn unknown_server(name: &str, map: &HashMap<String, ServerSlot>) -> String {
+        let mut names: Vec<&str> = map.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        if names.is_empty() {
+            format!("unknown MCP server '{name}'; no MCP servers are configured")
+        } else {
+            format!("unknown MCP server '{name}'; configured servers: {}", names.join(", "))
+        }
+    }
+
+    fn not_connected(name: &str, slot: &ServerSlot) -> String {
+        let reason = slot
+            .last_error
+            .as_ref()
+            .map(|e| format!(" (last error: {e})"))
+            .unwrap_or_default();
+        format!(
+            "MCP server '{name}' is not connected{reason}. \
+             Call restart_mcp_server with server='{name}' to relaunch it."
+        )
+    }
+
+    /// Marks a server disconnected after its transport died, unless a newer
+    /// connection has replaced the one that failed.
+    async fn mark_disconnected(&self, name: &str, generation: u64, reason: String) {
+        let old = {
+            let mut guard = self.servers.write().await;
+            let old = match guard.get_mut(name) {
+                Some(slot) if slot.generation == generation => {
+                    let old = slot.live.take();
+                    if old.is_some() {
+                        slot.last_error = Some(reason);
+                    }
+                    old
+                }
+                _ => None,
+            };
+            if old.is_some() {
+                self.rebuild_snapshot(&guard);
+            }
+            old
+        };
+        if let Some(entry) = old {
+            let server = name.to_string();
+            tokio::spawn(async move {
+                let report = entry.terminate(tokio::time::Instant::now() + SHUTDOWN_GRACE).await;
+                tracing::debug!(%server, ?report, "terminated MCP server after transport loss");
+            });
         }
     }
 
@@ -234,7 +421,7 @@ impl McpClientManager {
                 let name = cfg.name.clone();
                 async move {
                     let result = connect_one_stdio(&cfg, connect_timeout, tool_timeout).await;
-                    (name, result)
+                    (name, ServerSpec::Stdio(Box::new(cfg)), result)
                 }
             })
             .collect();
@@ -243,7 +430,7 @@ impl McpClientManager {
         let mut errors = Vec::new();
         let mut guard = self.servers.write().await;
 
-        for (name, result) in results {
+        for (name, spec, result) in results {
             match result {
                 Ok(entry) => {
                     tracing::info!(
@@ -252,14 +439,16 @@ impl McpClientManager {
                         tools = entry.client.tools().len(),
                         "MCP stdio server connected"
                     );
-                    guard.insert(name, entry);
+                    Self::record_connected(&mut guard, name, spec, entry);
                 }
                 Err(error) => {
                     tracing::warn!(server = %name, %error, "MCP stdio server failed to start");
+                    Self::record_failed(&mut guard, name.clone(), spec, error.to_string());
                     errors.push(McpConnectError { server_name: name, error });
                 }
             }
         }
+        self.rebuild_snapshot(&guard);
         errors
     }
 
@@ -285,7 +474,7 @@ impl McpClientManager {
                 let store = credential_store.clone();
                 async move {
                     let result = connect_one_http(&cfg, connect_timeout, tool_timeout, store.as_ref()).await;
-                    (name, result)
+                    (name, ServerSpec::Http(Box::new(cfg), store), result)
                 }
             })
             .collect();
@@ -294,7 +483,7 @@ impl McpClientManager {
         let mut errors = Vec::new();
         let mut guard = self.servers.write().await;
 
-        for (name, result) in results {
+        for (name, spec, result) in results {
             match result {
                 Ok(entry) => {
                     tracing::info!(
@@ -303,14 +492,16 @@ impl McpClientManager {
                         tools = entry.client.tools().len(),
                         "MCP HTTP server connected"
                     );
-                    guard.insert(name, entry);
+                    Self::record_connected(&mut guard, name, spec, entry);
                 }
                 Err(error) => {
                     tracing::warn!(server = %name, %error, "MCP HTTP server failed to start");
+                    Self::record_failed(&mut guard, name.clone(), spec, error.to_string());
                     errors.push(McpConnectError { server_name: name, error });
                 }
             }
         }
+        self.rebuild_snapshot(&guard);
         errors
     }
 
@@ -330,34 +521,56 @@ impl McpClientManager {
         let guard = self.servers.read().await;
         let mut out: Vec<McpServerStatus> = guard
             .iter()
-            .map(|(name, entry)| McpServerStatus {
-                name: name.clone(),
-                tool_count: entry.client.tools().len(),
+            .filter_map(|(name, slot)| {
+                slot.live.as_ref().map(|entry| McpServerStatus {
+                    name: name.clone(),
+                    tool_count: entry.client.tools().len(),
+                })
             })
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
 
-    /// Return all tools across all connected servers as `Arc<dyn Tool>`.
+    /// Configured servers that are not connected, with the last error.
+    pub async fn server_faults(&self) -> Vec<McpServerFault> {
+        let guard = self.servers.read().await;
+        let mut out: Vec<McpServerFault> = guard
+            .iter()
+            .filter(|(_, slot)| slot.live.is_none())
+            .map(|(name, slot)| McpServerFault {
+                name: name.clone(),
+                last_error: slot.last_error.clone().unwrap_or_else(|| "not connected".into()),
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    /// Return all tools across all configured servers as `Arc<dyn Tool>`,
+    /// including the last known tools of disconnected servers.
     ///
     /// Called after `connect_all`; the returned vector is fed into
     /// `ToolRegistry::new` alongside the built-in tools.
     pub async fn tools(self: &Arc<Self>) -> Vec<Arc<dyn Tool>> {
-        let guard = self.servers.read().await;
-        guard
+        let snapshot = self.tool_snapshot.read().unwrap_or_else(|e| e.into_inner());
+        snapshot
             .iter()
-            .flat_map(|(server_name, entry)| {
-                entry.client.tools().iter().map(|info| {
-                    let tool: Arc<dyn Tool> = Arc::new(McpTool::new(
-                        server_name.clone(),
-                        info.clone(),
-                        Arc::clone(self),
-                    ));
-                    tool
-                })
+            .map(|(server_name, info)| {
+                let tool: Arc<dyn Tool> = Arc::new(McpTool::new(
+                    server_name.clone(),
+                    info.clone(),
+                    Arc::clone(self),
+                ));
+                tool
             })
             .collect()
+    }
+
+    /// A live view of this manager's tools for `ToolRegistry::with_source`.
+    /// Follows restarts and keeps the last-known tools of disconnected servers.
+    pub fn tool_source(self: &Arc<Self>) -> Arc<dyn ToolSource> {
+        Arc::new(McpToolSource { manager: Arc::clone(self) })
     }
 
     /// Call a tool on the named server.
@@ -372,22 +585,31 @@ impl McpClientManager {
         arguments: &serde_json::Value,
     ) -> Result<(String, bool), String> {
         let guard = self.servers.read().await;
-        let entry = match guard.get(server_name) {
-            Some(e) => e,
-            None => {
-                return Err(format!(
-                    "MCP server '{server_name}' is not connected. \
-                     Check /mcp status and restart it if needed."
-                ));
-            }
+        let Some(slot) = guard.get(server_name) else {
+            return Err(Self::unknown_server(server_name, &guard));
         };
+        let Some(entry) = slot.live.as_ref() else {
+            return Err(Self::not_connected(server_name, slot));
+        };
+        let generation = slot.generation;
 
-        match self.until_shutdown(entry.client.call_tool(tool_name, arguments)).await? {
+        let outcome = self.until_shutdown(entry.client.call_tool(tool_name, arguments)).await?;
+        drop(guard);
+        match outcome {
             Ok(pair) => Ok(pair),
             Err(McpToolCallError::Timeout) => Err(format!(
                 "MCP tool '{tool_name}' on server '{server_name}' timed out. \
                  The server may be unresponsive."
             )),
+            Err(McpToolCallError::Transport(e)) if is_transport_loss(&e) => {
+                self.mark_disconnected(server_name, generation, e.to_string()).await;
+                Err(format!(
+                    "MCP tool '{tool_name}' on server '{server_name}' failed: {e}. \
+                     The server connection was lost; it is now marked disconnected. \
+                     Call restart_mcp_server with server='{server_name}' to relaunch it, \
+                     then retry."
+                ))
+            }
             Err(McpToolCallError::Transport(e)) => Err(format!(
                 "MCP tool '{tool_name}' on server '{server_name}' failed: {e}. \
                  The server connection was lost."
@@ -403,7 +625,7 @@ impl McpClientManager {
     pub async fn list_prompts(&self) -> Vec<(String, crate::client::McpPromptInfo)> {
         let guard = self.servers.read().await;
         let mut out = Vec::new();
-        for (name, entry) in guard.iter() {
+        for (name, entry) in guard.iter().filter_map(|(n, s)| s.live.as_ref().map(|e| (n, e))) {
             let prompts = match self.until_shutdown(entry.client.list_prompts()).await {
                 Ok(prompts) => prompts,
                 Err(error) => {
@@ -423,7 +645,7 @@ impl McpClientManager {
     pub async fn list_resources(&self) -> Vec<(String, crate::client::McpResourceInfo)> {
         let guard = self.servers.read().await;
         let mut out = Vec::new();
-        for (name, entry) in guard.iter() {
+        for (name, entry) in guard.iter().filter_map(|(n, s)| s.live.as_ref().map(|e| (n, e))) {
             let resources = match self.until_shutdown(entry.client.list_resources()).await {
                 Ok(resources) => resources,
                 Err(error) => {
@@ -442,11 +664,11 @@ impl McpClientManager {
     /// Fetches one prompt's rendered text from a named server.
     pub async fn get_prompt(&self, server_name: &str, prompt_name: &str) -> Result<String, String> {
         let guard = self.servers.read().await;
-        let Some(entry) = guard.get(server_name) else {
-            return Err(format!(
-                "MCP server '{server_name}' is not connected. \
-                 Check /mcp status and restart it if needed."
-            ));
+        let Some(slot) = guard.get(server_name) else {
+            return Err(Self::unknown_server(server_name, &guard));
+        };
+        let Some(entry) = slot.live.as_ref() else {
+            return Err(Self::not_connected(server_name, slot));
         };
         self.until_shutdown(entry.client.get_prompt(prompt_name)).await?
     }
@@ -454,58 +676,109 @@ impl McpClientManager {
     /// Reads one resource from a named server.
     pub async fn read_resource(&self, server_name: &str, uri: &str) -> Result<String, String> {
         let guard = self.servers.read().await;
-        let Some(entry) = guard.get(server_name) else {
-            return Err(format!(
-                "MCP server '{server_name}' is not connected. \
-                 Check /mcp status and restart it if needed."
-            ));
+        let Some(slot) = guard.get(server_name) else {
+            return Err(Self::unknown_server(server_name, &guard));
+        };
+        let Some(entry) = slot.live.as_ref() else {
+            return Err(Self::not_connected(server_name, slot));
         };
         self.until_shutdown(entry.client.read_resource(uri)).await?
     }
 
-    /// Restarts one server, reconnecting and refreshing its tool list.
+    /// Restarts one server from its retained launch spec, whatever state it is
+    /// in: connected, crashed, hung, failed at startup or already disconnected.
     ///
-    /// Returns the number of tools the restarted server advertises. A server
-    /// that is not currently connected is an error rather than a silent
-    /// no-op — the caller asked for a restart and needs to know it did not
-    /// happen.
-    pub async fn restart_server(&self, server_name: &str) -> Result<usize, String> {
-        let entry = {
-            let mut guard = self.servers.write().await;
-            guard.remove(server_name)
+    /// The old process tree is terminated first, so a server holding an
+    /// exclusive resource can rebind. How that went is reported, never fatal.
+    /// A failed relaunch keeps the slot so the restart can be retried.
+    pub async fn restart_server(&self, server_name: &str) -> Result<RestartReport, String> {
+        const SHUTTING_DOWN: &str = "MCP manager is shutting down";
+        if self.stopping.is_cancelled() {
+            return Err(SHUTTING_DOWN.into());
+        }
+        let lock = {
+            let mut locks = self.restart_locks.lock().unwrap_or_else(|e| e.into_inner());
+            Arc::clone(locks.entry(server_name.to_string()).or_default())
         };
-        let Some(entry) = entry else {
-            return Err(format!("MCP server '{server_name}' is not connected."));
+        let _restarting = lock.lock().await;
+        if self.stopping.is_cancelled() {
+            return Err(SHUTTING_DOWN.into());
+        }
+
+        let (old, spec) = {
+            let mut guard = self.servers.write().await;
+            let Some(slot) = guard.get_mut(server_name) else {
+                return Err(Self::unknown_server(server_name, &guard));
+            };
+            (slot.live.take(), slot.spec.clone())
         };
 
-        let spec = entry.spec.clone();
-        // Shut the old process down before starting a new one, so a server
-        // holding an exclusive resource (a port, a lock file) can rebind.
-        entry
-            .shutdown(tokio::time::Instant::now() + SHUTDOWN_GRACE)
-            .await
-            .map_err(|error| format!("failed to stop '{server_name}' before restart: {error}"))?;
+        let old_process = match old {
+            Some(entry) => {
+                let outcome = OldProcessOutcome::from_report(
+                    entry.terminate(tokio::time::Instant::now() + SHUTDOWN_GRACE).await,
+                );
+                match &outcome {
+                    OldProcessOutcome::ForceKilled { .. }
+                    | OldProcessOutcome::AlreadyExited(_)
+                    | OldProcessOutcome::Unconfirmed(_) => {
+                        tracing::warn!(server = %server_name, ?outcome, "old MCP server did not exit cleanly");
+                    }
+                    _ => {}
+                }
+                outcome
+            }
+            None => OldProcessOutcome::NotRunning,
+        };
 
         let connect_timeout = DEFAULT_CONNECT_TIMEOUT;
         let tool_timeout = self.tool_timeout;
-        let reconnected = match &spec {
-            ServerSpec::Stdio(cfg) => {
-                connect_one_stdio(cfg, connect_timeout, tool_timeout).await
-            }
-            ServerSpec::Http(cfg, store) => {
-                connect_one_http(cfg, connect_timeout, tool_timeout, store.as_ref()).await
+        let reconnect = async {
+            match &spec {
+                ServerSpec::Stdio(cfg) => {
+                    connect_one_stdio(cfg, connect_timeout, tool_timeout).await
+                }
+                ServerSpec::Http(cfg, store) => {
+                    connect_one_http(cfg, connect_timeout, tool_timeout, store.as_ref()).await
+                }
             }
         };
+        let reconnected = self.until_shutdown(reconnect).await?;
 
+        let mut guard = self.servers.write().await;
         match reconnected {
-            Ok(new_entry) => {
-                let count = new_entry.client.tools().len();
-                self.servers.write().await.insert(server_name.to_string(), new_entry);
-                Ok(count)
+            Ok(entry) => {
+                let tool_count = entry.client.tools().len();
+                let slot = if self.stopping.is_cancelled() {
+                    None
+                } else {
+                    guard.get_mut(server_name)
+                };
+                let Some(slot) = slot else {
+                    drop(guard);
+                    if let Err(error) =
+                        entry.shutdown(tokio::time::Instant::now() + SHUTDOWN_GRACE).await
+                    {
+                        tracing::warn!(server = %server_name, %error, "discarding restarted MCP server failed");
+                    }
+                    return Err(SHUTTING_DOWN.into());
+                };
+                slot.tools = entry.client.tools().to_vec();
+                slot.live = Some(entry);
+                slot.last_error = None;
+                slot.generation += 1;
+                self.rebuild_snapshot(&guard);
+                Ok(RestartReport { tool_count, old_process })
             }
-            // The server is now disconnected rather than half-restarted; the
-            // caller is told so instead of being left believing it recovered.
-            Err(e) => Err(format!("failed to restart '{server_name}': {e}")),
+            Err(e) => {
+                if let Some(slot) = guard.get_mut(server_name) {
+                    slot.last_error = Some(e.to_string());
+                }
+                Err(format!(
+                    "failed to restart '{server_name}': {e}. The server stays configured; \
+                     fix the cause and call restart_mcp_server again."
+                ))
+            }
         }
     }
 
@@ -514,7 +787,11 @@ impl McpClientManager {
         let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
         self.stopping.cancel();
         let mut guard = self.servers.write().await;
-        let entries: Vec<_> = guard.drain().collect();
+        let entries: Vec<_> = guard
+            .drain()
+            .filter_map(|(name, slot)| slot.live.map(|entry| (name, entry)))
+            .collect();
+        self.rebuild_snapshot(&guard);
         drop(guard);
 
         let results =
@@ -534,6 +811,27 @@ impl McpClientManager {
     }
 }
 
+struct McpToolSource {
+    manager: Arc<McpClientManager>,
+}
+
+impl ToolSource for McpToolSource {
+    fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        let snapshot: Vec<(String, McpToolInfo)> = self
+            .manager
+            .tool_snapshot
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        snapshot
+            .into_iter()
+            .map(|(server, info)| {
+                Arc::new(McpTool::new(server, info, Arc::clone(&self.manager))) as Arc<dyn Tool>
+            })
+            .collect()
+    }
+}
+
 impl Default for McpClientManager {
     fn default() -> Self {
         Self::new()
@@ -547,7 +845,22 @@ async fn connect_one_stdio(
 ) -> Result<ServerEntry, McpError> {
     let (proc, stdin, stdout) = McpProcess::spawn(config)?;
     let client = McpClient::connect(stdout, stdin, connect_timeout, tool_timeout).await?;
-    Ok(ServerEntry { client: AnyClient::Stdio(client), _process: Some(proc), spec: ServerSpec::Stdio(Box::new(config.clone())) })
+    Ok(ServerEntry { client: AnyClient::Stdio(client), _process: Some(proc) })
+}
+
+/// A dead pipe, or an HTTP-style "session not found" answer, means the
+/// connection cannot recover without a restart.
+fn is_transport_loss(error: &crate::error::McpTransportError) -> bool {
+    use crate::error::McpTransportError;
+    match error {
+        McpTransportError::ConnectionClosed => true,
+        McpTransportError::Rpc(e) => {
+            let message = e.message.to_ascii_lowercase();
+            message.contains("session not found") || message.contains("connection closed before responding")
+        }
+        McpTransportError::Other(message) => message.to_ascii_lowercase().contains("session not found"),
+        _ => false,
+    }
 }
 
 async fn connect_one_http(
@@ -621,11 +934,7 @@ async fn connect_one_http(
         tool_timeout,
     )
     .await?;
-    Ok(ServerEntry {
-        client: AnyClient::Http(client),
-        _process: None,
-        spec: ServerSpec::Http(Box::new(config.clone()), credential_store.cloned()),
-    })
+    Ok(ServerEntry { client: AnyClient::Http(client), _process: None })
 }
 
 // ── Test support (hermetic in-memory fake server) ────────────────────────────
@@ -697,19 +1006,18 @@ pub mod test_support {
         .expect("fake MCP server handshake must succeed");
 
         let mut guard = manager.servers.write().await;
-        guard.insert(
+        McpClientManager::record_connected(
+            &mut guard,
             server_name.to_string(),
-            ServerEntry {
-                client: AnyClient::Stdio(client),
-                _process: None,
-                spec: ServerSpec::Stdio(Box::new(McpConnectable {
-                    name: server_name.to_string(),
-                    command: "fake-in-memory".into(),
-                    args: Vec::new(),
-                    env: Default::default(),
-                })),
-            },
+            ServerSpec::Stdio(Box::new(McpConnectable {
+                name: server_name.to_string(),
+                command: "fake-in-memory".into(),
+                args: Vec::new(),
+                env: Default::default(),
+            })),
+            ServerEntry { client: AnyClient::Stdio(client), _process: None },
         );
+        manager.rebuild_snapshot(&guard);
 
         FakeServerHandle { call_count }
     }
@@ -828,6 +1136,7 @@ mod tests {
 
     use crate::client::McpClient;
     use crate::config::McpConnectable;
+    use crate::test_fixture::{fake_server_connectable, is_process_alive, wait_until, PID_FILE_ENV};
 
     /// Injects a pre-connected `McpClient` (built from in-memory streams)
     /// directly into the manager, bypassing the process layer. Used in unit
@@ -838,21 +1147,20 @@ mod tests {
         client: McpClient,
     ) {
         let mut guard = manager.servers.write().await;
-        guard.insert(
+        McpClientManager::record_connected(
+            &mut guard,
             server_name.to_string(),
-            ServerEntry {
-                client: AnyClient::Stdio(client),
-                _process: None,
-                // An injected client has no real launch spec; a restart of it
-                // would legitimately fail, which is what the test expects.
-                spec: ServerSpec::Stdio(Box::new(McpConnectable {
-                    name: server_name.to_string(),
-                    command: "does-not-exist".into(),
-                    args: Vec::new(),
-                    env: Default::default(),
-                })),
-            },
+            // An injected client has no real launch spec; a restart of it
+            // would legitimately fail unless a test replaces the spec.
+            ServerSpec::Stdio(Box::new(McpConnectable {
+                name: server_name.to_string(),
+                command: "does-not-exist".into(),
+                args: Vec::new(),
+                env: Default::default(),
+            })),
+            ServerEntry { client: AnyClient::Stdio(client), _process: None },
         );
+        manager.rebuild_snapshot(&guard);
     }
 
     /// Builds a minimal McpClient from in-memory streams with the given tools.
@@ -1020,11 +1328,15 @@ mod tests {
             .await
             .get_mut("old")
             .unwrap()
+            .live
+            .as_mut()
+            .unwrap()
             ._process = Some(process);
         drop(stdin);
         drop(stdout);
-        let error = manager.restart_server("old").await.unwrap_err();
-        assert!(error.contains("failed to restart"), "{error}");
+        manager.servers.write().await.get_mut("old").unwrap().spec =
+            ServerSpec::Stdio(Box::new(fake_server_connectable("old", "serve", &[])));
+        restart_ok(&manager, "old").await;
         let cleaned_up = !marker.exists();
         if !cleaned_up {
             std::fs::remove_file(&marker).unwrap();
@@ -1033,6 +1345,227 @@ mod tests {
             cleaned_up,
             "replacement started before old process released its resource"
         );
+    }
+
+    async fn restart_ok(manager: &McpClientManager, name: &str) -> RestartReport {
+        tokio::time::timeout(Duration::from_secs(30), manager.restart_server(name))
+            .await
+            .expect("restart must not hang")
+            .expect("restart must succeed")
+    }
+
+    async fn connect_fake(manager: &McpClientManager, name: &str, mode: &str, env: &[(&str, &str)]) {
+        let errors = manager
+            .connect_many(vec![fake_server_connectable(name, mode, env)], Some(Duration::from_secs(10)))
+            .await;
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    fn pid_of(text: &str) -> u32 {
+        text.strip_prefix("pid:").expect("pid reply").parse().expect("numeric pid")
+    }
+
+    async fn echo_pid(manager: &McpClientManager, name: &str) -> u32 {
+        let (text, is_error) = tokio::time::timeout(
+            Duration::from_secs(10),
+            manager.call_tool(name, "echo", &json!({})),
+        )
+        .await
+        .expect("call must not hang")
+        .expect("call must succeed");
+        assert!(!is_error);
+        pid_of(&text)
+    }
+
+    async fn set_command(manager: &McpClientManager, name: &str, command: &str) -> String {
+        let mut guard = manager.servers.write().await;
+        let ServerSpec::Stdio(cfg) = &mut guard.get_mut(name).unwrap().spec else {
+            panic!("stdio spec expected");
+        };
+        std::mem::replace(&mut cfg.command, command.to_string())
+    }
+
+    const MISSING: &str = "definitely-not-a-real-mcp-executable-xyz";
+
+    #[tokio::test]
+    async fn restart_force_kills_a_hung_server_and_reconnects() {
+        let manager = McpClientManager::new();
+        connect_fake(&manager, "s", "hang", &[]).await;
+        let old_pid = echo_pid(&manager, "s").await;
+        let report = restart_ok(&manager, "s").await;
+        assert!(matches!(report.old_process, OldProcessOutcome::ForceKilled { .. }), "{report:?}");
+        assert!(report.summary("s").contains("force-killed"));
+        assert!(wait_until(Duration::from_secs(5), || !is_process_alive(old_pid)).await);
+        let new_pid = echo_pid(&manager, "s").await;
+        assert_ne!(old_pid, new_pid);
+    }
+
+    #[tokio::test]
+    async fn restart_kills_the_old_grandchild() {
+        let pid_file = std::env::temp_dir().join(format!("coda-mcp-gc-{}", uuid::Uuid::new_v4()));
+        let manager = McpClientManager::new();
+        connect_fake(&manager, "s", "grandchild", &[(PID_FILE_ENV, &pid_file.to_string_lossy())]).await;
+        assert!(wait_until(Duration::from_secs(10), || pid_file.exists()).await);
+        let grandchild: u32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+        std::fs::remove_file(&pid_file).unwrap();
+        assert!(is_process_alive(grandchild));
+        restart_ok(&manager, "s").await;
+        let gone = wait_until(Duration::from_secs(5), || !is_process_alive(grandchild)).await;
+        if let Ok(new) = std::fs::read_to_string(&pid_file) {
+            if let Ok(pid) = new.trim().parse::<u32>() {
+                let _ = std::process::Command::new(if cfg!(windows) { "taskkill" } else { "kill" })
+                    .args(if cfg!(windows) { vec!["/F".to_string(), "/PID".into(), pid.to_string()] } else { vec![pid.to_string()] })
+                    .output();
+            }
+        }
+        manager.shutdown().await.ok();
+        assert!(gone, "old grandchild survived the restart");
+    }
+
+    #[tokio::test]
+    async fn restart_of_a_crashed_server_succeeds() {
+        let manager = McpClientManager::new();
+        connect_fake(&manager, "s", "crash", &[]).await;
+        restart_ok(&manager, "s").await;
+        assert_eq!(manager.connected_status().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_reconnect_keeps_the_server_restartable() {
+        let manager = McpClientManager::new();
+        connect_fake(&manager, "s", "serve", &[]).await;
+        let real = set_command(&manager, "s", MISSING).await;
+        let error = tokio::time::timeout(Duration::from_secs(30), manager.restart_server("s"))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.contains("restart_mcp_server again"), "{error}");
+        let faults = manager.server_faults().await;
+        assert_eq!(faults.len(), 1);
+        assert_eq!(faults[0].name, "s");
+        assert!(manager.connected_status().await.is_empty());
+        set_command(&manager, "s", &real).await;
+        restart_ok(&manager, "s").await;
+        assert!(manager.server_faults().await.is_empty());
+        echo_pid(&manager, "s").await;
+    }
+
+    #[tokio::test]
+    async fn restart_twice_in_a_row_succeeds() {
+        let manager = McpClientManager::new();
+        connect_fake(&manager, "s", "serve", &[]).await;
+        restart_ok(&manager, "s").await;
+        restart_ok(&manager, "s").await;
+        echo_pid(&manager, "s").await;
+    }
+
+    #[tokio::test]
+    async fn a_server_that_failed_at_startup_can_be_started_by_restart() {
+        let manager = Arc::new(McpClientManager::new());
+        let mut cfg = fake_server_connectable("s", "serve", &[]);
+        let real = std::mem::replace(&mut cfg.command, MISSING.to_string());
+        let errors = manager.connect_many(vec![cfg], Some(Duration::from_secs(5))).await;
+        assert_eq!(errors.len(), 1);
+        let faults = manager.server_faults().await;
+        assert_eq!(faults.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["s"]);
+        assert!(manager.connected_status().await.is_empty());
+
+        set_command(&manager, "s", &real).await;
+        let report = restart_ok(&manager, "s").await;
+        assert_eq!(report.old_process, OldProcessOutcome::NotRunning);
+        assert_eq!(report.tool_count, 1);
+        assert_eq!(manager.connected_status().await[0].name, "s");
+        assert_eq!(manager.tools().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn restart_refreshes_the_tool_list() {
+        let manager = Arc::new(McpClientManager::new());
+        connect_fake(&manager, "s", "serve", &[]).await;
+        assert_eq!(manager.tools().await.len(), 1);
+        manager.servers.write().await.get_mut("s").unwrap().spec =
+            ServerSpec::Stdio(Box::new(fake_server_connectable("s", "tools2", &[])));
+        assert_eq!(restart_ok(&manager, "s").await.tool_count, 2);
+        assert_eq!(manager.tools().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn restarting_an_unknown_server_lists_configured_names() {
+        let manager = McpClientManager::new();
+        let error = manager.restart_server("nope").await.unwrap_err();
+        assert!(error.contains("no MCP servers are configured"), "{error}");
+        inject_client(&manager, "known", make_client(json!([])).await).await;
+        let error = manager.restart_server("nope").await.unwrap_err();
+        assert!(error.contains("unknown MCP server 'nope'"), "{error}");
+        assert!(error.contains("known"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_lost_connection_marks_the_server_disconnected() {
+        let manager = McpClientManager::new();
+        connect_fake(&manager, "s", "serve", &[]).await;
+        {
+            let mut guard = manager.servers.write().await;
+            let live = guard.get_mut("s").unwrap().live.as_mut().unwrap();
+            live._process.as_mut().unwrap().child.start_kill().unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(5), live._process.as_mut().unwrap().child.wait()).await;
+        }
+        let error = tokio::time::timeout(Duration::from_secs(10), manager.call_tool("s", "echo", &json!({})))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.contains("restart_mcp_server"), "{error}");
+        assert_eq!(manager.server_faults().await[0].name, "s");
+        assert!(manager.connected_status().await.is_empty());
+        let error = manager.call_tool("s", "echo", &json!({})).await.unwrap_err();
+        assert!(error.contains("is not connected (last error:"), "{error}");
+        restart_ok(&manager, "s").await;
+        echo_pid(&manager, "s").await;
+    }
+
+    #[tokio::test]
+    async fn the_tool_source_reflects_a_restart_with_a_new_tool_list() {
+        let manager = Arc::new(McpClientManager::new());
+        let errors = manager
+            .connect_many(vec![fake_server_connectable("s", "serve", &[])], Some(Duration::from_secs(10)))
+            .await;
+        assert!(errors.is_empty(), "{errors:?}");
+        let source = manager.tool_source();
+        let names = |s: &Arc<dyn ToolSource>| -> Vec<String> {
+            s.tools().iter().map(|t| t.name().to_owned()).collect()
+        };
+        assert_eq!(names(&source), [crate::tool::namespaced_name("s", "echo")]);
+
+        manager.servers.write().await.get_mut("s").unwrap().spec =
+            ServerSpec::Stdio(Box::new(fake_server_connectable("s", "tools2", &[])));
+        restart_ok(&manager, "s").await;
+        let after = names(&source);
+        assert!(after.contains(&crate::tool::namespaced_name("s", "extra")), "{after:?}");
+    }
+
+    #[tokio::test]
+    async fn a_disconnected_server_keeps_its_tools_routable() {
+        let manager = Arc::new(McpClientManager::new());
+        let errors = manager
+            .connect_many(vec![fake_server_connectable("s", "serve", &[])], Some(Duration::from_secs(10)))
+            .await;
+        assert!(errors.is_empty(), "{errors:?}");
+        {
+            let mut guard = manager.servers.write().await;
+            let live = guard.get_mut("s").unwrap().live.as_mut().unwrap();
+            live._process.as_mut().unwrap().child.start_kill().unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(5), live._process.as_mut().unwrap().child.wait()).await;
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(10), manager.call_tool("s", "echo", &json!({}))).await;
+        assert!(manager.connected_status().await.is_empty());
+
+        let tools = manager.tool_source().tools();
+        assert_eq!(tools.len(), 1);
+        let outcome = tools[0]
+            .execute(&json!({}), &coda_tool::ToolContext::new("."), CancellationToken::new())
+            .await;
+        assert!(outcome.is_error);
+        assert!(outcome.content.contains("restart_mcp_server"), "{}", outcome.content);
     }
 
     #[tokio::test]
@@ -1050,6 +1583,29 @@ mod tests {
         let tools = manager.tools().await;
         assert_eq!(tools.len(), 1);
         assert!(tools[0].name().starts_with("mcp__"), "tool name must be namespaced");
+    }
+
+    #[test]
+    fn http_session_loss_counts_as_transport_loss() {
+        use crate::error::McpTransportError;
+        let session_lost = r#"HTTP 404: {"error":{"code":-32001,"message":"Session not found"}}"#;
+        assert!(is_transport_loss(&McpTransportError::Other(session_lost.into())));
+        assert!(!is_transport_loss(&McpTransportError::Other("HTTP 500: boom".into())));
+        assert!(is_transport_loss(&McpTransportError::Rpc(coda_proto::ResponseError {
+            code: -32001,
+            message: "Session not found".into(),
+            data: None,
+        })));
+        assert!(is_transport_loss(&McpTransportError::ConnectionClosed));
+    }
+
+    #[tokio::test]
+    async fn restart_after_shutdown_is_refused() {
+        let manager = McpClientManager::new();
+        connect_fake(&manager, "s", "serve", &[]).await;
+        manager.shutdown().await.expect("shutdown");
+        let error = manager.restart_server("s").await.unwrap_err();
+        assert!(error.contains("shutting down"), "{error}");
     }
 
     #[tokio::test]

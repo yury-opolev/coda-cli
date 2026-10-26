@@ -567,22 +567,11 @@ pub fn resolve_child_tools(
     depth: u32,
 ) -> ToolRegistry {
     let deny_task = read_only_definition || depth >= MAX_SUBAGENT_DEPTH;
-    let base: Vec<_> = if read_only_definition {
-        tools.all().iter().filter(|t| t.is_read_only()).cloned().collect()
-    } else {
-        tools.all().iter().cloned().collect()
-    };
-    if deny_task {
-        ToolRegistry::new(
-            base.into_iter()
-                .filter(|t| !is_task_management_tool(t.name()))
-                .collect::<Vec<_>>(),
-        )
-    } else {
-        ToolRegistry::new(base)
-    }
+    tools.filtered(move |t| {
+        (!read_only_definition || t.is_read_only())
+            && !(deny_task && is_task_management_tool(t.name()))
+    })
 }
-
 // ─────────────────────────────────────────────────────────────────────────────
 // ForwardingSink
 // ─────────────────────────────────────────────────────────────────────────────
@@ -668,14 +657,16 @@ mod tests {
 
         // At MAX_SUBAGENT_DEPTH, task tools are stripped.
         let child = resolve_child_tools(&registry, false, MAX_SUBAGENT_DEPTH);
-        let names: Vec<&str> = child.all().iter().map(|t| t.name()).collect();
+        let all = child.all();
+        let names: Vec<&str> = all.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"task"), "task must be stripped at max depth");
         assert!(!names.contains(&"task_wait"), "task_wait must be stripped at max depth");
         assert!(names.contains(&"bash"), "bash must remain");
 
         // Below max depth, task tools are kept.
         let child_shallow = resolve_child_tools(&registry, false, 1);
-        let names_shallow: Vec<&str> = child_shallow.all().iter().map(|t| t.name()).collect();
+        let all_shallow = child_shallow.all();
+        let names_shallow: Vec<&str> = all_shallow.iter().map(|t| t.name()).collect();
         assert!(names_shallow.contains(&"task"));
     }
 
@@ -704,7 +695,8 @@ mod tests {
 
         // Read-only definition strips mutating tools at any depth.
         let child = resolve_child_tools(&registry, true, 1);
-        let names: Vec<&str> = child.all().iter().map(|t| t.name()).collect();
+        let all = child.all();
+        let names: Vec<&str> = all.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"read_file"));
         assert!(!names.contains(&"write_file"), "mutating tool must be stripped");
         assert!(!names.contains(&"task"), "task must be stripped for read-only");

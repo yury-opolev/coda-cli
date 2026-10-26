@@ -271,7 +271,7 @@ impl Tool for RestartMcpServerTool {
         "restart_mcp_server"
     }
     fn description(&self) -> &str {
-        "Restart a connected MCP server, reconnecting and refreshing its tool list."
+        "Restart an MCP server: kill whatever is left of its process tree, relaunch it from its original configuration, reconnect and refresh its tools. Works whether the server is connected, disconnected, crashed or failed to start. Call it when an MCP server stops responding, then retry the failed call."
     }
     fn input_schema_json(&self) -> &str {
         RESTART_SCHEMA
@@ -288,9 +288,7 @@ impl Tool for RestartMcpServerTool {
             Err(e) => return e,
         };
         match self.manager.restart_server(server).await {
-            Ok(tool_count) => ToolResult::ok(format!(
-                "Restarted MCP server '{server}'. {tool_count} tool(s) available."
-            )),
+            Ok(report) => ToolResult::ok(report.summary(server)),
             Err(e) => ToolResult::error(format!("MCP restart error: {e}")),
         }
     }
@@ -375,7 +373,7 @@ mod tests {
             )
             .await;
         assert!(out.is_error);
-        assert!(out.content.contains("not connected"), "{}", out.content);
+        assert!(out.content.contains("unknown MCP server"), "{}", out.content);
     }
 
     /// SECURITY: restarting launches a process, so it must not be able to skip
