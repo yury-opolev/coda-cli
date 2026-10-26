@@ -230,8 +230,9 @@ pub const DEFAULT_COMPACT_RATIO: f64 = 0.80;
 /// default to "unset", which yields [`DEFAULT_COMPACT_RATIO`].
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct CompactionTrigger {
-    /// An absolute token count. Any positive value wins outright, including
-    /// over the output reserve: pinning a number means that number.
+    /// An absolute token count. Any positive value outranks `ratio` and
+    /// `free_tokens`; like them it is held to the floor and the reply cap,
+    /// since a pin above the window would never fire.
     pub tokens: usize,
     /// Fraction of the window that may fill before compaction, `0 < r <= 1`.
     /// Anything outside that range (or non-finite) falls back to the default.
@@ -291,8 +292,9 @@ impl CompactionPolicy {
     /// The threshold is therefore a *fraction* of the window, so it scales with
     /// the model instead of being a number that happens to suit one of them.
     ///
-    /// `configured` is an explicit override: any positive value wins, which is
-    /// how a user pins a threshold regardless of the model. `context_window`
+    /// `configured` is an explicit override: any positive value wins over the
+    /// window fraction, which is how a user pins a threshold regardless of the
+    /// model (still within the floor and the reply cap). `context_window`
     /// of `None` means the window is genuinely unknown, and falls back to the
     /// conservative default rather than assuming a large one.
     pub fn resolve_threshold(
@@ -322,27 +324,28 @@ impl CompactionPolicy {
         context_window: Option<usize>,
         output_reserve: Option<usize>,
     ) -> usize {
-        if trigger.tokens > 0 {
-            return trigger.tokens;
-        }
         let window = context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW);
         let reserve = output_reserve.unwrap_or(FALLBACK_MAX_OUTPUT_TOKENS);
 
-        let derived = match trigger.free_tokens {
-            // Headroom that would leave less than the floor to work in is not a
-            // budget, it is a mistake — honouring it would pin the threshold to
-            // the floor and summarise every few exchanges for the rest of the
-            // session. This is reachable without anyone typing a silly number:
-            // the window is re-derived per turn from the active model, so a
-            // value sized for a 1M-window model lands on a 128k one the moment
-            // the model is switched. An unusable ratio falls back to the
-            // default, so an unusable headroom does too.
-            Some(free) if window.saturating_sub(free) >= MIN_AUTO_COMPACT_THRESHOLD => {
-                window - free
+        let derived = if trigger.tokens > 0 {
+            trigger.tokens
+        } else {
+            match trigger.free_tokens {
+                // Headroom that would leave less than the floor to work in is not a
+                // budget, it is a mistake — honouring it would pin the threshold to
+                // the floor and summarise every few exchanges for the rest of the
+                // session. This is reachable without anyone typing a silly number:
+                // the window is re-derived per turn from the active model, so a
+                // value sized for a 1M-window model lands on a 128k one the moment
+                // the model is switched. An unusable ratio falls back to the
+                // default, so an unusable headroom does too.
+                Some(free) if window.saturating_sub(free) >= MIN_AUTO_COMPACT_THRESHOLD => {
+                    window - free
+                }
+                // `as usize` truncates, which is the right direction: rounding a
+                // threshold up would spend headroom the ratio exists to protect.
+                _ => (window as f64 * trigger.effective_ratio()) as usize,
             }
-            // `as usize` truncates, which is the right direction: rounding a
-            // threshold up would spend headroom the ratio exists to protect.
-            _ => (window as f64 * trigger.effective_ratio()) as usize,
         };
 
         // A reserve at or above the window is not a reply budget, it is a

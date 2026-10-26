@@ -3402,8 +3402,8 @@ mod tests {
             800_000,
         );
 
-        // An explicit value wins outright: that is how a threshold is pinned
-        // regardless of which model is active.
+        // An explicit value wins over the window fraction: that is how a
+        // threshold is pinned regardless of which model is active.
         assert_eq!(CompactionPolicy::resolve_threshold(50_000, Some(1_000_000), None), 50_000);
 
         // Unknown window falls back conservatively rather than assuming a big
@@ -3483,6 +3483,14 @@ mod tests {
             ),
             50_000,
         );
+
+        // A pin is still held to the floor and the reply cap: one above the
+        // window would never fire, and one of a few hundred tokens would
+        // summarise after every exchange.
+        let pin = |tokens| CompactionTrigger { tokens, ..CompactionTrigger::default() };
+        assert_eq!(resolve(pin(120_000), 200_000, Some(4_096)), 120_000);
+        assert_eq!(resolve(pin(500_000), 200_000, Some(4_096)), 195_904);
+        assert_eq!(resolve(pin(1_000), 200_000, None), 8_000);
     }
 
     /// When threshold is 0, compaction is disabled.
