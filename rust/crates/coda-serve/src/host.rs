@@ -4940,11 +4940,17 @@ impl ServeHost {
             LlmForkedAgent { client: Arc::clone(&client), model: captured.config.model.clone() },
         ) as Arc<dyn ForkedAgent>)))
         // The threshold is a fraction of the model's window (80% by default),
-        // overridable per user via `compactAtPercent` / `compactFreeTokens`.
+        // overridable per user via `compactAtPercent` / `compactFreeTokens`,
+        // or per model via `compactByModel`. The agent is rebuilt every turn,
+        // so a model switch picks up the new model's entry.
         // The reserve is the `max_tokens` the loop actually requests. It only
         // caps the threshold, so on a large window the fraction still rules.
         .with_compaction_policy(CompactionPolicy::for_context_window_with(
-            crate::settings::compaction_trigger_from(&load_settings_value()),
+            crate::settings::compaction_trigger_from(
+                &load_settings_value(),
+                client.provider_id(),
+                &captured.config.model,
+            ),
             self.active_context_window(),
             Some(output_budget.budget.max_tokens as usize),
         ));

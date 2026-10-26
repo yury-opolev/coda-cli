@@ -1125,15 +1125,23 @@ tokens. The estimate is therefore a lower bound on the real prompt, and the rema
 Configurable in `~/.coda/settings.json`:
 
 ```json
-{ "compactAtPercent": 80 }
+{
+  "compactAtPercent": 60,
+  "compactByModel": {
+    "github-copilot/claude-opus-5.5": { "tokens": 120000 },
+    "claude-ai/claude-sonnet-4-6": { "percent": 70 },
+    "gpt-5": { "freeTokens": 40000 }
+  }
+}
 ```
 
 | Field | Default | Effect |
 |---|---|---|
 | `compactAtPercent` | `80` | How full the context window may get, as a percentage, before compaction fires. Values outside `0 < p <= 100` are ignored and the default applies. |
 | `compactFreeTokens` | *(none)* | The same decision expressed as headroom: compact once fewer than this many tokens remain. **Wins over `compactAtPercent`** when both are set, being the more specific of the two. Ignored (falling back to the percentage) if it would leave less than 8,000 tokens to work in — which can happen without you typing a silly number, since the window is re-derived from whichever model is active. |
+| `compactByModel` | *(none)* | Per-model overrides keyed `"<provider>/<model>"` (as `effortByModel`) or by bare model id, tried in that order; keys match exactly. Each entry takes `tokens` (an absolute threshold), `freeTokens` and/or `percent`, with the same meaning and validation as the global keys; within an entry `tokens` wins over `freeTokens`, which wins over `percent`. The first entry with a valid field replaces the global settings for that model; an entry with none is ignored. An entry's `freeTokens` that would leave less than 8,000 tokens falls back to the entry's own `percent`, or to 80% — not to the global settings. |
 
-Both are floored at 8,000 tokens and capped so the trigger always leaves room for a
+Every form — including a per-model `tokens` — is floored at 8,000 tokens and capped so the trigger always leaves room for a
 reply (the [output budget](#output-budget) the turn requests). The cap matters only on
 windows small enough that the percentage would not — an 8k window at 80% leaves 1.6k,
 which is not a reply, so with a 4,096-token budget the threshold drops to 3,904.

@@ -199,32 +199,59 @@ pub fn resolve() -> StartupModel {
 // Auto-compaction trigger
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Reads the auto-compaction trigger from a settings document.
+/// Reads the auto-compaction trigger for the active model from a settings
+/// document.
 ///
-/// Two spellings of one decision, because the question is asked both ways:
-/// `compactAtPercent` is how full the context window may get, and
-/// `compactFreeTokens` is how much of it to keep free. The token form wins when
-/// both are present, being the more specific of the two.
+/// `compactByModel` holds per-model overrides keyed `"<provider>/<model>"` (as
+/// `effortByModel`) or by the bare model id, tried in that order. An entry
+/// is `{ "tokens", "freeTokens", "percent" }`; the first entry with at least
+/// one valid field replaces the global settings outright.
+///
+/// Otherwise the global keys apply. Two spellings of one decision, because the
+/// question is asked both ways: `compactAtPercent` is how full the context
+/// window may get, and `compactFreeTokens` is how much of it to keep free. The
+/// token form wins when both are present, being the more specific of the two.
 ///
 /// A wrongly typed or out-of-range value is ignored rather than rejected. The
 /// engine must start whatever the settings file says, and the fallback here is
 /// the default trigger, which is always safe — unlike the startup model, a bad
 /// value cannot leave compaction in a state that fails every prompt.
-pub fn compaction_trigger_from(value: &Value) -> CompactionTrigger {
-    let ratio = value
-        .get("compactAtPercent")
-        .and_then(Value::as_f64)
-        .filter(|percent| percent.is_finite() && *percent > 0.0 && *percent <= 100.0)
-        .map(|percent| percent / 100.0);
-
-    let free_tokens = value
-        .get("compactFreeTokens")
-        .and_then(Value::as_u64)
-        .and_then(|tokens| usize::try_from(tokens).ok());
-
-    CompactionTrigger { tokens: 0, ratio, free_tokens }
+pub fn compaction_trigger_from(value: &Value, provider: &str, model: &str) -> CompactionTrigger {
+    let by_model = value.get("compactByModel");
+    [format!("{provider}/{model}"), model.to_owned()]
+        .iter()
+        .filter_map(|key| by_model?.get(key))
+        .find_map(model_compaction_trigger)
+        .unwrap_or(CompactionTrigger {
+            tokens: 0,
+            ratio: compaction_ratio(value.get("compactAtPercent")),
+            free_tokens: token_count(value.get("compactFreeTokens")),
+        })
 }
 
+/// One `compactByModel` entry, or `None` when none of its fields is usable so
+/// the lookup falls through to the next key.
+fn model_compaction_trigger(entry: &Value) -> Option<CompactionTrigger> {
+    let trigger = CompactionTrigger {
+        tokens: token_count(entry.get("tokens")).unwrap_or(0),
+        ratio: compaction_ratio(entry.get("percent")),
+        free_tokens: token_count(entry.get("freeTokens")),
+    };
+    (trigger != CompactionTrigger::default()).then_some(trigger)
+}
+
+/// A percentage in `0 < p <= 100`, as a fraction.
+fn compaction_ratio(percent: Option<&Value>) -> Option<f64> {
+    percent
+        .and_then(Value::as_f64)
+        .filter(|percent| percent.is_finite() && *percent > 0.0 && *percent <= 100.0)
+        .map(|percent| percent / 100.0)
+}
+
+/// A non-negative integer token count.
+fn token_count(tokens: Option<&Value>) -> Option<usize> {
+    tokens.and_then(Value::as_u64).and_then(|tokens| usize::try_from(tokens).ok())
+}
 // ─────────────────────────────────────────────────────────────────────────────
 // Enterprise Copilot configuration resolver
 // ─────────────────────────────────────────────────────────────────────────────
@@ -336,16 +363,16 @@ mod tests {
     #[test]
     fn the_compaction_trigger_reads_a_percentage_or_a_free_token_budget() {
         assert_eq!(
-            compaction_trigger_from(&json!({ "compactAtPercent": 90 })),
+            compaction_trigger_from(&json!({ "compactAtPercent": 90 }), "p", "m"),
             CompactionTrigger { tokens: 0, ratio: Some(0.9), free_tokens: None },
         );
         assert_eq!(
-            compaction_trigger_from(&json!({ "compactFreeTokens": 40_000 })),
+            compaction_trigger_from(&json!({ "compactFreeTokens": 40_000 }), "p", "m"),
             CompactionTrigger { tokens: 0, ratio: None, free_tokens: Some(40_000) },
         );
 
         // Silence means the default, which is the whole point of the default.
-        assert_eq!(compaction_trigger_from(&json!({})), CompactionTrigger::default());
+        assert_eq!(compaction_trigger_from(&json!({}), "p", "m"), CompactionTrigger::default());
     }
 
     #[test]
@@ -362,7 +389,7 @@ mod tests {
             json!({ "compactFreeTokens": "lots" }),
         ] {
             assert_eq!(
-                compaction_trigger_from(&bad),
+                compaction_trigger_from(&bad, "p", "m"),
                 CompactionTrigger::default(),
                 "{bad} must fall back to the default trigger",
             );
@@ -373,13 +400,100 @@ mod tests {
     #[test]
     fn the_free_token_budget_outranks_the_percentage() {
         let trigger =
-            compaction_trigger_from(&json!({ "compactAtPercent": 90, "compactFreeTokens": 40_000 }));
+            compaction_trigger_from(&json!({ "compactAtPercent": 90, "compactFreeTokens": 40_000 }), "p", "m");
         assert_eq!(trigger.free_tokens, Some(40_000));
         assert_eq!(
             coda_agent::CompactionPolicy::resolve_threshold_with(trigger, Some(200_000), None),
             160_000,
             "the headroom form must decide the threshold when both are set",
         );
+    }
+
+    #[test]
+    fn a_model_entry_is_found_by_provider_and_model_then_by_bare_id() {
+        let settings = json!({
+            "compactAtPercent": 60,
+            "compactByModel": {
+                "github-copilot/claude-opus-5.5": { "tokens": 120_000 },
+                "claude-opus-5.5": { "percent": 70 },
+                "gpt-5": { "freeTokens": 40_000 }
+            }
+        });
+        assert_eq!(
+            compaction_trigger_from(&settings, "github-copilot", "claude-opus-5.5"),
+            CompactionTrigger { tokens: 120_000, ratio: None, free_tokens: None },
+        );
+        assert_eq!(
+            compaction_trigger_from(&settings, "claude-ai", "claude-opus-5.5"),
+            CompactionTrigger { tokens: 0, ratio: Some(0.7), free_tokens: None },
+        );
+        assert_eq!(
+            compaction_trigger_from(&settings, "openai", "gpt-5"),
+            CompactionTrigger { tokens: 0, ratio: None, free_tokens: Some(40_000) },
+        );
+        // Keys match exactly, like `effortByModel`.
+        assert_eq!(
+            compaction_trigger_from(&settings, "openai", "GPT-5"),
+            CompactionTrigger::ratio(0.6),
+        );
+    }
+
+    #[test]
+    fn a_model_entry_replaces_the_global_settings() {
+        let settings = json!({
+            "compactFreeTokens": 10_000,
+            "compactByModel": { "p/m": { "percent": 50 } }
+        });
+        assert_eq!(compaction_trigger_from(&settings, "p", "m"), CompactionTrigger::ratio(0.5));
+        assert_eq!(
+            compaction_trigger_from(&settings, "p", "other"),
+            CompactionTrigger::free_tokens(10_000),
+        );
+    }
+
+    #[test]
+    fn an_entry_keeps_all_its_valid_fields_and_drops_invalid_ones() {
+        let settings = json!({ "compactByModel": { "p/m": {
+            "tokens": 90_000, "freeTokens": 30_000, "percent": 70, "unknown": true
+        } } });
+        assert_eq!(
+            compaction_trigger_from(&settings, "p", "m"),
+            CompactionTrigger { tokens: 90_000, ratio: Some(0.7), free_tokens: Some(30_000) },
+        );
+        let settings = json!({ "compactByModel": { "p/m": { "tokens": "lots", "percent": 70 } } });
+        assert_eq!(compaction_trigger_from(&settings, "p", "m"), CompactionTrigger::ratio(0.7));
+    }
+
+    #[test]
+    fn an_entry_with_nothing_usable_falls_through() {
+        for bad in [
+            json!({}),
+            json!(120_000),
+            json!("big"),
+            json!({ "tokens": 0 }),
+            json!({ "tokens": -5 }),
+            json!({ "percent": 140 }),
+            json!({ "freeTokens": "lots" }),
+        ] {
+            let settings = json!({
+                "compactAtPercent": 60,
+                "compactByModel": { "p/m": bad.clone(), "m": { "tokens": 50_000 } }
+            });
+            assert_eq!(
+                compaction_trigger_from(&settings, "p", "m").tokens,
+                50_000,
+                "{bad} must fall through to the bare id",
+            );
+            let settings = json!({ "compactAtPercent": 60, "compactByModel": { "p/m": bad.clone() } });
+            assert_eq!(
+                compaction_trigger_from(&settings, "p", "m"),
+                CompactionTrigger::ratio(0.6),
+                "{bad} must fall through to the global setting",
+            );
+        }
+        // A map that is not an object is ignored too.
+        let settings = json!({ "compactAtPercent": 60, "compactByModel": [1, 2] });
+        assert_eq!(compaction_trigger_from(&settings, "p", "m"), CompactionTrigger::ratio(0.6));
     }
 
     #[test]
