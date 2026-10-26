@@ -21,7 +21,6 @@
 //! | file says | manager says | reported as |
 //! |---|---|---|
 //! | enabled | has a client | `enabled` + `connected` |
-//! | enabled | no client | `enabled` + `notConnected` (failed, or added after startup) |
 //! | enabled | no client | `enabled` + `notConnected` (failed, or added after startup); `lastError` when the manager recorded a fault |
 //! | disabled / shadowed | — | `disabled`/`shadowed` + `notAttempted` |
 //! | — | has a client | still `connected` (deleted from the file after startup) |
@@ -106,7 +105,8 @@ pub fn build(
             let last_error = (runtime_status == McpRuntimeStatus::NotConnected)
                 .then(|| faults.iter().find(|f| f.name == raw.name))
                 .flatten()
-                .map(|f| sanitise_error(&f.last_error));
+                .filter(|f| f.last_error != "not connected")
+                .map(|f| sanitise_error(&redact_configured(raw, &f.last_error)));
 
             McpServerDto {
                 name: raw.name.clone(),
@@ -155,17 +155,45 @@ pub fn build(
 /// Makes a connection error safe to publish: URLs are reduced to scheme + host
 /// + path, control characters become spaces, whitespace is collapsed and the
 /// length capped.
+///
+/// Also masks the token after `Bearer`/`Basic` and the value of
+/// credential-named `k=v` / `k:v` tokens, and drops the query of schemeless
+/// URL-like tokens.
 fn sanitise_error(raw: &str) -> String {
-    const TRAILING: &[char] = &[',', '.', ';', ')', '\'', '"'];
+    const LEADING: &[char] = &['(', '\'', '"', '<', '['];
+    const TRAILING: &[char] = &[',', '.', ';', ')', '\'', '"', '>', ']'];
+    const SENSITIVE_KEYS: &[&str] =
+        &["token", "key", "secret", "pass", "auth", "sig", "credential"];
+
     let flat: String = raw.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let mut mask_next = false;
     let cleaned = flat
         .split_whitespace()
         .map(|token| {
-            if !token.contains("://") {
-                return token.to_string();
-            }
-            let core = token.trim_end_matches(TRAILING);
-            format!("{}{}", sanitise_url(core), &token[core.len()..])
+            let rest = token.trim_start_matches(LEADING);
+            let core = rest.trim_end_matches(TRAILING);
+            let head = &token[..token.len() - rest.len()];
+            let tail = &rest[core.len()..];
+
+            let body = if mask_next && !core.is_empty() {
+                mask_next = false;
+                "***".to_string()
+            } else {
+                mask_next = core.eq_ignore_ascii_case("bearer") || core.eq_ignore_ascii_case("basic");
+                if core.contains("://") {
+                    sanitise_url(core)
+                } else if let Some(sep) = core.find(['=', ':']).filter(|&i| i + 1 < core.len()) {
+                    let key = core[..sep].trim_start_matches(['-', '?', '&']).to_ascii_lowercase();
+                    if SENSITIVE_KEYS.iter().any(|k| key.contains(k)) {
+                        format!("{}***", &core[..=sep])
+                    } else {
+                        drop_query(core)
+                    }
+                } else {
+                    drop_query(core)
+                }
+            };
+            format!("{head}{body}{tail}")
         })
         .collect::<Vec<_>>()
         .join(" ");
@@ -173,6 +201,28 @@ fn sanitise_error(raw: &str) -> String {
         Some((end, _)) => format!("{}…", &cleaned[..end]),
         None => cleaned,
     }
+}
+
+fn drop_query(token: &str) -> String {
+    token.split('?').next().unwrap_or_default().to_string()
+}
+
+/// Replaces values known from the configuration (URL, command, env values)
+/// with their safe forms, longest first so overlapping values cannot leave
+/// a partial remainder.
+fn redact_configured(raw: &McpRawServer, message: &str) -> String {
+    let mut subs: Vec<(String, String)> = Vec::new();
+    if let Some(url) = raw.url.as_deref().filter(|u| !u.is_empty()) {
+        subs.push((url.to_string(), sanitise_url(url)));
+    }
+    if let Some(cmd) = raw.command.as_deref().filter(|c| !c.trim().is_empty()) {
+        subs.push((cmd.to_string(), command_label(cmd)));
+    }
+    for value in raw.env.values().filter(|v| v.chars().count() >= 4) {
+        subs.push((value.clone(), "<redacted>".to_string()));
+    }
+    subs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    subs.iter().fold(message.to_string(), |acc, (from, to)| acc.replace(from.as_str(), to))
 }
 
 /// A display label that cannot leak a credential.
@@ -479,5 +529,74 @@ mod tests {
         let user_fs = result.servers.iter().find(|s| s.scope == "user" && s.name == "fs").unwrap();
         assert!(find(&result, "off").last_error.is_none());
         assert!(user_fs.last_error.is_none());
+    }
+
+    fn error_for(server: McpRawServer, message: &str) -> String {
+        let faults = [fault(&server.name, message)];
+        let result = build(&[server], Some(&[]), &faults, true);
+        result.servers[0].last_error.clone().expect("last error")
+    }
+
+    #[test]
+    fn a_schemeless_configured_url_is_redacted_from_the_error() {
+        let url = "mcp.example.com/mcp?api_key=sk-live-123";
+        let error = error_for(
+            http("remote", url),
+            &format!("invalid MCP server URL: {url}"),
+        );
+        assert!(!error.contains("sk-live-123"), "SECURITY: {error}");
+    }
+
+    #[test]
+    fn a_configured_command_path_is_reduced_to_its_file_name_in_the_error() {
+        let cmd = r"C:\Users\alice\bin\mcp.exe";
+        let mut server = raw("fs", McpScope::User);
+        server.command = Some(cmd.into());
+        let error = error_for(server, &format!("spawning MCP server '{cmd}' failed: not found"));
+        assert!(!error.contains("alice"), "SECURITY: {error}");
+        assert!(error.contains("mcp.exe"), "{error}");
+    }
+
+    #[test]
+    fn a_configured_env_value_echoed_in_the_error_is_redacted() {
+        let mut server = raw("fs", McpScope::User);
+        server.env.insert("API_TOKEN".into(), "tok_live_ABCD".into());
+        let error = error_for(server, "failed with API_TOKEN value tok_live_ABCD rejected");
+        assert!(!error.contains("tok_live_ABCD"), "SECURITY: {error}");
+    }
+
+    #[test]
+    fn bearer_and_basic_credentials_are_masked() {
+        let error = error_for(raw("fs", McpScope::User), "Authorization: Bearer abc.def.ghi");
+        assert!(!error.contains("abc.def.ghi"), "SECURITY: {error}");
+        let error = error_for(raw("fs", McpScope::User), "sent basic dXNlcjpwdw== denied");
+        assert!(!error.contains("dXNlcjpwdw"), "SECURITY: {error}");
+    }
+
+    #[test]
+    fn a_credential_shaped_key_value_token_is_masked() {
+        let error = error_for(raw("fs", McpScope::User), "bad arg --token=XYZ123 given");
+        assert!(!error.contains("XYZ123"), "SECURITY: {error}");
+        let error = error_for(raw("fs", McpScope::User), "password:hunter22 rejected");
+        assert!(!error.contains("hunter22"), "SECURITY: {error}");
+    }
+
+    #[test]
+    fn a_parenthesised_url_keeps_its_path_but_loses_its_query() {
+        let error = error_for(
+            raw("fs", McpScope::User),
+            "error sending request for url (https://h.example/x?k=S)",
+        );
+        assert!(error.contains("https://h.example/x"), "{error}");
+        assert!(!error.contains("k=S"), "SECURITY: {error}");
+        let error = error_for(raw("fs", McpScope::User), "bad host.example/x?zzz=1 here");
+        assert!(!error.contains("zzz"), "SECURITY: {error}");
+    }
+
+    #[test]
+    fn a_fault_that_only_says_not_connected_carries_no_last_error() {
+        let faults = [fault("fs", "not connected")];
+        let result = build(&[raw("fs", McpScope::User)], Some(&[]), &faults, true);
+        assert!(find(&result, "fs").last_error.is_none());
     }
 }
