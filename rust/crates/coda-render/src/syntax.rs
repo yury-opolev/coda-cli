@@ -277,7 +277,16 @@ impl Tokenizer {
             Carry::None => {}
         }
 
+        let mut last_scanned: Option<usize> = None;
         while i < chars.len() {
+            // Every branch must advance `i`. Fail loudly in debug builds, but
+            // never let a future mistake hang the UI in release builds.
+            if last_scanned == Some(i) {
+                debug_assert!(false, "tokenizer made no progress at char {i} of {line:?}");
+                i += 1;
+                continue;
+            }
+            last_scanned = Some(i);
             let c = chars[i];
 
             if c.is_whitespace() {
@@ -349,7 +358,11 @@ impl Tokenizer {
 
             // Identifier, keyword or type.
             if is_identifier_start(c) {
+                // Consume the start char first: '@' starts an identifier but
+                // cannot continue one, so scanning only continuation chars
+                // would never advance past it.
                 let start = i;
+                i += 1;
                 while i < chars.len() && is_identifier_char(chars[i]) {
                     i += 1;
                 }
@@ -748,5 +761,162 @@ mod tests {
         assert!(spans.iter().any(|s| s.role == Role::SyntaxString));
         assert!(spans.iter().any(|s| s.role == Role::SyntaxKeyword));
         assert!(spans.iter().any(|s| s.role == Role::SyntaxNumber));
+    }
+
+    const LANGUAGES: [Language; 8] = [
+        Language::CSharp,
+        Language::TypeScript,
+        Language::JavaScript,
+        Language::Python,
+        Language::Json,
+        Language::Shell,
+        Language::PowerShell,
+        Language::Rust,
+    ];
+
+    /// Tokenizes `lines` (sharing one tokenizer, so carried state is
+    /// exercised) on a worker thread, failing instead of hanging the test
+    /// runner if the scan loop stops making progress.
+    fn tokenize_within_deadline(language: Language, lines: Vec<String>) -> Vec<Vec<Span>> {
+        use std::sync::mpsc::{self, RecvTimeoutError};
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut tokenizer = Tokenizer::new(language);
+            let spans: Vec<Vec<Span>> = lines.iter().map(|l| tokenizer.tokenize_line(l)).collect();
+            let _ = tx.send(spans);
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(spans) => spans,
+            Err(RecvTimeoutError::Timeout) => panic!("{language:?} tokenizer did not terminate"),
+            Err(RecvTimeoutError::Disconnected) => panic!("{language:?} tokenizer panicked"),
+        }
+    }
+
+    fn keyword_for(language: Language) -> &'static str {
+        match language {
+            Language::CSharp => "class",
+            Language::TypeScript | Language::JavaScript => "const",
+            Language::Python => "def",
+            Language::Json => "true",
+            Language::Shell => "echo",
+            Language::PowerShell => "if",
+            Language::Rust => "let",
+            Language::None => "",
+        }
+    }
+
+    fn texts_with_role(line: &str, spans: &[Span], role: Role) -> Vec<String> {
+        spans
+            .iter()
+            .filter(|s| s.role == role)
+            .map(|s| text_of(line, s))
+            .collect()
+    }
+
+    #[test]
+    fn terminates_on_unquoted_at_signs() {
+        let lines = [
+            "@",
+            "@name",
+            "@@",
+            "a@@b",
+            "x @",
+            "claude plugin install superpowers@superpowers-marketplace",
+        ];
+        for language in LANGUAGES {
+            let lines = lines.iter().map(|l| l.to_string()).collect();
+            tokenize_within_deadline(language, lines);
+        }
+    }
+
+    #[test]
+    fn keeps_scanning_after_an_at_sign() {
+        for language in LANGUAGES {
+            let kw = keyword_for(language);
+            let line = format!("@ {kw} @@ 42 @{kw}");
+            let spans = tokenize_within_deadline(language, vec![line.clone()]).remove(0);
+            let keywords = texts_with_role(&line, &spans, Role::SyntaxKeyword);
+            assert_eq!(keywords, vec![kw.to_string()], "{language:?}: {spans:?}");
+            let numbers = texts_with_role(&line, &spans, Role::SyntaxNumber);
+            assert_eq!(numbers, vec!["42".to_string()], "{language:?}: {spans:?}");
+        }
+    }
+
+    #[test]
+    fn tokenizes_the_reported_powershell_command() {
+        let line = "claude plugin install superpowers@superpowers-marketplace";
+        let spans = tokenize_within_deadline(Language::PowerShell, vec![line.to_string()]);
+        let cells = crate::text::width(line);
+        for span in &spans[0] {
+            assert!(span.start < span.end && span.end <= cells, "bad span {span:?}");
+            if matches!(span.role, Role::SyntaxKeyword | Role::SyntaxType) {
+                assert!(!text_of(line, span).contains('@'), "{span:?} covers '@'");
+            }
+        }
+    }
+
+    #[test]
+    fn treats_prefixed_identifiers_as_whole_words() {
+        let line = "var @class = 1;";
+        let spans = tokenize_within_deadline(Language::CSharp, vec![line.to_string()]).remove(0);
+        assert_eq!(texts_with_role(line, &spans, Role::SyntaxKeyword), vec!["var"]);
+        assert_eq!(texts_with_role(line, &spans, Role::SyntaxNumber), vec!["1"]);
+
+        let lines = vec!["@property".to_string(), "def f(self):".to_string()];
+        let spans = tokenize_within_deadline(Language::Python, lines);
+        let keywords = texts_with_role("def f(self):", &spans[1], Role::SyntaxKeyword);
+        assert_eq!(keywords, vec!["def"]);
+
+        let line = "$h = @{ a = 1 }";
+        let spans = tokenize_within_deadline(Language::PowerShell, vec![line.to_string()]);
+        assert_eq!(texts_with_role(line, &spans[0], Role::SyntaxNumber), vec!["1"]);
+    }
+
+    #[test]
+    fn keeps_quoted_and_commented_at_signs_in_their_spans() {
+        let line = r#"let s = "a@b"; // c@d"#;
+        let spans = tokenize_within_deadline(Language::Rust, vec![line.to_string()]).remove(0);
+        assert_eq!(texts_with_role(line, &spans, Role::SyntaxString), vec!["\"a@b\""]);
+        assert_eq!(texts_with_role(line, &spans, Role::SyntaxComment), vec!["// c@d"]);
+
+        let line = "# @{x}";
+        let spans = tokenize_within_deadline(Language::PowerShell, vec![line.to_string()]);
+        assert_eq!(spans[0], vec![Span::new(0, line.len(), Role::SyntaxComment)]);
+
+        let line = "x = '@x'";
+        let spans = tokenize_within_deadline(Language::Python, vec![line.to_string()]);
+        assert_eq!(texts_with_role(line, &spans[0], Role::SyntaxString), vec!["'@x'"]);
+    }
+
+    #[test]
+    fn terminates_on_every_printable_char_and_pair() {
+        let extra = [
+            'é', '日', '🚀', '\u{0301}', '\u{216B}', '\u{0663}', '\u{00A0}', 'ª', '\u{200B}',
+        ];
+        let chars: Vec<char> = (' '..='~').chain(extra).collect();
+        let mut lines: Vec<String> = chars.iter().map(|c| c.to_string()).collect();
+        for &a in &chars {
+            for &b in &chars {
+                lines.push([a, b].iter().collect());
+            }
+        }
+        for language in LANGUAGES {
+            let spans = tokenize_within_deadline(language, lines.clone());
+            for (line, line_spans) in lines.iter().zip(&spans) {
+                // Known separate issue: `to_cell_spans` measures combining
+                // marks per char, so their spans can overshoot the grapheme
+                // width. Only termination is checked for those lines.
+                if line.contains('\u{0301}') {
+                    continue;
+                }
+                let cells = crate::text::width(line);
+                for span in line_spans {
+                    assert!(
+                        span.start < span.end && span.end <= cells,
+                        "{language:?}: span {span:?} out of bounds for {line:?}"
+                    );
+                }
+            }
+        }
     }
 }

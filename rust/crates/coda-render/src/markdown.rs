@@ -917,6 +917,50 @@ mod tests {
         assert!(code.spans.is_empty());
     }
 
+    /// Renders on a worker thread, failing instead of hanging the test runner
+    /// if rendering never finishes.
+    fn render_within_deadline(markdown: &str, width: usize) -> Vec<RenderLine> {
+        use std::sync::mpsc::{self, RecvTimeoutError};
+        let markdown = markdown.to_string();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(render(&markdown, width));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(rows) => rows,
+            Err(RecvTimeoutError::Timeout) => panic!("rendering did not terminate"),
+            Err(RecvTimeoutError::Disconnected) => panic!("rendering panicked"),
+        }
+    }
+
+    const AT_SIGN_COMMAND: &str = "claude plugin install superpowers@superpowers-marketplace";
+
+    #[test]
+    fn renders_a_powershell_fence_containing_an_at_sign() {
+        let markdown = format!("```powershell\n{AT_SIGN_COMMAND}\n```");
+        let rows = render_within_deadline(&markdown, 120);
+        assert!(
+            rows.iter().any(|r| r.role == Role::Code && r.text.contains(AT_SIGN_COMMAND)),
+            "no code row with the command: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn renders_a_multi_paragraph_reply_with_an_at_sign_fence() {
+        let markdown = format!(
+            "To add the plugin, open a terminal and run the installer.\n\n\
+             - make sure the marketplace is registered\n\
+             - restart the session afterwards\n\n\
+             ```powershell\n{AT_SIGN_COMMAND}\n```\n\n\
+             Once it finishes, the new skills are listed by the plugin command."
+        );
+        let rows = render_within_deadline(&markdown, 120);
+        let all: Vec<&str> = rows.iter().map(|r| r.text.as_str()).collect();
+        assert!(all.iter().any(|t| t.contains("To add the plugin")), "{all:?}");
+        assert!(all.iter().any(|t| t.contains(AT_SIGN_COMMAND)), "{all:?}");
+        assert!(all.iter().any(|t| t.contains("Once it finishes")), "{all:?}");
+    }
+
     #[test]
     fn preserves_indentation_inside_a_code_block() {
         let rows = render("```rust\n    indented\n```", 40);
