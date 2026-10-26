@@ -16,7 +16,7 @@
 //!    avoid a layering violation (coda-client knows about `coda serve`).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use coda_proto::error_codes;
@@ -52,6 +52,9 @@ pub(crate) struct Connection {
     outgoing: mpsc::UnboundedSender<String>,
     pending: PendingMap,
     next_id: Arc<AtomicI64>,
+    /// Set (under the `pending` lock) once the reader hit EOF, so a request
+    /// registered afterwards fails instead of waiting for a reply that cannot come.
+    reader_done: Arc<AtomicBool>,
 }
 
 impl Connection {
@@ -95,10 +98,13 @@ impl Connection {
         let line = serde_json::to_string(&request).map_err(McpTransportError::Json)?;
 
         let (tx, rx) = oneshot::channel();
-        self.pending
-            .lock()
-            .expect("pending map poisoned")
-            .insert(id.clone(), tx);
+        {
+            let mut pending = self.pending.lock().expect("pending map poisoned");
+            if self.reader_done.load(Ordering::SeqCst) {
+                return Err(McpTransportError::ConnectionClosed);
+            }
+            pending.insert(id.clone(), tx);
+        }
 
         if let Err(_) = self.outgoing.send(line) {
             // Remove the registration we just made; otherwise finish() would
@@ -138,15 +144,17 @@ where
     let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel::<String>();
     let (notif_tx, notif_rx) = mpsc::unbounded_channel::<ServerNotification>();
     let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+    let reader_done = Arc::new(AtomicBool::new(false));
 
     let connection = Connection {
         outgoing: outgoing_tx,
         pending: Arc::clone(&pending),
         next_id: Arc::new(AtomicI64::new(1)),
+        reader_done: Arc::clone(&reader_done),
     };
 
     let writer_task = tokio::spawn(write_loop(writer, outgoing_rx));
-    let reader_task = tokio::spawn(read_loop(reader, notif_tx, pending));
+    let reader_task = tokio::spawn(read_loop(reader, notif_tx, pending, reader_done));
 
     (connection, notif_rx, ConnectionTasks { reader: reader_task, writer: writer_task })
 }
@@ -173,6 +181,7 @@ async fn read_loop<R>(
     reader: R,
     notifications: mpsc::UnboundedSender<ServerNotification>,
     pending: PendingMap,
+    reader_done: Arc<AtomicBool>,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
 {
@@ -186,17 +195,16 @@ async fn read_loop<R>(
             Ok(None) | Err(_) => break, // EOF or I/O error
         }
     }
-    finish(pending);
+    finish(pending, &reader_done);
 }
 
 /// Fail every in-flight request so no caller waits forever on a dead server.
-fn finish(pending: PendingMap) {
-    let waiters: Vec<_> = pending
-        .lock()
-        .expect("pending map poisoned")
-        .drain()
-        .map(|(_, tx)| tx)
-        .collect();
+fn finish(pending: PendingMap, reader_done: &AtomicBool) {
+    let waiters: Vec<_> = {
+        let mut pending = pending.lock().expect("pending map poisoned");
+        reader_done.store(true, Ordering::SeqCst);
+        pending.drain().map(|(_, tx)| tx).collect()
+    };
     for tx in waiters {
         let _ = tx.send(Err(ResponseError {
             code: error_codes::INTERNAL_ERROR,

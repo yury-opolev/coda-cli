@@ -37,7 +37,7 @@ mod test_fixture;
 pub(crate) mod transport;
 
 pub use error::{McpConnectError, McpError};
-pub use manager::{McpClientManager, McpServerStatus};
+pub use manager::{McpClientManager, McpServerFault, McpServerStatus, OldProcessOutcome, RestartReport};
 pub use tool::McpTool;
 
 // Auth re-exports for consumers that need to configure HTTP servers.
