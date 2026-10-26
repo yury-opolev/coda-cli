@@ -99,11 +99,14 @@ impl McpProcess {
             Ok(Ok(status)) => ProcessExit::Exited(status.to_string()),
             Ok(Err(error)) => ProcessExit::Exited(error.to_string()),
             Err(_) => {
-                self.tree.kill_tree_gracefully();
-                let polite = tokio::time::Instant::now() + TERM_GRACE;
-                let exited = tokio::time::timeout_at(polite.min(deadline + FORCE_WAIT), self.child.wait())
-                    .await
-                    .is_ok();
+                let exited = if self.tree.kill_tree_gracefully() {
+                    let polite = tokio::time::Instant::now() + TERM_GRACE;
+                    tokio::time::timeout_at(polite.min(deadline + FORCE_WAIT), self.child.wait())
+                        .await
+                        .is_ok()
+                } else {
+                    false
+                };
                 if !exited {
                     // The count includes the direct child, which is not a leftover.
                     early_kills = self.tree.kill_tree(true).map_or(0, |n| n.saturating_sub(1));
@@ -221,7 +224,11 @@ mod tree {
             Self { job, pid }
         }
 
-        pub(super) fn kill_tree_gracefully(&self) {}
+        /// Windows has no tree-wide polite signal; returns `false` so the
+        /// caller force-kills at the deadline without an extra wait.
+        pub(super) fn kill_tree_gracefully(&self) -> bool {
+            false
+        }
 
         /// Kills the whole tree; returns how many processes were active, when known.
         /// `root_alive` tells whether the direct child may still be running, so
@@ -323,8 +330,9 @@ mod tree {
             }
         }
 
-        pub(super) fn kill_tree_gracefully(&self) {
+        pub(super) fn kill_tree_gracefully(&self) -> bool {
             self.signal(libc::SIGTERM);
+            true
         }
 
         /// Cannot count the members of a process group, so always `None`.
