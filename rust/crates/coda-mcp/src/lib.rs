@@ -32,6 +32,8 @@ pub(crate) mod client;
 pub(crate) mod http_client;
 pub(crate) mod process;
 pub(crate) mod ssrf;
+#[cfg(test)]
+mod test_fixture;
 pub(crate) mod transport;
 
 pub use error::{McpConnectError, McpError};

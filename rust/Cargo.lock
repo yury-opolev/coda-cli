@@ -770,6 +770,7 @@ dependencies = [
  "coda-tool",
  "directories",
  "futures",
+ "libc",
  "pretty_assertions",
  "regex",
  "reqwest",
@@ -780,6 +781,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
