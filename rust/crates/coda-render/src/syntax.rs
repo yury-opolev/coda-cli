@@ -905,11 +905,14 @@ mod tests {
             for (line, line_spans) in lines.iter().zip(&spans) {
                 // Known separate issue: `to_cell_spans` measures combining
                 // marks per char, so their spans can overshoot the grapheme
-                // width. Only termination is checked for those lines.
-                if line.contains('\u{0301}') {
-                    continue;
-                }
-                let cells = crate::text::width(line);
+                // width; bound those lines by their per-char width instead.
+                let cells = if line.contains('\u{0301}') {
+                    line.chars()
+                        .map(|c| crate::text::grapheme_width(&c.to_string()))
+                        .sum()
+                } else {
+                    crate::text::width(line)
+                };
                 for span in line_spans {
                     assert!(
                         span.start < span.end && span.end <= cells,

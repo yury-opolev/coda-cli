@@ -110,3 +110,9 @@ Run: expected FAIL with "did not terminate".
 - [ ] **Step 6: Green** — `cargo test -p coda-render`; all pass, no new warnings. `rustfmt --edition 2021 --check` only on changed files is not required (files not fmt-clean); hand-format changed lines.
 
 - [ ] **Step 7: Commit** `fix(render): stop the syntax tokenizer looping on an unquoted @` with the Copilot co-author trailer.
+
+## Deviations (as implemented)
+
+- Test 2 uses `@ {kw} @@ 42 @{kw}`: with the fix `@42` is one identifier token, so `42` must be separated to be a number.
+- Test 6 bounds spans on lines containing U+0301 by per-char width rather than grapheme width: `to_cell_spans` measures per char, a pre-existing mismatch tracked as a follow-up.
+
