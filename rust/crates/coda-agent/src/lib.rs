@@ -104,6 +104,6 @@ pub use todos::{TodoItem, TodoStatus, TodoStore};
 pub use tool::{
     AnswerOutcome, NoAnswerReason, PlanApprover, ScheduleOrigin, Tool, ToolContext, ToolControl,
     ToolDescriptor, ToolNameFilter, ToolOutcome, ToolQuarantine, ToolRegistry, ToolResult,
-    UserQuestion,
+        ToolSource, UserQuestion,
 };
 pub use tools::{built_in_file_tools, built_in_tools};

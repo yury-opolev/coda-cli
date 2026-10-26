@@ -26,7 +26,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use coda_auth::store::CredentialStore;
-use coda_tool::Tool;
+use coda_tool::{Tool, ToolSource};
 
 use crate::auth::{McpAuthMode, McpAuthProvider, McpOAuthProvider, StaticBearerAuthProvider};
 use crate::client::{McpClient, McpServerInfo, McpToolCallError, McpToolInfo, DEFAULT_CONNECT_TIMEOUT};
@@ -567,6 +567,12 @@ impl McpClientManager {
             .collect()
     }
 
+    /// A live view of this manager's tools for `ToolRegistry::with_source`.
+    /// Follows restarts and keeps the last-known tools of disconnected servers.
+    pub fn tool_source(self: &Arc<Self>) -> Arc<dyn ToolSource> {
+        Arc::new(McpToolSource { manager: Arc::clone(self) })
+    }
+
     /// Call a tool on the named server.
     ///
     /// Returns the (text, is_error) pair from the server's `tools/call`
@@ -780,6 +786,27 @@ impl McpClientManager {
         } else {
             Err(errors.join("; "))
         }
+    }
+}
+
+struct McpToolSource {
+    manager: Arc<McpClientManager>,
+}
+
+impl ToolSource for McpToolSource {
+    fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        let snapshot: Vec<(String, McpToolInfo)> = self
+            .manager
+            .tool_snapshot
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        snapshot
+            .into_iter()
+            .map(|(server, info)| {
+                Arc::new(McpTool::new(server, info, Arc::clone(&self.manager))) as Arc<dyn Tool>
+            })
+            .collect()
     }
 }
 
@@ -1471,6 +1498,51 @@ mod tests {
         assert!(error.contains("is not connected (last error:"), "{error}");
         restart_ok(&manager, "s").await;
         echo_pid(&manager, "s").await;
+    }
+
+    #[tokio::test]
+    async fn the_tool_source_reflects_a_restart_with_a_new_tool_list() {
+        let manager = Arc::new(McpClientManager::new());
+        let errors = manager
+            .connect_many(vec![fake_server_connectable("s", "serve", &[])], Some(Duration::from_secs(10)))
+            .await;
+        assert!(errors.is_empty(), "{errors:?}");
+        let source = manager.tool_source();
+        let names = |s: &Arc<dyn ToolSource>| -> Vec<String> {
+            s.tools().iter().map(|t| t.name().to_owned()).collect()
+        };
+        assert_eq!(names(&source), [crate::tool::namespaced_name("s", "echo")]);
+
+        manager.servers.write().await.get_mut("s").unwrap().spec =
+            ServerSpec::Stdio(Box::new(fake_server_connectable("s", "tools2", &[])));
+        restart_ok(&manager, "s").await;
+        let after = names(&source);
+        assert!(after.contains(&crate::tool::namespaced_name("s", "extra")), "{after:?}");
+    }
+
+    #[tokio::test]
+    async fn a_disconnected_server_keeps_its_tools_routable() {
+        let manager = Arc::new(McpClientManager::new());
+        let errors = manager
+            .connect_many(vec![fake_server_connectable("s", "serve", &[])], Some(Duration::from_secs(10)))
+            .await;
+        assert!(errors.is_empty(), "{errors:?}");
+        {
+            let mut guard = manager.servers.write().await;
+            let live = guard.get_mut("s").unwrap().live.as_mut().unwrap();
+            live._process.as_mut().unwrap().child.start_kill().unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(5), live._process.as_mut().unwrap().child.wait()).await;
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(10), manager.call_tool("s", "echo", &json!({}))).await;
+        assert!(manager.connected_status().await.is_empty());
+
+        let tools = manager.tool_source().tools();
+        assert_eq!(tools.len(), 1);
+        let outcome = tools[0]
+            .execute(&json!({}), &coda_tool::ToolContext::new("."), CancellationToken::new())
+            .await;
+        assert!(outcome.is_error);
+        assert!(outcome.content.contains("restart_mcp_server"), "{}", outcome.content);
     }
 
     #[tokio::test]

@@ -86,6 +86,14 @@ impl ToolResult {
 /// field can be threaded through the call site without changing every tool impl.
 pub type ToolOutcome = ToolResult;
 
+/// A live, changing set of tools (e.g. MCP servers that reconnect).
+///
+/// Queried on every registry lookup, so changes show up without rebuilding
+/// the registry.
+pub trait ToolSource: Send + Sync {
+    fn tools(&self) -> Vec<std::sync::Arc<dyn Tool>>;
+}
+
 /// An executable tool the model can call.
 ///
 /// Object-safe via `async_trait`; lives in the registry as `Arc<dyn Tool>`.
