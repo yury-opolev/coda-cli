@@ -692,11 +692,18 @@ impl McpClientManager {
     /// exclusive resource can rebind. How that went is reported, never fatal.
     /// A failed relaunch keeps the slot so the restart can be retried.
     pub async fn restart_server(&self, server_name: &str) -> Result<RestartReport, String> {
+        const SHUTTING_DOWN: &str = "MCP manager is shutting down";
+        if self.stopping.is_cancelled() {
+            return Err(SHUTTING_DOWN.into());
+        }
         let lock = {
             let mut locks = self.restart_locks.lock().unwrap_or_else(|e| e.into_inner());
             Arc::clone(locks.entry(server_name.to_string()).or_default())
         };
         let _restarting = lock.lock().await;
+        if self.stopping.is_cancelled() {
+            return Err(SHUTTING_DOWN.into());
+        }
 
         let (old, spec) = {
             let mut guard = self.servers.write().await;
@@ -726,25 +733,40 @@ impl McpClientManager {
 
         let connect_timeout = DEFAULT_CONNECT_TIMEOUT;
         let tool_timeout = self.tool_timeout;
-        let reconnected = match &spec {
-            ServerSpec::Stdio(cfg) => {
-                connect_one_stdio(cfg, connect_timeout, tool_timeout).await
-            }
-            ServerSpec::Http(cfg, store) => {
-                connect_one_http(cfg, connect_timeout, tool_timeout, store.as_ref()).await
+        let reconnect = async {
+            match &spec {
+                ServerSpec::Stdio(cfg) => {
+                    connect_one_stdio(cfg, connect_timeout, tool_timeout).await
+                }
+                ServerSpec::Http(cfg, store) => {
+                    connect_one_http(cfg, connect_timeout, tool_timeout, store.as_ref()).await
+                }
             }
         };
+        let reconnected = self.until_shutdown(reconnect).await?;
 
         let mut guard = self.servers.write().await;
         match reconnected {
             Ok(entry) => {
                 let tool_count = entry.client.tools().len();
-                if let Some(slot) = guard.get_mut(server_name) {
-                    slot.tools = entry.client.tools().to_vec();
-                    slot.live = Some(entry);
-                    slot.last_error = None;
-                    slot.generation += 1;
-                }
+                let slot = if self.stopping.is_cancelled() {
+                    None
+                } else {
+                    guard.get_mut(server_name)
+                };
+                let Some(slot) = slot else {
+                    drop(guard);
+                    if let Err(error) =
+                        entry.shutdown(tokio::time::Instant::now() + SHUTDOWN_GRACE).await
+                    {
+                        tracing::warn!(server = %server_name, %error, "discarding restarted MCP server failed");
+                    }
+                    return Err(SHUTTING_DOWN.into());
+                };
+                slot.tools = entry.client.tools().to_vec();
+                slot.live = Some(entry);
+                slot.last_error = None;
+                slot.generation += 1;
                 self.rebuild_snapshot(&guard);
                 Ok(RestartReport { tool_count, old_process })
             }
@@ -836,6 +858,7 @@ fn is_transport_loss(error: &crate::error::McpTransportError) -> bool {
             let message = e.message.to_ascii_lowercase();
             message.contains("session not found") || message.contains("connection closed before responding")
         }
+        McpTransportError::Other(message) => message.to_ascii_lowercase().contains("session not found"),
         _ => false,
     }
 }
@@ -1560,6 +1583,29 @@ mod tests {
         let tools = manager.tools().await;
         assert_eq!(tools.len(), 1);
         assert!(tools[0].name().starts_with("mcp__"), "tool name must be namespaced");
+    }
+
+    #[test]
+    fn http_session_loss_counts_as_transport_loss() {
+        use crate::error::McpTransportError;
+        let session_lost = r#"HTTP 404: {"error":{"code":-32001,"message":"Session not found"}}"#;
+        assert!(is_transport_loss(&McpTransportError::Other(session_lost.into())));
+        assert!(!is_transport_loss(&McpTransportError::Other("HTTP 500: boom".into())));
+        assert!(is_transport_loss(&McpTransportError::Rpc(coda_proto::ResponseError {
+            code: -32001,
+            message: "Session not found".into(),
+            data: None,
+        })));
+        assert!(is_transport_loss(&McpTransportError::ConnectionClosed));
+    }
+
+    #[tokio::test]
+    async fn restart_after_shutdown_is_refused() {
+        let manager = McpClientManager::new();
+        connect_fake(&manager, "s", "serve", &[]).await;
+        manager.shutdown().await.expect("shutdown");
+        let error = manager.restart_server("s").await.unwrap_err();
+        assert!(error.contains("shutting down"), "{error}");
     }
 
     #[tokio::test]
