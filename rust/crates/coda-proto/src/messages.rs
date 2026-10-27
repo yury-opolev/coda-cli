@@ -100,8 +100,8 @@ pub mod method {
     pub const TASK_STOP: &str = "task/stop";
 
     // ── Non-blocking runtime (Phase 2) ───────────────────────────────────
-    /// Deliver a user message to a running subagent's inbox: it cuts the
-    /// subagent's current wait short, or wakes it when it is parked.
+    /// Deliver a user message to a running subagent's inbox: it is delivered
+    /// at the subagent's next boundary, or wakes it when it is parked.
     pub const TASK_SEND: &str = "task/send";
 
     // ── Non-blocking runtime (Phase 3) ───────────────────────────────────

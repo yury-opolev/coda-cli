@@ -2557,10 +2557,10 @@ mod tests {
             assert_eq!(build.status(), TaskRunStatus::Completed);
         }
 
-        /// `task_wait` attaches with the yield contract: capped at 30 s, cut
-        /// short by a new message, and it never stops the task.
+        /// `task_wait` attaches with the yield contract: capped at 30 s, not
+        /// cut short by a new message, and it never stops the task.
         #[tokio::test(start_paused = true)]
-        async fn task_wait_is_capped_and_cut_short_by_steering() {
+        async fn task_wait_is_capped_and_not_cut_short_by_a_message() {
             let dir = tempfile::tempdir().unwrap();
             let mgr = manager(&dir);
             let job = mgr
@@ -2610,9 +2610,10 @@ mod tests {
                 .await
                 .unwrap();
             sender.await.unwrap();
-            assert_eq!(begun.elapsed(), Duration::from_secs(5), "the message cut the wait short");
+            assert_eq!(begun.elapsed(), Duration::from_secs(30), "a message does not end the wait");
             let second = &client.requests_for("steered")[1];
-            assert!(second.contains("ended early because a new message arrived"), "{second}");
+            assert!(second.contains("still running"), "{second}");
+            assert!(!second.contains("ended early"), "{second}");
             assert!(second.contains("are you done?"), "{second}");
             assert_eq!(job.status(), TaskRunStatus::Running, "waiting never stops the task");
         }

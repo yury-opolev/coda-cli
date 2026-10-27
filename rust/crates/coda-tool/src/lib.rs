@@ -46,8 +46,8 @@ pub enum ToolControl {
     /// a user "background now"). `content` of the carrying result is unused.
     RunningTask { task_id: String, wait: Option<std::time::Duration> },
     /// Attach to an already running task (`task_wait`): the executor waits up
-    /// to `wait` for it under the same rules as `RunningTask` — cut short by
-    /// a user/parent message or a cancelled turn — but never stops, promotes
+    /// to `wait` for it under the same rules as `RunningTask` — cut short only
+    /// by a cancelled turn, never by a message — but never stops, promotes
     /// or otherwise touches the task, and never skips the rest of the batch.
     /// `content` of the carrying result is what the model sees when the wait
     /// ends before the task does.

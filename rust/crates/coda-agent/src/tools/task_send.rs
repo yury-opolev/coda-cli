@@ -18,8 +18,9 @@ impl Tool for TaskSendTool {
 
     fn description(&self) -> &str {
         "Deliver a message to a running subagent task. It goes to the subagent's inbox: a \
-         wait on a running command is cut short, a parked subagent wakes up, and the message is \
-         delivered before its next model call. Fails for shell tasks and finished tasks."
+         parked subagent wakes up, and the message is delivered before its next model call (a \
+         wait on a running command is not cut short; it ends within 30 seconds). Fails for \
+         shell tasks and finished tasks."
     }
 
     fn input_schema_json(&self) -> &str {
@@ -72,8 +73,8 @@ impl Tool for TaskSendTool {
         }
 
         // Deliver via the agent's inbox if one is attached (subagent tasks only).
-        // A message cuts the subagent's current wait short and wakes it when
-        // it is parked.
+        // A message wakes the subagent when it is parked; a running wait is
+        // not cut short.
         match task.steering() {
             Some(inbox) => match inbox.enqueue(message.to_owned()) {
                 Some(_) => ToolResult::ok(format!("Message delivered to task '{task_id}'.")),

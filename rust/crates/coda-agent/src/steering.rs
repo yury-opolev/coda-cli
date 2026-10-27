@@ -29,7 +29,8 @@ use std::sync::{Arc, Mutex};
 /// completions of the tasks it started and its own deadline notice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InboxItemKind {
-    /// A user (main) or parent (`task_send`) message. Cuts a running wait short.
+    /// A user (main) or parent (`task_send`) message. Delivered at the next
+    /// boundary; it never cuts a running wait short.
     #[default]
     Message,
     /// A task this agent started has finished; the text is a framed data block.
@@ -87,8 +88,7 @@ pub trait SteeringObserver: Send + Sync {
 pub struct SteeringInbox {
     gate: Mutex<SteeringInboxInner>,
     observer: Option<Arc<dyn SteeringObserver>>,
-    /// Signalled whenever a message is accepted, so a loop that is waiting
-    /// on a running tool can cut that wait short (the tool keeps running).
+    /// Signalled whenever an item is accepted, so a parked agent wakes up.
     arrived: tokio::sync::Notify,
 }
 
@@ -112,25 +112,9 @@ impl SteeringInbox {
         }
     }
 
-    /// Resolves once at least one undelivered *message* is waiting. Returns
-    /// immediately when one already is. Never consumes anything: delivery
-    /// stays with [`SteeringInbox::take_all_for_delivery`]. Task completions
-    /// do not count: they wait for the next boundary instead of cutting a
-    /// running tool's wait short.
-    pub async fn wait_for_pending(&self) {
-        loop {
-            let notified = self.arrived.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.has_pending() {
-                return;
-            }
-            notified.await;
-        }
-    }
-
     /// Resolves once any undelivered item (message, completion, deadline) is
-    /// waiting. Used by a parked agent.
+    /// waiting. Used by a parked agent. A running tool's wait never listens
+    /// here: only an explicit "background now" ends it early.
     pub async fn wait_for_any(&self) {
         loop {
             let notified = self.arrived.notified();
@@ -511,7 +495,7 @@ mod tests {
         assert!(inbox.try_seal_empty());
         inbox.push_item(InboxItemKind::TaskCompleted, "[task-completed] task-0002");
         assert!(inbox.has_any());
-        assert!(!inbox.has_pending(), "a completion must not cut a running wait short");
+        assert!(!inbox.has_pending(), "a completion is not a pending message");
         assert!(!inbox.try_seal_empty(), "an undelivered completion keeps the agent going");
         let items = inbox.take_all_for_delivery();
         assert_eq!(items.len(), 1);
@@ -519,7 +503,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_for_any_wakes_on_a_completion_and_wait_for_pending_does_not() {
+    async fn wait_for_any_wakes_on_a_completion() {
         let inbox = Arc::new(SteeringInbox::new());
         let waiter = {
             let inbox = Arc::clone(&inbox);
@@ -531,12 +515,6 @@ mod tests {
             .await
             .expect("wait_for_any must wake")
             .unwrap();
-        let pending = tokio::time::timeout(
-            std::time::Duration::from_millis(20),
-            inbox.wait_for_pending(),
-        )
-        .await;
-        assert!(pending.is_err(), "only a message satisfies wait_for_pending");
     }
 
     #[test]

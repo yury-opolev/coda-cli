@@ -143,6 +143,10 @@ impl std::fmt::Debug for RowActions {
     }
 }
 
+/// Minimum content rows of the `/tasks` list, so a list of a few tasks (or
+/// none) does not look cramped.
+const TASKS_MIN_LIST_ROWS: u16 = 8;
+
 pub struct BrowserSurface {
     browser: Browser,
     kind: BrowserKind,
@@ -253,6 +257,19 @@ impl Surface for BrowserSurface {
                 }),
             },
         }
+    }
+
+    fn desired_size(&self, max_width: u16, theme: &Theme) -> (u16, u16) {
+        let probe = Rect::new(0, 0, max_width.max(1), u16::MAX / 2);
+        let natural = self.render(probe, theme).len() as u16;
+        // A short `/tasks` list gets a little room; a long one is exactly as
+        // tall as its rows. The stack clamps either to the terminal.
+        let height = if self.kind == BrowserKind::Tasks && self.browser.view() == View::List {
+            natural.max(TASKS_MIN_LIST_ROWS)
+        } else {
+            natural
+        };
+        (max_width, height)
     }
 
     fn render(&self, area: Rect, theme: &Theme) -> Vec<Line<'static>> {
@@ -406,15 +423,45 @@ mod tests {
         items[0].detail = vec!["long output ".repeat(20)];
         s.browser.set_items(items);
         assert!(matches!(s.placement(), super::super::Placement::FitContent { .. }));
-        assert_eq!(s.desired_size(80, &Theme::default()), (80, 4));
+        assert_eq!(s.desired_size(80, &Theme::default()), (80, 8));
         s.handle_key(key(KeyCode::Char('/')));
         for c in "alpha".chars() {
             s.handle_key(key(KeyCode::Char(c)));
         }
         s.handle_key(key(KeyCode::Enter));
-        assert_eq!(s.desired_size(80, &Theme::default()), (80, 2));
+        assert_eq!(s.desired_size(80, &Theme::default()), (80, 8));
         s.handle_key(key(KeyCode::Enter));
         assert!(s.desired_size(40, &Theme::default()).1 > 1);
+    }
+
+    #[test]
+    fn the_tasks_list_has_a_minimum_height_and_no_padding_when_full() {
+        let mut s = surface();
+        s.kind = BrowserKind::Tasks;
+        let theme = Theme::default();
+        let with_tasks = |s: &mut BrowserSurface, n: usize| {
+            let items: Vec<Item> = (0..n)
+                .map(|i| Item::new(format!("s/task-{i}"), vec!["•".into(), format!("task-{i}")]))
+                .collect();
+            s.browser.set_items(items);
+            s.desired_size(80, &theme).1
+        };
+        assert_eq!(with_tasks(&mut s, 0), 8, "an empty list is not cramped");
+        assert_eq!(with_tasks(&mut s, 3), 8, "a short list is not cramped");
+        // The heading row plus 16 task rows, and no blank rows below them.
+        assert_eq!(with_tasks(&mut s, 16), 17);
+
+        let small = Rect::new(0, 0, 80, 7);
+        let region = crate::surface::chrome::fit_content_region(
+            s.desired_size(78, &theme), &s.hints(), small,
+        );
+        assert_eq!(region.height, 7, "clamped to the terminal");
+    }
+
+    #[test]
+    fn other_browsers_keep_their_natural_height() {
+        let s = surface();
+        assert_eq!(s.desired_size(80, &Theme::default()), (80, 4));
     }
 
     #[test]

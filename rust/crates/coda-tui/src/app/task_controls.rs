@@ -1,5 +1,5 @@
 //! User controls for running tool work (non-blocking runtime, Phases 1–2):
-//! background-now (Ctrl+B), send-now (Ctrl+Enter / Ctrl+G), `/stop`,
+//! background-now (Ctrl+B), `/stop`,
 //! `/send <task> <message>`, and the `/tasks` browser's `b` (background),
 //! `x` (stop) and `m` (message) keys.
 //!
@@ -65,25 +65,6 @@ impl App {
                 NoticeLevel::Error,
             ),
         }
-    }
-
-    /// Ctrl+Enter / Ctrl+G: while a turn runs, stop waiting on tool work and
-    /// deliver the composed message at once (as steering). When idle it is
-    /// an ordinary submit.
-    pub(super) async fn send_now(&mut self) {
-        if !self.state.is_busy() {
-            self.submit().await;
-            return;
-        }
-        if self.require_engine("Send now") {
-            // Quietly: the message itself is the feedback the user expects.
-            let _ = self.ask::<TaskBulkControlResult>(method::BACKGROUND_ALL, None).await;
-        }
-        if self.composer.is_empty() {
-            self.hint("Moved waiting work to the background; queued messages are delivered now.");
-            return;
-        }
-        self.submit().await;
     }
 
     /// `/stop`: interrupt the turn (if one is running) and stop every running

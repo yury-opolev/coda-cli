@@ -562,8 +562,22 @@ pub fn compose_activity(state: &UiState, now: Instant) -> Option<String> {
         text.push_str(&format!(" {} {n} queued", glyphs::RULE_VERTICAL));
     }
 
+    // Once a tool has held the turn for a while, say how to stop waiting on
+    // it. Nothing else on screen mentions the key.
+    if progress
+        .running_tools_ms(now)
+        .is_some_and(|ms| ms >= BACKGROUND_TIP_AFTER_MS)
+    {
+        text.push_str(&format!(" {} {BACKGROUND_TIP}", glyphs::RULE_VERTICAL));
+    }
+
     Some(text)
 }
+
+/// How long `Running tools` lasts before the activity row offers the
+/// background key.
+pub const BACKGROUND_TIP_AFTER_MS: i64 = 5_000;
+pub const BACKGROUND_TIP: &str = "Ctrl+B to background";
 
 /// Draws the transient status line above the composer.
 ///
@@ -1680,6 +1694,34 @@ mod tests {
         state.apply(crate::state::UiEvent::Queued { text: "later".into(), id: Some("s1".into()) });
         let text = compose_activity(&state, Instant::now()).expect("busy");
         assert!(text.contains("1 queued"), "{text:?}");
+    }
+
+    #[test]
+    fn compose_activity_offers_the_background_key_only_after_tools_run_a_while() {
+        assert!(!BACKGROUND_TIP.contains("Enter"), "there is no send-now key to advertise");
+        let mut state = UiState::new();
+        state.apply(crate::state::UiEvent::Submitted { text: "go".into() });
+        let start = Instant::now();
+        let at = |ms: u64| start + std::time::Duration::from_millis(ms);
+        let progress = state.turn_progress.as_mut().expect("a submitted turn has a clock");
+        progress.on_tool_call_started(start);
+
+        let tip_shown = |state: &UiState, now| {
+            compose_activity(state, now).expect("busy").contains(BACKGROUND_TIP)
+        };
+        assert!(!tip_shown(&state, at(4_999)), "too early for the tip");
+        assert!(tip_shown(&state, at(5_000)));
+
+        // A second tool in the same run keeps the original start.
+        state.turn_progress.as_mut().unwrap().on_tool_call_started(at(4_000));
+        assert!(tip_shown(&state, at(5_000)));
+
+        // Leaving the tools phase hides it, and a later run starts over.
+        state.turn_progress.as_mut().unwrap().on_waiting_for_model(at(6_000));
+        assert!(!tip_shown(&state, at(60_000)));
+        state.turn_progress.as_mut().unwrap().on_tool_call_started(at(60_000));
+        assert!(!tip_shown(&state, at(62_000)));
+        assert!(tip_shown(&state, at(65_000)));
     }
 
     #[test]

@@ -201,13 +201,14 @@ as a `tool` task, and
 every subagent as a `subagent` task that starts in the `background` (nothing ever waits on
 it in the foreground). While
 the agent waits on a task it is `foreground`; once the agent stops waiting (its yield
-budget ran out, a steering message arrived, or a client asked) it is `background` and keeps
-running. `session/backgroundAll` and `task/background` end the agent's wait — never the
+budget ran out, or a client asked) it is `background` and keeps
+running. Messages never end the wait; `session/backgroundAll` and `task/background` are
+the only ways to end it early — never the
 work; the agent receives a task handle and continues. `count` is how many foreground tasks
 were released (`0` is not an error). `task/stop` and `session/stopAllTasks` stop tasks and
 kill shell process trees (stopping a subagent also stops everything it started).
-`task/send` delivers `text` to a running subagent's inbox: it cuts the subagent's current
-wait short, or wakes it when it is parked (waiting, without model calls, for tasks it
+`task/send` delivers `text` to a running subagent's inbox: it is delivered at the
+subagent's next boundary (a running wait is not cut short), or wakes it when it is parked (waiting, without model calls, for tasks it
 started). A refused `task/*` call answers `ok: false` with `reason` `notFound`,
 `notRunning`, for `task/background` only `notForeground` (already in the background — every
 subagent is) / `notBackgroundable`, and for `task/send` only `notAgent` (a shell task has no
