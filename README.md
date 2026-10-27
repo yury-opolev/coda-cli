@@ -123,12 +123,26 @@ for limits, failure behavior, and compatibility with older logging flags.
     it started).
   - **You stay in control:** `Ctrl+B` moves whatever the agent is waiting on to the
     background, `Ctrl+Enter` (or `Ctrl+G`) does that *and* sends your message now,
-    `/tasks` → `b` / `x` backgrounds / stops one task (only shell commands are ever
-    waited on, so only they can be backgrounded), `/tasks` → `m` or
+    `/tasks` → `b` / `x` backgrounds / stops one task (only shell commands and long tool
+    calls are ever waited on, so only they can be backgrounded), `/tasks` → `m` or
     `/send <task-id> <message>` sends a message to a running subagent (it cuts the
     subagent's current wait short, or wakes it when parked), and `/stop` interrupts the
     turn and stops every task. `Esc` (interrupt) stops only the command the agent was
     waiting on; commands and subagents already in the background keep running.
+  - **Ask without interrupting:** `/btw <question>` (alias `/ask`) answers a side
+    question — *"are the reviews still running?"* — from the conversation so far and a
+    live snapshot of the task table, in a side panel, while the agent keeps working. It
+    uses no tools and is never added to the conversation; `p` in the panel sends the
+    question to the agent as an ordinary message after all. The status row shows
+    `N tasks running · /tasks` whenever anything runs.
+  - **Messages cannot rewrite running work.** A message you send while tasks the agent
+    started are running reaches the model prefixed with a compact `[live-tasks]` list
+    (id, kind, command, age), so it knows those processes are already running with their
+    original parameters and must stop and restart one to apply a change.
+  - **Long MCP tool calls are tasks too:** a remote MCP call is awaited under the same
+    yield budget as a shell command and keeps running in the background when it takes
+    longer. At most **32** shell commands run at once; another is refused with a clear
+    error until one finishes or is stopped.
   - The agent can still inspect and steer work with `task_list` / `task_get` /
     `task_peek` / `task_output` / `task_send` / `task_stop`, and `task_remove` a finished
     task (its log file is preserved). `task_wait` attaches to a task for at most **30 s**
@@ -292,6 +306,7 @@ Inside the REPL:
 /login [claude|copilot|api-key]   sign in (Claude.ai browser / Copilot device code / API key)
 /status                   sign-in state for every provider
 /tasks                    open the live task browser (prints a textual snapshot in plain mode)
+/btw <question>           ask a side question about the session and its tasks (alias /ask)
 /provider [id]            show the connected account, or connect a different one
 /setup                    the first-run wizard: choose an account and sign in
 /model [id]               show or set the chat model
@@ -342,7 +357,9 @@ subagent's current wait short, or wakes it if it is parked. `/stop` interrupts t
 
 `coda serve` exposes the same controls to any client: `session/listTasks`,
 `session/backgroundAll`, `task/background {taskId}`, `task/stop {taskId}`,
-`task/send {taskId, text}` and `session/stopAllTasks` (see [docs/serve-protocol.md](docs/serve-protocol.md)).
+`task/send {taskId, text}`, `session/stopAllTasks` and `session/askAside {question}`, plus the
+`event/taskStarted`, throttled `event/taskOutput` and `event/taskCompleted` (with the owning
+agent) notifications (see [docs/serve-protocol.md](docs/serve-protocol.md)).
 
 ### Model, effort & context
 

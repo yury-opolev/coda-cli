@@ -72,6 +72,10 @@ might infer from its name. Unsupported operations are listed separately.
 | `skills/trust` | Unsupported | Always refused in serve mode. |
 | `plugins/list` | Limited | Compatibility route currently returns an empty list; not an authoritative installed-plugin inventory. |
 | `session/pendingMessages` | Reusable | Non-destructive recovery of engine-owned background notifications (`notify_user`, Stage 2). Available before initialize; see [Background notifications](#background-notifications-notify_user). |
+| `session/backgroundAll`, `task/background` | Reusable | Stop *waiting* on foreground tasks (all, or one); the work keeps running and reports later. Requires initialize. |
+| `session/stopAllTasks`, `task/stop` | Reusable | Stop running tasks and their process trees. Requires initialize. |
+| `task/send` | Reusable | Deliver a message to a running subagent's inbox. Requires initialize. |
+| `session/askAside` | Reusable | A side question answered by one tool-less model request over the conversation and the live task table; never added to history, works during a turn. Requires initialize. |
 
 The new `session/getHistory`, `session/getPendingRequests`,
 `session/resolveRequest`, `session/cancelRequest` and `config/set` methods
@@ -125,7 +129,8 @@ the same structured projection regardless of that hint.
 | `event/usage`, `event/streamProgress` | Reported response usage and streaming progress; do not silently interpret last-response usage as cumulative. |
 | `event/error`, `event/limitReached` | Execution errors and enforced limits. |
 | `event/steeringDelivered` | Inbox entries injected at a safe boundary, not proof of provider receipt or execution. |
-| `event/taskCompleted`, `event/scheduleLifecycle` | Existing background lifecycle vocabulary. Do not infer complete fleet or background counters from availability of these names. |
+| `event/taskStarted`, `event/taskOutput`, `event/taskCompleted` | Task lifecycle: one start and one completion per task (kind, owning agent, mode) and throttled, bounded, secret-redacted output (≤ 4 frames/s per task, ≤ 2 000 chars, withheld while the client is not reading). `session/listTasks` stays authoritative. |
+| `event/scheduleLifecycle` | Existing background lifecycle vocabulary. Do not infer complete fleet or background counters from availability of this name. |
 | `event/promptRewritten`, `event/responseRewritten` | Hook rewrite notifications. |
 | `event/toolInputModified`, `event/toolResultModified` | Hook changes to tool content. |
 | `event/permissionDecided`, `event/permissionsUpdated` | Permission hook/control notifications. |
