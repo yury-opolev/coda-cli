@@ -131,10 +131,11 @@ pub struct AgentMessageDeliveredItemDto {
     pub id: String,
     pub seq: i64,
     pub label: String,
-    /// One of `"scheduledTask"` | `"subagent"` | `"main"` — see
-    /// [`AgentMessageDto::source`]. `"main"` is unreachable here: `ask_main`
-    /// refuses a main-context caller outright (self-question loop), so
-    /// nothing ever queues an item attributed to `main`.
+    /// One of `"scheduledTask"` | `"subagent"` | `"taskCompletion"` | `"main"`
+    /// — see [`AgentMessageDto::source`]. `"taskCompletion"` is a background
+    /// task's completion report (non-blocking runtime). `"main"` is
+    /// unreachable here: `ask_main` refuses a main-context caller outright
+    /// (self-question loop), so nothing ever queues an item attributed to `main`.
     pub source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,

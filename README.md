@@ -88,21 +88,40 @@ for limits, failure behavior, and compatibility with older logging flags.
   - `web_fetch` / `web_search` (DuckDuckGo), `notebook_edit`, `git_worktree`,
     `todo_write` (a live checklist), plan mode, `schedule_*` **scheduled tasks**
     (see [Scheduled tasks](#scheduled-tasks)), and the
-    unified task tools (`task_start` / `task_output` / `task_stop` plus
-    `task_list` / `task_get` / `task_peek` / `task_send` / `task_wait` /
-    `task_background` / `task_remove`) for long-running jobs.
-- **Unified task runtime** — one in-process `TaskManager` owns every long-running
-  job in the session (background **subagents** and shell commands alike). It gives
-  each task a shared id/status/depth model, a bounded ring of recent output, and a
-  persistent, secret-redacted log under `~/.coda/task-logs`. `run_command` accepts
-  `run_in_background` (then poll with `task_output`). Beyond inspection, the agent
-  can `task_wait` for a task to finish (optional `timeout_seconds`, default **600**,
-  maximum **1800** — a timeout reports *still running* and never stops the task),
-  `task_background` a running foreground shell so it stops awaiting it, and
-  `task_remove` a finished task from the list (its log file is preserved). The
-  interactive TUI adds a live `/tasks` browser over the same manager. Tasks are
-  **process-local** — they do **not** survive across processes, and the manager
-  stops every task when Coda exits.
+    task tools (`task` for a subagent, `task_start` / `task_output` for a background
+    subagent, plus `task_list` / `task_get` / `task_peek` / `task_send` / `task_wait` /
+    `task_stop` / `task_remove` / `task_recall`) for long-running jobs.
+- **Non-blocking task runtime** — one in-process `TaskManager` owns every long-running
+  job in the session (**subagents** and **shell commands** alike). It gives each task a
+  shared id/status/depth model, a bounded ring of recent output, and a persistent,
+  secret-redacted log under `~/.coda/task-logs`.
+  - **Every `run_command` is a task.** The agent waits for it under a short, bounded
+    *yield budget*: `waitSeconds` (default **20**, clamped to **0–30**; `0` returns at
+    once — meant for known long jobs such as builds, reviews or servers). A command that
+    finishes in time returns exactly the usual `exit code: N` + output. One that does not
+    **keeps running**: the model gets `Still running as task <id> … Output so far: …`, and
+    any tool calls planned after it in the same batch are skipped so the model re-plans.
+    Waiting less **never kills** the command; `timeoutSeconds` is a separate, optional
+    *work deadline* that kills the process tree after N seconds (no default).
+  - **Messages you send while a tool runs cut the wait short** — the command keeps
+    running and your message reaches the model within seconds, not when the command ends.
+  - **Completions are pushed.** When a backgrounded command completes, fails or is
+    stopped, the main agent receives one `[task-completed]` data block (status, exit
+    code, log path, last output) — and an idle session starts a turn by itself. The model
+    is told not to poll.
+  - **You stay in control:** `Ctrl+B` moves whatever the agent is waiting on to the
+    background, `Ctrl+Enter` (or `Ctrl+G`) does that *and* sends your message now,
+    `/tasks` → `b` / `x` backgrounds / stops one task, and `/stop` interrupts the turn and
+    stops every task. `Esc` (interrupt) stops only the command the agent was waiting on;
+    commands already in the background keep running.
+  - The agent can still inspect and steer work with `task_list` / `task_get` /
+    `task_peek` / `task_wait` (default **300 s**; a timeout reports *still running* and
+    never stops the task) / `task_send` / `task_stop`, and `task_remove` a finished task
+    (its log file is preserved). Background **subagent** completions are still collected
+    with `task_recall` (pushing them is the next phase).
+  - Headless `coda run` sets `CODA_RUN_COMMAND_YIELD=0`, so its single turn waits for its
+    commands instead of yielding. Tasks are **process-local** — they do **not** survive
+    across processes, and the manager stops every task when Coda exits.
 - **Subagents** — delegate a self-contained subtask with `task`, which runs a nested
   agent loop in its own context with a scoped toolset. Nesting and fan-out are
   bounded (by default the main agent at depth 0 with subagents at depth 1 and 2, and
@@ -192,7 +211,7 @@ interactive, headless, and slash-command flows. Export/import carries it as the 
 
 **Keys (Warm Ember):** `Enter` submits — while the slash-command completion menu is open and the highlighted
 command differs from what you typed, it accepts that command into the prompt instead, so press it again to
-send · `Shift+Enter` (or `Ctrl+Enter`/`Ctrl+J` as terminal-compatible fallbacks) inserts a newline · while an agent is busy, ordinary submissions queue for its next safe boundary · `Up` on an empty first composer line recalls queued messages into the draft (otherwise it navigates history) · `Up`/`Down` move the composer
+send · `Shift+Enter` (or `Ctrl+J`, and `Ctrl+Enter` while idle, as terminal-compatible fallbacks) inserts a newline · while an agent is busy, ordinary submissions are delivered at its next safe boundary — which is within seconds even while a command runs, because the wait for it is cut short · `Ctrl+Enter` (or `Ctrl+G`) while busy **sends now**: whatever the agent is waiting on moves to the background and your message is delivered at once · `Up` on an empty first composer line recalls queued messages into the draft (otherwise it navigates history) · `Up`/`Down` move the composer
 cursor between the lines of a multi-line prompt · `Ctrl+Up`/`Ctrl+Down` step through prompt history ·
 `Esc` dismisses the active menu or overlay, or clears a selection, and never exits Coda; pressing `Esc`
 twice within 1.5 s while the agent is working asks to stop the current turn — `Enter` then stops
@@ -200,9 +219,8 @@ it and `Esc` keeps it going ·
 `Ctrl+C` copies the current transcript selection and, with nothing selected,
 exits on a **second** press · `/exit` (or `/quit`) exits — there is **no `Ctrl+D`** binding · `Ctrl+L` repaints the screen (use it if a tool that wrote to the terminal directly has left stray
 characters behind) · `F2`
-switches between full-screen and inline · `Ctrl+B` sends the selected (or latest) running **foreground
-shell** to the background — and, inside the `/tasks` browser, releases an output attachment — without ever
-opening the browser · `Ctrl+End` jumps to the newest transcript output (the scrollbar shows position).
+switches between full-screen and inline · `Ctrl+B` **backgrounds now**: the agent stops waiting on the
+command or task it is running (which keeps running and reports back when it finishes) · `Ctrl+End` jumps to the newest transcript output (the scrollbar shows position).
 Typing a `/` shows a slash-command completion menu directly
 above the composer (Up/Down select, Tab or Enter completes, a single Esc dismisses). The menu opens for a `/`
 at the start of the prompt **or after whitespace**, so a command can be picked mid-sentence — a `/`
@@ -288,48 +306,24 @@ Windows, `sh` elsewhere.
 
 > **Tip:** append `--help` (or `-h`) to any command for its usage and examples, e.g. `/model --help`.
 
-### `/tasks` — the live task browser
+### `/tasks` — the task browser
 
-In the full-screen TUI, `/tasks` opens a **focused, content-sized
-live browser** over the session's in-process `TaskManager`. The bare `/tasks` submission is
-intercepted **before** the dispatch/startup guard, so the browser opens even while an agent
-turn is running. Plain mode instead prints a **read-only textual snapshot** of the
-same tasks (no interactive actions). Before the first turn there is no session yet, so the
-browser/snapshot shows an empty list.
+In the full-screen TUI, `/tasks` opens a content-sized browser over the session's
+`TaskManager`, read through the engine's `session/listTasks` (so it works the same in local,
+API-only and serve-backed sessions, and shows tasks that have produced no output yet). Each row
+shows a status glyph, the task id, status, kind (subagent/shell) and description.
 
-The list shows **active tasks first as a parent/child hierarchy**, then **recent completed,
-failed, and stopped** tasks, each with a status glyph, description, kind (subagent/shell),
-foreground/background mode, and duration. Selection is stable by task id.
-The browser height follows the visible list or wrapped detail content, within
-the terminal bounds; spare list width goes to the description column.
-
-- **List:** `Up`/`Down` or `k`/`j`, `PageUp`/`PageDown`, `Home`/`End` navigate · `Enter` opens the
-  detail page · `/` filters by name · `x` twice within ~1.5 s stops a running task · `d` dismisses a
-  **terminal** task from the in-memory list (its **persistent log is preserved**) · `r` reloads ·
+- **List:** `Up`/`Down` or `k`/`j` move · `Enter` opens the detail page (mode, parent, report,
+  secret-redacted output tail) · `b` **backgrounds** the selected task (the agent stops waiting on
+  it; it keeps running) · `x` **stops** it (and its process tree) · `r` reloads · `/` filters ·
   `Esc` or `q` closes.
-- **Detail:** `s` steers a running **subagent** (modal editor: `Enter` queues, `Shift+Enter` /
-  `Ctrl+Enter` / `Ctrl+J` insert a newline, `Esc` cancels; messages are delivered FIFO at the
-  subagent's next safe loop boundary) · `a` **attaches** a running **background shell**'s output
-  and pauses the main agent · `Ctrl+B` releases a UI attachment (or backgrounds an originally
-  foreground shell) · `x` twice stops · `d` dismisses a terminal task · `l` toggles between recent
-  live output and the persistent **log** tail · `End` jumps to newest and restores **auto-follow**
-  · `Esc` or `q` returns to the list (releasing any attachment first).
 
-> **Changed:** `r` used to dismiss a task here while meaning *reload* in the other browsers. It now
-> means **reload** everywhere and dismiss moved to `d`.
+`/stop` interrupts the running turn and stops **every** running task. Everything here is
+**process-local** and **stops when Coda exits**.
 
-**Attachment is output-only** — there is **no shell stdin** in this phase. Attaching requests a
-pause through a reference-counted execution gate: if the main agent is idle the pause is immediate,
-otherwise it waits for the next **safe loop boundary** or turn completion (the page shows
-`pausing main agent…`). The pause lease is released on `Esc`, `Ctrl+B`, shell completion, stop,
-mode switch, or shutdown, and the main agent resumes. UI attachment is presentation-only and never
-leaks into the model-facing `task_list`/`task_get`. Everything here is **process-local** and
-**stops when Coda exits**.
-
-`coda serve` has the **same non-UI task capabilities** — the `task_*` model tools, including
-`task_wait` / `task_background` / `task_remove`, are registered identically for interactive and
-serve pipelines — but serve has **no slash commands and no TUI**, so there is no `/tasks` browser
-in serve.
+`coda serve` exposes the same controls to any client: `session/listTasks`,
+`session/backgroundAll`, `task/background {taskId}`, `task/stop {taskId}` and
+`session/stopAllTasks` (see [docs/serve-protocol.md](docs/serve-protocol.md)).
 
 ### Model, effort & context
 

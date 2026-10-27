@@ -227,7 +227,8 @@ pub struct UserMessage {
     pub body: String,
     /// Optional short additional context (bounded, see [`MAX_CONTEXT_CHARS`]).
     pub context: Option<String>,
-    /// Stable classification of the origin ("scheduledTask" | "subagent" | "main").
+    /// Stable classification of the origin ("scheduledTask" | "subagent" | "main"
+    /// | "taskCompletion").
     pub source_kind: &'static str,
     /// The trusted task id this notification is scoped to, when the source
     /// is a task at all (`Main` has none). Derived only from
