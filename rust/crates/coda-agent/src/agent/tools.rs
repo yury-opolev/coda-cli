@@ -535,7 +535,6 @@ enum TaskWaitOutcome {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum YieldReason {
     Budget,
-    Steering,
     UserBackground,
 }
 
@@ -546,7 +545,7 @@ const YIELD_TAIL_CHARS: usize = 4_000;
 /// [`detachable`](crate::tool::Tool::detachable) tool (a remote MCP call)
 /// runs as a [`TaskKind::Tool`](crate::tasks::TaskKind::Tool) task, so the
 /// executor awaits it under the yield contract like a shell command —
-/// cut short by steering or "background now", reported later when it ends.
+/// cut short only by "background now", reported later when it ends.
 ///
 /// Only where a completion can be pushed back (see [`receives_completions`])
 /// and a task manager exists; otherwise, or when the task cannot be
@@ -618,8 +617,9 @@ fn start_tool_task(
 const TOOL_TASK_REPORT_CHARS: usize = 12_000;
 
 /// The yield contract (§6.2): wait for a running task until it finishes, its
-/// yield budget expires, operator steering arrives, the user asks for
-/// "background now", or the turn is cancelled — whichever is first.
+/// yield budget expires, the user asks for "background now", or the turn is
+/// cancelled — whichever is first. A message arriving meanwhile does not end
+/// the wait; it is delivered at the boundary the wait ends at.
 ///
 /// Ending the wait never stops the work, with one exception: an interrupted
 /// turn stops the task it was awaiting in the foreground (D4). Tasks already
@@ -644,19 +644,11 @@ async fn await_running_task(
             None => std::future::pending().await,
         }
     };
-    let steering_arrived = async {
-        match ctx.steering {
-            Some(inbox) => inbox.wait_for_pending().await,
-            None => std::future::pending().await,
-        }
-    };
-
     let reason = tokio::select! {
         biased;
         _ = cancel.cancelled() => None,
         _ = task.wait_for_completion() => Some(None),
         _ = task.background_requested() => Some(Some(YieldReason::UserBackground)),
-        _ = steering_arrived => Some(Some(YieldReason::Steering)),
         _ = budget_expired => Some(Some(YieldReason::Budget)),
     };
 
@@ -698,9 +690,9 @@ pub(crate) fn receives_completions(ctx: &BatchContext<'_>) -> bool {
 }
 
 /// `task_wait` (§6.6): attach to a running task with the normal yield
-/// contract. Ends when the task finishes (its final status), when `wait`
-/// expires or a user/parent message arrives (`pending`, the tool's own
-/// answer), and returns `None` when the turn is cancelled. Never stops,
+/// contract. Ends when the task finishes (its final status) or when `wait`
+/// expires (`pending`, the tool's own answer) — a message does not end it —
+/// and returns `None` when the turn is cancelled. Never stops,
 /// promotes or otherwise changes the task.
 async fn await_attached_task(
     ctx: &BatchContext<'_>,
@@ -724,19 +716,10 @@ async fn await_attached_task(
     let finished = |task: &crate::tasks::ManagedTask| {
         Some(crate::tools::task_wait::format_terminal_result(&task.to_snapshot()))
     };
-    let steering_arrived = async {
-        match ctx.steering {
-            Some(inbox) => inbox.wait_for_pending().await,
-            None => std::future::pending().await,
-        }
-    };
     let ended = tokio::select! {
         biased;
         _ = cancel.cancelled() => None,
         _ = task.wait_for_completion() => Some(None),
-        _ = steering_arrived => Some(Some(ToolResult::ok(format!(
-            "{pending} The wait ended early because a new message arrived."
-        )))),
         _ = tokio::time::sleep(wait) => Some(Some(ToolResult::ok(pending.to_owned()))),
     };
     if !owner {
@@ -797,7 +780,6 @@ fn yield_handle(task: &crate::tasks::ManagedTask, reason: YieldReason, pushed: b
     let age = task.started_at.elapsed().map(|d| d.as_secs()).unwrap_or(0);
     let why = match reason {
         YieldReason::Budget => "",
-        YieldReason::Steering => "; the wait ended early because a new user message arrived",
         YieldReason::UserBackground => "; the user moved it to the background",
     };
     let tail = task.redacted_peek(YIELD_TAIL_CHARS);

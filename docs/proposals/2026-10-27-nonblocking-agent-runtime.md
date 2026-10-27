@@ -570,3 +570,22 @@ sketches above:
 - **Not in Phase 3:** seeding the status-row count from `session/listTasks` after the client
   attaches to an engine that already has running tasks (the TUI always starts its own engine,
   so it sees every start); a configurable shell cap.
+
+## 15. Post-implementation changes
+
+After using Phases 1–3, the user decided that backgrounding must be **explicit only**:
+
+- **Send-now removed.** `Ctrl+Enter` always inserts a newline in the composer, busy or idle (as
+  before Phase 1 — every modified Enter is a newline). The `Ctrl+G` chord and the TUI's
+  send-now action are gone. This supersedes D6's Send-now half and the §6 "Send now" control.
+- **Messages no longer cut waits short.** A user message sent while a tool runs (steering), a
+  parent's `task_send` to a subagent, and task completions are all delivered at the next normal
+  boundary: when the awaited tool finishes or yields at its budget (≤ 30 s). The yield select
+  (`await_running_task`) and `task_wait` (`await_attached_task`) no longer listen on the inbox;
+  `SteeringInbox::wait_for_pending` was removed. This reverses design principle 2 ("user input
+  must cut a wait short") and the "cuts the current wait short" wording of §6 and §12–§14.
+- **Background-now is the explicit control.** The only ways to end a wait early are `Ctrl+B`,
+  `session/backgroundAll`, `task/background` and `b` in `/tasks`. `Esc` / interrupt is
+  unchanged (it stops the task awaited in the foreground, D4).
+- **Tip.** Once the turn has been running tools for 5 s without a break, the pinned activity row
+  appends `│ Ctrl+B to background`, so the key is discoverable exactly when it is useful.

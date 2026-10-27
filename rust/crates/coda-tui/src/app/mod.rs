@@ -737,7 +737,6 @@ impl App {
                 self.interrupt();
             }
             Action::BackgroundNow => self.background_now().await,
-            Action::SendNow => self.send_now().await,
             Action::Arm(chord) => {
                 self.armed = Some((chord, std::time::Instant::now()));
                 let hint_text = match chord {

@@ -4301,7 +4301,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn steering_cuts_a_long_wait_short_and_reaches_the_model_while_the_work_continues() {
+    async fn a_message_does_not_cut_a_wait_short_but_background_now_does() {
         let started = Arc::new(Mutex::new(Vec::new()));
         let manager = task_manager_for_test();
         let steering = Arc::new(SteeringInbox::new());
@@ -4316,25 +4316,57 @@ mod tests {
             .build();
 
         let inbox = Arc::clone(&steering);
+        let controls = Arc::clone(&manager);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(2)).await;
             inbox.enqueue("for OWASP it will be dry-run").unwrap();
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            assert_eq!(controls.background_all(), 1);
         });
 
         let begun = tokio::time::Instant::now();
         let mut history = vec![Message::user("go")];
         agent.run(&mut history, &NullSink, None, CancellationToken::new()).await.unwrap();
-        assert!(begun.elapsed() < Duration::from_secs(5), "steering must not wait out the budget");
+        assert_eq!(begun.elapsed(), Duration::from_secs(10), "only background-now ends the wait early");
 
         let request = client.requests.lock().unwrap()[1].clone();
         let (handle, _) = tool_result_text(&request, "t1");
-        assert!(handle.contains("a new user message arrived"), "{handle}");
+        assert!(handle.contains("the user moved it to the background"), "{handle}");
         assert!(
             request.messages.iter().any(|m| m.role == Role::User && m.text().contains("for OWASP it will be dry-run")),
-            "the steering reaches the very next model request"
+            "the message is delivered at the boundary the wait ended at"
         );
         let task = manager.find_task(&started.lock().unwrap()[0]).unwrap();
         assert_eq!(task.status(), crate::tasks::TaskRunStatus::Running, "the process stays alive");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_message_waits_for_the_command_to_finish_within_its_budget() {
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let steering = Arc::new(SteeringInbox::new());
+        let client = MockLlmClient::new(two_turn_script(&[("t1", "build")]));
+        let tools = Arc::new(ToolRegistry::new([task_tool(
+            "build", Some(Duration::from_secs(20)), Some((Duration::from_secs(8), 0)), &started,
+        )]));
+        let agent = AgentLoopBuilder::new(client.clone(), Arc::new(AllowAll), tools)
+            .with_task_manager(task_manager_for_test())
+            .with_steering(Arc::clone(&steering))
+            .with_main_context()
+            .build();
+
+        let inbox = Arc::clone(&steering);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            inbox.enqueue("also run the linter").unwrap();
+        });
+
+        let mut history = vec![Message::user("go")];
+        agent.run(&mut history, &NullSink, None, CancellationToken::new()).await.unwrap();
+
+        let request = client.requests.lock().unwrap()[1].clone();
+        let (content, _) = tool_result_text(&request, "t1");
+        assert_eq!(content, "exit code: 0\nquick", "the command's result arrives inline");
+        assert!(request.messages.iter().any(|m| m.role == Role::User && m.text().contains("also run the linter")));
     }
 
     #[tokio::test(start_paused = true)]

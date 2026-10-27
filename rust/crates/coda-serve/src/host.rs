@@ -15085,7 +15085,7 @@ mod tests {
                 async move { dispatch("task/send", params(&task_id, text), host.as_ref()).await.unwrap() }
             };
             assert_eq!(send(agent.id.clone(), "use the dry run").await, json!({ "ok": true, "taskId": agent.id }));
-            assert!(inbox.has_pending(), "a message cuts the subagent's wait short");
+            assert!(inbox.has_pending(), "the message waits in the subagent's inbox");
             assert_eq!(inbox.take_all_for_delivery()[0].text, "use the dry run");
             assert_eq!(send(agent.id.clone(), "  ").await["reason"], "emptyText");
             assert_eq!(send(shell.id.clone(), "hi").await["reason"], "notAgent");

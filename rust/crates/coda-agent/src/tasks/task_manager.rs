@@ -326,8 +326,8 @@ impl TaskManager {
     }
 
     /// Delivers an operator message to a running agent task's inbox (Phase 2,
-    /// `task/send`): it cuts the agent's current wait short, or wakes it when
-    /// parked. `Rejected` for a task with no inbox (a shell command),
+    /// `task/send`): it is delivered at the agent's next boundary (a running
+    /// wait is not cut short), or wakes it when parked. `Rejected` for a task with no inbox (a shell command),
     /// `InvalidState` when it is not running or no longer accepts messages.
     pub fn send_message(&self, id: &str, text: &str) -> TaskActionResult {
         let Some(task) = self.find_task(id) else { return TaskActionResult::NotFound };

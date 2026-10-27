@@ -24,8 +24,8 @@ impl Tool for TaskWaitTool {
     fn description(&self) -> &str {
         "Wait briefly (at most 30 seconds) for a task to finish and return its final status \
          and result. Rarely needed: completions are delivered to you automatically, so the \
-         preferred way to wait is to end your turn. The wait ends early when a new message \
-         arrives and never stops the task."
+         preferred way to wait is to end your turn. Messages that arrive meanwhile are \
+         delivered when the wait ends; it never stops the task."
     }
 
     fn input_schema_json(&self) -> &str {
@@ -82,7 +82,7 @@ impl Tool for TaskWaitTool {
         }
 
         // Still running: the batch executor attaches to it with the yield
-        // contract (bounded, cut short by a new message, never kills).
+        // contract (bounded, not cut short by messages, never kills).
         ToolResult::attach_task(
             task_id,
             Duration::from_secs(wait_secs),

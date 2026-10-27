@@ -104,8 +104,9 @@ for limits, failure behavior, and compatibility with older logging flags.
     any tool calls planned after it in the same batch are skipped so the model re-plans.
     Waiting less **never kills** the command; `timeoutSeconds` is a separate, optional
     *work deadline* that kills the process tree after N seconds (no default).
-  - **Messages you send while a tool runs cut the wait short** — the command keeps
-    running and your message reaches the model within seconds, not when the command ends.
+  - **Messages you send while a tool runs do not interrupt it** — your message reaches the
+    model at the next boundary: when the command finishes or yields at its budget (at most
+    30 s). To stop waiting immediately, background it explicitly with `Ctrl+B`.
   - **Completions are pushed — to every agent.** When a backgrounded command or a
     subagent completes, fails or is stopped, the agent that started it receives one
     `[task-completed]` data block (status; for a command its exit code, log path and last
@@ -121,12 +122,12 @@ for limits, failure behavior, and compatibility with older logging flags.
     is its report. Limits: **2 h** lifetime and **30 min** parked without news; either
     wakes it once to write a partial report, after which it stops (and so does anything
     it started).
-  - **You stay in control:** `Ctrl+B` moves whatever the agent is waiting on to the
-    background, `Ctrl+Enter` (or `Ctrl+G`) does that *and* sends your message now,
-    `/tasks` → `b` / `x` backgrounds / stops one task (only shell commands and long tool
-    calls are ever waited on, so only they can be backgrounded), `/tasks` → `m` or
-    `/send <task-id> <message>` sends a message to a running subagent (it cuts the
-    subagent's current wait short, or wakes it when parked), and `/stop` interrupts the
+  - **You stay in control:** backgrounding is always explicit — `Ctrl+B` moves whatever
+    the agent is waiting on to the background (once a tool has run for 5 s the activity
+    row shows `Ctrl+B to background`), `/tasks` → `b` / `x` backgrounds / stops one task
+    (only shell commands and long tool calls are ever waited on, so only they can be
+    backgrounded), `/tasks` → `m` or `/send <task-id> <message>` sends a message to a
+    running subagent (delivered at its next boundary, or it wakes it when parked), and `/stop` interrupts the
     turn and stops every task. `Esc` (interrupt) stops only the command the agent was
     waiting on; commands and subagents already in the background keep running.
   - **Ask without interrupting:** `/btw <question>` (alias `/ask`) answers a side
@@ -146,7 +147,7 @@ for limits, failure behavior, and compatibility with older logging flags.
   - The agent can still inspect and steer work with `task_list` / `task_get` /
     `task_peek` / `task_output` / `task_send` / `task_stop`, and `task_remove` a finished
     task (its log file is preserved). `task_wait` attaches to a task for at most **30 s**
-    (cut short by a new message, never stops the task); ending the turn is the preferred
+    (never cut short by a message, never stops the task); ending the turn is the preferred
     way to wait. `task_recall` only returns a completion that could not be pushed.
   - Headless `coda run` sets `CODA_RUN_WAIT_FOR_TASKS=1`: its single turn parks until the
     tasks it started have finished and reported (at most 30 min without news), then lets
@@ -242,7 +243,7 @@ interactive, headless, and slash-command flows. Export/import carries it as the 
 
 **Keys (Warm Ember):** `Enter` submits — while the slash-command completion menu is open and the highlighted
 command differs from what you typed, it accepts that command into the prompt instead, so press it again to
-send · `Shift+Enter` (or `Ctrl+J`, and `Ctrl+Enter` while idle, as terminal-compatible fallbacks) inserts a newline · while an agent is busy, ordinary submissions are delivered at its next safe boundary — which is within seconds even while a command runs, because the wait for it is cut short · `Ctrl+Enter` (or `Ctrl+G`) while busy **sends now**: whatever the agent is waiting on moves to the background and your message is delivered at once · `Up` on an empty first composer line recalls queued messages into the draft (otherwise it navigates history) · `Up`/`Down` move the composer
+send · `Shift+Enter` (or `Ctrl+Enter`, `Alt+Enter` or `Ctrl+J`, as terminal-compatible fallbacks) inserts a newline · while an agent is busy, ordinary submissions are delivered at its next safe boundary — while a command runs, that is when it finishes or yields at its budget (at most 30 s); press `Ctrl+B` to stop waiting on it sooner · `Up` on an empty first composer line recalls queued messages into the draft (otherwise it navigates history) · `Up`/`Down` move the composer
 cursor between the lines of a multi-line prompt · `Ctrl+Up`/`Ctrl+Down` step through prompt history ·
 `Esc` dismisses the active menu or overlay, or clears a selection, and never exits Coda; pressing `Esc`
 twice within 1.5 s while the agent is working asks to stop the current turn — `Enter` then stops
@@ -351,8 +352,9 @@ shows a status glyph, the task id, status, kind (subagent/shell) and description
   a running subagent (closes the browser and fills in `/send <task-id> `) · `r` reloads · `/`
   filters · `Esc` or `q` closes.
 
-`/send <task-id> <message>` delivers a message to a running subagent's inbox: it cuts the
-subagent's current wait short, or wakes it if it is parked. `/stop` interrupts the running turn and stops **every** running task. Everything here is
+`/send <task-id> <message>` delivers a message to a running subagent's inbox: it is delivered
+at the subagent's next boundary (a wait on a running command ends within 30 s at most), or
+wakes it if it is parked. `/stop` interrupts the running turn and stops **every** running task. Everything here is
 **process-local** and **stops when Coda exits**.
 
 `coda serve` exposes the same controls to any client: `session/listTasks`,

@@ -90,6 +90,10 @@ pub struct TurnProgress {
     /// Whether any `Thinking` event has ever been observed this turn — an
     /// empty first delta still counts, because the phase genuinely began.
     has_reasoned: bool,
+    /// When the current, unbroken run of `RunningTools` began. Successive
+    /// tool calls in one batch keep the first instant; any other phase
+    /// clears it.
+    tools_started_at: Option<Instant>,
     /// `(input, output)` from the most recent `Usage` event, if any has
     /// arrived. Explicitly the *last response*'s tokens, per the existing
     /// reducer: `Event::Usage` overwrites rather than accumulates, so this
@@ -113,6 +117,7 @@ impl TurnProgress {
             reasoning_committed_ms: 0,
             reasoning_started_at: None,
             has_reasoned: false,
+            tools_started_at: None,
             last_response_tokens: None,
             frozen_elapsed_ms: None,
         }
@@ -169,6 +174,22 @@ impl TurnProgress {
         Some(self.reasoning_committed_ms + live)
     }
 
+    /// How long the turn has been running tools without a break, or `None`
+    /// when it is doing something else or has finished.
+    pub fn running_tools_ms(&self, now: Instant) -> Option<i64> {
+        if self.is_finished() || self.phase != Phase::RunningTools {
+            return None;
+        }
+        self.tools_started_at.map(|started| elapsed_since(started, now))
+    }
+
+    fn set_phase(&mut self, phase: Phase) {
+        if phase != Phase::RunningTools {
+            self.tools_started_at = None;
+        }
+        self.phase = phase;
+    }
+
     /// The last response's token counts, when a `Usage` event has reported
     /// them. Labelled by the caller as the last response's, never a total.
     pub fn last_response_tokens(&self) -> Option<(i64, i64)> {
@@ -182,7 +203,7 @@ impl TurnProgress {
         if self.is_finished() {
             return;
         }
-        self.phase = Phase::Thinking;
+        self.set_phase(Phase::Thinking);
         self.has_reasoned = true;
         if self.reasoning_started_at.is_none() {
             self.reasoning_started_at = Some(now);
@@ -194,7 +215,7 @@ impl TurnProgress {
     pub fn on_thinking_end(&mut self, now: Instant) {
         self.commit_reasoning(now);
         if !self.is_finished() {
-            self.phase = Phase::Working;
+            self.set_phase(Phase::Working);
         }
     }
 
@@ -206,6 +227,9 @@ impl TurnProgress {
         // A tool call arriving mid-reasoning still ends that reasoning
         // segment: running a tool is not thinking, however it was reached.
         self.commit_reasoning(now);
+        if self.phase != Phase::RunningTools {
+            self.tools_started_at = Some(now);
+        }
         self.phase = Phase::RunningTools;
     }
 
@@ -215,7 +239,7 @@ impl TurnProgress {
             return;
         }
         self.commit_reasoning(now);
-        self.phase = Phase::Responding;
+        self.set_phase(Phase::Responding);
     }
 
     /// The engine is waiting on a permission or question prompt.
@@ -224,7 +248,7 @@ impl TurnProgress {
             return;
         }
         self.commit_reasoning(now);
-        self.phase = Phase::AwaitingApproval;
+        self.set_phase(Phase::AwaitingApproval);
     }
 
     /// The user answered; the turn resumes without a more specific signal
@@ -233,7 +257,7 @@ impl TurnProgress {
         if self.is_finished() {
             return;
         }
-        self.phase = Phase::Working;
+        self.set_phase(Phase::Working);
     }
 
     /// The engine is waiting on the provider.
@@ -246,7 +270,7 @@ impl TurnProgress {
             return;
         }
         self.commit_reasoning(now);
-        self.phase = Phase::WaitingForModel;
+        self.set_phase(Phase::WaitingForModel);
     }
 
     /// A real `Usage` event arrived, naming the last response's tokens.
