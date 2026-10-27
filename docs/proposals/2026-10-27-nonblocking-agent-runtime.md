@@ -1,8 +1,8 @@
 # Proposal: Non-blocking agent runtime — no tool call may hold a conversation hostage
 
 - **Date:** 2026-10-27
-- **Status:** Accepted. Decisions D1–D7 made (§10). **Phase 1 implemented** (§8, §12);
-  Phases 2 and 3 open.
+- **Status:** Accepted. Decisions D1–D7 made (§10). **Phases 1 and 2 implemented** (§8, §12,
+  §13); Phase 3 open.
 - **Author:** Yury Opolev (design exploration, Coda)
 - **Scope:** coda-agent (`agent/mod.rs` loop, `agent/tools.rs` batch executor,
   `tools/run_command.rs`, `tools/task.rs`, `tools/background_task.rs`, `tools/task_wait.rs`,
@@ -325,7 +325,7 @@ Each phase is independently shippable and leaves the system consistent.
    **Implemented** — see §12.
 2. **Phase 2 — universal.** Per-agent inbox for subagents; parked state + generalized waker;
    subagent lifecycle (§6.5); `task` returns handles; `task_wait`/`task_recall` reduced (§6.6);
-   coalescing; lifetime limits.
+   coalescing; lifetime limits. **Implemented** — see §13.
 3. **Phase 3 — observation.** `/btw` with task snapshot (§6.8); throttled `event/taskOutput`;
    status-row task count; steering prefixed with live tasks (§6.9).
 
@@ -424,3 +424,81 @@ What shipped, and where it deliberately differs from the sketches above:
 - **Not in Phase 1:** steering prefixed with the live task list (§6.9) and `event/taskStarted` /
   `event/taskOutput` (Phase 3); a cap on live shell tasks; `task_wait` still blocks up to its own
   timeout (Phase 2 reduces it).
+
+## 13. Phase 2 implementation notes
+
+Implemented on main @ `8489df6`. What shipped, and where it deliberately differs from the
+sketches above:
+
+- **Inbox.** Rather than a new inbox type, `SteeringInbox` gained typed items
+  (`InboxItemKind::{Message, TaskCompleted, Deadline}`). Every subagent — and every scheduled
+  run, which executes through the same host — gets its own inbox, attached to its
+  `ManagedTask` (`attach_steering` / `steering()`), so `task_send` (and the new operator RPC)
+  can reach it. Runtime items are accepted even when the inbox is sealed (the seal protects a
+  user's words after the last delivery boundary; runtime items are re-checked by the owner
+  after sealing). The main conversation keeps its existing pair — the session steering inbox
+  plus the `MessageBus` main lane — so `ask_main`, permission answers and the serve observers
+  are untouched. `PermissionAnswer` / `AskMainReply` were not turned into inbox items: they are
+  already answered in place by their own seams.
+- **Only messages cut waits.** A user/parent message cuts a running tool's wait short and
+  pre-empts the rest of a batch, exactly as steering did. A pushed completion does **not**: it
+  waits for the next iteration boundary, so an unrelated child finishing never skips planned
+  work. (`wait_for_pending` / `has_pending` mean "messages"; `wait_for_any` / `has_any` mean
+  any item.)
+- **Push.** `TaskManager` posts a finished task's completion into its owner's inbox itself
+  (`push_to_owner_inbox`) when the owner is a running agent task with an inbox — exactly once
+  per terminal transition, skipped for a task the loop observed inline (still foreground), and
+  including failure and every stop. **Deviation:** operator stops *are* delivered to a
+  subagent owner (with `note: stopped by the user`), because the subagent may be parked on
+  that very task; the main agent still does not get them (Phase 1 rule).
+  `MainInboxCompletionPush` now also covers main-owned **subagent** tasks; their body carries
+  the final report (bounded to the main inbox's 4,000 characters, with a pointer to `task_get`
+  for the rest; 12,000 for a subagent owner). One formatter (`completion_frame`) frames both.
+  A task is *settled* once its completion is in the owner's inbox; only then does it stop
+  counting as live, which closes the race between "the child finished" and "its report
+  arrived". The pull outbox remains for the deprecated `task_recall`, which now returns only
+  completions that could not be pushed (e.g. a full main inbox).
+- **Parked state.** `AgentLoopBuilder::with_park_policy` (`agent/park.rs`). At a natural stop
+  a loop with a policy checks its inbox and its live tasks (`TaskManager::live_children`): an
+  item → another turn; live tasks → **park** (no model call; wakes on an inbox item, a task
+  settling, a deadline, or cancel); neither → finish. After the first wake-up item it waits a
+  2 s debounce so a burst coalesces into one turn. The interactive main conversation has no
+  policy: between turns it is parked by the serve main-inbox pump, as before.
+- **Subagent lifecycle.** A subagent finishes when a turn ends with nothing of its own left
+  running; **its report is its final assistant message** (previously all text it ever
+  streamed). When it ends for any reason, everything it started that is still running is
+  stopped (`TaskManager::stop_descendants`). A background subagent now runs under its own
+  task's cancellation token, so `task_stop`, `/stop` and shutdown actually stop it (a
+  `task_start` subagent used to ignore them) and it ends `stopped`, not `failed`.
+- **Limits (D5).** 2 h lifetime and 30 min parked without news. Either injects one
+  `[deadline]` message (naming the tasks that will be stopped) and the agent finishes at its
+  next natural stop. **Addition:** an agent that keeps working more than 5 min after its
+  deadline is aborted (the parent receives a failure), so a model that ignores the notice
+  cannot run unbounded. The lifetime is checked at every iteration boundary, so it also
+  applies to an agent that never parks.
+- **`task` is always asynchronous (D2).** `task` and the deprecated `task_start` share one
+  implementation and return `Started subagent task <id> …` immediately. They do *not* use the
+  `RunningTask` yield seam: that would skip the rest of the batch, and several `task` calls in
+  one response must all start. A context with a factory but no task manager (direct callers,
+  tests) still runs the subagent inline. A parked subagent keeps its concurrency slot.
+- **`task_wait` (§6.6)** returns a new control, `ToolControl::AttachTask`: the executor waits
+  at most 30 s (requests are clamped), ends early on a message, returns the task's final status
+  if it finishes, and never stops, promotes or otherwise touches the task, nor skips the batch.
+  Its description says ending the turn is the preferred way to wait.
+- **Who yields.** `run_command` now yields in every context that receives completions: the
+  main conversation and any agent running as a task with an inbox. Only contexts without one
+  (e.g. an agent-type hook's unregistered run) still wait for the command. The Phase 1
+  `CODA_RUN_COMMAND_YIELD=0` override still exists but `coda run` no longer sets it.
+- **Headless `coda run`.** It sets `CODA_RUN_WAIT_FOR_TASKS=1`; the engine then gives the main
+  loop `ParkPolicy::headless_main()` (30 min parked limit, no lifetime limit). The single turn
+  parks until the tasks it started have settled — woken by the main `MessageBus` lane, which
+  gained an arrival `Notify` — and then lets the model finish, so the engine never exits with
+  work still running unreported.
+- **Steering a subagent (§6.5).** `task_send` reaches the subagent's inbox (it previously
+  always failed: no inbox was ever attached). For the user: serve `task/send {taskId, text}`
+  (initialization-gated; reasons `notFound`, `notRunning`, `notAgent`, `notAccepting`,
+  `emptyText`), the TUI command `/send <task-id> <message>`, and `m` in `/tasks`, which closes
+  the browser and pre-fills `/send <task-id> `.
+- **Not in Phase 2:** the generic task wrapper for other long tools (MCP); `event/taskStarted`
+  / `event/taskOutput`; `/btw`; steering prefixed with the live task list (all Phase 3); a cap
+  on live shell tasks.
