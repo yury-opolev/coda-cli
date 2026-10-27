@@ -659,14 +659,6 @@ pub fn format_session_age(created_utc: DateTime<Utc>) -> String {
     }
 }
 
-/// What the engine reported about a finished task.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TaskOutcome {
-    pub status: String,
-    pub description: String,
-    pub report: Option<String>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

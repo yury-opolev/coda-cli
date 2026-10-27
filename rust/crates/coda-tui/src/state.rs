@@ -1618,12 +1618,14 @@ impl UiState {
                 description,
                 status,
                 mode,
+                owner_task_id,
                 ..
             } => {
                 self.running_tasks.remove(&task_id);
-                // Work an agent waited for in the foreground already reported
-                // through its own tool result; saying it again is noise.
-                if mode.as_deref() == Some("foreground") {
+                // Announced only for the main agent's background work: a
+                // foreground task's end is already its tool result, and a
+                // subagent's own tasks are reported to that subagent.
+                if mode.as_deref() == Some("foreground") || owner_task_id.is_some() {
                     return;
                 }
                 let level = if status == "failed" {

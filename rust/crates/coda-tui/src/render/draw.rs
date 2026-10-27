@@ -1721,6 +1721,25 @@ mod tests {
             .collect();
         assert_eq!(notices, ["Task completed: build"], "only background completions are announced");
 
+        state.running_tasks.insert("task-0004".into());
+        state.apply(crate::state::UiEvent::Engine(Event::TaskCompleted {
+            task_id: "task-0004".into(),
+            status: "failed".into(),
+            description: "child lint".into(),
+            report: None,
+            owner_task_id: Some("task-0002".into()),
+            kind: Some("shell".into()),
+            mode: Some("background".into()),
+        }));
+        assert!(state.running_tasks.is_empty());
+        assert!(
+            state.transcript.blocks().iter().all(|b| !matches!(
+                b,
+                crate::transcript::Block::Notice { text, .. } if text.contains("child lint")
+            )),
+            "a subagent's own tasks are reported to it, not announced"
+        );
+
         state.running_tasks.insert("task-0003".into());
         state.apply(crate::state::UiEvent::EngineAdopted);
         assert!(state.running_tasks.is_empty(), "tasks die with the engine that ran them");

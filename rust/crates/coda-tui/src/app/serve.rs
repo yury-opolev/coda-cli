@@ -331,10 +331,6 @@ impl App {
             return;
         }
         let event = Event::parse(&frame.method, Some(&frame.params));
-        // Metadata first, and unconditionally: a task's outcome is a side
-        // table the browsers read, not conversation content, so it must
-        // survive even when the content itself is already on screen.
-        self.record_task_outcome(&event);
         if let Event::AgentMessageDelivered { .. } = &event {
             // Reflected by HISTORY (Stage 3 chunk B), unlike
             // `Event::AgentMessage`'s passive, display-only Stage 2
@@ -1325,20 +1321,6 @@ impl App {
         false
     }
 
-    /// Notes an inbound message's task outcome, which the browsers surface.
-    fn record_task_outcome(&mut self, event: &Event) {
-        if let Event::TaskCompleted { task_id, status, description, report, .. } = event {
-            self.task_outcomes.insert(
-                task_id.clone(),
-                crate::browsers::TaskOutcome {
-                    status: status.clone(),
-                    description: description.clone(),
-                    report: report.clone(),
-                },
-            );
-        }
-    }
-
     /// One inbound message from the engine.
     pub(in crate::app) fn on_inbound(&mut self, message: Inbound) {
         match message {
@@ -1529,7 +1511,6 @@ impl App {
             armed: None,
             surfaces: Default::default(),
             paths: Paths::new(project_root),
-            task_outcomes: std::collections::BTreeMap::new(),
             engine_command: command,
             restarted: None,
             staged_images: Vec::new(),

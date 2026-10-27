@@ -541,8 +541,10 @@ sketches above:
   last output of a task precedes its completion.
 - **Status row.** The TUI keeps the set of running task ids from those events and shows
   `N tasks running · /tasks`; task output only touches the status row (no transcript
-  relayout). The "Task completed: …" notice is now limited to `background` completions, since a
-  foreground task's end is already its tool result.
+  relayout). The "Task completed: …" notice is now limited to background completions of the
+    main agent's own tasks, since a foreground task's end is already its tool result and a
+    subagent's tasks are reported to that subagent. The never-read client-side outcome table that
+    would otherwise have grown with every completion was removed.
 - **Steering prefixed with live tasks (§6.9).** When a steering message is delivered at an
   iteration boundary and the agent (main or subagent) has running tasks it started, the
   injected text starts with a `[live-tasks] … [/live-tasks]` block (id, kind, description,

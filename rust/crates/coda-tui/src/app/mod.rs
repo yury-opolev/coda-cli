@@ -230,8 +230,6 @@ pub struct App {
     surfaces: crate::surface::stack::SurfaceStack,
     /// Local Coda file locations for this session.
     paths: Paths,
-    /// Outcomes reported by `event/taskCompleted`, keyed by task id.
-    task_outcomes: std::collections::BTreeMap<String, crate::browsers::TaskOutcome>,
     /// How the engine was launched, so it can be restarted in place.
     engine_command: EngineCommand,
     /// A freshly started engine waiting for the run loop to swap it in.
