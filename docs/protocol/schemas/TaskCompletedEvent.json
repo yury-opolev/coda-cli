@@ -26,6 +26,28 @@
         "null"
       ],
       "default": null
+    },
+    "ownerTaskId": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The task id of the agent that started the task; absent for the main\nagent.",
+      "default": null
+    },
+    "kind": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "mode": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
     }
   },
   "required": [

@@ -45,6 +45,25 @@ pub struct TaskControlResult {
     pub reason: Option<String>,
 }
 
+/// Outcome of `session/askAside`.
+///
+/// `ok:true` carries the `answer`. `ok:false` carries a stable `reason`:
+/// `emptyQuestion`, `noProvider` (no model is connected yet) or
+/// `modelError` (the request failed; `error` says how, without secrets).
+/// The answer is never added to the conversation history.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AskAsideResult {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// Outcome of `session/backgroundAll` or `session/stopAllTasks`: how many
 /// running tasks the request applied to (`0` is a success, not an error).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

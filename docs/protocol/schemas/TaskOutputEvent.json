@@ -1,0 +1,32 @@
+{
+  "type": "object",
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "engineInstanceId": {
+      "type": "string"
+    },
+    "taskId": {
+      "type": "string",
+      "default": ""
+    },
+    "text": {
+      "type": "string",
+      "description": "Secret-redacted output since the previous frame (bounded).",
+      "default": ""
+    },
+    "truncated": {
+      "type": "boolean",
+      "description": "Output before `text` was skipped.",
+      "default": false
+    }
+  },
+  "required": [
+    "seq",
+    "engineInstanceId"
+  ],
+  "title": "TaskOutputEvent",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

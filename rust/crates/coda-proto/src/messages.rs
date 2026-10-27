@@ -103,6 +103,12 @@ pub mod method {
     /// Deliver a user message to a running subagent's inbox: it cuts the
     /// subagent's current wait short, or wakes it when it is parked.
     pub const TASK_SEND: &str = "task/send";
+
+    // ── Non-blocking runtime (Phase 3) ───────────────────────────────────
+    /// A side question (`/btw`): answered by a separate, tool-less model
+    /// request that sees the conversation so far and the live task table.
+    /// Never added to the history; works while a turn is running.
+    pub const ASK_ASIDE: &str = "session/askAside";
 }
 
 /// Method names the server may call on us. Each expects a reply.

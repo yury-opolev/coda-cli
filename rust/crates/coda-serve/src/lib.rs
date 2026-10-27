@@ -15,7 +15,11 @@
 //! - `turn_scope` — which API turn a unit of execution belongs to
 //! - `transport`  — stdio read/write loop
 //! - `session`    — per-session state
+//! - `task_events`— `event/taskStarted` / throttled `event/taskOutput` /
+//!   `event/taskCompleted` (non-blocking runtime, Phase 3)
+//! - `aside`      — `session/askAside` side questions (Phase 3)
 
+pub mod aside;
 pub mod catalog;
 pub mod bus;
 pub mod capabilities;
@@ -34,6 +38,7 @@ pub mod sink;
 pub mod skills;
 pub mod state;
 pub mod state_sink;
+pub mod task_events;
 pub mod transport;
 pub mod turn_scope;
 

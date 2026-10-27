@@ -98,12 +98,14 @@ pub(super) fn document() -> Value {
         rpc(m::TASK_BACKGROUND, Some("TaskIdParams"), Some("TaskControlResult"), S, S),
         rpc(m::TASK_STOP, Some("TaskIdParams"), Some("TaskControlResult"), S, S),
         rpc(m::TASK_SEND, Some("TaskSendParams"), Some("TaskControlResult"), S, S),
+        rpc(m::ASK_ASIDE, Some("AskAsideParams"), Some("AskAsideResult"), S, S),
     ];
     let mut events: Vec<_> = [
         e::ASSISTANT_TEXT, e::ASSISTANT_TEXT_COMPLETE, e::THINKING, e::THINKING_COMPLETE,
         e::TOOL_CALL, e::TOOL_PROGRESS, e::TOOL_RESULT, e::TURN_COMPLETE, e::STOP,
         e::USAGE, e::ERROR, e::LIMIT_REACHED, e::STREAM_PROGRESS, e::STEERING_DELIVERED,
-        e::TASK_COMPLETED, e::SCHEDULE_LIFECYCLE, e::PROMPT_REWRITTEN, e::RESPONSE_REWRITTEN,
+        e::TASK_COMPLETED, e::TASK_STARTED, e::TASK_OUTPUT, e::SCHEDULE_LIFECYCLE,
+        e::PROMPT_REWRITTEN, e::RESPONSE_REWRITTEN,
         e::TOOL_INPUT_MODIFIED, e::TOOL_RESULT_MODIFIED, e::PERMISSION_DECIDED,
         e::PERMISSIONS_UPDATED, e::SUBAGENT_BLOCKED, e::SUBAGENT_RESULT_MODIFIED,
         e::COMPACTION_CANCELLED, e::POST_COMPACT_CONTEXT_INJECTED, e::AGENT_MESSAGE,

@@ -28,6 +28,12 @@ pub mod event_method {
     pub const STREAM_PROGRESS: &str = "event/streamProgress";
     pub const STEERING_DELIVERED: &str = "event/steeringDelivered";
     pub const TASK_COMPLETED: &str = "event/taskCompleted";
+    /// A task (shell command, subagent, scheduled run, wrapped tool call)
+    /// was registered and is running (non-blocking runtime, Phase 3).
+    pub const TASK_STARTED: &str = "event/taskStarted";
+    /// New, secret-redacted output of a running task. Throttled per task and
+    /// bounded per frame; a frame says when output was skipped.
+    pub const TASK_OUTPUT: &str = "event/taskOutput";
     pub const SCHEDULE_LIFECYCLE: &str = "event/scheduleLifecycle";
     pub const PROMPT_REWRITTEN: &str = "event/promptRewritten";
     pub const RESPONSE_REWRITTEN: &str = "event/responseRewritten";
@@ -192,6 +198,37 @@ pub enum Event {
         status: String,
         description: String,
         report: Option<String>,
+        /// The task id of the agent that started it; absent when the main
+        /// agent did (or the sender predates this field).
+        owner_task_id: Option<String>,
+        /// `"shell"`, `"subagent"`, `"scheduled"` or `"tool"`, when known.
+        kind: Option<String>,
+        /// `"foreground"` when the agent that started it observed the end
+        /// inline (its tool result already says how it ended), `"background"`
+        /// when the completion is reported separately. Absent from older
+        /// senders.
+        mode: Option<String>,
+    },
+    /// A task started running (non-blocking runtime, Phase 3).
+    TaskStarted {
+        task_id: String,
+        /// `"shell"`, `"subagent"`, `"scheduled"` or `"tool"`.
+        kind: String,
+        description: String,
+        /// The task id of the agent that started it; absent for the main agent.
+        owner_task_id: Option<String>,
+        /// `"foreground"` (an agent is waiting on it) or `"background"`.
+        mode: String,
+    },
+    /// New output of a running task: secret-redacted, at most a few frames
+    /// per second per task and a bounded number of characters per frame.
+    /// `truncated` means output between the previous frame and this text was
+    /// skipped (too much, or the client was not keeping up); the task log
+    /// and `session/listTasks` still have the retained tail.
+    TaskOutput {
+        task_id: String,
+        text: String,
+        truncated: bool,
     },
     ScheduleLifecycle {
         definition_id: String,
@@ -444,6 +481,46 @@ struct TaskCompletedPayload {
     description: String,
     #[serde(default)]
     report: Option<String>,
+    /// The task id of the agent that started the task; absent for the main
+    /// agent.
+    #[serde(default)]
+    owner_task_id: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+struct TaskStartedPayload {
+    #[serde(default)]
+    task_id: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    description: String,
+    /// The task id of the agent that started the task; absent for the main
+    /// agent.
+    #[serde(default)]
+    owner_task_id: Option<String>,
+    #[serde(default)]
+    mode: String,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+struct TaskOutputPayload {
+    #[serde(default)]
+    task_id: String,
+    /// Secret-redacted output since the previous frame (bounded).
+    #[serde(default)]
+    text: String,
+    /// Output before `text` was skipped.
+    #[serde(default)]
+    truncated: bool,
 }
 
 #[derive(Default, Deserialize)]
@@ -750,7 +827,24 @@ impl Event {
                     status: p.status,
                     description: p.description,
                     report: p.report,
+                    owner_task_id: p.owner_task_id,
+                    kind: p.kind,
+                    mode: p.mode,
                 }
+            }
+            m::TASK_STARTED => {
+                let p: TaskStartedPayload = parse(params);
+                Event::TaskStarted {
+                    task_id: p.task_id,
+                    kind: p.kind,
+                    description: p.description,
+                    owner_task_id: p.owner_task_id,
+                    mode: p.mode,
+                }
+            }
+            m::TASK_OUTPUT => {
+                let p: TaskOutputPayload = parse(params);
+                Event::TaskOutput { task_id: p.task_id, text: p.text, truncated: p.truncated }
             }
             m::SCHEDULE_LIFECYCLE => {
                 let p: ScheduleLifecyclePayload = parse(params);
@@ -976,14 +1070,38 @@ impl Event {
                 m::STEERING_DELIVERED,
                 serde_json::json!({ "messageIds": message_ids }),
             ),
-            Event::TaskCompleted { task_id, status, description, report } => {
+            Event::TaskCompleted {
+                task_id,
+                status,
+                description,
+                report,
+                owner_task_id,
+                kind,
+                mode,
+            } => {
                 let mut map = Map::new();
                 map.insert("taskId".into(), task_id.clone().into());
                 map.insert("status".into(), status.clone().into());
                 map.insert("description".into(), description.clone().into());
                 put_opt(&mut map, "report", report);
+                put_opt(&mut map, "ownerTaskId", owner_task_id);
+                put_opt(&mut map, "kind", kind);
+                put_opt(&mut map, "mode", mode);
                 (m::TASK_COMPLETED, Value::Object(map))
             }
+            Event::TaskStarted { task_id, kind, description, owner_task_id, mode } => {
+                let mut map = Map::new();
+                map.insert("taskId".into(), task_id.clone().into());
+                map.insert("kind".into(), kind.clone().into());
+                map.insert("description".into(), description.clone().into());
+                put_opt(&mut map, "ownerTaskId", owner_task_id);
+                map.insert("mode".into(), mode.clone().into());
+                (m::TASK_STARTED, Value::Object(map))
+            }
+            Event::TaskOutput { task_id, text, truncated } => (
+                m::TASK_OUTPUT,
+                serde_json::json!({ "taskId": task_id, "text": text, "truncated": truncated }),
+            ),
             Event::ScheduleLifecycle {
                 definition_id,
                 definition_name,
@@ -1258,6 +1376,37 @@ mod tests {
                 status: "completed".into(),
                 description: "did a thing".into(),
                 report: None,
+                owner_task_id: None,
+                kind: None,
+                mode: None,
+            });
+            assert_round_trips(Event::TaskCompleted {
+                task_id: "t2".into(),
+                status: "failed".into(),
+                description: "lint".into(),
+                report: Some("exit code: 1".into()),
+                owner_task_id: Some("task-0001".into()),
+                kind: Some("shell".into()),
+                mode: Some("background".into()),
+            });
+            assert_round_trips(Event::TaskStarted {
+                task_id: "t3".into(),
+                kind: "subagent".into(),
+                description: "deep review".into(),
+                owner_task_id: None,
+                mode: "background".into(),
+            });
+            assert_round_trips(Event::TaskStarted {
+                task_id: "t4".into(),
+                kind: "shell".into(),
+                description: "cargo test".into(),
+                owner_task_id: Some("t3".into()),
+                mode: "foreground".into(),
+            });
+            assert_round_trips(Event::TaskOutput {
+                task_id: "t4".into(),
+                text: "running 12 tests\n".into(),
+                truncated: true,
             });
             assert_round_trips(Event::ScheduleLifecycle {
                 definition_id: "d1".into(),
@@ -1554,11 +1703,41 @@ mod tests {
             event_method::TASK_COMPLETED,
             json!({ "taskId": "t1", "status": "failed", "description": "build" }),
         );
-        let Event::TaskCompleted { status, report, .. } = event else {
+        let Event::TaskCompleted { status, report, owner_task_id, mode, .. } = event else {
             panic!("expected task completed");
         };
         assert_eq!(status, "failed");
         assert!(report.is_none());
+        assert!(owner_task_id.is_none() && mode.is_none(), "an older sender's frame still parses");
+
+        let event = parse_event(
+            event_method::TASK_COMPLETED,
+            json!({ "taskId": "t2", "status": "completed", "description": "lint",
+                    "ownerTaskId": "task-0001", "kind": "shell", "mode": "background" }),
+        );
+        let Event::TaskCompleted { owner_task_id, kind, mode, .. } = event else {
+            panic!("expected task completed");
+        };
+        assert_eq!(owner_task_id.as_deref(), Some("task-0001"));
+        assert_eq!((kind.as_deref(), mode.as_deref()), (Some("shell"), Some("background")));
+    }
+
+    #[test]
+    fn parses_task_started_and_task_output() {
+        let event = parse_event(
+            event_method::TASK_STARTED,
+            json!({ "taskId": "t1", "kind": "shell", "description": "cargo build", "mode": "foreground" }),
+        );
+        assert!(matches!(
+            event,
+            Event::TaskStarted { ref task_id, ref kind, owner_task_id: None, .. }
+                if task_id == "t1" && kind == "shell"
+        ));
+        let event = parse_event(event_method::TASK_OUTPUT, json!({ "taskId": "t1", "text": "ok\n" }));
+        assert!(matches!(
+            event,
+            Event::TaskOutput { ref text, truncated: false, .. } if text == "ok\n"
+        ));
     }
 
     #[test]

@@ -18,7 +18,16 @@ pub const INITIALIZATION_GATED_METHODS: &[&str] = &[
     crate::messages::method::TASK_BACKGROUND,
     crate::messages::method::TASK_STOP,
     crate::messages::method::TASK_SEND,
+    crate::messages::method::ASK_ASIDE,
 ];
+
+/// A side question (`session/askAside`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AskAsideParams {
+    pub question: String,
+}
 
 /// Names one registered task (`task/background`, `task/stop`).
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]

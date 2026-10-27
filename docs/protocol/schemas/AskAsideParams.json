@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "properties": {
+    "question": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "question"
+  ],
+  "description": "A side question (`session/askAside`).",
+  "title": "AskAsideParams",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

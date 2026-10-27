@@ -32,6 +32,8 @@ pub(crate) fn documents() -> BTreeMap<&'static str, Value> {
         "StreamProgressEvent.json" => StreamProgressPayload,
         "SteeringDeliveredEvent.json" => SteeringDeliveredPayload,
         "TaskCompletedEvent.json" => TaskCompletedPayload,
+        "TaskStartedEvent.json" => TaskStartedPayload,
+        "TaskOutputEvent.json" => TaskOutputPayload,
         "ScheduleLifecycleEvent.json" => ScheduleLifecyclePayload,
         "PromptRewrittenEvent.json" => PromptRewrittenPayload,
         "ResponseRewrittenEvent.json" => ResponseRewrittenPayload,
