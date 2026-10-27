@@ -106,13 +106,14 @@ for limits, failure behavior, and compatibility with older logging flags.
   - **Messages you send while a tool runs cut the wait short** — the command keeps
     running and your message reaches the model within seconds, not when the command ends.
   - **Completions are pushed.** When a backgrounded command completes, fails or is
-    stopped, the main agent receives one `[task-completed]` data block (status, exit
-    code, log path, last output) — and an idle session starts a turn by itself. The model
-    is told not to poll.
+    stopped by the agent, the main agent receives one `[task-completed]` data block
+    (status, exit code, log path, last output) — and an idle session starts a turn by
+    itself. The model is told not to poll. Stops *you* make (`/stop`, `/tasks` → `x`) are
+    not reported back, so they never start a turn.
   - **You stay in control:** `Ctrl+B` moves whatever the agent is waiting on to the
     background, `Ctrl+Enter` (or `Ctrl+G`) does that *and* sends your message now,
-    `/tasks` → `b` / `x` backgrounds / stops one task, and `/stop` interrupts the turn and
-    stops every task. `Esc` (interrupt) stops only the command the agent was waiting on;
+    `/tasks` → `b` / `x` backgrounds / stops one task (only shell commands can be
+    backgrounded for now), and `/stop` interrupts the turn and stops every task. `Esc` (interrupt) stops only the command the agent was waiting on;
     commands already in the background keep running.
   - The agent can still inspect and steer work with `task_list` / `task_get` /
     `task_peek` / `task_wait` (default **300 s**; a timeout reports *still running* and

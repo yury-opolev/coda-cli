@@ -18,7 +18,7 @@
     "ok",
     "taskId"
   ],
-  "description": "Outcome of `task/background` or `task/stop` for one task.\n\n`ok:false` carries a stable `reason`: `notFound` (no such task),\n`notRunning` (already finished), or `notForeground` (`task/background`\nonly: nothing is waiting on it — it is already in the background).",
+  "description": "Outcome of `task/background` or `task/stop` for one task.\n\n`ok:false` carries a stable `reason`: `notFound` (no such task),\n`notRunning` (already finished), and for `task/background` only\n`notForeground` (nothing is waiting on it — it is already in the\nbackground) or `notBackgroundable` (a kind that cannot be released yet,\ne.g. a foreground subagent).",
   "title": "TaskControlResult",
   "$schema": "https://json-schema.org/draft/2020-12/schema"
 }

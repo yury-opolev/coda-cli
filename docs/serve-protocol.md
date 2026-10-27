@@ -198,11 +198,13 @@ running. `session/backgroundAll` and `task/background` end the agent's wait — 
 work; the agent receives a task handle and continues. `count` is how many foreground tasks
 were released (`0` is not an error). `task/stop` and `session/stopAllTasks` stop tasks and
 kill shell process trees. A refused `task/*` call answers `ok: false` with `reason`
-`notFound`, `notRunning`, or (`task/background` only) `notForeground`. When a background
-shell task owned by the main agent ends — completed, failed or stopped — exactly one
+`notFound`, `notRunning`, or (`task/background` only) `notForeground` / `notBackgroundable`
+(only shell tasks can be released in this phase). When a background shell task owned by the
+main agent ends — completed, failed, or stopped by the agent — exactly one
 `[task-completed]` item is delivered to the main conversation through the main inbox
 (announced like any delivered agent message, `source: "taskCompletion"`); an idle engine
-starts a turn for it.
+starts a turn for it. Tasks stopped by the operator (`task/stop`, `session/stopAllTasks`) are
+not reported back, so a stop never triggers a new turn. Engine `shutdown` stops every task.
 
 `outputTail` contains at most 4,000 Unicode characters of buffered, secret-redacted
 output, using the same per-channel streaming redaction as task logs. Browsing does

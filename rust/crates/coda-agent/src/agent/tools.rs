@@ -572,8 +572,12 @@ async fn await_running_task(
             }
             TaskWaitOutcome::Interrupted
         }
+        // Decided under the task's own lock: promoted means it is still
+        // running and now in the background; not promoted and not running
+        // means it finished first and its result is reported inline.
         Some(Some(reason))
-            if task.try_promote_to_background().is_some() || !task.is_terminal() =>
+            if task.try_promote_to_background().is_some()
+                || task.status() == crate::tasks::TaskRunStatus::Running =>
         {
             TaskWaitOutcome::Yielded(yield_handle(&task, reason, ctx.caller_task_id.is_none()))
         }

@@ -410,9 +410,15 @@ What shipped, and where it deliberately differs from the sketches above:
   `<task_output>…</task_output>` data block (status, exit code, log path, ≤ 3,000-char redacted
   tail; a literal closing tag in the output is escaped). The existing pump wakes an idle main
   agent; a busy turn picks it up at its next iteration boundary. Subagent completions remain
-  pull-only via `task_recall` until Phase 2.
+  pull-only via `task_recall` until Phase 2. **Deviation:** stops made by the *operator*
+  (`/stop`, `task/stop`, `session/stopAllTasks`) are not pushed — otherwise an idle agent would
+  start a turn right after being told to stop and could restart the work. Stops by the agent's own
+  `task_stop`, failures and completions are pushed. Engine `shutdown` now stops every task
+  (`TaskManager::shutdown`), since backgrounded commands are no longer owned by any turn.
 - **Controls.** Serve: `session/backgroundAll`, `session/stopAllTasks`, `task/background`,
-  `task/stop` (initialization-gated, schemas + catalog). TUI: Ctrl+B, Ctrl+Enter while busy /
+  `task/stop` (initialization-gated, schemas + catalog). Background-now applies to shell tasks
+  only in Phase 1 (`notBackgroundable` for a foreground subagent, which `task` still awaits
+  directly). TUI: Ctrl+B, Ctrl+Enter while busy /
   Ctrl+G, `/tasks` `b` / `x`, and `/stop` (now its own command: interrupt + stop all; it used to be
   an `/interrupt` alias).
 - **Not in Phase 1:** steering prefixed with the live task list (§6.9) and `event/taskStarted` /

@@ -120,6 +120,10 @@ pub struct ManagedTask {
     /// the foreground ("background now"). Signalled through `background_signal`.
     background_requested: std::sync::atomic::AtomicBool,
     background_signal: Notify,
+    /// Set when the operator (not the agent) stopped this task — `/stop`,
+    /// `task/stop`. Such a stop is not pushed back to the agent as a
+    /// completion: the user asked for quiet, not for a new turn.
+    operator_stop: std::sync::atomic::AtomicBool,
     /// One-shot hand-off of the full result for the tool call that started
     /// this task, when that call observes the completion inline. Never part
     /// of a snapshot: it is the tool's own (unredacted) output, which must not
@@ -169,8 +173,19 @@ impl ManagedTask {
             terminal_flag: std::sync::atomic::AtomicBool::new(false),
             background_requested: std::sync::atomic::AtomicBool::new(false),
             background_signal: Notify::new(),
+            operator_stop: std::sync::atomic::AtomicBool::new(false),
             tool_output: Mutex::new(None),
         })
+    }
+
+    /// Records that the operator asked for this task to stop.
+    pub fn mark_operator_stop(&self) {
+        self.operator_stop.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether the operator (rather than the agent) stopped this task.
+    pub fn stopped_by_operator(&self) -> bool {
+        self.operator_stop.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Stores the starting tool call's full result. Call before the terminal

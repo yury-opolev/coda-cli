@@ -41,17 +41,21 @@ impl MainInboxCompletionPush {
     /// Phase 1 scope: shell tasks owned by the main agent (no parent task)
     /// that had already been handed to the background when they ended. A
     /// task still in the foreground was observed inline by the loop that was
-    /// waiting on it, so reporting it again would be a duplicate.
-    pub fn applies_to(task: &ManagedTask) -> bool {
+    /// waiting on it, so reporting it again would be a duplicate. A task the
+    /// operator stopped (`/stop`, `task/stop`) is not reported either: an
+    /// idle agent would otherwise start a turn right after being told to
+    /// stop — and might restart the very work it was told to drop.
+    pub fn applies_to(task: &ManagedTask, status: TaskRunStatus) -> bool {
         task.kind == TaskKind::Shell
             && task.parent_id.is_none()
             && task.mode() == TaskExecutionMode::Background
+            && !(status == TaskRunStatus::Stopped && task.stopped_by_operator())
     }
 }
 
 impl TaskCompletionListener for MainInboxCompletionPush {
     fn on_terminal(&self, task: &Arc<ManagedTask>, status: TaskRunStatus) {
-        if !Self::applies_to(task) {
+        if !Self::applies_to(task, status) {
             return;
         }
         let Some(bus) = self.bus.upgrade() else { return };
@@ -184,6 +188,34 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert!(items[0].body.contains("status: failed") && items[0].body.contains("exit code: 3"));
         assert!(items[1].body.contains("status: stopped"), "{}", items[1].body);
+    }
+
+    #[test]
+    fn an_operator_stop_is_not_pushed_but_an_agent_stop_is() {
+        let (manager, bus) = setup();
+        let by_operator = shell(&manager, None);
+        by_operator.try_promote_to_background().unwrap();
+        assert_eq!(manager.stop_task(&by_operator.id), crate::tasks::TaskActionResult::Ok);
+        manager.stop(&by_operator.id);
+        assert!(bus.take_main_for_delivery().is_empty(), "/stop must not wake the agent");
+
+        let by_agent = shell(&manager, None);
+        by_agent.try_promote_to_background().unwrap();
+        manager.request_stop(&by_agent.id, None);
+        manager.stop(&by_agent.id);
+        assert_eq!(bus.take_main_for_delivery().len(), 1);
+    }
+
+    #[test]
+    fn only_shell_tasks_can_be_released_to_the_background() {
+        let (manager, _bus) = setup();
+        let agent = manager
+            .register(TaskKind::Subagent, "agent", None, TaskExecutionMode::Foreground)
+            .unwrap();
+        let command = shell(&manager, None);
+        assert_eq!(manager.background(&agent.id), crate::tasks::TaskActionResult::Rejected);
+        assert_eq!(manager.background_all(), 1, "only the shell task is released");
+        assert_eq!(manager.background(&command.id), crate::tasks::TaskActionResult::Ok);
     }
 
     #[test]

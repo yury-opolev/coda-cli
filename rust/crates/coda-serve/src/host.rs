@@ -2983,6 +2983,11 @@ impl ServeBackend for ServeHost {
                 },
             });
         }
+        // Stop every task (subagents and shell commands alike). A command
+        // the agent handed to the background is owned by its own runner, not
+        // by any turn, so cancelling the turn above does not reach it; this
+        // kills its process tree rather than leaving it orphaned.
+        self.task_manager.shutdown(coda_agent::tasks::DEFAULT_SHUTDOWN_BUDGET).await;
         // Close the engine-owned notification bus: no further `notify_user`
         // publication is meaningful once the engine itself has begun
         // shutting down, and closing it makes that refusal explicit rather
@@ -4076,6 +4081,7 @@ impl ServeBackend for ServeHost {
         let reason = match outcome {
             coda_agent::tasks::TaskActionResult::Ok => None,
             coda_agent::tasks::TaskActionResult::NotFound => Some("notFound"),
+            coda_agent::tasks::TaskActionResult::Rejected => Some("notBackgroundable"),
             _ => match self.task_manager.get(&p.task_id) {
                 Some(task) if task.status == coda_agent::tasks::TaskRunStatus::Running => {
                     Some("notForeground")
@@ -14891,6 +14897,25 @@ mod tests {
             assert_eq!(host.message_bus.pending_main_len(), 0);
         }
 
+        /// Engine shutdown stops work the agent had handed to the background:
+        /// no turn owns it any more, so nothing else would.
+        #[tokio::test]
+        async fn shutdown_stops_backgrounded_tasks() {
+            use coda_agent::tasks::{TaskExecutionMode, TaskKind};
+
+            let dir = tempfile::tempdir().unwrap();
+            let host = host_with(None, dir.path());
+            host.initialize(InitParams::default()).await.unwrap();
+            let task = host
+                .task_manager
+                .register(TaskKind::Shell, "server", None, TaskExecutionMode::Foreground)
+                .unwrap();
+            task.try_promote_to_background().unwrap();
+            crate::dispatch::dispatch("shutdown", None, host.as_ref()).await.unwrap();
+            assert!(task.cancel.is_cancelled(), "the task was asked to stop");
+            assert!(task.is_terminal(), "nothing is left running after shutdown");
+        }
+
         /// The task-control methods: routed, gated on `initialize`, and
         /// reporting exact refusal reasons.
         #[tokio::test]
@@ -14931,6 +14956,10 @@ mod tests {
             assert_eq!(call("task/background", &detached.id).await["reason"], "notForeground");
             assert_eq!(call("task/background", &done.id).await["reason"], "notRunning");
             assert_eq!(call("task/background", "task-9999").await["reason"], "notFound");
+            let subagent = manager
+                .register(TaskKind::Subagent, "agent", None, TaskExecutionMode::Foreground)
+                .unwrap();
+            assert_eq!(call("task/background", &subagent.id).await["reason"], "notBackgroundable");
             assert!(dispatch("task/background", None, host.as_ref()).await.is_err(), "taskId is required");
 
             let all = dispatch("session/backgroundAll", None, host.as_ref()).await.unwrap();

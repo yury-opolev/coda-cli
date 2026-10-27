@@ -501,6 +501,13 @@ async fn run_shell_task(
     };
 
     tokio::select! {
+        // A stop that lands as the process dies (the kill itself ends it)
+        // must read as a stop, not as a failed exit.
+        biased;
+        _ = task.cancel.cancelled() => {
+            if let Some(p) = pid { kill_tree(p).await; }
+            manager.stop(&id);
+        }
         (exit_res, out_bytes, err_bytes) = work => {
             let exit_code = exit_res.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
             let result = format_result(exit_code, &out_bytes, &err_bytes);
@@ -511,10 +518,6 @@ async fn run_shell_task(
             } else {
                 manager.fail(&id, Some(summary));
             }
-        }
-        _ = task.cancel.cancelled() => {
-            if let Some(p) = pid { kill_tree(p).await; }
-            manager.stop(&id);
         }
         _ = deadline_sleep => {
             if let Some(p) = pid { kill_tree(p).await; }

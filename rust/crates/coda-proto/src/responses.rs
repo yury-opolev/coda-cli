@@ -29,8 +29,10 @@ pub struct TaskSummaryDto {
 /// Outcome of `task/background` or `task/stop` for one task.
 ///
 /// `ok:false` carries a stable `reason`: `notFound` (no such task),
-/// `notRunning` (already finished), or `notForeground` (`task/background`
-/// only: nothing is waiting on it — it is already in the background).
+/// `notRunning` (already finished), and for `task/background` only
+/// `notForeground` (nothing is waiting on it — it is already in the
+/// background) or `notBackgroundable` (a kind that cannot be released yet,
+/// e.g. a foreground subagent).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

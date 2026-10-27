@@ -23,6 +23,9 @@ fn refusal(task_id: &str, reason: Option<&str>) -> String {
         Some("notForeground") => {
             format!("Task {task_id} is already running in the background.")
         }
+        Some("notBackgroundable") => format!(
+            "Task {task_id} cannot be moved to the background (only shell commands can, for now)."
+        ),
         Some(other) => format!("The engine refused the request for task {task_id} ({other})."),
         None => format!("The engine refused the request for task {task_id}."),
     }

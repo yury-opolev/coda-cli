@@ -154,8 +154,15 @@ impl TaskManager {
     // ── User controls (non-blocking runtime, Phase 1) ─────────────────────────
 
     /// Stops awaiting one task in the foreground; the work keeps running.
+    ///
+    /// Only shell tasks can be released this way in Phase 1: a foreground
+    /// subagent is still awaited directly by its `task` call, so asking would
+    /// promise something nothing honours (`Rejected`).
     pub fn background(&self, id: &str) -> TaskActionResult {
         let Some(task) = self.find_task(id) else { return TaskActionResult::NotFound };
+        if task.kind != TaskKind::Shell {
+            return TaskActionResult::Rejected;
+        }
         if task.request_background() {
             TaskActionResult::Ok
         } else {
@@ -163,16 +170,25 @@ impl TaskManager {
         }
     }
 
-    /// Stops awaiting every running foreground task. Returns how many were
-    /// asked to move to the background.
+    /// Stops awaiting every running foreground shell task. Returns how many
+    /// were asked to move to the background.
     pub fn background_all(&self) -> usize {
         let running = self.state.lock().unwrap().running_tasks();
-        running.iter().filter(|task| task.request_background()).count()
+        running
+            .iter()
+            .filter(|task| task.kind == TaskKind::Shell && task.request_background())
+            .count()
     }
 
     /// Stops one running task (and its process tree, for a shell). Operator
-    /// authority: there is no calling agent to authorize.
+    /// authority: there is no calling agent to authorize. Marked as an
+    /// operator stop, so its completion does not wake the agent.
     pub fn stop_task(&self, id: &str) -> TaskActionResult {
+        if let Some(task) = self.find_task(id) {
+            if task.status() == TaskRunStatus::Running {
+                task.mark_operator_stop();
+            }
+        }
         let result = self.request_stop(id, None);
         if result == TaskActionResult::Ok {
             if let Some(task) = self.find_task(id) {
@@ -186,6 +202,7 @@ impl TaskManager {
     pub fn stop_all(&self) -> usize {
         let running = self.state.lock().unwrap().running_tasks();
         for task in &running {
+            task.mark_operator_stop();
             task.cancel_task();
             task.kill_attached_shell();
         }
