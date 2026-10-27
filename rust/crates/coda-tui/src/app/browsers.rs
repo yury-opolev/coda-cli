@@ -256,7 +256,8 @@ impl App {
             // Enter opens a task's output, which the browser handles itself.
             BrowserKind::Tasks => RowActions::new()
                 .on_key('b', |id| A::BackgroundTask(id.to_string()))
-                .on_key('x', |id| A::StopTask(id.to_string())),
+                .on_key('x', |id| A::StopTask(id.to_string()))
+                .on_key('m', |id| A::MessageTask(id.to_string())),
             // Hooks are read-only; Enter opens their detail view, which the
             // browser handles without troubling the host.
             BrowserKind::Hooks => RowActions::new(),

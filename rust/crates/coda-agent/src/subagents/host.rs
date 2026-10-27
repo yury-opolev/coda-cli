@@ -23,11 +23,13 @@ use tokio_util::sync::CancellationToken;
 use coda_llm::Message;
 
 use crate::agent::output_budget::ModelBudget;
+use crate::agent::park::ParkPolicy;
 use crate::agent::{AgentError, AgentLoopBuilder};
 use crate::events::{AgentSink, CollectingSink};
 use crate::hooks::HookRunner;
 use crate::permission::{PermissionModeState, PermissionPrompt};
 use crate::scheduling::ScheduledTaskStore;
+use crate::steering::SteeringInbox;
 use crate::tasks::{TaskExecutionMode, TaskKind, TaskManager};
 use crate::tool::{ToolRegistry, ToolQuarantine};
 
@@ -373,6 +375,21 @@ impl SubagentHost {
             builder = builder.with_schedule_origin(origin.clone());
         }
 
+        // Non-blocking runtime, Phase 2: a subagent running as a registered
+        // task gets its own inbox (parent messages via `task_send`, pushed
+        // completions of the tasks it starts) and parks — instead of ending —
+        // while any of those tasks are still running. A run without a
+        // registered task (e.g. an agent-type hook) keeps the old rule.
+        let managed = self.task_manager.find_task(&request.task_id);
+        if let Some(task) = &managed {
+            task.attach_steering(Arc::new(SteeringInbox::new()));
+            if let Some(inbox) = task.steering() {
+                builder = builder
+                    .with_steering(Arc::clone(inbox))
+                    .with_park_policy(ParkPolicy::subagent(request.task_id.clone()));
+            }
+        }
+
         let loop_ = builder.build();
 
         let collecting_sink = Arc::new(CollectingSink::new());
@@ -383,7 +400,18 @@ impl SubagentHost {
         let mut history = vec![Message::user(effective_prompt)];
         let run_result = loop_.run(&mut history, &forwarding, None, cancel.clone()).await;
 
-        let text = collecting_sink.collected_text();
+        // Nothing a subagent started may outlive it: commands and children
+        // still running when it ends (deadline, cancel, failure) are stopped.
+        if managed.is_some() {
+            self.task_manager.stop_descendants(&request.task_id);
+        }
+
+        // The report is the subagent's final message (it may have run many
+        // turns while parked); earlier narration is not part of it.
+        let text = match final_assistant_text(&history) {
+            Some(text) => text,
+            None => collecting_sink.collected_text(),
+        };
         let result = if text.is_empty() { "(subagent produced no text output)".into() } else { text };
 
         // Surface run errors as error strings (not propagated as Err).
@@ -500,7 +528,18 @@ impl SubagentFactory for SubagentHost {
             let mut req2 = request.clone();
             req2.task_id = task_id.clone();
             let sink2 = sink.clone();
-            let cancel2 = cancel.clone();
+            // The run is stopped through its own task (`task_stop`, `/stop`,
+            // shutdown) or by the caller's token, whichever fires first.
+            let run_cancel = task.cancel.clone();
+            {
+                let run_cancel = run_cancel.clone();
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = cancel.cancelled() => run_cancel.cancel(),
+                        _ = run_cancel.cancelled() => {}
+                    }
+                });
+            }
             let mgr = self.task_manager.clone();
             let tid2 = task_id.clone();
 
@@ -508,10 +547,13 @@ impl SubagentFactory for SubagentHost {
                 // Drop the permit only when this future completes (success or
                 // failure), so the slot stays occupied for the full run.
                 let _permit = permit;
-                match self_arc.run_inner(req2, sink2, cancel2).await {
+                match self_arc.run_inner(req2, sink2, run_cancel.clone()).await {
                     Ok(report) => { mgr.complete(&tid2, Some(report)); }
+                    Err(_) if run_cancel.is_cancelled() => { mgr.stop(&tid2); }
                     Err(e) => { mgr.fail(&tid2, Some(e)); }
                 }
+                // Ends the caller-token watcher; the task is already terminal.
+                run_cancel.cancel();
             });
 
             // Return just the task id so the calling tool can format its own message.
@@ -593,6 +635,26 @@ impl AgentSink for ForwardingSink {
 // ─────────────────────────────────────────────────────────────────────────────
 // CollectingSink extension
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// The text of the last assistant message that has any, trimmed.
+fn final_assistant_text(history: &[Message]) -> Option<String> {
+    history
+        .iter()
+        .rev()
+        .filter(|m| m.role == coda_llm::Role::Assistant)
+        .map(|m| {
+            m.content
+                .iter()
+                .filter_map(|c| match c {
+                    coda_llm::Content::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect::<String>()
+                .trim()
+                .to_owned()
+        })
+        .find(|t| !t.is_empty())
+}
 
 trait CollectedText {
     fn collected_text(&self) -> String;
@@ -1105,15 +1167,15 @@ mod tests {
             }
         }
 
-        fn done_event() -> StreamEvent {
+        pub(super) fn done_event() -> StreamEvent {
             StreamEvent::Done { stop_reason: Some("end_turn".into()), usage: Usage::ZERO }
         }
 
-        fn text_turn(text: &str) -> Vec<StreamEvent> {
+        pub(super) fn text_turn(text: &str) -> Vec<StreamEvent> {
             vec![StreamEvent::TextDelta(text.into()), done_event()]
         }
 
-        fn tool_turn(id: &str, name: &str, input_json: &str) -> Vec<StreamEvent> {
+        pub(super) fn tool_turn(id: &str, name: &str, input_json: &str) -> Vec<StreamEvent> {
             vec![
                 StreamEvent::ToolUse(Content::ToolUse {
                     id: id.into(),
@@ -1386,24 +1448,34 @@ mod tests {
 
         /// The real `task` tool inside a depth-1 child registers a depth-2
         /// grandchild under the child, and the grandchild cannot nest further.
-        #[tokio::test]
+        /// End to end at depth 2 (Phase 2): the child gets the handle at once,
+        /// parks, is woken by the grandchild's pushed report, and finishes.
+        #[tokio::test(start_paused = true)]
         async fn nested_task_tool_builds_the_authorization_tree_and_stops_at_depth_two() {
             let dir = tempfile::tempdir().unwrap();
             let mgr = manager(&dir);
             let seen = Arc::new(Mutex::new(Vec::new()));
 
-            let client = ScriptedClient::new(vec![
-                // depth-1 child: spawn a grandchild
-                tool_turn("c1", "task", r#"{"prompt":"grandchild work"}"#),
-                // depth-2 grandchild: probe, then try to nest further
-                tool_turn("g1", "probe", "{}"),
-                tool_turn("g2", "task", r#"{"prompt":"great-grandchild"}"#),
-                text_turn("grandchild done"),
-                // back in the depth-1 child
-                text_turn("child done"),
+            let client = super::nonblocking::RoutedClient::new(vec![
+                (
+                    "delegate",
+                    vec![
+                        tool_turn("c1", "task", r#"{"prompt":"grandchild work"}"#),
+                        text_turn("waiting for the grandchild"),
+                        text_turn("child done"),
+                    ],
+                ),
+                (
+                    "grandchild work",
+                    vec![
+                        tool_turn("g1", "probe", "{}"),
+                        tool_turn("g2", "task", r#"{"prompt":"great-grandchild"}"#),
+                        text_turn("grandchild done"),
+                    ],
+                ),
             ]);
             let host = host_with(
-                client,
+                Arc::clone(&client) as Arc<dyn coda_llm::LlmClient>,
                 vec![
                     Arc::new(ProbeTool { seen: Arc::clone(&seen) }) as Arc<dyn Tool>,
                     Arc::new(crate::tools::TaskTool) as Arc<dyn Tool>,
@@ -1419,7 +1491,22 @@ mod tests {
                 SubagentRequest::foreground("general-purpose", "delegate", &child.id, 1);
 
             let sink = Arc::new(CollectingSink::new());
-            host.spawn(request, sink.clone(), CancellationToken::new()).await.unwrap();
+            let report =
+                host.spawn(request, sink.clone(), CancellationToken::new()).await.unwrap();
+            assert_eq!(report, "child done", "the report is the child's final message");
+            let child_requests = client.requests_for("delegate");
+            assert_eq!(child_requests.len(), 3, "spawn, park, one wake-up turn");
+            assert!(
+                child_requests[2].contains("[task-completed]")
+                    && child_requests[2].contains("grandchild done"),
+                "the grandchild's report reaches the parked child: {}",
+                child_requests[2]
+            );
+            assert!(
+                child_requests[1].contains("Started subagent task"),
+                "the task tool returns a handle immediately: {}",
+                child_requests[1]
+            );
 
             let captures = seen.lock().unwrap().clone();
             assert_eq!(captures.len(), 1, "the grandchild probe must have run");
@@ -2071,6 +2158,625 @@ mod tests {
                 !wait_content.contains("completed"),
                 "task_wait must not leak the sibling's terminal status: {wait_content}"
             );
+        }
+    }
+
+    // ── Non-blocking runtime, Phase 2: parked agents and pushed completions ──
+
+    pub(super) mod nonblocking {
+        use std::collections::VecDeque;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        use async_trait::async_trait as at;
+        use coda_llm::anthropic::StreamEvent;
+        use coda_llm::{Content, Correlation, LlmError, Message};
+        use tokio_util::sync::CancellationToken;
+
+        use super::trusted_child_context::{done_event, host_with, manager, text_turn, tool_turn, AllowAll};
+        use crate::agent::park::ParkPolicy;
+        use crate::agent::AgentLoopBuilder;
+        use crate::events::CollectingSink;
+        use crate::message::MessageBus;
+        use crate::steering::SteeringInbox;
+        use crate::subagents::{SubagentFactory, SubagentRequest};
+        use crate::tasks::{
+            MainInboxCompletionPush, TaskExecutionMode, TaskKind, TaskManager, TaskRunStatus,
+        };
+        use crate::tool::{Tool, ToolContext, ToolContextServiceExt as _, ToolOutcome, ToolRegistry, ToolResult};
+
+        /// Scripted model that serves each agent its own script, chosen by the
+        /// agent's original prompt (its first message), and records every
+        /// request — so concurrently running agents cannot steal each other's
+        /// turns.
+        pub(crate) struct RoutedClient {
+            scripts: Mutex<Vec<(String, VecDeque<Vec<StreamEvent>>)>>,
+            requests: Mutex<Vec<(String, String)>>,
+        }
+
+        impl RoutedClient {
+            pub(crate) fn new(routes: Vec<(&str, Vec<Vec<StreamEvent>>)>) -> Arc<Self> {
+                Arc::new(Self {
+                    scripts: Mutex::new(
+                        routes.into_iter().map(|(k, v)| (k.to_owned(), v.into())).collect(),
+                    ),
+                    requests: Mutex::new(Vec::new()),
+                })
+            }
+
+            /// The full text of every request one agent made, in order.
+            pub(crate) fn requests_for(&self, key: &str) -> Vec<String> {
+                self.requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(k, _)| k == key)
+                    .map(|(_, text)| text.clone())
+                    .collect()
+            }
+        }
+
+        fn message_text(message: &Message) -> String {
+            message
+                .content
+                .iter()
+                .filter_map(|c| match c {
+                    Content::Text(t) => Some(t.clone()),
+                    Content::ToolResult { content, .. } => Some(content.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        #[at]
+        impl coda_llm::LlmClient for RoutedClient {
+            fn provider_id(&self) -> &str {
+                "routed"
+            }
+            async fn stream(
+                &self,
+                request: coda_llm::ChatRequest,
+            ) -> Result<coda_llm::ResponseStream, LlmError> {
+                let first = request.messages.first().map(message_text).unwrap_or_default();
+                let full =
+                    request.messages.iter().map(message_text).collect::<Vec<_>>().join("\n");
+                let (key, events) = {
+                    let mut scripts = self.scripts.lock().unwrap();
+                    let route = scripts
+                        .iter_mut()
+                        .find(|(k, _)| first.contains(k.as_str()))
+                        .unwrap_or_else(|| panic!("no script for prompt {first:?}"));
+                    let events =
+                        route.1.pop_front().unwrap_or_else(|| text_turn("(script exhausted)"));
+                    (route.0.clone(), events)
+                };
+                self.requests.lock().unwrap().push((key, full));
+                let (tx, rx) = tokio::sync::mpsc::channel(16);
+                tokio::spawn(async move {
+                    for e in events {
+                        let _ = tx.send(Ok(e)).await;
+                    }
+                });
+                Ok(coda_llm::ResponseStream::new(rx))
+            }
+        }
+
+        /// One model turn calling several tools at once.
+        fn tools_turn(calls: &[(&str, &str, String)]) -> Vec<StreamEvent> {
+            let mut events: Vec<StreamEvent> = calls
+                .iter()
+                .map(|(id, name, input)| {
+                    StreamEvent::ToolUse(Content::ToolUse {
+                        id: (*id).into(),
+                        name: (*name).into(),
+                        input_json: input.clone(),
+                        correlation: Correlation::default(),
+                    })
+                })
+                .collect();
+            events.push(done_event());
+            events
+        }
+
+        /// Sleeps `ms` milliseconds (paused clock in these tests).
+        struct SlowTool;
+
+        #[at]
+        impl Tool for SlowTool {
+            fn name(&self) -> &str {
+                "slow"
+            }
+            fn description(&self) -> &str {
+                "sleeps"
+            }
+            fn input_schema_json(&self) -> &str {
+                r#"{"type":"object","properties":{"ms":{"type":"integer"}}}"#
+            }
+            fn is_read_only(&self) -> bool {
+                true
+            }
+            async fn execute(
+                &self,
+                input: &serde_json::Value,
+                _: &ToolContext,
+                _: CancellationToken,
+            ) -> ToolOutcome {
+                let ms = input.get("ms").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                ToolResult::ok("slept")
+            }
+        }
+
+        /// Starts a task owned by the caller that never finishes on its own
+        /// (e.g. a server); `finish_after_ms` completes it after a delay.
+        struct StartTaskTool {
+            started: Arc<Mutex<Vec<String>>>,
+        }
+
+        #[at]
+        impl Tool for StartTaskTool {
+            fn name(&self) -> &str {
+                "start_task"
+            }
+            fn description(&self) -> &str {
+                "starts a background task"
+            }
+            fn input_schema_json(&self) -> &str {
+                r#"{"type":"object","properties":{"finish_after_ms":{"type":"integer"}}}"#
+            }
+            fn is_read_only(&self) -> bool {
+                true
+            }
+            async fn execute(
+                &self,
+                input: &serde_json::Value,
+                ctx: &ToolContext,
+                _: CancellationToken,
+            ) -> ToolOutcome {
+                use crate::tool::ToolContextServiceExt as _;
+                let mgr = Arc::clone(ctx.get_task_manager().unwrap());
+                let task = mgr
+                    .register(
+                        TaskKind::Shell,
+                        "long job",
+                        ctx.caller_task_id.as_deref(),
+                        TaskExecutionMode::Background,
+                    )
+                    .unwrap();
+                mgr.append_output(&task.id, "job output line");
+                self.started.lock().unwrap().push(task.id.clone());
+                if let Some(ms) = input.get("finish_after_ms").and_then(serde_json::Value::as_u64)
+                {
+                    let id = task.id.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(ms)).await;
+                        mgr.complete(&id, Some("exit code: 0".into()));
+                    });
+                }
+                ToolResult::ok(format!("started {}", task.id))
+            }
+        }
+
+        fn depth_one_child(mgr: &TaskManager, what: &str) -> String {
+            mgr.register(TaskKind::Subagent, what, None, TaskExecutionMode::Foreground)
+                .unwrap()
+                .id
+                .clone()
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_burst_of_five_completions_wakes_a_parked_subagent_once() {
+            let dir = tempfile::tempdir().unwrap();
+            let mgr = manager(&dir);
+            let calls: Vec<(String, String)> = (1..=5)
+                .map(|i| (format!("t{i}"), format!(r#"{{"prompt":"leaf {i}"}}"#)))
+                .collect();
+            let batch: Vec<(&str, &str, String)> =
+                calls.iter().map(|(id, input)| (id.as_str(), "task", input.clone())).collect();
+            let mut routes = vec![(
+                "orchestrate",
+                vec![tools_turn(&batch), text_turn("waiting"), text_turn("all five done")],
+            )];
+            let leaf_keys: Vec<String> = (1..=5).map(|i| format!("leaf {i}")).collect();
+            for (i, key) in leaf_keys.iter().enumerate() {
+                let ms = (i as u64 + 1) * 100;
+                routes.push((
+                    key.as_str(),
+                    vec![
+                        tool_turn("s", "slow", &format!(r#"{{"ms":{ms}}}"#)),
+                        text_turn(&format!("{key} report")),
+                    ],
+                ));
+            }
+            let client = RoutedClient::new(routes);
+            let host = host_with(
+                Arc::clone(&client) as Arc<dyn coda_llm::LlmClient>,
+                vec![
+                    Arc::new(crate::tools::TaskTool) as Arc<dyn Tool>,
+                    Arc::new(SlowTool) as Arc<dyn Tool>,
+                ],
+                Arc::clone(&mgr),
+                8,
+            );
+            let child = depth_one_child(&mgr, "orchestrate");
+            let request = SubagentRequest::foreground("general-purpose", "orchestrate", &child, 1);
+
+            let report = host
+                .spawn(request, Arc::new(CollectingSink::new()), CancellationToken::new())
+                .await
+                .unwrap();
+
+            assert_eq!(report, "all five done");
+            let requests = client.requests_for("orchestrate");
+            assert_eq!(requests.len(), 3, "five completions coalesce into one wake-up turn");
+            assert_eq!(requests[2].matches("[task-completed]").count(), 5, "{}", requests[2]);
+            for i in 1..=5 {
+                assert!(requests[2].contains(&format!("leaf {i} report")), "{}", requests[2]);
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_parked_subagent_is_woken_by_a_message_then_reports_at_its_park_deadline() {
+            let dir = tempfile::tempdir().unwrap();
+            let mgr = manager(&dir);
+            let started = Arc::new(Mutex::new(Vec::new()));
+            let client = RoutedClient::new(vec![(
+                "watch the job",
+                vec![
+                    tool_turn("j", "start_task", "{}"),
+                    text_turn("parked while the job runs"),
+                    text_turn("noted the new instruction"),
+                    text_turn("partial report: the job never finished"),
+                ],
+            )]);
+            let host = host_with(
+                Arc::clone(&client) as Arc<dyn coda_llm::LlmClient>,
+                vec![Arc::new(StartTaskTool { started: Arc::clone(&started) }) as Arc<dyn Tool>],
+                Arc::clone(&mgr),
+                4,
+            );
+            let child = depth_one_child(&mgr, "watch the job");
+            let request =
+                SubagentRequest::foreground("general-purpose", "watch the job", &child, 1);
+            let run = tokio::spawn(async move {
+                host.spawn(request, Arc::new(CollectingSink::new()), CancellationToken::new())
+                    .await
+            });
+
+            // Let it start the job and park.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            assert_eq!(client.requests_for("watch the job").len(), 2, "parked: no model calls");
+            let sent = crate::tools::TaskSendTool
+                .execute(
+                    &serde_json::json!({"taskId": child, "message": "also check the logs"}),
+                    &ToolContext::new(".").with_task_manager(Arc::clone(&mgr)),
+                    CancellationToken::new(),
+                )
+                .await;
+            assert!(!sent.is_error, "{}", sent.content);
+
+            let report = run.await.unwrap().unwrap();
+            assert_eq!(report, "partial report: the job never finished");
+            let requests = client.requests_for("watch the job");
+            assert_eq!(requests.len(), 4);
+            assert!(requests[2].contains("also check the logs"), "{}", requests[2]);
+            assert!(
+                requests[3].contains("[deadline]") && requests[3].contains("maximum time waiting"),
+                "{}",
+                requests[3]
+            );
+            let job = mgr.find_task(&started.lock().unwrap()[0]).unwrap();
+            assert!(job.cancel.is_cancelled(), "a subagent's tasks do not outlive it");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_subagent_past_its_lifetime_is_asked_for_its_report() {
+            let dir = tempfile::tempdir().unwrap();
+            let mgr = manager(&dir);
+            let owner = depth_one_child(&mgr, "long work");
+            let client = RoutedClient::new(vec![(
+                "long work",
+                vec![tool_turn("s", "slow", r#"{"ms":61000}"#), text_turn("final partial report")],
+            )]);
+            let policy = ParkPolicy {
+                max_lifetime: Some(Duration::from_secs(60)),
+                ..ParkPolicy::subagent(owner.clone())
+            };
+            let agent = AgentLoopBuilder::new(
+                Arc::clone(&client) as Arc<dyn coda_llm::LlmClient>,
+                Arc::new(AllowAll),
+                Arc::new(ToolRegistry::new(vec![Arc::new(SlowTool) as Arc<dyn Tool>])),
+            )
+            .with_task_manager(Arc::clone(&mgr))
+            .with_caller_task_id(owner)
+            .with_steering(Arc::new(SteeringInbox::new()))
+            .with_park_policy(policy)
+            .build();
+
+            let mut history = vec![Message::user("long work")];
+            agent
+                .run(&mut history, &CollectingSink::new(), None, CancellationToken::new())
+                .await
+                .unwrap();
+
+            let requests = client.requests_for("long work");
+            assert_eq!(requests.len(), 2);
+            assert!(
+                requests[1].contains("[deadline]") && requests[1].contains("maximum lifetime"),
+                "{}",
+                requests[1]
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_headless_main_run_does_not_end_while_its_tasks_run() {
+            let dir = tempfile::tempdir().unwrap();
+            let mgr = manager(&dir);
+            let bus = Arc::new(MessageBus::new());
+            mgr.set_completion_listener(MainInboxCompletionPush::new(&bus));
+            let client = RoutedClient::new(vec![(
+                "build it",
+                vec![
+                    tool_turn("b", "start_task", r#"{"finish_after_ms":600000}"#),
+                    text_turn("started the build"),
+                    text_turn("the build passed"),
+                ],
+            )]);
+            let started = Arc::new(Mutex::new(Vec::new()));
+            let agent = AgentLoopBuilder::new(
+                Arc::clone(&client) as Arc<dyn coda_llm::LlmClient>,
+                Arc::new(AllowAll),
+                Arc::new(ToolRegistry::new(vec![
+                    Arc::new(StartTaskTool { started: Arc::clone(&started) }) as Arc<dyn Tool>
+                ])),
+            )
+            .with_task_manager(Arc::clone(&mgr))
+            .with_message_bus(Arc::clone(&bus))
+            .with_steering(Arc::new(SteeringInbox::new()))
+            .with_main_context()
+            .with_park_policy(ParkPolicy::headless_main())
+            .build();
+
+            let begun = tokio::time::Instant::now();
+            let mut history = vec![Message::user("build it")];
+            agent
+                .run(&mut history, &CollectingSink::new(), None, CancellationToken::new())
+                .await
+                .unwrap();
+
+            assert!(begun.elapsed() >= Duration::from_secs(600), "the run waited for the build");
+            let requests = client.requests_for("build it");
+            assert_eq!(requests.len(), 3);
+            assert!(
+                requests[2].contains("[task-completed]") && requests[2].contains("exit code: 0"),
+                "{}",
+                requests[2]
+            );
+            let build = mgr.find_task(&started.lock().unwrap()[0]).unwrap();
+            assert_eq!(build.status(), TaskRunStatus::Completed);
+        }
+
+        /// `task_wait` attaches with the yield contract: capped at 30 s, cut
+        /// short by a new message, and it never stops the task.
+        #[tokio::test(start_paused = true)]
+        async fn task_wait_is_capped_and_cut_short_by_steering() {
+            let dir = tempfile::tempdir().unwrap();
+            let mgr = manager(&dir);
+            let job = mgr
+                .register(TaskKind::Shell, "job", None, TaskExecutionMode::Background)
+                .unwrap();
+            let wait = format!(r#"{{"taskId":"{}","timeoutSeconds":300}}"#, job.id);
+            let client = RoutedClient::new(vec![
+                ("capped", vec![tool_turn("w", "task_wait", &wait), text_turn("ok")]),
+                ("steered", vec![tool_turn("w", "task_wait", &wait), text_turn("ok")]),
+            ]);
+            let build = |steering: Arc<SteeringInbox>| {
+                AgentLoopBuilder::new(
+                    Arc::clone(&client) as Arc<dyn coda_llm::LlmClient>,
+                    Arc::new(AllowAll),
+                    Arc::new(ToolRegistry::new(vec![
+                        Arc::new(crate::tools::TaskWaitTool) as Arc<dyn Tool>
+                    ])),
+                )
+                .with_task_manager(Arc::clone(&mgr))
+                .with_steering(steering)
+                .with_main_context()
+                .build()
+            };
+
+            let begun = tokio::time::Instant::now();
+            let mut history = vec![Message::user("capped")];
+            build(Arc::new(SteeringInbox::new()))
+                .run(&mut history, &CollectingSink::new(), None, CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(begun.elapsed(), Duration::from_secs(30), "300 s is capped at 30 s");
+            assert!(client.requests_for("capped")[1].contains("still running"));
+
+            let steering = Arc::new(SteeringInbox::new());
+            let agent = build(Arc::clone(&steering));
+            let begun = tokio::time::Instant::now();
+            let sender = {
+                let steering = Arc::clone(&steering);
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    steering.enqueue("are you done?");
+                })
+            };
+            let mut history = vec![Message::user("steered")];
+            agent
+                .run(&mut history, &CollectingSink::new(), None, CancellationToken::new())
+                .await
+                .unwrap();
+            sender.await.unwrap();
+            assert_eq!(begun.elapsed(), Duration::from_secs(5), "the message cut the wait short");
+            let second = &client.requests_for("steered")[1];
+            assert!(second.contains("ended early because a new message arrived"), "{second}");
+            assert!(second.contains("are you done?"), "{second}");
+            assert_eq!(job.status(), TaskRunStatus::Running, "waiting never stops the task");
+        }
+
+        /// A completion the owner already received inline through `task_wait`
+        /// is not pushed to it a second time.
+        #[tokio::test(start_paused = true)]
+        async fn a_completion_seen_through_task_wait_is_not_pushed_again() {
+            let dir = tempfile::tempdir().unwrap();
+            let mgr = manager(&dir);
+            let bus = Arc::new(MessageBus::new());
+            mgr.set_completion_listener(MainInboxCompletionPush::new(&bus));
+            let job = mgr
+                .register(TaskKind::Shell, "job", None, TaskExecutionMode::Background)
+                .unwrap();
+            {
+                let mgr = Arc::clone(&mgr);
+                let id = job.id.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    mgr.complete(&id, Some("exit code: 0\nall good".into()));
+                });
+            }
+            let wait = format!(r#"{{"taskId":"{}"}}"#, job.id);
+            let client = RoutedClient::new(vec![(
+                "wait for it",
+                vec![tool_turn("w", "task_wait", &wait), text_turn("ok")],
+            )]);
+            let agent = AgentLoopBuilder::new(
+                Arc::clone(&client) as Arc<dyn coda_llm::LlmClient>,
+                Arc::new(AllowAll),
+                Arc::new(ToolRegistry::new(vec![
+                    Arc::new(crate::tools::TaskWaitTool) as Arc<dyn Tool>
+                ])),
+            )
+            .with_task_manager(Arc::clone(&mgr))
+            .with_message_bus(Arc::clone(&bus))
+            .with_steering(Arc::new(SteeringInbox::new()))
+            .with_main_context()
+            .build();
+            let mut history = vec![Message::user("wait for it")];
+            agent
+                .run(&mut history, &CollectingSink::new(), None, CancellationToken::new())
+                .await
+                .unwrap();
+
+            let second = &client.requests_for("wait for it")[1];
+            assert!(second.contains("completed") && second.contains("all good"), "{second}");
+            assert!(!second.contains("[task-completed]"), "{second}");
+            assert!(!bus.has_pending_main(), "the completion must not be pushed as well");
+        }
+
+        /// Failure and stop of a subagent reach the parent as completions.
+        #[tokio::test(start_paused = true)]
+        async fn a_failed_and_a_stopped_child_subagent_both_wake_the_parent() {
+            let dir = tempfile::tempdir().unwrap();
+            let mgr = manager(&dir);
+            let client = RoutedClient::new(vec![
+                (
+                    "parent",
+                    vec![
+                        tools_turn(&[
+                            ("a", "task", r#"{"prompt":"doomed child"}"#.into()),
+                            ("b", "task", r#"{"prompt":"endless child"}"#.into()),
+                        ]),
+                        text_turn("waiting"),
+                        text_turn("first wake"),
+                        text_turn("second wake"),
+                    ],
+                ),
+                ("doomed child", vec![tool_turn("x", "abort_now", "{}")]),
+                ("endless child", vec![tool_turn("j", "start_task", "{}"), text_turn("parked")]),
+            ]);
+            let host = host_with(
+                Arc::clone(&client) as Arc<dyn coda_llm::LlmClient>,
+                vec![
+                    Arc::new(crate::tools::TaskTool) as Arc<dyn Tool>,
+                    Arc::new(AbortTool) as Arc<dyn Tool>,
+                    Arc::new(StartTaskTool { started: Arc::new(Mutex::new(Vec::new())) })
+                        as Arc<dyn Tool>,
+                ],
+                Arc::clone(&mgr),
+                8,
+            );
+            let parent = depth_one_child(&mgr, "parent");
+            let request = SubagentRequest::foreground("general-purpose", "parent", &parent, 1);
+            let run = tokio::spawn(async move {
+                host.spawn(request, Arc::new(CollectingSink::new()), CancellationToken::new())
+                    .await
+            });
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            let endless = mgr
+                .list()
+                .into_iter()
+                .find(|t| t.description == "endless child")
+                .unwrap();
+            assert_eq!(mgr.stop_task(&endless.id), crate::tasks::TaskActionResult::Ok);
+
+            assert_eq!(run.await.unwrap().unwrap(), "second wake");
+            let requests = client.requests_for("parent");
+            let all = requests.join("\n");
+            assert!(all.contains("status: failed"), "{all}");
+            assert!(all.contains("status: stopped") && all.contains("stopped by the user"), "{all}");
+        }
+
+        struct AbortTool;
+
+        #[at]
+        impl Tool for AbortTool {
+            fn name(&self) -> &str {
+                "abort_now"
+            }
+            fn description(&self) -> &str {
+                "aborts the run"
+            }
+            fn input_schema_json(&self) -> &str {
+                r#"{"type":"object","properties":{}}"#
+            }
+            fn is_read_only(&self) -> bool {
+                true
+            }
+            async fn execute(
+                &self,
+                _: &serde_json::Value,
+                _: &ToolContext,
+                _: CancellationToken,
+            ) -> ToolOutcome {
+                ToolResult::abort("test.abort", "aborted")
+            }
+        }
+
+        /// The `task` tool hands back a handle at once; the subagent runs on.
+        #[tokio::test]
+        async fn the_task_tool_returns_a_handle_immediately() {
+            let dir = tempfile::tempdir().unwrap();
+            let mgr = manager(&dir);
+            let client = RoutedClient::new(vec![(
+                "slow job",
+                vec![tool_turn("s", "slow", r#"{"ms":3600000}"#), text_turn("done")],
+            )]);
+            let host = host_with(
+                Arc::clone(&client) as Arc<dyn coda_llm::LlmClient>,
+                vec![Arc::new(SlowTool) as Arc<dyn Tool>],
+                Arc::clone(&mgr),
+                4,
+            );
+            let ctx = ToolContext::new(".")
+                .with_task_manager(Arc::clone(&mgr))
+                .with_subagent_factory(Arc::clone(&host) as Arc<dyn SubagentFactory>);
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                crate::tools::TaskTool.execute(
+                    &serde_json::json!({"prompt": "slow job"}),
+                    &ctx,
+                    CancellationToken::new(),
+                ),
+            )
+            .await
+            .expect("task must not wait for the subagent");
+            assert!(result.content.starts_with("Started subagent task task-"), "{}", result.content);
+            let task = &mgr.list()[0];
+            assert_eq!(task.status, TaskRunStatus::Running);
+            assert_eq!(task.mode, TaskExecutionMode::Background);
+            mgr.stop_all();
         }
     }
 }

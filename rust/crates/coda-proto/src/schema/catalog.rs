@@ -97,6 +97,7 @@ pub(super) fn document() -> Value {
         rpc(m::STOP_ALL_TASKS, None, Some("TaskBulkControlResult"), S, S),
         rpc(m::TASK_BACKGROUND, Some("TaskIdParams"), Some("TaskControlResult"), S, S),
         rpc(m::TASK_STOP, Some("TaskIdParams"), Some("TaskControlResult"), S, S),
+        rpc(m::TASK_SEND, Some("TaskSendParams"), Some("TaskControlResult"), S, S),
     ];
     let mut events: Vec<_> = [
         e::ASSISTANT_TEXT, e::ASSISTANT_TEXT_COMPLETE, e::THINKING, e::THINKING_COMPLETE,

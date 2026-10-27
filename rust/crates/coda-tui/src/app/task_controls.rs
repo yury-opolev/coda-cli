@@ -1,6 +1,7 @@
-//! User controls for running tool work (non-blocking runtime, Phase 1):
-//! background-now (Ctrl+B), send-now (Ctrl+Enter / Ctrl+G), `/stop`, and the
-//! `/tasks` browser's `b` (background) and `x` (stop) keys.
+//! User controls for running tool work (non-blocking runtime, Phases 1–2):
+//! background-now (Ctrl+B), send-now (Ctrl+Enter / Ctrl+G), `/stop`,
+//! `/send <task> <message>`, and the `/tasks` browser's `b` (background),
+//! `x` (stop) and `m` (message) keys.
 //!
 //! Every action is the engine's: this module only asks and reports what the
 //! engine answered, never what it hoped would happen.
@@ -16,6 +17,13 @@ fn task_id_of(row_id: &str) -> &str {
     row_id.rsplit_once('/').map(|(_, task)| task).unwrap_or(row_id)
 }
 
+/// Splits `/send` arguments into the task id and the message.
+fn parse_send_args(args: &str) -> Option<(String, String)> {
+    let (task_id, text) = args.trim().split_once(char::is_whitespace)?;
+    let text = text.trim();
+    (!text.is_empty()).then(|| (task_id.to_owned(), text.to_owned()))
+}
+
 fn refusal(task_id: &str, reason: Option<&str>) -> String {
     match reason {
         Some("notFound") => format!("Task {task_id} no longer exists."),
@@ -24,8 +32,15 @@ fn refusal(task_id: &str, reason: Option<&str>) -> String {
             format!("Task {task_id} is already running in the background.")
         }
         Some("notBackgroundable") => format!(
-            "Task {task_id} cannot be moved to the background (only shell commands can, for now)."
+            "Task {task_id} cannot be moved to the background (only shell commands can)."
         ),
+        Some("notAgent") => {
+            format!("Task {task_id} is a command, not an agent; it cannot receive messages.")
+        }
+        Some("notAccepting") => {
+            format!("Task {task_id} is finishing and no longer accepts messages.")
+        }
+        Some("emptyText") => "Type a message after the task id.".to_owned(),
         Some(other) => format!("The engine refused the request for task {task_id} ({other})."),
         None => format!("The engine refused the request for task {task_id}."),
     }
@@ -91,6 +106,52 @@ impl App {
         }
     }
 
+    /// A `/tasks` row action (`b`, `x`, `m`).
+    pub(super) async fn task_row_action(&mut self, action: crate::surface::SurfaceAction) {
+        use crate::surface::SurfaceAction as A;
+        match action {
+            A::BackgroundTask(id) => self.background_task(&id).await,
+            A::StopTask(id) => self.stop_task(&id).await,
+            A::MessageTask(id) => self.compose_task_message(&id),
+            _ => {}
+        }
+    }
+
+    /// `/tasks` `m`: close the browser and start a `/send` to the task.
+    pub(super) fn compose_task_message(&mut self, row_id: &str) {
+        let task_id = task_id_of(row_id).to_owned();
+        self.surfaces.pop();
+        self.composer.set_text(format!("/send {task_id} "));
+        self.hint(format!("Type your message for task {task_id} and press Enter."));
+        self.dirty = true;
+    }
+
+    /// `/send <task-id> <message>`: deliver a message to a running subagent.
+    /// It reaches the subagent's inbox, cutting its current wait short or
+    /// waking it if it is parked.
+    pub(super) async fn send_task_message(&mut self, args: &str) {
+        let Some((task_id, text)) = parse_send_args(args) else {
+            self.notice("Usage: /send <task-id> <message>", NoticeLevel::Warning);
+            return;
+        };
+        if !self.require_engine("Messaging a task") {
+            return;
+        }
+        let params = serde_json::json!({ "taskId": task_id, "text": text });
+        match self.ask::<TaskControlResult>(method::TASK_SEND, Some(params)).await {
+            Ok(result) if result.ok => {
+                self.notice(format!("Message sent to task {task_id}."), NoticeLevel::Info)
+            }
+            Ok(result) => {
+                self.notice(refusal(&task_id, result.reason.as_deref()), NoticeLevel::Warning)
+            }
+            Err(error) => self.notice(
+                format!("Could not reach the engine for task {task_id}: {error}"),
+                NoticeLevel::Error,
+            ),
+        }
+    }
+
     /// `/tasks` `b`: stop waiting on one task.
     pub(super) async fn background_task(&mut self, row_id: &str) {
         self.task_control(method::TASK_BACKGROUND, row_id, "Moved task {} to the background.")
@@ -143,6 +204,18 @@ mod tests {
     }
 
     #[test]
+    fn send_arguments_split_into_the_task_and_the_whole_message() {
+        assert_eq!(
+            parse_send_args("  task-0004   use the dry run, please "),
+            Some(("task-0004".into(), "use the dry run, please".into()))
+        );
+        assert_eq!(parse_send_args("task-0004"), None);
+        assert_eq!(parse_send_args("task-0004   "), None);
+        assert_eq!(parse_send_args(""), None);
+        assert!(refusal("task-1", Some("notAgent")).contains("cannot receive messages"));
+    }
+
+    #[test]
     fn the_tasks_browser_backgrounds_and_stops_the_selected_task() {
         use crate::surface::browser::BrowserKind;
         use crate::surface::{Surface, SurfaceAction, SurfaceOutcome};
@@ -173,6 +246,12 @@ mod tests {
         match surface.handle_key(press('x')) {
             SurfaceOutcome::Emit(SurfaceAction::StopTask(id)) => assert_eq!(task_id_of(&id), "task-0003"),
             _ => panic!("x must stop the selected task"),
+        }
+        match surface.handle_key(press('m')) {
+            SurfaceOutcome::Emit(SurfaceAction::MessageTask(id)) => {
+                assert_eq!(task_id_of(&id), "task-0003")
+            }
+            _ => panic!("m must start a message to the selected task"),
         }
     }
 }

@@ -107,8 +107,9 @@ pub struct ManagedTask {
     pub cancel: CancellationToken,
     /// Resolved model id (subagents only); set once before the loop starts.
     pub resolved_model: Option<String>,
-    /// Steering inbox for subagent tasks; `None` for shell tasks.
-    pub steering: Option<Arc<SteeringInbox>>,
+    /// Inbox of the agent running as this task (subagents and scheduled runs;
+    /// attached once by the subagent host). `None` for shell tasks.
+    steering: std::sync::OnceLock<Arc<SteeringInbox>>,
     output: OutputRing,
     pub(super) redacted_output: Arc<OutputRing>,
     state: Mutex<TaskState>,
@@ -129,6 +130,18 @@ pub struct ManagedTask {
     /// of a snapshot: it is the tool's own (unredacted) output, which must not
     /// reach `session/listTasks` or any other reader.
     tool_output: Mutex<Option<String>>,
+    /// Set once the terminal transition has been fully reported (the owner's
+    /// inbox already holds its completion, if it gets one). Until then the
+    /// task still counts as live for its owner's parked state, which closes
+    /// the race between "the child just finished" and "its report arrived".
+    settled: std::sync::atomic::AtomicBool,
+    /// Set when the completion was pushed to its owner's inbox, so the
+    /// deprecated `task_recall` does not hand it out a second time.
+    completion_pushed: std::sync::atomic::AtomicBool,
+    /// `(owner waits attached, delivery claimed inline)`: while the owning
+    /// agent waits on this task with `task_wait`, a completion is handed to
+    /// that wait instead of being pushed, so it is delivered exactly once.
+    owner_attach: Mutex<(u32, bool)>,
 }
 
 /// Stable consumer id for the main agent's cursor. The leading NUL cannot collide
@@ -156,7 +169,7 @@ impl ManagedTask {
             started_at: SystemTime::now(),
             cancel: CancellationToken::new(),
             resolved_model: None,
-            steering: None,
+            steering: std::sync::OnceLock::new(),
             output: OutputRing::new(output_ring_bytes),
             redacted_output: Arc::new(OutputRing::new(16 * 1024)),
             state: Mutex::new(TaskState {
@@ -175,7 +188,66 @@ impl ManagedTask {
             background_signal: Notify::new(),
             operator_stop: std::sync::atomic::AtomicBool::new(false),
             tool_output: Mutex::new(None),
+            settled: std::sync::atomic::AtomicBool::new(false),
+            completion_pushed: std::sync::atomic::AtomicBool::new(false),
+            owner_attach: Mutex::new((0, false)),
         })
+    }
+
+    /// The owning agent starts waiting on this task inline (`task_wait`).
+    pub fn begin_owner_attach(&self) {
+        self.owner_attach.lock().unwrap().0 += 1;
+    }
+
+    /// The owning agent stops waiting. Returns `true` when the completion was
+    /// claimed by the wait (not pushed), so the waiter must report it.
+    pub fn end_owner_attach(&self) -> bool {
+        let mut attach = self.owner_attach.lock().unwrap();
+        attach.0 = attach.0.saturating_sub(1);
+        attach.1
+    }
+
+    /// Called once at the terminal notification: claims the completion for
+    /// an attached owner wait, if there is one.
+    pub(crate) fn claim_delivery_for_attached_owner(&self) -> bool {
+        let mut attach = self.owner_attach.lock().unwrap();
+        if attach.0 > 0 {
+            attach.1 = true;
+        }
+        attach.1
+    }
+
+    /// Whether the completion went to an attached owner wait instead of a push.
+    pub fn delivered_inline_to_owner(&self) -> bool {
+        self.owner_attach.lock().unwrap().1
+    }
+
+    /// Attaches the inbox of the agent running as this task. First call wins.
+    pub fn attach_steering(&self, inbox: Arc<SteeringInbox>) -> bool {
+        self.steering.set(inbox).is_ok()
+    }
+
+    /// The inbox of the agent running as this task, if one is attached.
+    pub fn steering(&self) -> Option<&Arc<SteeringInbox>> {
+        self.steering.get()
+    }
+
+    /// Whether the terminal transition has been fully reported.
+    pub fn is_settled(&self) -> bool {
+        self.settled.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_settled(&self) {
+        self.settled.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether this task's completion was pushed into its owner's inbox.
+    pub fn completion_pushed(&self) -> bool {
+        self.completion_pushed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn mark_completion_pushed(&self) {
+        self.completion_pushed.store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Records that the operator asked for this task to stop.

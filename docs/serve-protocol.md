@@ -173,10 +173,11 @@ re-fetches the catalog from models.dev first.
 | `session/stopAllTasks` | `{}` | `{ ok, count }` |
 | `task/background` | `{ taskId }` | `{ ok, taskId, reason? }` |
 | `task/stop` | `{ taskId }` | `{ ok, taskId, reason? }` |
+| `task/send` | `{ taskId, text }` | `{ ok, taskId, reason? }` |
 
 **Initialization gate.** `session/getHistory`, `session/getPendingRequests`,
-`session/resolveRequest`, `session/cancelRequest`, `config/set` and the four task controls
-(`session/backgroundAll`, `session/stopAllTasks`, `task/background`, `task/stop`) require a completed
+`session/resolveRequest`, `session/cancelRequest`, `config/set` and the five task controls
+(`session/backgroundAll`, `session/stopAllTasks`, `task/background`, `task/stop`, `task/send`) require a completed
 `initialize` and otherwise return `-32011`. Read-only discovery — `session/listSessions`,
 `session/listTasks`, `config/describe`, `mcp/list`, `session/getState`, `session/getEvents` — is valid **before**
 `initialize`, so a client can choose a session before resuming one. Every route that shipped
@@ -191,20 +192,29 @@ notifications. `kind` is `subagent`, `shell`, or `scheduled`; `status` is `runni
 The session id namespaces the registry's task ids. This is runtime discovery, not an
 archive of task logs from earlier engine processes.
 
-**Task controls (non-blocking runtime).** Every `run_command` runs as a `shell` task. While
+**Task controls (non-blocking runtime).** Every `run_command` runs as a `shell` task, and
+every subagent as a `subagent` task that starts in the `background` (nothing ever waits on
+it in the foreground). While
 the agent waits on a task it is `foreground`; once the agent stops waiting (its yield
 budget ran out, a steering message arrived, or a client asked) it is `background` and keeps
 running. `session/backgroundAll` and `task/background` end the agent's wait — never the
 work; the agent receives a task handle and continues. `count` is how many foreground tasks
 were released (`0` is not an error). `task/stop` and `session/stopAllTasks` stop tasks and
-kill shell process trees. A refused `task/*` call answers `ok: false` with `reason`
-`notFound`, `notRunning`, or (`task/background` only) `notForeground` / `notBackgroundable`
-(only shell tasks can be released in this phase). When a background shell task owned by the
-main agent ends — completed, failed, or stopped by the agent — exactly one
-`[task-completed]` item is delivered to the main conversation through the main inbox
-(announced like any delivered agent message, `source: "taskCompletion"`); an idle engine
-starts a turn for it. Tasks stopped by the operator (`task/stop`, `session/stopAllTasks`) are
-not reported back, so a stop never triggers a new turn. Engine `shutdown` stops every task.
+kill shell process trees (stopping a subagent also stops everything it started).
+`task/send` delivers `text` to a running subagent's inbox: it cuts the subagent's current
+wait short, or wakes it when it is parked (waiting, without model calls, for tasks it
+started). A refused `task/*` call answers `ok: false` with `reason` `notFound`,
+`notRunning`, for `task/background` only `notForeground` (already in the background — every
+subagent is) / `notBackgroundable`, and for `task/send` only `notAgent` (a shell task has no
+inbox), `notAccepting` (the subagent is finishing) / `emptyText`. When a background shell or
+subagent task owned by the main agent ends — completed, failed, or stopped by the agent —
+exactly one `[task-completed]` item (for a subagent, carrying its final report) is delivered
+to the main conversation through the main inbox (announced like any delivered agent message,
+`source: "taskCompletion"`); an idle engine starts a turn for it. Tasks stopped by the
+operator (`task/stop`, `session/stopAllTasks`) are not reported back to the main agent, so a
+stop never triggers a new turn. Completions of tasks owned by a subagent go to that
+subagent's own inbox and are never seen by clients as agent messages. Engine `shutdown`
+stops every task.
 
 `outputTail` contains at most 4,000 Unicode characters of buffered, secret-redacted
 output, using the same per-channel streaming redaction as task logs. Browsing does

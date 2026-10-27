@@ -88,9 +88,10 @@ for limits, failure behavior, and compatibility with older logging flags.
   - `web_fetch` / `web_search` (DuckDuckGo), `notebook_edit`, `git_worktree`,
     `todo_write` (a live checklist), plan mode, `schedule_*` **scheduled tasks**
     (see [Scheduled tasks](#scheduled-tasks)), and the
-    task tools (`task` for a subagent, `task_start` / `task_output` for a background
-    subagent, plus `task_list` / `task_get` / `task_peek` / `task_send` / `task_wait` /
-    `task_stop` / `task_remove` / `task_recall`) for long-running jobs.
+    task tools (`task` starts a subagent in the background, plus `task_list` /
+    `task_get` / `task_peek` / `task_output` / `task_send` / `task_wait` / `task_stop` /
+    `task_remove`; `task_start` and `task_recall` are deprecated aliases kept for one
+    release) for long-running jobs.
 - **Non-blocking task runtime** — one in-process `TaskManager` owns every long-running
   job in the session (**subagents** and **shell commands** alike). It gives each task a
   shared id/status/depth model, a bounded ring of recent output, and a persistent,
@@ -105,26 +106,41 @@ for limits, failure behavior, and compatibility with older logging flags.
     *work deadline* that kills the process tree after N seconds (no default).
   - **Messages you send while a tool runs cut the wait short** — the command keeps
     running and your message reaches the model within seconds, not when the command ends.
-  - **Completions are pushed.** When a backgrounded command completes, fails or is
-    stopped by the agent, the main agent receives one `[task-completed]` data block
-    (status, exit code, log path, last output) — and an idle session starts a turn by
+  - **Completions are pushed — to every agent.** When a backgrounded command or a
+    subagent completes, fails or is stopped, the agent that started it receives one
+    `[task-completed]` data block (status; for a command its exit code, log path and last
+    output, for a subagent its final report) — and an idle session starts a turn by
     itself. The model is told not to poll. Stops *you* make (`/stop`, `/tasks` → `x`) are
-    not reported back, so they never start a turn.
+    not reported back to the main agent, so they never start a turn; a subagent is told,
+    because it may be waiting on that very task.
+  - **Agents park instead of waiting.** Every agent — the main session and each
+    subagent, at every depth — has an inbox. A subagent whose turn ends while tasks it
+    started are still running **parks**: no model calls, no polling, until a completion
+    or a message arrives; a burst of completions within ~2 s produces one turn. It
+    finishes when a turn ends with nothing of its own left running, and its final message
+    is its report. Limits: **2 h** lifetime and **30 min** parked without news; either
+    wakes it once to write a partial report, after which it stops (and so does anything
+    it started).
   - **You stay in control:** `Ctrl+B` moves whatever the agent is waiting on to the
     background, `Ctrl+Enter` (or `Ctrl+G`) does that *and* sends your message now,
-    `/tasks` → `b` / `x` backgrounds / stops one task (only shell commands can be
-    backgrounded for now), and `/stop` interrupts the turn and stops every task. `Esc` (interrupt) stops only the command the agent was waiting on;
-    commands already in the background keep running.
+    `/tasks` → `b` / `x` backgrounds / stops one task (only shell commands are ever
+    waited on, so only they can be backgrounded), `/tasks` → `m` or
+    `/send <task-id> <message>` sends a message to a running subagent (it cuts the
+    subagent's current wait short, or wakes it when parked), and `/stop` interrupts the
+    turn and stops every task. `Esc` (interrupt) stops only the command the agent was
+    waiting on; commands and subagents already in the background keep running.
   - The agent can still inspect and steer work with `task_list` / `task_get` /
-    `task_peek` / `task_wait` (default **300 s**; a timeout reports *still running* and
-    never stops the task) / `task_send` / `task_stop`, and `task_remove` a finished task
-    (its log file is preserved). Background **subagent** completions are still collected
-    with `task_recall` (pushing them is the next phase).
-  - Headless `coda run` sets `CODA_RUN_COMMAND_YIELD=0`, so its single turn waits for its
-    commands instead of yielding. Tasks are **process-local** — they do **not** survive
-    across processes, and the manager stops every task when Coda exits.
-- **Subagents** — delegate a self-contained subtask with `task`, which runs a nested
-  agent loop in its own context with a scoped toolset. Nesting and fan-out are
+    `task_peek` / `task_output` / `task_send` / `task_stop`, and `task_remove` a finished
+    task (its log file is preserved). `task_wait` attaches to a task for at most **30 s**
+    (cut short by a new message, never stops the task); ending the turn is the preferred
+    way to wait. `task_recall` only returns a completion that could not be pushed.
+  - Headless `coda run` sets `CODA_RUN_WAIT_FOR_TASKS=1`: its single turn parks until the
+    tasks it started have finished and reported (at most 30 min without news), then lets
+    the model finish. Tasks are **process-local** — they do **not** survive across
+    processes, and the manager stops every task when Coda exits.
+- **Subagents** — delegate a self-contained subtask with `task`, which starts a nested
+  agent loop in its own context with a scoped toolset and returns its task id at once;
+  the report arrives as a pushed completion. Nesting and fan-out are
   bounded (by default the main agent at depth 0 with subagents at depth 1 and 2, and
   8 subagents running at once), both configurable via the
   [`subagents` settings block](#subagent-limits--prompts). The main agent can inspect
@@ -316,15 +332,17 @@ shows a status glyph, the task id, status, kind (subagent/shell) and description
 
 - **List:** `Up`/`Down` or `k`/`j` move · `Enter` opens the detail page (mode, parent, report,
   secret-redacted output tail) · `b` **backgrounds** the selected task (the agent stops waiting on
-  it; it keeps running) · `x` **stops** it (and its process tree) · `r` reloads · `/` filters ·
-  `Esc` or `q` closes.
+  it; it keeps running) · `x` **stops** it (and its process tree) · `m` starts a **message** to
+  a running subagent (closes the browser and fills in `/send <task-id> `) · `r` reloads · `/`
+  filters · `Esc` or `q` closes.
 
-`/stop` interrupts the running turn and stops **every** running task. Everything here is
+`/send <task-id> <message>` delivers a message to a running subagent's inbox: it cuts the
+subagent's current wait short, or wakes it if it is parked. `/stop` interrupts the running turn and stops **every** running task. Everything here is
 **process-local** and **stops when Coda exits**.
 
 `coda serve` exposes the same controls to any client: `session/listTasks`,
-`session/backgroundAll`, `task/background {taskId}`, `task/stop {taskId}` and
-`session/stopAllTasks` (see [docs/serve-protocol.md](docs/serve-protocol.md)).
+`session/backgroundAll`, `task/background {taskId}`, `task/stop {taskId}`,
+`task/send {taskId, text}` and `session/stopAllTasks` (see [docs/serve-protocol.md](docs/serve-protocol.md)).
 
 ### Model, effort & context
 
@@ -474,7 +492,8 @@ Once connected, just type a message. Coda streams the assistant reply and runs a
 - read-only (automatic): `read_file`, `list_dir`, `glob`, `grep`
 - permission-gated: `edit_file`, `write_file`, `run_command`
 - `task` — delegate a self-contained subtask to a **subagent** (a nested agent loop
-  with the file/command tools but not `task`; it streams its work and reports back).
+  with the file/command tools but not `task`). It starts in the background and the call
+  returns its task id at once; its final report is pushed back when it finishes.
   `system_prompt_append` adds standing instructions for it — see
   [Subagent limits & prompts](#subagent-limits--prompts)
 - any tools from configured **MCP servers** (below), as `mcp__<server>__<tool>`
@@ -1202,8 +1221,8 @@ widen its own budget or ungate its own prompt.
 > **Fan-out is a fleet budget, not a per-level one.** The slot count is session-wide,
 > so a leader that dispatches 20 workers holds every slot and those workers cannot then
 > spawn children of their own. If you want depth *and* width, raise `maxConcurrent`.
-> Note also that `task` blocks until its subagent finishes, so genuine parallelism comes
-> from `task_start`, which returns immediately.
+> Note also that `task` returns at once and the subagent runs in the background, so
+> several `task` calls in one response run in parallel; a parked subagent keeps its slot.
 
 #### Choosing a subagent's model
 

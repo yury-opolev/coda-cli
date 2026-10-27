@@ -1,0 +1,18 @@
+{
+  "type": "object",
+  "properties": {
+    "taskId": {
+      "type": "string"
+    },
+    "text": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "taskId",
+    "text"
+  ],
+  "description": "A user message for one running subagent (`task/send`).",
+  "title": "TaskSendParams",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

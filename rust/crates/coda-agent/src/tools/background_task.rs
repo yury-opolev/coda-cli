@@ -1,4 +1,4 @@
-//! Background task tools: `task_start`, `task_output`.
+//! Background task tools: `task_start` (deprecated alias of `task`), `task_output`.
 //!
 //! Mirrors C# `BackgroundTaskStartTool`, `BackgroundTaskOutputTool`, `BackgroundTaskStopTool`.
 //! `task_stop` is implemented in `task_stop.rs` (which also handles the authorization-based
@@ -8,42 +8,13 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::subagents::{SubagentRequest, MAX_SUBAGENT_DEPTH};
 use crate::tasks::TaskRunStatus;
 use crate::tool::{Tool, ToolContext, ToolOutcome, ToolResult};
 use crate::tool::ToolContextServiceExt as _;
-use crate::events::NullSink;
-
-// ── helper: derive caller depth from context ──────────────────────────────────
-
-/// Resolve the calling agent's nesting depth.
-///
-/// `Ok(0)` means "the main agent" and is reserved for a context that carries no
-/// task identity at all. A caller id that cannot be resolved against the task
-/// manager returns `Err`: it must never be collapsed into the main agent's
-/// depth, because `TaskManager` reads a `None` caller as having session-wide
-/// authority and an unverifiable id would then inherit it.
-fn caller_depth(ctx: &ToolContext) -> Result<u32, String> {
-    let task_id = match ctx.caller_task_id.as_deref() {
-        Some(id) => id,
-        None => return Ok(0),
-    };
-    let mgr = ctx.get_task_manager().ok_or_else(|| {
-        "Background tasks are unavailable: this run carries a task identity but no task \
-         manager is wired, so its depth and authority cannot be verified."
-            .to_owned()
-    })?;
-    mgr.get(task_id).map(|s| s.depth).ok_or_else(|| {
-        format!(
-            "Background tasks are unavailable: the calling task '{task_id}' is not registered, \
-             so its depth and authority cannot be verified."
-        )
-    })
-}
 
 // ── BackgroundTaskStartTool ───────────────────────────────────────────────────
 
-/// `task_start` — start a background subagent and return its task id immediately.
+/// `task_start` — deprecated alias of `task` (decision D3), kept for one release.
 pub struct BackgroundTaskStartTool;
 
 #[async_trait]
@@ -53,8 +24,8 @@ impl Tool for BackgroundTaskStartTool {
     }
 
     fn description(&self) -> &str {
-        "Start a subagent in the background and return its task id immediately. \
-         Use task_output to read incremental progress and task_stop to cancel it."
+        "Deprecated alias of `task`: starts a subagent in the background and returns its task \
+         id immediately. Its final report is delivered to you automatically when it finishes."
     }
 
     fn input_schema_json(&self) -> &str {
@@ -77,61 +48,12 @@ impl Tool for BackgroundTaskStartTool {
         true
     }
 
-    async fn execute(&self, input: &Value, ctx: &ToolContext, _cancel: CancellationToken) -> ToolOutcome {
+    async fn execute(&self, input: &Value, ctx: &ToolContext, cancel: CancellationToken) -> ToolOutcome {
         // Both task manager and subagent factory must be present.
         if ctx.get_task_manager().is_none() || ctx.get_subagent_factory().is_none() {
             return ToolResult::ok("Background tasks are not available in this context.");
         }
-
-        // Depth check: reject when the calling context is already at max depth.
-        let current_depth = match caller_depth(ctx) {
-            Ok(d) => d,
-            Err(e) => return ToolResult::error(e),
-        };
-        if current_depth >= MAX_SUBAGENT_DEPTH {
-            return ToolResult::error(
-                "Cannot start a background subagent from here: the maximum subagent nesting depth has been reached.",
-            );
-        }
-
-        let prompt = match input.get("prompt").and_then(Value::as_str) {
-            Some(p) if !p.trim().is_empty() => p,
-            _ => return ToolResult::error("Missing required 'prompt'."),
-        };
-
-        let subagent_type = input
-            .get("subagent_type")
-            .and_then(Value::as_str)
-            .unwrap_or("general-purpose")
-            .to_owned();
-
-        let model = input.get("model").and_then(Value::as_str).map(str::to_owned);
-
-        let factory = ctx.get_subagent_factory().unwrap(); // checked above
-
-        // Child depth = current_depth + 1.
-        let child_depth = current_depth + 1;
-
-        let request = SubagentRequest {
-            agent_type: subagent_type.clone(),
-            prompt: prompt.to_owned(),
-            task_id: String::new(), // background: host assigns the id
-            depth: child_depth,
-            model,
-            foreground: false,
-            caller_task_id: ctx.caller_task_id.clone(),
-            // Trusted context value: a background child of a scheduled run
-            // belongs to the same job; the model cannot set it.
-            schedule_origin: ctx.schedule_origin.clone(),
-        };
-
-        let sink = std::sync::Arc::new(NullSink);
-        match factory.spawn(request, sink, CancellationToken::new()).await {
-            Ok(task_id) => ToolResult::ok(format!(
-                "Started background task {task_id}. Use task_output to read its progress."
-            )),
-            Err(e) => ToolResult::error(e),
-        }
+        super::task::start_subagent(input, ctx, cancel).await
     }
 }
 

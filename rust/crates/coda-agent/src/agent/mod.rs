@@ -36,6 +36,7 @@ use crate::todos::TodoStore;
 use crate::tool::{PlanApprover, ScheduleOrigin, ToolQuarantine, ToolRegistry, UserQuestion};
 
 pub mod output_budget;
+pub mod park;
 pub mod stop;
 pub mod stream;
 pub mod tools;
@@ -167,6 +168,9 @@ pub struct AgentLoop {
     message_bus: Option<Arc<crate::message::MessageBus>>,
     /// `true` only for the trusted top-level (main) conversation loop.
     is_main_context: bool,
+    /// When set, a natural stop with live tasks of this agent's own parks the
+    /// loop instead of ending the run (non-blocking runtime, Phase 2).
+    park_policy: Option<park::ParkPolicy>,
 
     // Configuration.
     model: String,
@@ -192,6 +196,16 @@ pub struct AgentLoop {
 }
 
 impl AgentLoop {
+    /// The parked-state watcher, when this loop parks (policy + task manager).
+    fn parker(&self) -> Option<park::Parker<'_>> {
+        Some(park::Parker {
+            policy: self.park_policy.as_ref()?,
+            tasks: self.task_manager.as_deref()?,
+            steering: self.steering.as_deref(),
+            main_inbox: if self.is_main_context { self.message_bus.as_deref() } else { None },
+        })
+    }
+
     /// The `max_tokens` for the next request: the configured budget, shrunk
     /// only when the estimated prompt leaves less room than that in the
     /// model's context window.
@@ -264,6 +278,7 @@ impl AgentLoop {
         let mut files_changed: u64 = 0;
         let mut activity = ToolActivity::new();
         let mut blocked_compaction_at: Option<usize> = None;
+        let mut park_state = park::ParkState::new();
 
         let retry_cfg = RetryConfig {
             max_schema_evictions: self.max_schema_evictions,
@@ -300,6 +315,12 @@ impl AgentLoop {
             // never starts new work after a cancel.
             if cancel.is_cancelled() {
                 return Err(AgentError::Cancelled);
+            }
+
+            // Lifetime limit of a parking agent (D5): asks for the report once,
+            // aborts a run that ignores it past the grace period.
+            if let Some(parker) = self.parker() {
+                parker.check_deadlines(&mut park_state, history)?;
             }
 
             // 1. Cooperative pause gate (no-op seam; later phase adds the gate).
@@ -363,9 +384,16 @@ impl AgentLoop {
                         .collect::<Vec<_>>()
                         .join("\n\n");
                     history.push(Message::user(text));
-                    sink.emit(AgentEvent::SteeringDelivered {
-                        message_ids: steers.iter().map(|e| e.id.clone()).collect(),
-                    });
+                    // Runtime items (task completions, deadlines) are not
+                    // operator steering; only messages are reported as such.
+                    let message_ids: Vec<String> = steers
+                        .iter()
+                        .filter(|e| e.kind == crate::steering::InboxItemKind::Message)
+                        .map(|e| e.id.clone())
+                        .collect();
+                    if !message_ids.is_empty() {
+                        sink.emit(AgentEvent::SteeringDelivered { message_ids });
+                    }
                 }
             }
 
@@ -664,6 +692,15 @@ impl AgentLoop {
                         continue;
                     }
                     StopAction::Stop => {
+                        // A parking agent with live tasks of its own does not
+                        // end here: it waits (no model calls) for the next
+                        // inbox item and runs another turn.
+                        if let Some(parker) = self.parker() {
+                            match parker.at_natural_stop(&mut park_state, history, &cancel).await? {
+                                park::ParkOutcome::Resume => continue,
+                                park::ParkOutcome::Finish => {}
+                            }
+                        }
                         // Emit Stop + optional LimitReached.
                         sink.emit(AgentEvent::Stop {
                             stop_reason: acc.stop_reason.clone(),
@@ -959,6 +996,7 @@ pub struct AgentLoopBuilder {
     subagent_factory: Option<Arc<dyn SubagentFactory>>,
     message_bus: Option<Arc<crate::message::MessageBus>>,
     is_main_context: bool,
+    park_policy: Option<park::ParkPolicy>,
     model: String,
     system_prompt: Option<String>,
     max_tokens: u32,
@@ -1004,6 +1042,7 @@ impl AgentLoopBuilder {
             subagent_factory: None,
             message_bus: None,
             is_main_context: false,
+            park_policy: None,
             model: "claude-opus-4-5".into(),
             system_prompt: None,
             max_tokens: DEFAULT_MAX_TOKENS,
@@ -1202,6 +1241,13 @@ impl AgentLoopBuilder {
         self
     }
 
+    /// Park instead of ending the run while this agent's own tasks are still
+    /// running (see [`park`]). Needs a task manager; without one it is inert.
+    pub fn with_park_policy(mut self, policy: park::ParkPolicy) -> Self {
+        self.park_policy = Some(policy);
+        self
+    }
+
     pub fn build(self) -> AgentLoop {
         AgentLoop {
             client: self.client,
@@ -1226,6 +1272,7 @@ impl AgentLoopBuilder {
             subagent_factory: self.subagent_factory,
             message_bus: self.message_bus,
             is_main_context: self.is_main_context,
+            park_policy: self.park_policy,
             model: self.model,
             system_prompt: self.system_prompt,
             max_tokens: self.max_tokens,

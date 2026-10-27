@@ -120,6 +120,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         scope: Scope::Engine,
     },
     CommandSpec {
+        name: "send",
+        aliases: &[],
+        args: "<task-id> <message>",
+        summary: "Send a message to a running subagent (wakes it or cuts its wait short).",
+        scope: Scope::Engine,
+    },
+    CommandSpec {
         name: "history",
         aliases: &[],
         args: "",

@@ -521,7 +521,7 @@ pub fn tasks(result: &TaskListResult) -> Browser {
             Column::new("description", 44),
         ],
     )
-    .with_footer("↑/↓ k/j move · Enter output · b background · x stop · r reload · / filter · Esc q close");
+    .with_footer("↑/↓ k/j move · Enter output · m message · b background · x stop · r reload · / filter · Esc q close");
 
     browser.set_items(
         result.tasks.iter()

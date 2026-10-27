@@ -17,6 +17,7 @@ pub const INITIALIZATION_GATED_METHODS: &[&str] = &[
     crate::messages::method::STOP_ALL_TASKS,
     crate::messages::method::TASK_BACKGROUND,
     crate::messages::method::TASK_STOP,
+    crate::messages::method::TASK_SEND,
 ];
 
 /// Names one registered task (`task/background`, `task/stop`).
@@ -25,6 +26,15 @@ pub const INITIALIZATION_GATED_METHODS: &[&str] = &[
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TaskIdParams {
     pub task_id: String,
+}
+
+/// A user message for one running subagent (`task/send`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TaskSendParams {
+    pub task_id: String,
+    pub text: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]

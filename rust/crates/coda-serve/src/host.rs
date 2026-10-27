@@ -4101,6 +4101,24 @@ impl ServeBackend for ServeHost {
         task_control_result(p.task_id, reason)
     }
 
+    /// Phase 2: a user message for one running subagent's inbox.
+    async fn task_send(&self, p: crate::dispatch::TaskSendParams) -> Result<Value, RpcError> {
+        use coda_agent::tasks::{TaskActionResult, TaskRunStatus};
+        if p.text.trim().is_empty() {
+            return task_control_result(p.task_id, Some("emptyText"));
+        }
+        let reason = match self.task_manager.send_message(&p.task_id, &p.text) {
+            TaskActionResult::Ok => None,
+            TaskActionResult::NotFound => Some("notFound"),
+            TaskActionResult::Rejected => Some("notAgent"),
+            _ => match self.task_manager.get(&p.task_id) {
+                Some(task) if task.status == TaskRunStatus::Running => Some("notAccepting"),
+                _ => Some("notRunning"),
+            },
+        };
+        task_control_result(p.task_id, reason)
+    }
+
     async fn session_list_tasks(&self) -> Result<Value, RpcError> {
         use coda_agent::tasks::{TaskExecutionMode, TaskKind, TaskRunStatus};
         use coda_proto::responses::{TaskListResult, TaskSummaryDto};
@@ -5026,6 +5044,15 @@ impl ServeHost {
         let agent = match captured.config.system_prompt.as_deref() {
             Some(prompt) => agent.with_system_prompt(prompt.to_owned()),
             None => agent,
+        };
+        // Headless `coda run`: the engine exits when this turn ends, so the
+        // turn parks until the tasks it started have finished and reported.
+        let agent = if coda_agent::agent::park::headless_wait_requested(
+            std::env::var(coda_agent::agent::park::HEADLESS_WAIT_ENV).ok().as_deref(),
+        ) {
+            agent.with_park_policy(coda_agent::agent::park::ParkPolicy::headless_main())
+        } else {
+            agent
         };
 
         // Installed only for a goal-less run — see the comment where `uq_goal`
@@ -14974,6 +15001,46 @@ mod tests {
             let stopped = dispatch("session/stopAllTasks", None, host.as_ref()).await.unwrap();
             assert_eq!(stopped["ok"], true);
             assert!(awaited.cancel.is_cancelled(), "stop-all reaches every running task");
+        }
+
+        /// `task/send` (Phase 2): a user message lands in a running
+        /// subagent's inbox; everything else is refused with an exact reason.
+        #[tokio::test]
+        async fn task_send_delivers_to_a_subagent_inbox_with_exact_refusals() {
+            use coda_agent::tasks::{TaskExecutionMode, TaskKind};
+            use crate::dispatch::dispatch;
+
+            let dir = tempfile::tempdir().unwrap();
+            let host = host_with(None, dir.path());
+            let params = |task_id: &str, text: &str| Some(json!({ "taskId": task_id, "text": text }));
+            let gated = dispatch("task/send", params("task-0001", "hi"), host.as_ref()).await.unwrap_err();
+            assert_eq!(gated.code, coda_proto::messages::error_code::NOT_INITIALIZED);
+            host.initialize(InitParams::default()).await.unwrap();
+
+            let manager = &host.task_manager;
+            let agent = manager
+                .register(TaskKind::Subagent, "agent", None, TaskExecutionMode::Background)
+                .unwrap();
+            let inbox = Arc::new(coda_agent::SteeringInbox::new());
+            agent.attach_steering(Arc::clone(&inbox));
+            let shell = manager
+                .register(TaskKind::Shell, "build", None, TaskExecutionMode::Background)
+                .unwrap();
+
+            let send = |task_id: String, text: &'static str| {
+                let host = Arc::clone(&host);
+                async move { dispatch("task/send", params(&task_id, text), host.as_ref()).await.unwrap() }
+            };
+            assert_eq!(send(agent.id.clone(), "use the dry run").await, json!({ "ok": true, "taskId": agent.id }));
+            assert!(inbox.has_pending(), "a message cuts the subagent's wait short");
+            assert_eq!(inbox.take_all_for_delivery()[0].text, "use the dry run");
+            assert_eq!(send(agent.id.clone(), "  ").await["reason"], "emptyText");
+            assert_eq!(send(shell.id.clone(), "hi").await["reason"], "notAgent");
+            assert_eq!(send("task-9999".into(), "hi").await["reason"], "notFound");
+            inbox.close_for_turn();
+            assert_eq!(send(agent.id.clone(), "late").await["reason"], "notAccepting");
+            manager.complete(&agent.id, Some("report".into()));
+            assert_eq!(send(agent.id.clone(), "hi").await["reason"], "notRunning");
         }
 
         /// An `ask_main` accepted while the engine is idle produces exactly

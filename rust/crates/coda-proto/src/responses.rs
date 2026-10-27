@@ -26,13 +26,15 @@ pub struct TaskSummaryDto {
     pub report: Option<String>,
 }
 
-/// Outcome of `task/background` or `task/stop` for one task.
+/// Outcome of `task/background`, `task/stop` or `task/send` for one task.
 ///
 /// `ok:false` carries a stable `reason`: `notFound` (no such task),
-/// `notRunning` (already finished), and for `task/background` only
+/// `notRunning` (already finished); for `task/background` only
 /// `notForeground` (nothing is waiting on it — it is already in the
-/// background) or `notBackgroundable` (a kind that cannot be released yet,
-/// e.g. a foreground subagent).
+/// background, as every subagent is) or `notBackgroundable` (a kind that
+/// cannot be released); for `task/send` only `notAgent` (a shell command
+/// cannot receive messages), `notAccepting` (the agent is finishing) or
+/// `emptyText`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

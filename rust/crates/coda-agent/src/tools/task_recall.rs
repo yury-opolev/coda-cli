@@ -1,4 +1,9 @@
-//! `task_recall` — drain completion entries from the owner's outbox.
+//! `task_recall` — deprecated (non-blocking runtime, Phase 2; decision D3).
+//!
+//! Completions are now pushed into the owner's inbox automatically. The tool
+//! stays for one release so older prompts keep working: it returns only
+//! completions that could *not* be pushed (for example a full main inbox),
+//! never one the agent has already been told about.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -17,9 +22,8 @@ impl Tool for TaskRecallTool {
     }
 
     fn description(&self) -> &str {
-        "Drain all background-task completion notifications from the outbox. Each entry is \
-         delivered exactly once. Returns the list of completed/failed/stopped background tasks \
-         since the last call."
+        "Deprecated: task completions are delivered to you automatically, so there is no need \
+         to call this. Returns any completion that could not be delivered automatically."
     }
 
     fn input_schema_json(&self) -> &str {
@@ -36,9 +40,19 @@ impl Tool for TaskRecallTool {
             None => return ToolResult::error("Task manager is not available."),
         };
 
-        let entries = mgr.drain_completions(ctx.caller_task_id.as_deref());
+        let entries: Vec<_> = mgr
+            .drain_completions(ctx.caller_task_id.as_deref())
+            .into_iter()
+            .filter(|e| {
+                !mgr.find_task(&e.task_id)
+                    .is_some_and(|t| t.completion_pushed() || t.delivered_inline_to_owner())
+            })
+            .collect();
         if entries.is_empty() {
-            return ToolResult::ok("No pending completions.");
+            return ToolResult::ok(
+                "No pending completions. Task completions are delivered to you automatically \
+                 when tasks finish; you do not need to call task_recall.",
+            );
         }
 
         let lines: Vec<String> = entries
@@ -100,5 +114,20 @@ mod tests {
             .await;
         assert!(!second.is_error);
         assert!(second.content.contains("No pending"), "{}", second.content);
+    }
+
+    #[tokio::test]
+    async fn a_completion_already_pushed_is_not_returned_again() {
+        let m = TaskManager::with_defaults("session");
+        let t = m
+            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .unwrap();
+        m.complete(&t.id, Some("pushed".into()));
+        t.mark_completion_pushed();
+        let result = TaskRecallTool
+            .execute(&Value::Object(Default::default()), &ctx(m), CancellationToken::new())
+            .await;
+        assert!(!result.content.contains("pushed"), "{}", result.content);
+        assert!(result.content.contains("delivered to you automatically"), "{}", result.content);
     }
 }

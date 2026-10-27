@@ -103,6 +103,9 @@ pub struct TaskManager {
     max_retained_terminal_tasks: usize,
     state: Mutex<ManagerState>,
     completion_listener: Mutex<Option<Arc<dyn TaskCompletionListener>>>,
+    /// Signalled after every task settles (its terminal transition has been
+    /// fully reported). A parked agent waits on it to re-check its live tasks.
+    settle_signal: tokio::sync::Notify,
 }
 
 impl TaskManager {
@@ -134,6 +137,7 @@ impl TaskManager {
                 disposed: false,
             }),
             completion_listener: Mutex::new(None),
+            settle_signal: tokio::sync::Notify::new(),
             session_id,
         })
     }
@@ -145,23 +149,104 @@ impl TaskManager {
     }
 
     fn notify_terminal(&self, task: &Arc<ManagedTask>, status: TaskRunStatus) {
+        // An owner waiting on this task inline (`task_wait`) receives the
+        // completion there; it is then pushed nowhere.
+        task.claim_delivery_for_attached_owner();
+        self.push_to_owner_inbox(task, status);
         let listener = self.completion_listener.lock().unwrap().clone();
         if let Some(listener) = listener {
             listener.on_terminal(task, status);
         }
+        self.settle(task);
+        // Pruning only removes settled tasks, so run it again now that this
+        // one is (see `prune_terminal_tasks`).
+        self.prune_terminal_tasks();
+    }
+
+    /// Marks a terminal task as fully reported and wakes parked owners.
+    fn settle(&self, task: &Arc<ManagedTask>) {
+        task.mark_settled();
+        self.settle_signal.notify_waiters();
+    }
+
+    /// Delivers a finished task's completion to the inbox of the agent that
+    /// started it, when that agent is a subagent (or scheduled run) with an
+    /// inbox (non-blocking runtime, Phase 2). The main agent's completions go
+    /// through the installed [`TaskCompletionListener`] instead.
+    ///
+    /// Exactly once: called once per terminal transition, and a task still in
+    /// the foreground was observed inline by the call that awaited it.
+    /// Unlike the main inbox, operator stops are delivered too: the owner is
+    /// still running (or parked waiting on this very task) and must learn
+    /// that the work it is waiting for will never report.
+    fn push_to_owner_inbox(&self, task: &Arc<ManagedTask>, status: TaskRunStatus) {
+        if task.mode() != TaskExecutionMode::Background || task.delivered_inline_to_owner() {
+            return;
+        }
+        let Some(parent_id) = task.parent_id.as_deref() else { return };
+        let Some(parent) = self.find_task(parent_id) else { return };
+        let Some(inbox) = parent.steering() else { return };
+        if parent.status() != TaskRunStatus::Running {
+            return;
+        }
+        inbox.push_item(
+            crate::steering::InboxItemKind::TaskCompleted,
+            super::completion_push::owner_completion_text(task, status),
+        );
+        task.mark_completion_pushed();
+    }
+
+    /// Signalled after any task settles; see [`TaskManager::live_children`].
+    pub fn settle_signal(&self) -> &tokio::sync::Notify {
+        &self.settle_signal
+    }
+
+    /// The tasks `owner` started that have not settled yet — the work a
+    /// parked agent is waiting for. `None` is the main agent; scheduled runs
+    /// are independent of it and never count as its children.
+    pub fn live_children(&self, owner: Option<&str>) -> Vec<Arc<ManagedTask>> {
+        self.state
+            .lock()
+            .unwrap()
+            .order
+            .iter()
+            .filter(|t| t.parent_id.as_deref() == owner)
+            .filter(|t| !(owner.is_none() && t.kind == TaskKind::Scheduled))
+            .filter(|t| !t.is_settled())
+            .cloned()
+            .collect()
+    }
+
+    /// Stops every running strict descendant of `id` (and their process
+    /// trees). Used when a subagent ends: nothing it started may outlive it.
+    pub fn stop_descendants(&self, id: &str) -> usize {
+        let running = self.state.lock().unwrap().running_tasks();
+        let mut stopped = 0;
+        for task in &running {
+            if task.id != id && self.is_authorized_caller(&task.id, Some(id)) {
+                task.cancel_task();
+                task.kill_attached_shell();
+                stopped += 1;
+            }
+        }
+        stopped
     }
 
     // ── User controls (non-blocking runtime, Phase 1) ─────────────────────────
 
     /// Stops awaiting one task in the foreground; the work keeps running.
     ///
-    /// Only shell tasks can be released this way in Phase 1: a foreground
-    /// subagent is still awaited directly by its `task` call, so asking would
-    /// promise something nothing honours (`Rejected`).
+    /// Only shell tasks are ever awaited in the foreground: subagents always
+    /// start in the background (Phase 2), so for them this reports
+    /// `InvalidState` (nothing is waiting on them).
     pub fn background(&self, id: &str) -> TaskActionResult {
         let Some(task) = self.find_task(id) else { return TaskActionResult::NotFound };
         if task.kind != TaskKind::Shell {
-            return TaskActionResult::Rejected;
+            return if task.mode() == TaskExecutionMode::Background {
+                TaskActionResult::InvalidState
+            } else {
+                TaskActionResult::Rejected
+            };
         }
         if task.request_background() {
             TaskActionResult::Ok
@@ -196,6 +281,22 @@ impl TaskManager {
             }
         }
         result
+    }
+
+    /// Delivers an operator message to a running agent task's inbox (Phase 2,
+    /// `task/send`): it cuts the agent's current wait short, or wakes it when
+    /// parked. `Rejected` for a task with no inbox (a shell command),
+    /// `InvalidState` when it is not running or no longer accepts messages.
+    pub fn send_message(&self, id: &str, text: &str) -> TaskActionResult {
+        let Some(task) = self.find_task(id) else { return TaskActionResult::NotFound };
+        if task.status() != TaskRunStatus::Running {
+            return TaskActionResult::InvalidState;
+        }
+        let Some(inbox) = task.steering() else { return TaskActionResult::Rejected };
+        match inbox.enqueue(text) {
+            Some(_) => TaskActionResult::Ok,
+            None => TaskActionResult::InvalidState,
+        }
     }
 
     /// Stops every running task. Returns how many were asked to stop.
@@ -643,6 +744,7 @@ impl TaskManager {
                 t.try_stop();
                 self.on_task_terminal(t);
             }
+            self.settle(t);
         }
 
         // Hard teardown: close subscriptions, flush logs, release resources.
@@ -685,7 +787,10 @@ impl TaskManager {
     fn prune_terminal_tasks(&self) {
         let pruned = {
             let mut s = self.state.lock().unwrap();
-            let terminal_count = s.order.iter().filter(|t| t.is_terminal()).count();
+            // Only settled tasks: a task that just ended but has not reported yet
+            // must stay visible to its parked owner (`live_children`).
+            let terminal_count =
+                s.order.iter().filter(|t| t.is_terminal() && t.is_settled()).count();
             if terminal_count <= self.max_retained_terminal_tasks {
                 return;
             }
@@ -695,7 +800,7 @@ impl TaskManager {
             let mut removed = 0usize;
             let mut idx = 0;
             while removed < excess && idx < s.order.len() {
-                if s.order[idx].is_terminal() {
+                if s.order[idx].is_terminal() && s.order[idx].is_settled() {
                     let version = s.order[idx].bump_version_for_removal();
                     let task = s.order.remove(idx);
                     s.tasks.remove(&task.id);
@@ -948,6 +1053,27 @@ mod tests {
         }
         // Only 3 terminal tasks should remain.
         assert!(m.list().len() <= 3, "too many tasks: {}", m.list().len());
+    }
+
+    #[test]
+    fn a_task_that_ended_but_has_not_reported_is_never_pruned() {
+        let m = TaskManager::new("test-session", Some(std::env::temp_dir().join("coda-mgr-prune3")), 512, 1);
+        // Ended, but its terminal notification (push, then settle) has not run.
+        let unreported = m
+            .register(TaskKind::Shell, "unreported", None, TaskExecutionMode::Background)
+            .unwrap();
+        unreported.try_complete(Some("exit code: 0".into()));
+        for _ in 0..3 {
+            let t = m
+                .register(TaskKind::Subagent, "done", None, TaskExecutionMode::Background)
+                .unwrap();
+            m.complete(&t.id, None);
+        }
+        assert!(
+            m.find_task(&unreported.id).is_some(),
+            "an unsettled task must stay visible to its parked owner"
+        );
+        assert_eq!(m.list().len(), 2, "settled tasks are still pruned to the limit");
     }
 
     #[test]
