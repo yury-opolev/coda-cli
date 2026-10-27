@@ -408,6 +408,15 @@
       "resultContract": "sharedServerDto",
       "requiresInitialize": true,
       "availability": "reusable"
+    },
+    {
+      "method": "task/send",
+      "paramsSchema": "schemas/TaskSendParams.json",
+      "resultSchema": "schemas/TaskControlResult.json",
+      "paramsContract": "sharedParser",
+      "resultContract": "sharedServerDto",
+      "requiresInitialize": true,
+      "availability": "reusable"
     }
   ],
   "serverRequests": [

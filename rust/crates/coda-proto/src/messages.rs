@@ -98,6 +98,11 @@ pub mod method {
     pub const TASK_BACKGROUND: &str = "task/background";
     /// Stop one running task (and its process tree).
     pub const TASK_STOP: &str = "task/stop";
+
+    // ── Non-blocking runtime (Phase 2) ───────────────────────────────────
+    /// Deliver a user message to a running subagent's inbox: it cuts the
+    /// subagent's current wait short, or wakes it when it is parked.
+    pub const TASK_SEND: &str = "task/send";
 }
 
 /// Method names the server may call on us. Each expects a reply.

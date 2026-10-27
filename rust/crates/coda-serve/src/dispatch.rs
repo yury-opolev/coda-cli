@@ -11,7 +11,7 @@ use serde_json::Value;
 pub use coda_proto::requests::{
     CancelRequestParams, ConfigSetParams, GetEventsParams, GetHistoryParams,
     GetStateParams, ListSessionsParams, PendingMessagesParams, ResolveRequestParams, SetModelParams,
-    HooksInfoParams, HooksTrustParams, ForkParams, RewindParams, TaskIdParams,
+    HooksInfoParams, HooksTrustParams, ForkParams, RewindParams, TaskIdParams, TaskSendParams,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -460,6 +460,9 @@ pub trait ServeBackend: Send + Sync {
     async fn task_background(&self, p: TaskIdParams) -> Result<Value, RpcError>;
     /// Stop one running task and its process tree. Requires initialization.
     async fn task_stop(&self, p: TaskIdParams) -> Result<Value, RpcError>;
+    /// Deliver a user message to one running subagent's inbox (Phase 2).
+    /// Requires initialization.
+    async fn task_send(&self, p: TaskSendParams) -> Result<Value, RpcError>;
 
     /// Whether `initialize` has completed on this connection.
     ///
@@ -596,6 +599,7 @@ pub async fn dispatch(
         "session/stopAllTasks" => backend.session_stop_all_tasks().await,
         "task/background" => backend.task_background(required(params)?).await,
         "task/stop" => backend.task_stop(required(params)?).await,
+        "task/send" => backend.task_send(required(params)?).await,
         _ => Err(RpcError::method_not_found(method)),
     }
 }
@@ -786,6 +790,9 @@ mod tests {
         async fn task_stop(&self, p: TaskIdParams) -> Result<Value, RpcError> {
             Ok(json!({ "ok": true, "taskId": p.task_id }))
         }
+        async fn task_send(&self, p: TaskSendParams) -> Result<Value, RpcError> {
+            Ok(json!({ "ok": true, "taskId": p.task_id }))
+        }
         fn is_initialized(&self) -> bool {
             true
         }
@@ -939,6 +946,9 @@ mod tests {
         }
         async fn task_stop(&self, p: TaskIdParams) -> Result<Value, RpcError> {
             self.0.task_stop(p).await
+        }
+        async fn task_send(&self, p: TaskSendParams) -> Result<Value, RpcError> {
+            self.0.task_send(p).await
         }
         fn is_initialized(&self) -> bool {
             false
@@ -1139,7 +1149,7 @@ mod tests {
     async fn an_initialized_backend_passes_the_gate() {
         for method in INITIALIZATION_GATED_METHODS {
             let result =
-                dispatch(method, Some(json!({ "requestId": "req-x-1", "key": "model", "taskId": "task-0001" })), &FakeBackend)
+                dispatch(method, Some(json!({ "requestId": "req-x-1", "key": "model", "taskId": "task-0001", "text": "hi" })), &FakeBackend)
                     .await;
             assert!(result.is_ok(), "{method} must be routed once initialized: {result:?}");
         }
@@ -1648,6 +1658,9 @@ mod tests {
             Err(RpcError { code: self.0, message: self.1.into() })
         }
         async fn task_stop(&self, _p: TaskIdParams) -> Result<Value, RpcError> {
+            Err(RpcError { code: self.0, message: self.1.into() })
+        }
+        async fn task_send(&self, _p: TaskSendParams) -> Result<Value, RpcError> {
             Err(RpcError { code: self.0, message: self.1.into() })
         }
         fn is_initialized(&self) -> bool {

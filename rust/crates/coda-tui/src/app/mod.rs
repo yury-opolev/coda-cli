@@ -1493,8 +1493,8 @@ impl App {
                 }
             }
             SurfaceAction::DeleteSchedule(id) => self.delete_schedule(&id).await,
-            SurfaceAction::BackgroundTask(id) => self.background_task(&id).await,
-            SurfaceAction::StopTask(id) => self.stop_task(&id).await,
+            action @ (SurfaceAction::BackgroundTask(_) | SurfaceAction::StopTask(_)
+            | SurfaceAction::MessageTask(_)) => self.task_row_action(action).await,
             SurfaceAction::NewMcpServer => {
                 if self.allow_local_maintenance("MCP server configuration") {
                     self.surfaces.push(Box::new(

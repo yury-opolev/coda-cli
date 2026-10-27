@@ -42,6 +42,19 @@ pub const WAKE_DEBOUNCE: Duration = Duration::from_secs(2);
 /// it is aborted.
 pub const DEADLINE_GRACE: Duration = Duration::from_secs(5 * 60);
 
+/// Set to `1` by headless `coda run`: the main conversation parks (rather
+/// than ending its turn) while tasks it started are still running, because
+/// the engine exits as soon as the turn ends.
+pub const HEADLESS_WAIT_ENV: &str = "CODA_RUN_WAIT_FOR_TASKS";
+
+/// Whether [`HEADLESS_WAIT_ENV`] asks for the headless policy.
+pub fn headless_wait_requested(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "on" | "yes")
+    )
+}
+
 /// When and how an agent loop parks instead of ending its run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParkPolicy {

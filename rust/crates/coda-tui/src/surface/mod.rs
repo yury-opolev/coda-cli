@@ -171,6 +171,8 @@ pub enum SurfaceAction {
     BackgroundTask(String),
     /// Stop a running task (and its process tree).
     StopTask(String),
+    /// Start a message to a running subagent (prefills `/send <task> `).
+    MessageTask(String),
     /// Explain that creating a schedule needs arguments.
     ExplainScheduleCreation,
     /// Explain that a skill cannot be toggled from the browser.

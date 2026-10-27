@@ -65,6 +65,7 @@ pub fn documents() -> BTreeMap<&'static str, Value> {
         ("PendingMessagesParams.json", schemars::schema_for!(crate::requests::PendingMessagesParams).to_value()),
         ("PendingMessagesResult.json", schemars::schema_for!(crate::responses::PendingMessagesResult).to_value()),
         ("TaskIdParams.json", schemars::schema_for!(crate::requests::TaskIdParams).to_value()),
+        ("TaskSendParams.json", schemars::schema_for!(crate::requests::TaskSendParams).to_value()),
         ("TaskControlResult.json", schemars::schema_for!(crate::responses::TaskControlResult).to_value()),
         ("TaskBulkControlResult.json", schemars::schema_for!(crate::responses::TaskBulkControlResult).to_value()),
     ]);

@@ -635,11 +635,10 @@ async fn run_headless(
         .arg("serve")
         .working_dir(&working_dir);
     command = forward_diagnostics_env(command, &diagnostics, &engine_log_dir);
-    // Headless runs end with the turn: a command handed to the background
-    // would be killed with the engine before its completion could be read.
-    // So the main agent waits for its commands here (an explicit waitSeconds
-    // still applies).
-    command = command.env("CODA_RUN_COMMAND_YIELD", "0");
+    // Headless runs end with the turn and the engine exits with it, so the
+    // main agent parks until the tasks it started (commands, subagents) have
+    // finished and reported, then lets the model finish.
+    command = command.env("CODA_RUN_WAIT_FOR_TASKS", "1");
     // Forward an explicit `--provider` so the engine selects that account at
     // startup and fails closed if unavailable (Finding C2).
     if let Some(ref provider) = args.provider {

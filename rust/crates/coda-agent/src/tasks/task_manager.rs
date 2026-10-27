@@ -277,6 +277,22 @@ impl TaskManager {
         result
     }
 
+    /// Delivers an operator message to a running agent task's inbox (Phase 2,
+    /// `task/send`): it cuts the agent's current wait short, or wakes it when
+    /// parked. `Rejected` for a task with no inbox (a shell command),
+    /// `InvalidState` when it is not running or no longer accepts messages.
+    pub fn send_message(&self, id: &str, text: &str) -> TaskActionResult {
+        let Some(task) = self.find_task(id) else { return TaskActionResult::NotFound };
+        if task.status() != TaskRunStatus::Running {
+            return TaskActionResult::InvalidState;
+        }
+        let Some(inbox) = task.steering() else { return TaskActionResult::Rejected };
+        match inbox.enqueue(text) {
+            Some(_) => TaskActionResult::Ok,
+            None => TaskActionResult::InvalidState,
+        }
+    }
+
     /// Stops every running task. Returns how many were asked to stop.
     pub fn stop_all(&self) -> usize {
         let running = self.state.lock().unwrap().running_tasks();
