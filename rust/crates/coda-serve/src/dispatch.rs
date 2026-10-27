@@ -11,7 +11,7 @@ use serde_json::Value;
 pub use coda_proto::requests::{
     CancelRequestParams, ConfigSetParams, GetEventsParams, GetHistoryParams,
     GetStateParams, ListSessionsParams, PendingMessagesParams, ResolveRequestParams, SetModelParams,
-    HooksInfoParams, HooksTrustParams, ForkParams, RewindParams, TaskIdParams, TaskSendParams,
+    HooksInfoParams, HooksTrustParams, ForkParams, RewindParams, TaskIdParams, TaskSendParams, AskAsideParams,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -463,6 +463,10 @@ pub trait ServeBackend: Send + Sync {
     /// Deliver a user message to one running subagent's inbox (Phase 2).
     /// Requires initialization.
     async fn task_send(&self, p: TaskSendParams) -> Result<Value, RpcError>;
+    /// A side question (Phase 3, `/btw`): one tool-less model request that
+    /// sees the conversation and the live task table, never added to the
+    /// history and independent of the running turn. Requires initialization.
+    async fn session_ask_aside(&self, p: AskAsideParams) -> Result<Value, RpcError>;
 
     /// Whether `initialize` has completed on this connection.
     ///
@@ -600,6 +604,7 @@ pub async fn dispatch(
         "task/background" => backend.task_background(required(params)?).await,
         "task/stop" => backend.task_stop(required(params)?).await,
         "task/send" => backend.task_send(required(params)?).await,
+        "session/askAside" => backend.session_ask_aside(required(params)?).await,
         _ => Err(RpcError::method_not_found(method)),
     }
 }
@@ -793,6 +798,9 @@ mod tests {
         async fn task_send(&self, p: TaskSendParams) -> Result<Value, RpcError> {
             Ok(json!({ "ok": true, "taskId": p.task_id }))
         }
+        async fn session_ask_aside(&self, p: AskAsideParams) -> Result<Value, RpcError> {
+            Ok(json!({ "ok": true, "answer": p.question }))
+        }
         fn is_initialized(&self) -> bool {
             true
         }
@@ -949,6 +957,9 @@ mod tests {
         }
         async fn task_send(&self, p: TaskSendParams) -> Result<Value, RpcError> {
             self.0.task_send(p).await
+        }
+        async fn session_ask_aside(&self, p: AskAsideParams) -> Result<Value, RpcError> {
+            self.0.session_ask_aside(p).await
         }
         fn is_initialized(&self) -> bool {
             false
@@ -1149,7 +1160,7 @@ mod tests {
     async fn an_initialized_backend_passes_the_gate() {
         for method in INITIALIZATION_GATED_METHODS {
             let result =
-                dispatch(method, Some(json!({ "requestId": "req-x-1", "key": "model", "taskId": "task-0001", "text": "hi" })), &FakeBackend)
+                dispatch(method, Some(json!({ "requestId": "req-x-1", "key": "model", "taskId": "task-0001", "text": "hi", "question": "q" })), &FakeBackend)
                     .await;
             assert!(result.is_ok(), "{method} must be routed once initialized: {result:?}");
         }
@@ -1661,6 +1672,9 @@ mod tests {
             Err(RpcError { code: self.0, message: self.1.into() })
         }
         async fn task_send(&self, _p: TaskSendParams) -> Result<Value, RpcError> {
+            Err(RpcError { code: self.0, message: self.1.into() })
+        }
+        async fn session_ask_aside(&self, _p: AskAsideParams) -> Result<Value, RpcError> {
             Err(RpcError { code: self.0, message: self.1.into() })
         }
         fn is_initialized(&self) -> bool {

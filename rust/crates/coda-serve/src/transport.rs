@@ -215,7 +215,7 @@ where
         }
     }
 
-    let writer_task = tokio::spawn(write_loop(writer, outgoing_rx));
+    let writer_task = tokio::spawn(write_loop(writer, outgoing_rx, backend.outbound_health()));
 
     read_loop(reader, outgoing_tx, prompt_channel, backend).await;
 
@@ -227,17 +227,22 @@ where
 // Write loop
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn write_loop<W>(mut writer: W, mut rx: mpsc::UnboundedReceiver<Vec<u8>>)
-where
+async fn write_loop<W>(
+    mut writer: W,
+    mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    health: Arc<crate::bus::OutboundHealth>,
+) where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     while let Some(frame) = rx.recv().await {
+        health.begin_write(rx.len());
         if writer.write_all(&frame).await.is_err() {
             break;
         }
         if writer.flush().await.is_err() {
             break;
         }
+        health.end_write();
     }
     let _ = writer.shutdown().await;
 }

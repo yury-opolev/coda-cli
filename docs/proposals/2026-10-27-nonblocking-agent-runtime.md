@@ -1,8 +1,8 @@
 # Proposal: Non-blocking agent runtime — no tool call may hold a conversation hostage
 
 - **Date:** 2026-10-27
-- **Status:** Accepted. Decisions D1–D7 made (§10). **Phases 1 and 2 implemented** (§8, §12,
-  §13); Phase 3 open.
+- **Status:** Implemented. Decisions D1–D7 made (§10). **Phases 1, 2 and 3 implemented** (§8,
+  §12, §13, §14).
 - **Author:** Yury Opolev (design exploration, Coda)
 - **Scope:** coda-agent (`agent/mod.rs` loop, `agent/tools.rs` batch executor,
   `tools/run_command.rs`, `tools/task.rs`, `tools/background_task.rs`, `tools/task_wait.rs`,
@@ -327,7 +327,7 @@ Each phase is independently shippable and leaves the system consistent.
    subagent lifecycle (§6.5); `task` returns handles; `task_wait`/`task_recall` reduced (§6.6);
    coalescing; lifetime limits. **Implemented** — see §13.
 3. **Phase 3 — observation.** `/btw` with task snapshot (§6.8); throttled `event/taskOutput`;
-   status-row task count; steering prefixed with live tasks (§6.9).
+   status-row task count; steering prefixed with live tasks (§6.9). **Implemented** — see §14.
 
 ## 9. Testing
 
@@ -505,3 +505,68 @@ sketches above:
 - **Not in Phase 2:** the generic task wrapper for other long tools (MCP); `event/taskStarted`
   / `event/taskOutput`; `/btw`; steering prefixed with the live task list (all Phase 3); a cap
   on live shell tasks.
+
+## 14. Phase 3 implementation notes
+
+Implemented on main @ `ddc971f`. What shipped, and where it deliberately differs from the
+sketches above:
+
+- **`/btw` side questions (§6.8).** Serve `session/askAside {question}` →
+  `{ok, answer?, reason?, error?}` (initialization-gated; refusals `emptyQuestion`,
+  `noProvider`, `modelError`). One ephemeral request on the session's client with **no tools**,
+  no effort setting and a 2,048-token cap, abandoned after 120 s. It never claims the turn slot
+  and never writes the history, so it works while a turn runs. **Deviation:** the conversation
+  is sent as a bounded *transcript* (newest ~48,000 characters of text, tool calls and result
+  excerpts, plus the turn in flight from the live projection) inside one user message, rather
+  than the replayed provider messages — a tool-less request may not carry tool-use blocks, and
+  this keeps the request small however long the session is. The live task table
+  (`tasks::live_brief::task_snapshot`: running tasks first, then the 8 most recently finished,
+  each with kind, owning agent, status, age and the last 5 redacted output lines) follows it.
+  TUI: `/btw <question>` (alias `/ask`) sends the request from its own task — neither the event
+  loop nor the turn waits — and opens a right-hand side panel (`surface::aside`, built from the
+  widget toolkit's `Form`/`StaticText`) that fills in when the answer arrives; `p` promotes the
+  question to an ordinary message (steering while busy, a new turn otherwise), `Esc` closes. An
+  answer that arrives after the panel was closed is printed as a transcript note marked as a
+  side answer; it is local to the screen and never persisted.
+- **Task events.** `TaskManager` gained a `TaskEventObserver` (start, output, terminal);
+  coda-serve's `TaskEventPublisher` turns it into `event/taskStarted {taskId, kind,
+  description, ownerTaskId?, mode}`, `event/taskOutput {taskId, text, truncated}` and an
+  extended `event/taskCompleted` (+ `ownerTaskId`, `kind`, `mode`; previously declared but
+  never emitted by the Rust engine). Output is throttled to **4 frames/s per task** and
+  **2,000 characters per frame** (newest kept). The publisher holds no text, only a cursor per
+  running task into the task's 16 KiB redacted tail; while the connection is congested — the
+  transport's write loop reports a write blocked ≥ 1 s or > 256 queued frames
+  (`bus::OutboundHealth`) — nothing optional is sent and nothing accumulates, so a client that
+  never reads cannot grow engine memory; the first frame after recovery says `truncated`. The
+  last output of a task precedes its completion.
+- **Status row.** The TUI keeps the set of running task ids from those events and shows
+  `N tasks running · /tasks`; task output only touches the status row (no transcript
+  relayout). The "Task completed: …" notice is now limited to background completions of the
+    main agent's own tasks, since a foreground task's end is already its tool result and a
+    subagent's tasks are reported to that subagent. The never-read client-side outcome table that
+    would otherwise have grown with every completion was removed.
+- **Steering prefixed with live tasks (§6.9).** When a steering message is delivered at an
+  iteration boundary and the agent (main or subagent) has running tasks it started, the
+  injected text starts with a `[live-tasks] … [/live-tasks]` block (id, kind, description,
+  age; at most 10 listed) telling the model those tasks keep their original parameters and
+  must be stopped and restarted to change. **Addition:** a new prompt to the main agent is
+  prefixed the same way (as a separate leading text block), because in the motivating incident
+  the main agent was already parked when the user wrote. Pushed completions and deadlines alone
+  are not prefixed; with nothing running, messages are delivered unchanged. The prefix is part
+  of the history (it is what the model saw), so a rehydrated transcript shows it.
+- **Shell cap.** At most **32** running shell commands (`DEFAULT_MAX_LIVE_SHELL_TASKS`); a
+  further `run_command` is refused with a tool error naming the cap and how to free a slot.
+  **Deviation from "LRU of exited":** finished commands never count (and are already pruned by
+  the existing 256-terminal-task retention), so there is nothing to evict; a running command is
+  never evicted.
+- **Long MCP calls as tasks (generic fallback, §6.1).** `Tool::detachable()` (default `false`;
+  `true` for `McpTool`). When the calling context receives pushed completions and has a task
+  manager, the batch executor registers a `TaskKind::Tool` task, runs the call on its own task
+  (the per-tool ceiling is its work deadline) and awaits it under the normal yield contract
+  (20 s, cut short by steering / background-now, Esc stops it). A call that finishes in time
+  returns its result unchanged; a longer one keeps running and its result (≤ 12,000
+  characters) is pushed as the task's report. `tool` tasks can be backgrounded like shells.
+  Other tools still run inline.
+- **Not in Phase 3:** seeding the status-row count from `session/listTasks` after the client
+  attaches to an engine that already has running tasks (the TUI always starts its own engine,
+  so it sees every start); a configurable shell cap.

@@ -174,10 +174,12 @@ re-fetches the catalog from models.dev first.
 | `task/background` | `{ taskId }` | `{ ok, taskId, reason? }` |
 | `task/stop` | `{ taskId }` | `{ ok, taskId, reason? }` |
 | `task/send` | `{ taskId, text }` | `{ ok, taskId, reason? }` |
+| `session/askAside` | `{ question }` | `{ ok, answer?, reason?, error? }` |
 
 **Initialization gate.** `session/getHistory`, `session/getPendingRequests`,
-`session/resolveRequest`, `session/cancelRequest`, `config/set` and the five task controls
-(`session/backgroundAll`, `session/stopAllTasks`, `task/background`, `task/stop`, `task/send`) require a completed
+`session/resolveRequest`, `session/cancelRequest`, `config/set`, the five task controls
+(`session/backgroundAll`, `session/stopAllTasks`, `task/background`, `task/stop`, `task/send`)
+and `session/askAside` require a completed
 `initialize` and otherwise return `-32011`. Read-only discovery — `session/listSessions`,
 `session/listTasks`, `config/describe`, `mcp/list`, `session/getState`, `session/getEvents` — is valid **before**
 `initialize`, so a client can choose a session before resuming one. Every route that shipped
@@ -187,12 +189,15 @@ before this contract keeps exactly the behaviour it had; the gate is not retrofi
 registry in registration order, including silent running tasks and retained terminal
 tasks. It is shared by local and API-only `/tasks` browsers, including `serve` mode;
 clients must not infer task existence or status from local log files or completion
-notifications. `kind` is `subagent`, `shell`, or `scheduled`; `status` is `running`,
+notifications. `kind` is `subagent`, `shell`, `scheduled` or `tool` (a long MCP tool call
+the agent runs as a task); `status` is `running`,
 `completed`, `failed`, or `stopped`; `mode` is `foreground` or `background`.
 The session id namespaces the registry's task ids. This is runtime discovery, not an
 archive of task logs from earlier engine processes.
 
-**Task controls (non-blocking runtime).** Every `run_command` runs as a `shell` task, and
+**Task controls (non-blocking runtime).** Every `run_command` runs as a `shell` task (at most
+32 run at once; another is refused with an explanatory tool error), every long MCP tool call
+as a `tool` task, and
 every subagent as a `subagent` task that starts in the `background` (nothing ever waits on
 it in the foreground). While
 the agent waits on a task it is `foreground`; once the agent stops waiting (its yield
@@ -214,7 +219,10 @@ to the main conversation through the main inbox (announced like any delivered ag
 operator (`task/stop`, `session/stopAllTasks`) are not reported back to the main agent, so a
 stop never triggers a new turn. Completions of tasks owned by a subagent go to that
 subagent's own inbox and are never seen by clients as agent messages. Engine `shutdown`
-stops every task.
+stops every task. A message delivered to an agent while tasks it started are running —
+a steering message, or a new prompt to the main agent — reaches the model prefixed with a
+compact `[live-tasks] … [/live-tasks]` list (id, kind, description, age), so the model knows
+those tasks keep their original parameters and must be stopped and restarted to change.
 
 `outputTail` contains at most 4,000 Unicode characters of buffered, secret-redacted
 output, using the same per-channel streaming redaction as task logs. Browsing does
@@ -665,26 +673,57 @@ at session startup, so schedule events may arrive immediately; in **API-key** mo
 does not start — and therefore emits nothing — until a valid key completes an
 authenticated `initialize`.
 
-### `event/taskCompleted`
+### Task events — `event/taskStarted`, `event/taskOutput`, `event/taskCompleted`
 
-Emitted whenever a background task reaches a terminal state (completed, failed, or
-stopped). Like `event/scheduleLifecycle`, this is **not** tied to a turn — a background
-subagent can finish at any time while the session is open.
+Not tied to a turn: tasks start and end at any time while the session is open. Every task
+(`shell`, `subagent`, `scheduled`, `tool` — a long MCP call run as a task) produces exactly one
+`event/taskStarted` and one `event/taskCompleted`; in between, `event/taskOutput` carries its
+new **secret-redacted** output.
 
 ```jsonc
+event/taskStarted {
+  "taskId":      "task-0003",
+  "kind":        "shell",        // "shell" | "subagent" | "scheduled" | "tool"
+  "description": "cargo test",
+  "ownerTaskId": "task-0001",    // the agent that started it; absent for the main agent
+  "mode":        "foreground"    // "foreground" (an agent waits on it) | "background"
+}
+event/taskOutput {
+  "taskId":    "task-0003",
+  "text":      "running 12 tests\n",  // output since the previous frame (newest kept)
+  "truncated": false                  // true when output before `text` was skipped
+}
 event/taskCompleted {
-  "taskId":      "task-0003",    // stable task identifier
-  "status":      "completed",    // "completed" | "failed" | "stopped"
-  "description": "explore docs", // human-readable task label
-  "report":      "Found 42 …"   // truncated result or error text; null when not applicable
+  "taskId":      "task-0003",
+  "status":      "failed",       // "completed" | "failed" | "stopped"
+  "description": "cargo test",
+  "report":      "exit code: 101", // result or error, ≤ 4 000 chars; absent when none
+  "ownerTaskId": "task-0001",    // absent for the main agent
+  "kind":        "shell",
+  "mode":        "foreground"    // "foreground": the owner saw the end inline (its tool
+                                 // result says so); "background": reported separately
 }
 ```
 
-`report` is truncated to 4 000 characters (the same cap applied by the TUI injection
-seam). Use `task_output` to retrieve the full log. The event is emitted for every
-background completion regardless of whether `task_wait` was called; if an agent is
-waiting on the task with `task_wait`, the wait call consumes the outbox entry so the
-event and the `task_wait` result are not double-delivered.
+`event/taskOutput` is throttled: at most **4 frames per second per task**, each at most
+**2 000 characters** (the newest part; `truncated: true` when anything was skipped). The
+engine never buffers output for a client: it keeps one cursor per running task into the
+task's bounded redacted tail. While the connection is not keeping up — a write blocked for
+1 s, or more than 256 frames queued — no `taskOutput` frames are sent at all; the next frame
+after recovery says `truncated: true`. A client that never reads therefore cannot make engine
+memory grow with task output. The last output of a task is sent before its `taskCompleted`
+(unless the connection is congested). Use `session/listTasks` for the authoritative list and
+the retained tail; the task log has everything.
+
+### `session/askAside` — side questions (`/btw`)
+
+`{ question }` → `{ ok, answer?, reason?, error? }`. One separate, **tool-less** model
+request answers the question from the conversation so far (committed history plus the turn in
+flight, as a bounded transcript) and a live snapshot of the task table (ids, kind, owner,
+status, age, last output lines). It runs concurrently with the main agent — it takes no turn
+slot, so it works while a turn is running — and is **never** added to the history. Refusals:
+`emptyQuestion`, `noProvider` (no model connected), `modelError` (`error` names the failure
+class, never provider text; the request is abandoned after 120 s). Requires `initialize`.
 
 ## Coda → Orchestrator (server-initiated requests — you MUST answer; the agent blocks)
 | Method | Params | Reply |

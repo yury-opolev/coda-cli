@@ -1410,6 +1410,9 @@ impl ServeHost {
         // pushed onto the main inbox, whose acceptance wakes the idle pump —
         // so the model learns about it without polling.
         task_manager.set_completion_listener(coda_agent::tasks::MainInboxCompletionPush::new(&message_bus));
+        // Phase 3: clients see every task start, its (throttled) output and
+        // its end, with the agent that owns it.
+        task_manager.set_event_observer(crate::task_events::TaskEventPublisher::new(Arc::clone(&bus)));
         let steering_observer = SteeringStateObserver::new(Arc::clone(&engine_state));
         // The registry publishes pending/resolved transitions through
         // `EngineState`, which owns the transaction (and therefore the
@@ -1522,6 +1525,12 @@ impl ServeHost {
 
     fn current_model(&self) -> String {
         self.runtime.lock().expect("runtime config poisoned").model.clone()
+    }
+
+    /// How well the connection is keeping up; the transport's write loop
+    /// reports into it (see [`crate::bus::OutboundHealth`]).
+    pub fn outbound_health(&self) -> Arc<crate::bus::OutboundHealth> {
+        self.sink.bus().outbound_health()
     }
 
     fn current_effort(&self) -> Option<Effort> {
@@ -4119,8 +4128,58 @@ impl ServeBackend for ServeHost {
         task_control_result(p.task_id, reason)
     }
 
+    /// Phase 3 (`/btw`): one tool-less model request that sees the
+    /// conversation so far (including the turn in flight) and the live task
+    /// table. It takes no turn slot, so it works while a turn runs, and it
+    /// never touches the history.
+    async fn session_ask_aside(&self, p: coda_proto::requests::AskAsideParams) -> Result<Value, RpcError> {
+        use coda_proto::responses::AskAsideResult;
+        let reply = |result: AskAsideResult| {
+            serde_json::to_value(result).map_err(|e| RpcError::internal(e.to_string()))
+        };
+        let refuse = |reason: &str, error: Option<String>| AskAsideResult {
+            ok: false,
+            answer: None,
+            reason: Some(reason.to_owned()),
+            error,
+        };
+        if p.question.trim().is_empty() {
+            return reply(refuse("emptyQuestion", None));
+        }
+        if self.wire_client_from_env_if_missing().await.is_err() {
+            return reply(refuse("noProvider", None));
+        }
+        let Some(client) = self.client.lock().await.clone() else {
+            return reply(refuse("noProvider", None));
+        };
+        let history = self.session.history.lock().expect("history poisoned").clone();
+        let live = self.engine_state.history_view().live.map(|l| l.entries).unwrap_or_default();
+        let tasks = coda_agent::tasks::live_brief::task_snapshot(&self.task_manager);
+        let request =
+            crate::aside::build_request(&self.current_model(), &history, &live, &tasks, &p.question);
+        let answer = tokio::time::timeout(crate::aside::ASIDE_TIMEOUT, async {
+            client.stream(request).await?.collect().await
+        })
+        .await;
+        match answer {
+            Ok(Ok(response)) => reply(AskAsideResult {
+                ok: true,
+                answer: Some(response.text),
+                reason: None,
+                error: None,
+            }),
+            Ok(Err(error)) => reply(refuse(
+                "modelError",
+                Some(format!(
+                    "the model request failed ({})",
+                    coda_llm::diagnostics::category(&error)
+                )),
+            )),
+            Err(_) => reply(refuse("modelError", Some("the model did not answer in time".into()))),
+        }
+    }
+
     async fn session_list_tasks(&self) -> Result<Value, RpcError> {
-        use coda_agent::tasks::{TaskExecutionMode, TaskKind, TaskRunStatus};
         use coda_proto::responses::{TaskListResult, TaskSummaryDto};
 
         let tasks = self.task_manager.list_with_output(4_000).into_iter()
@@ -4135,22 +4194,10 @@ impl ServeBackend for ServeHost {
                 TaskSummaryDto {
                     id: task.id,
                     parent_id: task.parent_id,
-                    kind: match task.kind {
-                        TaskKind::Subagent => "subagent",
-                        TaskKind::Shell => "shell",
-                        TaskKind::Scheduled => "scheduled",
-                    }.into(),
+                    kind: task.kind.as_str().into(),
                     description: task.description,
-                    status: match task.status {
-                        TaskRunStatus::Running => "running",
-                        TaskRunStatus::Completed => "completed",
-                        TaskRunStatus::Failed => "failed",
-                        TaskRunStatus::Stopped => "stopped",
-                    }.into(),
-                    mode: match task.mode {
-                        TaskExecutionMode::Foreground => "foreground",
-                        TaskExecutionMode::Background => "background",
-                    }.into(),
+                    status: task.status.as_str().into(),
+                    mode: task.mode.as_str().into(),
                     output_tail,
                     report,
                 }
@@ -4859,9 +4906,15 @@ impl ServeHost {
         };
 
         // Append user message to a local copy of history.
-        let user_msg = build_user_message(&p);
+        let mut user_msg = build_user_message(&p);
         let mut history = self.session.history.lock().expect("history poisoned").clone();
         if !user_msg.content.is_empty() {
+            // A new message cannot change work that is already running
+            // (§6.9): the model sees what is running, and with which
+            // parameters, before it reads what the user now wants.
+            if let Some(brief) = coda_agent::tasks::live_brief::live_task_brief(&self.task_manager, None) {
+                user_msg.content.insert(0, Content::Text(format!("{brief}\n\n")));
+            }
             history.push(user_msg);
         }
 
@@ -15041,6 +15094,121 @@ mod tests {
             assert_eq!(send(agent.id.clone(), "late").await["reason"], "notAccepting");
             manager.complete(&agent.id, Some("report".into()));
             assert_eq!(send(agent.id.clone(), "hi").await["reason"], "notRunning");
+        }
+
+        // ── Phase 3: side questions and live-task prefixes ───────────────
+
+        /// Answers a side question at once and leaves every other request
+        /// stalled, so a test can hold a main turn open while it asks.
+        struct AsideClient {
+            requests: Mutex<Vec<coda_llm::ChatRequest>>,
+            stalled: Mutex<Vec<tokio::sync::mpsc::Sender<Result<StreamEvent, coda_llm::LlmError>>>>,
+        }
+
+        #[async_trait]
+        impl LlmClient for AsideClient {
+            fn provider_id(&self) -> &str {
+                "aside-mock"
+            }
+            async fn stream(
+                &self,
+                request: coda_llm::ChatRequest,
+            ) -> Result<coda_llm::ResponseStream, coda_llm::LlmError> {
+                let aside = request.system.as_deref() == Some(crate::aside::ASIDE_SYSTEM_PROMPT);
+                self.requests.lock().unwrap().push(request);
+                let (tx, rx) = tokio::sync::mpsc::channel(8);
+                if aside {
+                    for event in answer("Yes: task-0001 is still running.") {
+                        tx.send(Ok(event)).await.unwrap();
+                    }
+                } else {
+                    self.stalled.lock().unwrap().push(tx);
+                }
+                Ok(coda_llm::ResponseStream::new(rx))
+            }
+        }
+
+        #[tokio::test]
+        async fn a_side_question_is_answered_during_a_turn_without_tools_or_history() {
+            use coda_agent::tasks::{TaskExecutionMode, TaskKind};
+            use crate::dispatch::dispatch;
+
+            let dir = tempfile::tempdir().unwrap();
+            let client = Arc::new(AsideClient { requests: Mutex::new(Vec::new()), stalled: Mutex::new(Vec::new()) });
+            let host = host_with(Some(Arc::clone(&client) as Arc<dyn LlmClient>), dir.path());
+            let question = json!({ "question": "are the reviews running?" });
+            let gated = dispatch("session/askAside", Some(question.clone()), host.as_ref()).await.unwrap_err();
+            assert_eq!(gated.code, coda_proto::messages::error_code::NOT_INITIALIZED);
+            host.initialize(InitParams::default()).await.unwrap();
+
+            let review = host
+                .task_manager
+                .register(TaskKind::Shell, "review.ps1 -Post", None, TaskExecutionMode::Background)
+                .unwrap();
+            host.task_manager.append_output(&review.id, "scanning PR 42\n");
+
+            let turn_host = Arc::clone(&host);
+            let turn = tokio::spawn(async move {
+                dispatch("session/prompt", Some(json!({ "text": "make it a dry run" })), turn_host.as_ref()).await
+            });
+            wait_for("the main turn to be in flight", || client.requests.lock().unwrap().len() == 1).await;
+            assert!(*host.turn_active.lock().unwrap(), "a turn is running");
+
+            // §6.9: the new message is prefixed with what is already running.
+            let main_request = client.requests.lock().unwrap()[0].clone();
+            let prompt = main_request.messages.last().unwrap().text();
+            assert!(prompt.starts_with("[live-tasks]"), "{prompt}");
+            assert!(prompt.contains(&review.id) && prompt.ends_with("make it a dry run"), "{prompt}");
+
+            let reply = dispatch("session/askAside", Some(question), host.as_ref()).await.unwrap();
+            assert_eq!(reply, json!({ "ok": true, "answer": "Yes: task-0001 is still running." }));
+
+            let aside = client.requests.lock().unwrap()[1].clone();
+            assert!(aside.tools.is_empty(), "a side question never offers tools");
+            let body = aside.messages[0].text();
+            assert!(body.contains(&review.id) && body.contains("| scanning PR 42"), "{body}");
+            assert!(body.contains("make it a dry run"), "the turn in flight is context: {body}");
+            assert!(body.ends_with("Side question: are the reviews running?"), "{body}");
+            assert!(*host.turn_active.lock().unwrap(), "the main turn was not disturbed");
+
+            host.session_interrupt().await.unwrap();
+            turn.await.unwrap().unwrap();
+            let committed = host.session.history.lock().unwrap().clone();
+            assert!(
+                committed.iter().all(|m| !m.text().contains("reviews running")
+                    && !m.text().contains("still running.")),
+                "neither the side question nor its answer enters the history"
+            );
+            host.task_manager.stop(&review.id);
+        }
+
+        #[tokio::test]
+        async fn a_side_question_refuses_empty_text_and_a_missing_provider() {
+            use crate::dispatch::dispatch;
+
+            let dir = tempfile::tempdir().unwrap();
+            let host = host_with(None, dir.path());
+            host.initialize(InitParams::default()).await.unwrap();
+            let ask = |q: &'static str| {
+                let host = Arc::clone(&host);
+                async move {
+                    dispatch("session/askAside", Some(json!({ "question": q })), host.as_ref()).await.unwrap()
+                }
+            };
+            assert_eq!(ask("  ").await, json!({ "ok": false, "reason": "emptyQuestion" }));
+            assert_eq!(ask("anything running?").await["reason"], "noProvider");
+        }
+
+        #[tokio::test]
+        async fn a_prompt_with_nothing_running_is_not_prefixed() {
+            let dir = tempfile::tempdir().unwrap();
+            let client = PumpClient::new(vec![answer("ok")]);
+            let host = host_with(Some(Arc::clone(&client) as Arc<dyn LlmClient>), dir.path());
+            host.initialize(InitParams::default()).await.unwrap();
+            crate::dispatch::dispatch("session/prompt", Some(json!({ "text": "hello" })), host.as_ref())
+                .await
+                .unwrap();
+            assert_eq!(client.requests()[0].messages.last().unwrap().text(), "hello");
         }
 
         /// An `ask_main` accepted while the engine is idle produces exactly

@@ -37,6 +37,7 @@ impl App {
             "interrupt" => self.interrupt(),
             "stop" => self.stop_everything().await,
             "send" => self.send_task_message(&invocation.args).await,
+            "btw" => self.ask_aside(&invocation.args),
             "theme" => self.set_theme(invocation.first()),
             "tools" => match commands::parse_display_mode(invocation.first()) {
                 Ok(mode) => {

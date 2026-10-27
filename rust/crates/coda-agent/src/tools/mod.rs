@@ -66,7 +66,7 @@ pub use list_dir::ListDirTool;
 pub use notebook_edit::NotebookEditTool;
 pub use notify_user::NotifyUserTool;
 pub use read_file::ReadFileTool;
-pub use run_command::{RunCommandTool, DEFAULT_TIMEOUT_SECS, TIMEOUT_ENV};
+pub use run_command::{RunCommandTool, DEFAULT_TIMEOUT_SECS, DEFAULT_WAIT_SECS as DEFAULT_TOOL_WAIT_SECS, TIMEOUT_ENV};
 pub use schedule_cancel_self::ScheduleCancelSelfTool;
 pub use schedule_create::ScheduleCreateTool;
 pub use schedule_tools::{ScheduleDeleteTool, ScheduleListTool};

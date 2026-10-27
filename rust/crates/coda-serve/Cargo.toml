@@ -30,7 +30,7 @@ chrono = { workspace = true }
 futures = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros", "time"] }
+tokio = { workspace = true, features = ["rt", "macros", "time", "test-util"] }
 tempfile = "3"
 coda-mcp = { workspace = true, features = ["test-support"] }
 # Test-only: the engine reads `settings.json`, the auth service writes the two

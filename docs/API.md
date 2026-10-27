@@ -201,7 +201,7 @@ The model can call these built-in tools (subject to the permission mode). MCP se
 |---|---|---|
 | `read_file`, `list_dir`, `glob`, `grep` | yes (auto-run) | inspect files/tree, find by glob, search content |
 | `edit_file`, `write_file` | no (gated) | modify / create files (sandboxed to the working dir) |
-| `run_command` | no (gated) | run a shell command as a task: returns its result if it finishes within `waitSeconds` (default 20, clamped 0–30), otherwise a task handle while it keeps running; the completion is pushed to the agent that started it (main or subagent). `timeoutSeconds` is an optional work deadline (kills the process tree) |
+| `run_command` | no (gated) | run a shell command as a task: returns its result if it finishes within `waitSeconds` (default 20, clamped 0–30), otherwise a task handle while it keeps running; the completion is pushed to the agent that started it (main or subagent). `timeoutSeconds` is an optional work deadline (kills the process tree). At most 32 commands run at once; another is refused with an explanatory error |
 | `web_fetch`, `web_search` | yes | fetch a URL as text; DuckDuckGo search |
 | `todo_write` | yes | maintain a live session checklist |
 | `ask_user_question`, `exit_plan_mode` | — | ask the host a question; submit a plan for approval |
@@ -215,6 +215,6 @@ The model can call these built-in tools (subject to the permission mode). MCP se
 | `git_worktree` | no (gated) | list/add/remove git worktrees |
 | `task` | — | start a subagent in the background; returns its task id at once and its final report is pushed back when it finishes (the subagent parks — no model calls — while its own tasks run) |
 | `lsp` | yes | code intelligence (when language servers are configured) |
-| `mcp__<server>__<tool>` | varies | tools advertised by configured MCP servers |
+| `mcp__<server>__<tool>` | varies | tools advertised by configured MCP servers; each call runs as a `tool` task under the same 20 s yield budget as `run_command`, and keeps running in the background when it takes longer |
 | `list_mcp_resources`, `read_mcp_resource`, `list_mcp_prompts`, `get_mcp_prompt` | yes | browse and read resources/prompts exposed by connected MCP servers |
 | `restart_mcp_server` | yes (auto-run) | stop and restart one configured, **enabled** MCP server to recover it when it hangs or stops responding; refuses unknown, disabled, or never-started servers, and relaunches only the configuration this session already connected with |

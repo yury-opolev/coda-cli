@@ -997,6 +997,16 @@ fn draw_status(
     );
 }
 
+/// The status row's task count, pointing at `/tasks`, or `None` when nothing
+/// runs.
+pub fn running_tasks_label(count: usize) -> Option<String> {
+    match count {
+        0 => None,
+        1 => Some("1 task running · /tasks".to_owned()),
+        n => Some(format!("{n} tasks running · /tasks")),
+    }
+}
+
 /// Builds the status line's spans.
 ///
 /// Pure and terminal-free so what the status bar *claims* — connected or not,
@@ -1076,6 +1086,13 @@ pub fn status_spans(
         spans.push(Span::styled(
             format!("{} {} queued ", glyphs::RULE_VERTICAL, state.queued.len()),
             theme.style(Role::PendingUser),
+        ));
+    }
+
+    if let Some(text) = running_tasks_label(state.running_tasks.len()) {
+        spans.push(Span::styled(
+            format!("{} {text} ", glyphs::RULE_VERTICAL),
+            theme.style(Role::Notification),
         ));
     }
 
@@ -1663,5 +1680,68 @@ mod tests {
         state.apply(crate::state::UiEvent::Queued { text: "later".into(), id: Some("s1".into()) });
         let text = compose_activity(&state, Instant::now()).expect("busy");
         assert!(text.contains("1 queued"), "{text:?}");
+    }
+
+    #[test]
+    fn the_status_row_counts_running_tasks_and_points_at_tasks() {
+        use coda_proto::Event;
+        let status = |state: &UiState| -> String {
+            status_spans(state, &Viewport::new(), &Theme::default())
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect()
+        };
+        let completed = |id: &str, mode: &str| Event::TaskCompleted {
+            task_id: id.into(),
+            status: "completed".into(),
+            description: "build".into(),
+            report: None,
+            owner_task_id: None,
+            kind: Some("shell".into()),
+            mode: Some(mode.into()),
+        };
+        let mut state = UiState::new();
+        assert!(!status(&state).contains("running"), "nothing runs yet");
+        state.running_tasks.insert("task-0001".into());
+        state.running_tasks.insert("task-0002".into());
+        assert!(status(&state).contains("2 tasks running · /tasks"), "{}", status(&state));
+
+        state.apply(crate::state::UiEvent::Engine(completed("task-0001", "foreground")));
+        assert!(status(&state).contains("1 task running · /tasks"), "{}", status(&state));
+        state.apply(crate::state::UiEvent::Engine(completed("task-0002", "background")));
+        assert!(!status(&state).contains("task running"), "{}", status(&state));
+        let notices: Vec<String> = state
+            .transcript
+            .blocks()
+            .iter()
+            .filter_map(|b| match b {
+                crate::transcript::Block::Notice { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notices, ["Task completed: build"], "only background completions are announced");
+
+        state.running_tasks.insert("task-0004".into());
+        state.apply(crate::state::UiEvent::Engine(Event::TaskCompleted {
+            task_id: "task-0004".into(),
+            status: "failed".into(),
+            description: "child lint".into(),
+            report: None,
+            owner_task_id: Some("task-0002".into()),
+            kind: Some("shell".into()),
+            mode: Some("background".into()),
+        }));
+        assert!(state.running_tasks.is_empty());
+        assert!(
+            state.transcript.blocks().iter().all(|b| !matches!(
+                b,
+                crate::transcript::Block::Notice { text, .. } if text.contains("child lint")
+            )),
+            "a subagent's own tasks are reported to it, not announced"
+        );
+
+        state.running_tasks.insert("task-0003".into());
+        state.apply(crate::state::UiEvent::EngineAdopted);
+        assert!(state.running_tasks.is_empty(), "tasks die with the engine that ran them");
     }
 }

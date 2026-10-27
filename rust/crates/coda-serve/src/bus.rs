@@ -81,10 +81,85 @@ struct BusInner {
     evicted_up_to: i64,
 }
 
+/// Whether the connection is keeping up with what the engine writes.
+///
+/// The outbound channel is unbounded, so a client that stops reading would
+/// otherwise let *optional* traffic (throttled `event/taskOutput`) pile up
+/// in engine memory for as long as tasks keep printing. The write loop
+/// records here when it starts and finishes each frame and how many frames
+/// were still queued; producers of optional frames consult
+/// [`OutboundHealth::congested`] and hold back (they keep only a cursor, never
+/// the text) until the client catches up. Required frames are unaffected.
+pub struct OutboundHealth {
+    epoch: tokio::time::Instant,
+    /// Milliseconds since `epoch` + 1 when the current write began; `0` idle.
+    busy_since_ms: std::sync::atomic::AtomicU64,
+    /// Frames still queued when the last write began.
+    queued: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    forced: AtomicBool,
+}
+
+/// A write blocked this long means the client is not reading.
+pub const OUTBOUND_STALL: std::time::Duration = std::time::Duration::from_secs(1);
+/// More queued frames than this means the client is not keeping up.
+pub const OUTBOUND_MAX_QUEUED_FRAMES: usize = 256;
+
+impl Default for OutboundHealth {
+    fn default() -> Self {
+        Self {
+            epoch: tokio::time::Instant::now(),
+            busy_since_ms: std::sync::atomic::AtomicU64::new(0),
+            queued: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            forced: AtomicBool::new(false),
+        }
+    }
+}
+
+impl OutboundHealth {
+    fn now_ms(&self) -> u64 {
+        tokio::time::Instant::now().duration_since(self.epoch).as_millis() as u64
+    }
+
+    /// The write loop is about to write one frame; `queued` more wait behind it.
+    pub fn begin_write(&self, queued: usize) {
+        self.queued.store(queued, Ordering::Relaxed);
+        self.busy_since_ms.store(self.now_ms() + 1, Ordering::Relaxed);
+    }
+
+    /// The frame was written and flushed.
+    pub fn end_write(&self) {
+        self.busy_since_ms.store(0, Ordering::Relaxed);
+    }
+
+    /// Whether optional output should be held back right now.
+    pub fn congested(&self) -> bool {
+        #[cfg(test)]
+        if self.forced.load(Ordering::Relaxed) {
+            return true;
+        }
+        if self.queued.load(Ordering::Relaxed) > OUTBOUND_MAX_QUEUED_FRAMES {
+            return true;
+        }
+        match self.busy_since_ms.load(Ordering::Relaxed) {
+            0 => false,
+            since => self.now_ms() + 1 >= since + OUTBOUND_STALL.as_millis() as u64,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_congested(&self, congested: bool) {
+        self.forced.store(congested, Ordering::Relaxed);
+    }
+}
+
 /// The single ordering/publication point for outbound event notifications.
 pub struct EventBus {
     outgoing: mpsc::UnboundedSender<Vec<u8>>,
     engine_instance_id: String,
+    /// How well the connection is keeping up (see [`OutboundHealth`]).
+    outbound_health: std::sync::Arc<OutboundHealth>,
     /// Set once `initialize` negotiates `clientCapabilities.stateEvents`.
     state_events_enabled: AtomicBool,
     inner: Mutex<BusInner>,
@@ -113,6 +188,7 @@ impl EventBus {
         Self {
             outgoing,
             engine_instance_id: engine_instance_id.into(),
+            outbound_health: std::sync::Arc::new(OutboundHealth::default()),
             state_events_enabled: AtomicBool::new(false),
             inner: Mutex::new(BusInner {
                 next_seq: 1,
@@ -136,6 +212,11 @@ impl EventBus {
 
     pub fn engine_instance_id(&self) -> &str {
         &self.engine_instance_id
+    }
+
+    /// How well the connection is keeping up; shared with the write loop.
+    pub fn outbound_health(&self) -> std::sync::Arc<OutboundHealth> {
+        std::sync::Arc::clone(&self.outbound_health)
     }
 
     pub fn ring_envelopes_limit(&self) -> i64 {

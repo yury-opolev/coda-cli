@@ -417,6 +417,15 @@
       "resultContract": "sharedServerDto",
       "requiresInitialize": true,
       "availability": "reusable"
+    },
+    {
+      "method": "session/askAside",
+      "paramsSchema": "schemas/AskAsideParams.json",
+      "resultSchema": "schemas/AskAsideResult.json",
+      "paramsContract": "sharedParser",
+      "resultContract": "sharedServerDto",
+      "requiresInitialize": true,
+      "availability": "reusable"
     }
   ],
   "serverRequests": [
@@ -527,6 +536,18 @@
     {
       "method": "event/taskCompleted",
       "paramsSchema": "schemas/TaskCompletedEvent.json",
+      "requiresStateEvents": false,
+      "paramsContract": "clientReaderWithRustMetadata"
+    },
+    {
+      "method": "event/taskStarted",
+      "paramsSchema": "schemas/TaskStartedEvent.json",
+      "requiresStateEvents": false,
+      "paramsContract": "clientReaderWithRustMetadata"
+    },
+    {
+      "method": "event/taskOutput",
+      "paramsSchema": "schemas/TaskOutputEvent.json",
       "requiresStateEvents": false,
       "paramsContract": "clientReaderWithRustMetadata"
     },

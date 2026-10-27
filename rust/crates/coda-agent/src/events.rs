@@ -230,6 +230,9 @@ pub fn to_proto_event(event: &AgentEvent) -> Option<ProtoEvent> {
                 status: status.clone(),
                 description: description.clone(),
                 report: report.clone(),
+                owner_task_id: None,
+                kind: None,
+                mode: None,
             })
         }
         AgentEvent::ScheduleLifecycle {

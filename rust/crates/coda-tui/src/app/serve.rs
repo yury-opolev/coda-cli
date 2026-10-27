@@ -302,6 +302,8 @@ impl App {
         // else happens to refresh it.
         self.state.model_labels.clear();
         self.needs_model_refresh = true;
+        // Tasks die with the process that ran them.
+        self.state.running_tasks.clear();
         // The message bus's own cursor is engine-scoped and does not survive
         // a replacement: a new process starts its notifications from cursor
         // 0 again, so the previous process's dedup ids must not linger and
@@ -329,10 +331,6 @@ impl App {
             return;
         }
         let event = Event::parse(&frame.method, Some(&frame.params));
-        // Metadata first, and unconditionally: a task's outcome is a side
-        // table the browsers read, not conversation content, so it must
-        // survive even when the content itself is already on screen.
-        self.record_task_outcome(&event);
         if let Event::AgentMessageDelivered { .. } = &event {
             // Reflected by HISTORY (Stage 3 chunk B), unlike
             // `Event::AgentMessage`'s passive, display-only Stage 2
@@ -392,6 +390,11 @@ impl App {
                 // where it is actually applied, the first and only time.
                 return;
             }
+        }
+        // Task progress moves only the status row: no transcript relayout.
+        if let Event::TaskStarted { task_id, .. } | Event::TaskOutput { task_id, .. } = &event {
+            self.dirty |= self.state.running_tasks.insert(task_id.clone());
+            return;
         }
         self.apply(UiEvent::Engine(event));
     }
@@ -1318,20 +1321,6 @@ impl App {
         false
     }
 
-    /// Notes an inbound message's task outcome, which the browsers surface.
-    fn record_task_outcome(&mut self, event: &Event) {
-        if let Event::TaskCompleted { task_id, status, description, report } = event {
-            self.task_outcomes.insert(
-                task_id.clone(),
-                crate::browsers::TaskOutcome {
-                    status: status.clone(),
-                    description: description.clone(),
-                    report: report.clone(),
-                },
-            );
-        }
-    }
-
     /// One inbound message from the engine.
     pub(in crate::app) fn on_inbound(&mut self, message: Inbound) {
         match message {
@@ -1522,7 +1511,6 @@ impl App {
             armed: None,
             surfaces: Default::default(),
             paths: Paths::new(project_root),
-            task_outcomes: std::collections::BTreeMap::new(),
             engine_command: command,
             restarted: None,
             staged_images: Vec::new(),
@@ -1541,6 +1529,7 @@ impl App {
             engine_connected: true,
             auth: super::auth::AuthState::new(),
             auth_port: crate::local::auth::AuthPort::profile(),
+            asides: Default::default(),
         }
     }
 }

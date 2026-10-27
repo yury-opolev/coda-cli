@@ -1,0 +1,32 @@
+{
+  "type": "object",
+  "properties": {
+    "ok": {
+      "type": "boolean"
+    },
+    "answer": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "ok"
+  ],
+  "description": "Outcome of `session/askAside`.\n\n`ok:true` carries the `answer`. `ok:false` carries a stable `reason`:\n`emptyQuestion`, `noProvider` (no model is connected yet) or\n`modelError` (the request failed; `error` says how, without secrets).\nThe answer is never added to the conversation history.",
+  "title": "AskAsideResult",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}
