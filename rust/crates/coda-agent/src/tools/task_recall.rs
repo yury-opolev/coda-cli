@@ -43,7 +43,10 @@ impl Tool for TaskRecallTool {
         let entries: Vec<_> = mgr
             .drain_completions(ctx.caller_task_id.as_deref())
             .into_iter()
-            .filter(|e| !mgr.find_task(&e.task_id).is_some_and(|t| t.completion_pushed()))
+            .filter(|e| {
+                !mgr.find_task(&e.task_id)
+                    .is_some_and(|t| t.completion_pushed() || t.delivered_inline_to_owner())
+            })
             .collect();
         if entries.is_empty() {
             return ToolResult::ok(

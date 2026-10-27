@@ -2617,6 +2617,54 @@ mod tests {
             assert_eq!(job.status(), TaskRunStatus::Running, "waiting never stops the task");
         }
 
+        /// A completion the owner already received inline through `task_wait`
+        /// is not pushed to it a second time.
+        #[tokio::test(start_paused = true)]
+        async fn a_completion_seen_through_task_wait_is_not_pushed_again() {
+            let dir = tempfile::tempdir().unwrap();
+            let mgr = manager(&dir);
+            let bus = Arc::new(MessageBus::new());
+            mgr.set_completion_listener(MainInboxCompletionPush::new(&bus));
+            let job = mgr
+                .register(TaskKind::Shell, "job", None, TaskExecutionMode::Background)
+                .unwrap();
+            {
+                let mgr = Arc::clone(&mgr);
+                let id = job.id.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    mgr.complete(&id, Some("exit code: 0\nall good".into()));
+                });
+            }
+            let wait = format!(r#"{{"taskId":"{}"}}"#, job.id);
+            let client = RoutedClient::new(vec![(
+                "wait for it",
+                vec![tool_turn("w", "task_wait", &wait), text_turn("ok")],
+            )]);
+            let agent = AgentLoopBuilder::new(
+                Arc::clone(&client) as Arc<dyn coda_llm::LlmClient>,
+                Arc::new(AllowAll),
+                Arc::new(ToolRegistry::new(vec![
+                    Arc::new(crate::tools::TaskWaitTool) as Arc<dyn Tool>
+                ])),
+            )
+            .with_task_manager(Arc::clone(&mgr))
+            .with_message_bus(Arc::clone(&bus))
+            .with_steering(Arc::new(SteeringInbox::new()))
+            .with_main_context()
+            .build();
+            let mut history = vec![Message::user("wait for it")];
+            agent
+                .run(&mut history, &CollectingSink::new(), None, CancellationToken::new())
+                .await
+                .unwrap();
+
+            let second = &client.requests_for("wait for it")[1];
+            assert!(second.contains("completed") && second.contains("all good"), "{second}");
+            assert!(!second.contains("[task-completed]"), "{second}");
+            assert!(!bus.has_pending_main(), "the completion must not be pushed as well");
+        }
+
         /// Failure and stop of a subagent reach the parent as completions.
         #[tokio::test(start_paused = true)]
         async fn a_failed_and_a_stopped_child_subagent_both_wake_the_parent() {

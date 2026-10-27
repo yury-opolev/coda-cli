@@ -62,6 +62,7 @@ impl MainInboxCompletionPush {
         matches!(task.kind, TaskKind::Shell | TaskKind::Subagent)
             && task.parent_id.is_none()
             && task.mode() == TaskExecutionMode::Background
+            && !task.delivered_inline_to_owner()
             && !(status == TaskRunStatus::Stopped && task.stopped_by_operator())
     }
 }

@@ -484,7 +484,10 @@ sketches above:
 - **`task_wait` (§6.6)** returns a new control, `ToolControl::AttachTask`: the executor waits
   at most 30 s (requests are clamped), ends early on a message, returns the task's final status
   if it finishes, and never stops, promotes or otherwise touches the task, nor skips the batch.
-  Its description says ending the turn is the preferred way to wait.
+  Its description says ending the turn is the preferred way to wait. When the *owner* is
+  attached and the task ends, the completion is claimed by that wait and not pushed as well
+  (exactly once). Terminal tasks are pruned from the registry only once settled, so a parked
+  owner never loses sight of a child that has ended but not yet reported.
 - **Who yields.** `run_command` now yields in every context that receives completions: the
   main conversation and any agent running as a task with an inbox. Only contexts without one
   (e.g. an agent-type hook's unregistered run) still wait for the command. The Phase 1

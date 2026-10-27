@@ -138,6 +138,10 @@ pub struct ManagedTask {
     /// Set when the completion was pushed to its owner's inbox, so the
     /// deprecated `task_recall` does not hand it out a second time.
     completion_pushed: std::sync::atomic::AtomicBool,
+    /// `(owner waits attached, delivery claimed inline)`: while the owning
+    /// agent waits on this task with `task_wait`, a completion is handed to
+    /// that wait instead of being pushed, so it is delivered exactly once.
+    owner_attach: Mutex<(u32, bool)>,
 }
 
 /// Stable consumer id for the main agent's cursor. The leading NUL cannot collide
@@ -186,7 +190,36 @@ impl ManagedTask {
             tool_output: Mutex::new(None),
             settled: std::sync::atomic::AtomicBool::new(false),
             completion_pushed: std::sync::atomic::AtomicBool::new(false),
+            owner_attach: Mutex::new((0, false)),
         })
+    }
+
+    /// The owning agent starts waiting on this task inline (`task_wait`).
+    pub fn begin_owner_attach(&self) {
+        self.owner_attach.lock().unwrap().0 += 1;
+    }
+
+    /// The owning agent stops waiting. Returns `true` when the completion was
+    /// claimed by the wait (not pushed), so the waiter must report it.
+    pub fn end_owner_attach(&self) -> bool {
+        let mut attach = self.owner_attach.lock().unwrap();
+        attach.0 = attach.0.saturating_sub(1);
+        attach.1
+    }
+
+    /// Called once at the terminal notification: claims the completion for
+    /// an attached owner wait, if there is one.
+    pub(crate) fn claim_delivery_for_attached_owner(&self) -> bool {
+        let mut attach = self.owner_attach.lock().unwrap();
+        if attach.0 > 0 {
+            attach.1 = true;
+        }
+        attach.1
+    }
+
+    /// Whether the completion went to an attached owner wait instead of a push.
+    pub fn delivered_inline_to_owner(&self) -> bool {
+        self.owner_attach.lock().unwrap().1
     }
 
     /// Attaches the inbox of the agent running as this task. First call wins.

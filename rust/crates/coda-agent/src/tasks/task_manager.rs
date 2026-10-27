@@ -149,12 +149,18 @@ impl TaskManager {
     }
 
     fn notify_terminal(&self, task: &Arc<ManagedTask>, status: TaskRunStatus) {
+        // An owner waiting on this task inline (`task_wait`) receives the
+        // completion there; it is then pushed nowhere.
+        task.claim_delivery_for_attached_owner();
         self.push_to_owner_inbox(task, status);
         let listener = self.completion_listener.lock().unwrap().clone();
         if let Some(listener) = listener {
             listener.on_terminal(task, status);
         }
         self.settle(task);
+        // Pruning only removes settled tasks, so run it again now that this
+        // one is (see `prune_terminal_tasks`).
+        self.prune_terminal_tasks();
     }
 
     /// Marks a terminal task as fully reported and wakes parked owners.
@@ -174,7 +180,7 @@ impl TaskManager {
     /// still running (or parked waiting on this very task) and must learn
     /// that the work it is waiting for will never report.
     fn push_to_owner_inbox(&self, task: &Arc<ManagedTask>, status: TaskRunStatus) {
-        if task.mode() != TaskExecutionMode::Background {
+        if task.mode() != TaskExecutionMode::Background || task.delivered_inline_to_owner() {
             return;
         }
         let Some(parent_id) = task.parent_id.as_deref() else { return };
@@ -781,7 +787,10 @@ impl TaskManager {
     fn prune_terminal_tasks(&self) {
         let pruned = {
             let mut s = self.state.lock().unwrap();
-            let terminal_count = s.order.iter().filter(|t| t.is_terminal()).count();
+            // Only settled tasks: a task that just ended but has not reported yet
+            // must stay visible to its parked owner (`live_children`).
+            let terminal_count =
+                s.order.iter().filter(|t| t.is_terminal() && t.is_settled()).count();
             if terminal_count <= self.max_retained_terminal_tasks {
                 return;
             }
@@ -791,7 +800,7 @@ impl TaskManager {
             let mut removed = 0usize;
             let mut idx = 0;
             while removed < excess && idx < s.order.len() {
-                if s.order[idx].is_terminal() {
+                if s.order[idx].is_terminal() && s.order[idx].is_settled() {
                     let version = s.order[idx].bump_version_for_removal();
                     let task = s.order.remove(idx);
                     s.tasks.remove(&task.id);
@@ -1044,6 +1053,27 @@ mod tests {
         }
         // Only 3 terminal tasks should remain.
         assert!(m.list().len() <= 3, "too many tasks: {}", m.list().len());
+    }
+
+    #[test]
+    fn a_task_that_ended_but_has_not_reported_is_never_pruned() {
+        let m = TaskManager::new("test-session", Some(std::env::temp_dir().join("coda-mgr-prune3")), 512, 1);
+        // Ended, but its terminal notification (push, then settle) has not run.
+        let unreported = m
+            .register(TaskKind::Shell, "unreported", None, TaskExecutionMode::Background)
+            .unwrap();
+        unreported.try_complete(Some("exit code: 0".into()));
+        for _ in 0..3 {
+            let t = m
+                .register(TaskKind::Subagent, "done", None, TaskExecutionMode::Background)
+                .unwrap();
+            m.complete(&t.id, None);
+        }
+        assert!(
+            m.find_task(&unreported.id).is_some(),
+            "an unsettled task must stay visible to its parked owner"
+        );
+        assert_eq!(m.list().len(), 2, "settled tasks are still pruned to the limit");
     }
 
     #[test]

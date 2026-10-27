@@ -631,8 +631,20 @@ async fn await_attached_task(
     pending: &str,
     cancel: &CancellationToken,
 ) -> Option<ToolResult> {
-    let Some(task) = ctx.task_manager.as_ref().and_then(|m| m.find_task(task_id)) else {
+    let Some(manager) = ctx.task_manager.as_ref() else {
         return Some(ToolResult::error(format!("Task '{task_id}' not found.")));
+    };
+    let Some(task) = manager.find_task(task_id) else {
+        return Some(ToolResult::error(format!("Task '{task_id}' not found.")));
+    };
+    // The owner waiting on its own task takes delivery of the completion
+    // here, so it is not pushed a second time (exactly once, §6.4).
+    let owner = task.parent_id.as_deref() == ctx.caller_task_id.as_deref();
+    if owner {
+        task.begin_owner_attach();
+    }
+    let finished = |task: &crate::tasks::ManagedTask| {
+        Some(crate::tools::task_wait::format_terminal_result(&task.to_snapshot()))
     };
     let steering_arrived = async {
         match ctx.steering {
@@ -640,16 +652,43 @@ async fn await_attached_task(
             None => std::future::pending().await,
         }
     };
-    tokio::select! {
+    let ended = tokio::select! {
         biased;
         _ = cancel.cancelled() => None,
-        _ = task.wait_for_completion() => {
-            Some(crate::tools::task_wait::format_terminal_result(&task.to_snapshot()))
-        }
-        _ = steering_arrived => Some(ToolResult::ok(format!(
+        _ = task.wait_for_completion() => Some(None),
+        _ = steering_arrived => Some(Some(ToolResult::ok(format!(
             "{pending} The wait ended early because a new message arrived."
+        )))),
+        _ = tokio::time::sleep(wait) => Some(Some(ToolResult::ok(pending.to_owned()))),
+    };
+    if !owner {
+        return match ended {
+            None => None,
+            Some(None) => finished(&task),
+            Some(Some(pending)) => Some(pending),
+        };
+    }
+    if matches!(ended, Some(None)) {
+        // The terminal notification runs right after the transition; wait for
+        // it so the claim below is decided.
+        while !task.is_settled() {
+            let settled = manager.settle_signal().notified();
+            tokio::pin!(settled);
+            settled.as_mut().enable();
+            if task.is_settled() {
+                break;
+            }
+            settled.await;
+        }
+    }
+    let claimed = task.end_owner_attach();
+    match ended {
+        _ if claimed => finished(&task),
+        None => None,
+        Some(None) => Some(ToolResult::ok(format!(
+            "Task '{task_id}' finished; its completion is delivered to you separately."
         ))),
-        _ = tokio::time::sleep(wait) => Some(ToolResult::ok(pending.to_owned())),
+        Some(Some(pending)) => Some(pending),
     }
 }
 
