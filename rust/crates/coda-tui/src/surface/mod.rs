@@ -167,6 +167,10 @@ pub enum SurfaceAction {
     DeleteMcpServer(String),
     /// Remove a scheduled task.
     DeleteSchedule(String),
+    /// Stop waiting on a running task; it keeps running in the background.
+    BackgroundTask(String),
+    /// Stop a running task (and its process tree).
+    StopTask(String),
     /// Explain that creating a schedule needs arguments.
     ExplainScheduleCreation,
     /// Explain that a skill cannot be toggled from the browser.

@@ -253,9 +253,13 @@ impl App {
             BrowserKind::Skills => {
                 RowActions::new().on_toggle(|_| A::ExplainSkillToggle)
             }
-            // Hooks and tasks are read-only; Enter opens their detail view,
-            // which the browser handles without troubling the host.
-            BrowserKind::Hooks | BrowserKind::Tasks => RowActions::new(),
+            // Enter opens a task's output, which the browser handles itself.
+            BrowserKind::Tasks => RowActions::new()
+                .on_key('b', |id| A::BackgroundTask(id.to_string()))
+                .on_key('x', |id| A::StopTask(id.to_string())),
+            // Hooks are read-only; Enter opens their detail view, which the
+            // browser handles without troubling the host.
+            BrowserKind::Hooks => RowActions::new(),
         }
     }
 
@@ -266,7 +270,7 @@ impl App {
     /// it is invisible when missed: the browser draws correctly and every key
     /// quietly does nothing. Reload used to construct its own and was exactly
     /// that bug.
-    fn browser_surface(kind: BrowserKind, browser: Browser) -> BrowserSurface {
+    pub(super) fn browser_surface(kind: BrowserKind, browser: Browser) -> BrowserSurface {
         BrowserSurface::new(kind, browser).with_actions(Self::row_actions(kind))
     }
 

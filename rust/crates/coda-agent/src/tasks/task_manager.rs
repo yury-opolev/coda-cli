@@ -45,6 +45,17 @@ pub const DEFAULT_MAX_RETAINED_TERMINAL_TASKS: usize = 256;
 pub const COMPLETION_OUTBOX_CAPACITY: usize = 64;
 pub static DEFAULT_SHUTDOWN_BUDGET: Duration = Duration::from_secs(5);
 
+/// Observes every task's single transition to a terminal state through
+/// [`TaskManager::complete`], [`TaskManager::fail`] or [`TaskManager::stop`].
+///
+/// Invoked exactly once per task, after the task's log is closed (so its
+/// redacted tail is final) and without any registry lock held. Must not block.
+/// Shutdown's force-stop of stragglers deliberately does not notify: the
+/// session is ending and nobody is left to tell.
+pub trait TaskCompletionListener: Send + Sync {
+    fn on_terminal(&self, task: &Arc<ManagedTask>, status: TaskRunStatus);
+}
+
 // ── Internal registry state ───────────────────────────────────────────────────
 
 struct ManagerState {
@@ -91,6 +102,7 @@ pub struct TaskManager {
     output_ring_bytes: u64,
     max_retained_terminal_tasks: usize,
     state: Mutex<ManagerState>,
+    completion_listener: Mutex<Option<Arc<dyn TaskCompletionListener>>>,
 }
 
 impl TaskManager {
@@ -121,8 +133,80 @@ impl TaskManager {
                 shutting_down: false,
                 disposed: false,
             }),
+            completion_listener: Mutex::new(None),
             session_id,
         })
+    }
+
+    /// Installs the listener told about every task's terminal transition
+    /// (see [`TaskCompletionListener`]). Replaces any previous listener.
+    pub fn set_completion_listener(&self, listener: Arc<dyn TaskCompletionListener>) {
+        *self.completion_listener.lock().unwrap() = Some(listener);
+    }
+
+    fn notify_terminal(&self, task: &Arc<ManagedTask>, status: TaskRunStatus) {
+        let listener = self.completion_listener.lock().unwrap().clone();
+        if let Some(listener) = listener {
+            listener.on_terminal(task, status);
+        }
+    }
+
+    // ── User controls (non-blocking runtime, Phase 1) ─────────────────────────
+
+    /// Stops awaiting one task in the foreground; the work keeps running.
+    ///
+    /// Only shell tasks can be released this way in Phase 1: a foreground
+    /// subagent is still awaited directly by its `task` call, so asking would
+    /// promise something nothing honours (`Rejected`).
+    pub fn background(&self, id: &str) -> TaskActionResult {
+        let Some(task) = self.find_task(id) else { return TaskActionResult::NotFound };
+        if task.kind != TaskKind::Shell {
+            return TaskActionResult::Rejected;
+        }
+        if task.request_background() {
+            TaskActionResult::Ok
+        } else {
+            TaskActionResult::InvalidState
+        }
+    }
+
+    /// Stops awaiting every running foreground shell task. Returns how many
+    /// were asked to move to the background.
+    pub fn background_all(&self) -> usize {
+        let running = self.state.lock().unwrap().running_tasks();
+        running
+            .iter()
+            .filter(|task| task.kind == TaskKind::Shell && task.request_background())
+            .count()
+    }
+
+    /// Stops one running task (and its process tree, for a shell). Operator
+    /// authority: there is no calling agent to authorize. Marked as an
+    /// operator stop, so its completion does not wake the agent.
+    pub fn stop_task(&self, id: &str) -> TaskActionResult {
+        if let Some(task) = self.find_task(id) {
+            if task.status() == TaskRunStatus::Running {
+                task.mark_operator_stop();
+            }
+        }
+        let result = self.request_stop(id, None);
+        if result == TaskActionResult::Ok {
+            if let Some(task) = self.find_task(id) {
+                task.kill_attached_shell();
+            }
+        }
+        result
+    }
+
+    /// Stops every running task. Returns how many were asked to stop.
+    pub fn stop_all(&self) -> usize {
+        let running = self.state.lock().unwrap().running_tasks();
+        for task in &running {
+            task.mark_operator_stop();
+            task.cancel_task();
+            task.kill_attached_shell();
+        }
+        running.len()
     }
 
     pub fn with_defaults(session_id: impl Into<String>) -> Arc<Self> {
@@ -292,6 +376,7 @@ impl TaskManager {
         self.on_task_terminal(&task);
         self.publish(&task.id, version, TaskChangeKind::Status);
         self.enqueue_completion_if_background(&task, TaskRunStatus::Completed, result);
+        self.notify_terminal(&task, TaskRunStatus::Completed);
         true
     }
 
@@ -308,6 +393,7 @@ impl TaskManager {
         self.on_task_terminal(&task);
         self.publish(&task.id, version, TaskChangeKind::Status);
         self.enqueue_completion_if_background(&task, TaskRunStatus::Failed, error);
+        self.notify_terminal(&task, TaskRunStatus::Failed);
         true
     }
 
@@ -324,6 +410,7 @@ impl TaskManager {
         self.on_task_terminal(&task);
         self.publish(&task.id, version, TaskChangeKind::Status);
         self.enqueue_completion_if_background(&task, TaskRunStatus::Stopped, None);
+        self.notify_terminal(&task, TaskRunStatus::Stopped);
         true
     }
 

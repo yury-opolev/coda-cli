@@ -1406,6 +1406,10 @@ impl ServeHost {
         let message_bus: Arc<coda_agent::MessageBus> = Arc::new(coda_agent::MessageBus::with_observer(Some(
             message_bus_bridge as Arc<dyn coda_agent::message::MessageBusObserver>,
         )));
+        // Non-blocking runtime: a backgrounded shell task's completion is
+        // pushed onto the main inbox, whose acceptance wakes the idle pump —
+        // so the model learns about it without polling.
+        task_manager.set_completion_listener(coda_agent::tasks::MainInboxCompletionPush::new(&message_bus));
         let steering_observer = SteeringStateObserver::new(Arc::clone(&engine_state));
         // The registry publishes pending/resolved transitions through
         // `EngineState`, which owns the transaction (and therefore the
@@ -2489,6 +2493,17 @@ fn safe_engine_error(code: i64) -> coda_proto::state::TurnErrorSummary {
     }
 }
 
+/// The `task/background` / `task/stop` reply: `ok` exactly when no refusal
+/// reason applies.
+fn task_control_result(task_id: String, reason: Option<&str>) -> Result<Value, RpcError> {
+    serde_json::to_value(coda_proto::responses::TaskControlResult {
+        ok: reason.is_none(),
+        task_id,
+        reason: reason.map(str::to_owned),
+    })
+    .map_err(|e| RpcError::internal(e.to_string()))
+}
+
 /// Resolves a `/import` path exactly like the C# original
 /// (`Path.IsPathRooted(args[0]) ? args[0] : Path.Combine(WorkingDirectory, args[0])`):
 /// an absolute path is used as-is, a relative one joins the *engine's*
@@ -2968,6 +2983,11 @@ impl ServeBackend for ServeHost {
                 },
             });
         }
+        // Stop every task (subagents and shell commands alike). A command
+        // the agent handed to the background is owned by its own runner, not
+        // by any turn, so cancelling the turn above does not reach it; this
+        // kills its process tree rather than leaving it orphaned.
+        self.task_manager.shutdown(coda_agent::tasks::DEFAULT_SHUTDOWN_BUDGET).await;
         // Close the engine-owned notification bus: no further `notify_user`
         // publication is meaningful once the engine itself has begun
         // shutting down, and closing it makes that refusal explicit rather
@@ -4039,6 +4059,46 @@ impl ServeBackend for ServeHost {
     async fn mcp_list(&self) -> Result<Value, RpcError> {
         let result = self.mcp_inventory().await;
         serde_json::to_value(&result).map_err(|e| RpcError::internal(e.to_string()))
+    }
+
+    /// Non-blocking runtime: stop waiting on every foreground task. The
+    /// agent loop that was waiting gets a task handle; the work continues.
+    async fn session_background_all(&self) -> Result<Value, RpcError> {
+        let count = self.task_manager.background_all();
+        serde_json::to_value(coda_proto::responses::TaskBulkControlResult { ok: true, count })
+            .map_err(|e| RpcError::internal(e.to_string()))
+    }
+
+    /// Stops every running task, killing shell process trees.
+    async fn session_stop_all_tasks(&self) -> Result<Value, RpcError> {
+        let count = self.task_manager.stop_all();
+        serde_json::to_value(coda_proto::responses::TaskBulkControlResult { ok: true, count })
+            .map_err(|e| RpcError::internal(e.to_string()))
+    }
+
+    async fn task_background(&self, p: crate::dispatch::TaskIdParams) -> Result<Value, RpcError> {
+        let outcome = self.task_manager.background(&p.task_id);
+        let reason = match outcome {
+            coda_agent::tasks::TaskActionResult::Ok => None,
+            coda_agent::tasks::TaskActionResult::NotFound => Some("notFound"),
+            coda_agent::tasks::TaskActionResult::Rejected => Some("notBackgroundable"),
+            _ => match self.task_manager.get(&p.task_id) {
+                Some(task) if task.status == coda_agent::tasks::TaskRunStatus::Running => {
+                    Some("notForeground")
+                }
+                _ => Some("notRunning"),
+            },
+        };
+        task_control_result(p.task_id, reason)
+    }
+
+    async fn task_stop(&self, p: crate::dispatch::TaskIdParams) -> Result<Value, RpcError> {
+        let reason = match self.task_manager.stop_task(&p.task_id) {
+            coda_agent::tasks::TaskActionResult::Ok => None,
+            coda_agent::tasks::TaskActionResult::NotFound => Some("notFound"),
+            _ => Some("notRunning"),
+        };
+        task_control_result(p.task_id, reason)
     }
 
     async fn session_list_tasks(&self) -> Result<Value, RpcError> {
@@ -14802,6 +14862,119 @@ mod tests {
         }
 
         // ── 1. The happy path ────────────────────────────────────────────
+
+        /// Non-blocking runtime: a shell task the main agent stopped waiting
+        /// for reports its completion by itself — the idle engine runs one
+        /// turn, the model sees a `[task-completed]` data block with the exit
+        /// code, and nothing is delivered twice.
+        #[tokio::test]
+        async fn a_backgrounded_shell_completion_wakes_the_idle_main_agent_exactly_once() {
+            use coda_agent::tasks::{TaskExecutionMode, TaskKind};
+
+            let dir = tempfile::tempdir().unwrap();
+            let client = PumpClient::new(vec![answer("the build finished")]);
+            let host = host_with(Some(Arc::clone(&client) as Arc<dyn LlmClient>), dir.path());
+            host.initialize(InitParams::default()).await.unwrap();
+
+            let task = host
+                .task_manager
+                .register(TaskKind::Shell, "cargo build", None, TaskExecutionMode::Foreground)
+                .unwrap();
+            host.task_manager.append_output(&task.id, "Finished dev profile\n");
+            task.try_promote_to_background().unwrap();
+            host.task_manager.fail(&task.id, Some("exit code: 101".into()));
+
+            wait_for("the pump to deliver the completion", || client.request_count() == 1).await;
+            wait_for("the turn to finish", || idle(&host) && last_outcome(&host).is_some()).await;
+            settle().await;
+
+            let requests = client.requests();
+            assert_eq!(requests.len(), 1, "exactly one wake-up turn");
+            let seen = requests[0].messages.last().unwrap().text();
+            assert!(seen.starts_with(&format!("[task-completed] taskId={}", task.id)), "{seen}");
+            assert!(seen.contains("status: failed") && seen.contains("exit code: 101"), "{seen}");
+            assert!(seen.contains("Finished dev profile"), "{seen}");
+            assert_eq!(host.message_bus.pending_main_len(), 0);
+        }
+
+        /// Engine shutdown stops work the agent had handed to the background:
+        /// no turn owns it any more, so nothing else would.
+        #[tokio::test]
+        async fn shutdown_stops_backgrounded_tasks() {
+            use coda_agent::tasks::{TaskExecutionMode, TaskKind};
+
+            let dir = tempfile::tempdir().unwrap();
+            let host = host_with(None, dir.path());
+            host.initialize(InitParams::default()).await.unwrap();
+            let task = host
+                .task_manager
+                .register(TaskKind::Shell, "server", None, TaskExecutionMode::Foreground)
+                .unwrap();
+            task.try_promote_to_background().unwrap();
+            crate::dispatch::dispatch("shutdown", None, host.as_ref()).await.unwrap();
+            assert!(task.cancel.is_cancelled(), "the task was asked to stop");
+            assert!(task.is_terminal(), "nothing is left running after shutdown");
+        }
+
+        /// The task-control methods: routed, gated on `initialize`, and
+        /// reporting exact refusal reasons.
+        #[tokio::test]
+        async fn task_control_methods_background_and_stop_tasks_with_exact_reasons() {
+            use coda_agent::tasks::{TaskExecutionMode, TaskKind};
+            use crate::dispatch::dispatch;
+
+            let dir = tempfile::tempdir().unwrap();
+            let host = host_with(None, dir.path());
+            let gated = dispatch("session/backgroundAll", None, host.as_ref()).await.unwrap_err();
+            assert_eq!(gated.code, coda_proto::messages::error_code::NOT_INITIALIZED);
+            host.initialize(InitParams::default()).await.unwrap();
+
+            let manager = &host.task_manager;
+            let awaited = manager
+                .register(TaskKind::Shell, "awaited", None, TaskExecutionMode::Foreground)
+                .unwrap();
+            let detached = manager
+                .register(TaskKind::Shell, "detached", None, TaskExecutionMode::Foreground)
+                .unwrap();
+            detached.try_promote_to_background().unwrap();
+            let done = manager
+                .register(TaskKind::Shell, "done", None, TaskExecutionMode::Foreground)
+                .unwrap();
+            manager.complete(&done.id, Some("exit code: 0".into()));
+
+            let call = |method: &'static str, task_id: &str| {
+                let params = json!({ "taskId": task_id });
+                let host = Arc::clone(&host);
+                async move { dispatch(method, Some(params), host.as_ref()).await.unwrap() }
+            };
+
+            let r = call("task/background", &awaited.id).await;
+            assert_eq!(r, json!({ "ok": true, "taskId": awaited.id }));
+            tokio::time::timeout(Duration::from_secs(1), awaited.background_requested())
+                .await
+                .expect("the waiting loop is told to let go");
+            assert_eq!(call("task/background", &detached.id).await["reason"], "notForeground");
+            assert_eq!(call("task/background", &done.id).await["reason"], "notRunning");
+            assert_eq!(call("task/background", "task-9999").await["reason"], "notFound");
+            let subagent = manager
+                .register(TaskKind::Subagent, "agent", None, TaskExecutionMode::Foreground)
+                .unwrap();
+            assert_eq!(call("task/background", &subagent.id).await["reason"], "notBackgroundable");
+            assert!(dispatch("task/background", None, host.as_ref()).await.is_err(), "taskId is required");
+
+            let all = dispatch("session/backgroundAll", None, host.as_ref()).await.unwrap();
+            assert_eq!(all, json!({ "ok": true, "count": 1 }), "only the foreground task counts");
+
+            let r = call("task/stop", &detached.id).await;
+            assert_eq!(r["ok"], true);
+            assert!(detached.cancel.is_cancelled());
+            assert_eq!(call("task/stop", &done.id).await["reason"], "notRunning");
+            assert_eq!(call("task/stop", "task-9999").await["reason"], "notFound");
+
+            let stopped = dispatch("session/stopAllTasks", None, host.as_ref()).await.unwrap();
+            assert_eq!(stopped["ok"], true);
+            assert!(awaited.cancel.is_cancelled(), "stop-all reaches every running task");
+        }
 
         /// An `ask_main` accepted while the engine is idle produces exactly
         /// ONE turn on the existing execution slot, the model actually

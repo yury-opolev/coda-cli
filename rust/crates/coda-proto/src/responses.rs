@@ -26,6 +26,33 @@ pub struct TaskSummaryDto {
     pub report: Option<String>,
 }
 
+/// Outcome of `task/background` or `task/stop` for one task.
+///
+/// `ok:false` carries a stable `reason`: `notFound` (no such task),
+/// `notRunning` (already finished), and for `task/background` only
+/// `notForeground` (nothing is waiting on it — it is already in the
+/// background) or `notBackgroundable` (a kind that cannot be released yet,
+/// e.g. a foreground subagent).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TaskControlResult {
+    pub ok: bool,
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Outcome of `session/backgroundAll` or `session/stopAllTasks`: how many
+/// running tasks the request applied to (`0` is a success, not an error).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TaskBulkControlResult {
+    pub ok: bool,
+    pub count: usize,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -106,10 +133,11 @@ pub struct AgentMessageDeliveredItemDto {
     pub id: String,
     pub seq: i64,
     pub label: String,
-    /// One of `"scheduledTask"` | `"subagent"` | `"main"` — see
-    /// [`AgentMessageDto::source`]. `"main"` is unreachable here: `ask_main`
-    /// refuses a main-context caller outright (self-question loop), so
-    /// nothing ever queues an item attributed to `main`.
+    /// One of `"scheduledTask"` | `"subagent"` | `"taskCompletion"` | `"main"`
+    /// — see [`AgentMessageDto::source`]. `"taskCompletion"` is a background
+    /// task's completion report (non-blocking runtime). `"main"` is
+    /// unreachable here: `ask_main` refuses a main-context caller outright
+    /// (self-question loop), so nothing ever queues an item attributed to `main`.
     pub source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,

@@ -116,6 +116,19 @@ pub struct ManagedTask {
     completion: Arc<Notify>,
     /// Atomic flag so `wait_for_completion` can detect terminal without the lock.
     terminal_flag: std::sync::atomic::AtomicBool,
+    /// Set (sticky) when a user asked for this task to stop being awaited in
+    /// the foreground ("background now"). Signalled through `background_signal`.
+    background_requested: std::sync::atomic::AtomicBool,
+    background_signal: Notify,
+    /// Set when the operator (not the agent) stopped this task — `/stop`,
+    /// `task/stop`. Such a stop is not pushed back to the agent as a
+    /// completion: the user asked for quiet, not for a new turn.
+    operator_stop: std::sync::atomic::AtomicBool,
+    /// One-shot hand-off of the full result for the tool call that started
+    /// this task, when that call observes the completion inline. Never part
+    /// of a snapshot: it is the tool's own (unredacted) output, which must not
+    /// reach `session/listTasks` or any other reader.
+    tool_output: Mutex<Option<String>>,
 }
 
 /// Stable consumer id for the main agent's cursor. The leading NUL cannot collide
@@ -158,7 +171,57 @@ impl ManagedTask {
             }),
             completion: Arc::new(Notify::new()),
             terminal_flag: std::sync::atomic::AtomicBool::new(false),
+            background_requested: std::sync::atomic::AtomicBool::new(false),
+            background_signal: Notify::new(),
+            operator_stop: std::sync::atomic::AtomicBool::new(false),
+            tool_output: Mutex::new(None),
         })
+    }
+
+    /// Records that the operator asked for this task to stop.
+    pub fn mark_operator_stop(&self) {
+        self.operator_stop.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether the operator (rather than the agent) stopped this task.
+    pub fn stopped_by_operator(&self) -> bool {
+        self.operator_stop.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Stores the starting tool call's full result. Call before the terminal
+    /// transition so a waiter woken by it always finds the result.
+    pub fn set_tool_output(&self, output: String) {
+        *self.tool_output.lock().unwrap() = Some(output);
+    }
+
+    /// Takes the starting tool call's full result, if one was stored.
+    pub fn take_tool_output(&self) -> Option<String> {
+        self.tool_output.lock().unwrap().take()
+    }
+
+    /// Asks whoever is awaiting this task in the foreground to stop waiting
+    /// and let it run on in the background. Never stops the work itself.
+    /// Returns `false` when the task is terminal or already in the background.
+    pub fn request_background(&self) -> bool {
+        if self.is_terminal() || self.mode() != TaskExecutionMode::Foreground {
+            return false;
+        }
+        self.background_requested.store(true, std::sync::atomic::Ordering::Release);
+        self.background_signal.notify_waiters();
+        true
+    }
+
+    /// Resolves once [`ManagedTask::request_background`] has been called.
+    pub async fn background_requested(&self) {
+        loop {
+            let notified = self.background_signal.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.background_requested.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
     }
 
     pub fn status(&self) -> TaskRunStatus {
@@ -297,6 +360,13 @@ impl ManagedTask {
     /// Returns the last `max_chars` characters of buffered output.
     pub fn peek(&self, max_chars: usize) -> String {
         self.output.peek(max_chars)
+    }
+
+    /// The last `max_chars` characters of the secret-redacted output tail —
+    /// the only form of task output that may be shown back to a model or a
+    /// client without passing through the original tool's own path.
+    pub fn redacted_peek(&self, max_chars: usize) -> String {
+        self.redacted_output.peek(max_chars)
     }
 
     /// Reads output since the given consumer's server-side cursor and advances it.

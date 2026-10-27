@@ -13,7 +13,19 @@ pub const INITIALIZATION_GATED_METHODS: &[&str] = &[
     crate::messages::method::RESOLVE_REQUEST,
     crate::messages::method::CANCEL_REQUEST,
     crate::messages::method::CONFIG_SET,
+    crate::messages::method::BACKGROUND_ALL,
+    crate::messages::method::STOP_ALL_TASKS,
+    crate::messages::method::TASK_BACKGROUND,
+    crate::messages::method::TASK_STOP,
 ];
+
+/// Names one registered task (`task/background`, `task/stop`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TaskIdParams {
+    pub task_id: String,
+}
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]

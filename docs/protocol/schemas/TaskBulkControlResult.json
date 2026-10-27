@@ -1,0 +1,20 @@
+{
+  "type": "object",
+  "properties": {
+    "ok": {
+      "type": "boolean"
+    },
+    "count": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "ok",
+    "count"
+  ],
+  "description": "Outcome of `session/backgroundAll` or `session/stopAllTasks`: how many\nrunning tasks the request applied to (`0` is a success, not an error).",
+  "title": "TaskBulkControlResult",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

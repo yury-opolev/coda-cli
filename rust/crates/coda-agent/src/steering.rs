@@ -72,6 +72,9 @@ pub trait SteeringObserver: Send + Sync {
 pub struct SteeringInbox {
     gate: Mutex<SteeringInboxInner>,
     observer: Option<Arc<dyn SteeringObserver>>,
+    /// Signalled whenever a message is accepted, so a loop that is waiting
+    /// on a running tool can cut that wait short (the tool keeps running).
+    arrived: tokio::sync::Notify,
 }
 
 struct SteeringInboxInner {
@@ -90,6 +93,22 @@ impl SteeringInbox {
         Self {
             gate: Mutex::new(SteeringInboxInner { pending: Vec::new(), sealed_empty: false }),
             observer,
+            arrived: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Resolves once at least one undelivered message is waiting. Returns
+    /// immediately when one already is. Never consumes anything: delivery
+    /// stays with [`SteeringInbox::take_all_for_delivery`].
+    pub async fn wait_for_pending(&self) {
+        loop {
+            let notified = self.arrived.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.has_pending() {
+                return;
+            }
+            notified.await;
         }
     }
 
@@ -135,6 +154,8 @@ impl SteeringInbox {
         if let Some(obs) = &self.observer {
             obs.on_enqueued(&entry);
         }
+        drop(inner);
+        self.arrived.notify_waiters();
         Ok(entry)
     }
 

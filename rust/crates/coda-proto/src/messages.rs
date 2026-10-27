@@ -87,6 +87,17 @@ pub mod method {
     /// available before `initialize` so an API-only external frontend can
     /// recover without local state.
     pub const PENDING_MESSAGES: &str = "session/pendingMessages";
+
+    // ── Non-blocking runtime (Phase 1) ───────────────────────────────────
+    /// Stop *waiting* on every task the agent is awaiting in the foreground;
+    /// the work keeps running and its completion is reported later.
+    pub const BACKGROUND_ALL: &str = "session/backgroundAll";
+    /// Stop every running task (and its process tree).
+    pub const STOP_ALL_TASKS: &str = "session/stopAllTasks";
+    /// Stop waiting on one foreground task; it keeps running.
+    pub const TASK_BACKGROUND: &str = "task/background";
+    /// Stop one running task (and its process tree).
+    pub const TASK_STOP: &str = "task/stop";
 }
 
 /// Method names the server may call on us. Each expects a reply.
