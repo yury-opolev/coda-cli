@@ -116,6 +116,10 @@ pub enum Action {
 
     /// Cancel the running turn.
     Interrupt,
+    /// Stop waiting on running tool work; it continues in the background.
+    BackgroundNow,
+    /// Background running tool work and deliver the composed message now.
+    SendNow,
     /// Arm a two-press chord and tell the user it is armed.
     Arm(Chord),
     /// Leave the application.
@@ -205,6 +209,13 @@ fn resolve_composer(
     alt: bool,
 ) -> Action {
     match key.code {
+        // While a turn runs, Ctrl+Enter is "send now": move awaited tool work
+        // to the background and deliver the message immediately. Ctrl+G is
+        // the same action for terminals that cannot report Ctrl+Enter
+        // (many report it as plain Enter or as Ctrl+J).
+        KeyCode::Enter if ctrl && context.busy => Action::SendNow,
+        KeyCode::Char('g') if ctrl => Action::SendNow,
+        KeyCode::Char('b') if ctrl => Action::BackgroundNow,
         // Enter submits; every modified Enter inserts a newline instead. Not
         // all terminals report Shift+Enter, hence the several accepted chords.
         KeyCode::Enter if shift || ctrl || alt => Action::Newline,
@@ -381,6 +392,17 @@ mod tests {
             resolve(with(KeyCode::Char('j'), KeyModifiers::CONTROL), composing()),
             Action::Newline
         );
+    }
+
+    #[test]
+    fn background_now_and_send_now_have_their_own_chords() {
+        let ctrl = |code| with(code, KeyModifiers::CONTROL);
+        assert_eq!(resolve(ctrl(KeyCode::Char('b')), busy()), Action::BackgroundNow);
+        assert_eq!(resolve(ctrl(KeyCode::Enter), busy()), Action::SendNow);
+        assert_eq!(resolve(ctrl(KeyCode::Char('g')), busy()), Action::SendNow,
+            "the fallback for terminals that cannot report Ctrl+Enter");
+        assert_eq!(resolve(ctrl(KeyCode::Enter), composing()), Action::Newline,
+            "an idle Ctrl+Enter still inserts a newline");
     }
 
     #[test]

@@ -43,7 +43,7 @@
         },
         "source": {
           "type": "string",
-          "description": "One of `\"scheduledTask\"` | `\"subagent\"` | `\"main\"` — see\n[`AgentMessageDto::source`]. `\"main\"` is unreachable here: `ask_main`\nrefuses a main-context caller outright (self-question loop), so\nnothing ever queues an item attributed to `main`."
+          "description": "One of `\"scheduledTask\"` | `\"subagent\"` | `\"taskCompletion\"` | `\"main\"`\n— see [`AgentMessageDto::source`]. `\"taskCompletion\"` is a background\ntask's completion report (non-blocking runtime). `\"main\"` is\nunreachable here: `ask_main` refuses a main-context caller outright\n(self-question loop), so nothing ever queues an item attributed to `main`."
         },
         "taskId": {
           "type": [

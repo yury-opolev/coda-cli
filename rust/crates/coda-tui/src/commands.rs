@@ -107,9 +107,16 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "interrupt",
-        aliases: &["stop"],
+        aliases: &[],
         args: "",
         summary: "Interrupt the running turn.",
+        scope: Scope::Engine,
+    },
+    CommandSpec {
+        name: "stop",
+        aliases: &[],
+        args: "",
+        summary: "Interrupt the turn and stop every running task.",
         scope: Scope::Engine,
     },
     CommandSpec {
@@ -538,7 +545,8 @@ mod tests {
         assert_eq!(lookup("q").expect("q").name, "exit");
         assert_eq!(lookup("quit").expect("quit").name, "exit");
         assert_eq!(lookup("cls").expect("cls").name, "clear");
-        assert_eq!(lookup("stop").expect("stop").name, "interrupt");
+        assert_eq!(lookup("stop").expect("stop").name, "stop",
+            "/stop is its own command (stops tasks too), no longer an /interrupt alias");
     }
 
     #[test]

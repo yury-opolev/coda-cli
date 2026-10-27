@@ -35,6 +35,7 @@ mod settings;
 mod shell;
 mod shutdown;
 mod startup_cli;
+mod task_controls;
 mod usage;
 
 use crate::config::{self, Paths};
@@ -730,6 +731,8 @@ impl App {
                 self.armed = None;
                 self.interrupt();
             }
+            Action::BackgroundNow => self.background_now().await,
+            Action::SendNow => self.send_now().await,
             Action::Arm(chord) => {
                 self.armed = Some((chord, std::time::Instant::now()));
                 let hint_text = match chord {
@@ -1490,6 +1493,8 @@ impl App {
                 }
             }
             SurfaceAction::DeleteSchedule(id) => self.delete_schedule(&id).await,
+            SurfaceAction::BackgroundTask(id) => self.background_task(&id).await,
+            SurfaceAction::StopTask(id) => self.stop_task(&id).await,
             SurfaceAction::NewMcpServer => {
                 if self.allow_local_maintenance("MCP server configuration") {
                     self.surfaces.push(Box::new(
