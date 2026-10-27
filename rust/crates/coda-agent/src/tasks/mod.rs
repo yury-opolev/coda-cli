@@ -10,6 +10,7 @@
 //! - [`task_manager`]: Central registry owning all tasks in a session.
 
 pub mod completion_push;
+pub mod live_brief;
 pub mod log_retention;
 pub mod log_writer;
 pub mod managed_task;
@@ -25,8 +26,8 @@ pub use managed_task::{
 };
 pub use completion_push::MainInboxCompletionPush;
 pub use task_manager::{
-    TaskCompletionEntry, TaskCompletionListener, TaskManager, DEFAULT_MAX_RETAINED_TERMINAL_TASKS,
-    DEFAULT_SHUTDOWN_BUDGET,
+    TaskCompletionEntry, TaskCompletionListener, TaskEventObserver, TaskManager,
+    DEFAULT_MAX_LIVE_SHELL_TASKS, DEFAULT_MAX_RETAINED_TERMINAL_TASKS, DEFAULT_SHUTDOWN_BUDGET,
 };
 pub use task_subscription::{TaskChange, TaskChangeKind, TaskSubscription};
 

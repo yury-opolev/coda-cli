@@ -196,6 +196,15 @@ pub struct AgentLoop {
 }
 
 impl AgentLoop {
+    /// The running tasks this agent started, as a prefix for a message
+    /// delivered to it (§6.9), or `None` when nothing it started is running.
+    fn live_task_brief(&self) -> Option<String> {
+        crate::tasks::live_brief::live_task_brief(
+            self.task_manager.as_deref()?,
+            self.caller_task_id.as_deref(),
+        )
+    }
+
     /// The parked-state watcher, when this loop parks (policy + task manager).
     fn parker(&self) -> Option<park::Parker<'_>> {
         Some(park::Parker {
@@ -383,6 +392,15 @@ impl AgentLoop {
                         .map(|e| e.text.as_str())
                         .collect::<Vec<_>>()
                         .join("\n\n");
+                    // A message cannot change work that is already running
+                    // (§6.9): the model is shown what is, before it reads it.
+                    let has_message = steers
+                        .iter()
+                        .any(|e| e.kind == crate::steering::InboxItemKind::Message);
+                    let text = match self.live_task_brief().filter(|_| has_message) {
+                        Some(brief) => format!("{brief}\n\n{text}"),
+                        None => text,
+                    };
                     history.push(Message::user(text));
                     // Runtime items (task completions, deadlines) are not
                     // operator steering; only messages are reported as such.
@@ -4393,6 +4411,165 @@ mod tests {
 
         let (content, _) = tool_result_text(&client.requests.lock().unwrap()[1], "t1");
         assert_eq!(content, "exit code: 0\nquick", "no budget: the result arrives inline");
+    }
+
+    // ── Steering prefixed with live tasks (Phase 3, §6.9) ────────────────
+
+    fn steered_run(
+        manager: Arc<TaskManager>,
+        inbox: Arc<crate::SteeringInbox>,
+    ) -> (AgentLoop, Arc<MockLlmClient>) {
+        let client = MockLlmClient::new(vec![vec![Ok(StreamEvent::TextDelta("ok".into())), Ok(done())]]);
+        let tools = Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
+        let agent = AgentLoopBuilder::new(client.clone(), Arc::new(AllowAll), tools)
+            .with_task_manager(manager)
+            .with_steering(inbox)
+            .with_main_context()
+            .with_tool_max_duration(None)
+            .build();
+        (agent, client)
+    }
+
+    #[tokio::test]
+    async fn steering_delivered_while_tasks_run_is_prefixed_with_the_live_task_list() {
+        let manager = task_manager_for_test();
+        let review = manager
+            .register(crate::tasks::TaskKind::Shell, "review.ps1 -Post", None, crate::tasks::TaskExecutionMode::Background)
+            .unwrap();
+        let inbox = Arc::new(crate::SteeringInbox::new());
+        inbox.enqueue("make it a dry run").unwrap();
+        let (agent, client) = steered_run(Arc::clone(&manager), Arc::clone(&inbox));
+
+        let mut history = vec![Message::user("go")];
+        agent.run(&mut history, &NullSink, None, CancellationToken::new()).await.unwrap();
+
+        let seen = client.requests.lock().unwrap()[0].messages.last().unwrap().text();
+        assert!(seen.starts_with("[live-tasks]"), "{seen}");
+        assert!(seen.contains(&review.id) && seen.contains("review.ps1 -Post"), "{seen}");
+        assert!(seen.ends_with("make it a dry run"), "the user's words follow the list: {seen}");
+        manager.stop(&review.id);
+    }
+
+    #[tokio::test]
+    async fn steering_with_nothing_running_is_delivered_unchanged() {
+        let manager = task_manager_for_test();
+        let done_task = manager
+            .register(crate::tasks::TaskKind::Shell, "cargo build", None, crate::tasks::TaskExecutionMode::Background)
+            .unwrap();
+        manager.complete(&done_task.id, Some("exit code: 0".into()));
+        let inbox = Arc::new(crate::SteeringInbox::new());
+        inbox.enqueue("and then run the tests").unwrap();
+        let (agent, client) = steered_run(manager, inbox);
+
+        let mut history = vec![Message::user("go")];
+        agent.run(&mut history, &NullSink, None, CancellationToken::new()).await.unwrap();
+
+        let seen = client.requests.lock().unwrap()[0].messages.last().unwrap().text();
+        assert_eq!(seen, "and then run the tests");
+    }
+
+    #[tokio::test]
+    async fn a_pushed_completion_alone_is_not_prefixed() {
+        let manager = task_manager_for_test();
+        let live = manager
+            .register(crate::tasks::TaskKind::Shell, "server", None, crate::tasks::TaskExecutionMode::Background)
+            .unwrap();
+        let inbox = Arc::new(crate::SteeringInbox::new());
+        inbox.push_item(crate::steering::InboxItemKind::TaskCompleted, "[task-completed] taskId=task-9");
+        let (agent, client) = steered_run(Arc::clone(&manager), inbox);
+
+        let mut history = vec![Message::user("go")];
+        agent.run(&mut history, &NullSink, None, CancellationToken::new()).await.unwrap();
+
+        let seen = client.requests.lock().unwrap()[0].messages.last().unwrap().text();
+        assert_eq!(seen, "[task-completed] taskId=task-9", "runtime items are not user messages");
+        manager.stop(&live.id);
+    }
+
+    // ── Long tool calls wrapped as tasks (Phase 3 generic fallback) ──────
+
+    struct RemoteTool {
+        delay: Duration,
+        detachable: bool,
+    }
+
+    #[async_trait]
+    impl crate::tool::Tool for RemoteTool {
+        fn name(&self) -> &str {
+            "mcp__remote__query"
+        }
+        fn description(&self) -> &str {
+            "remote"
+        }
+        fn input_schema_json(&self) -> &str {
+            r#"{"type":"object"}"#
+        }
+        fn is_read_only(&self) -> bool {
+            true
+        }
+        fn detachable(&self) -> bool {
+            self.detachable
+        }
+        async fn execute(&self, _: &serde_json::Value, _: &ToolContext, _: CancellationToken) -> ToolOutcome {
+            tokio::time::sleep(self.delay).await;
+            ToolResult::ok("remote result")
+        }
+    }
+
+    fn remote_run(delay: Duration, detachable: bool) -> (AgentLoop, Arc<MockLlmClient>, Arc<TaskManager>) {
+        let manager = task_manager_for_test();
+        let client = MockLlmClient::new(two_turn_script(&[("r1", "mcp__remote__query")]));
+        let tools = Arc::new(ToolRegistry::new([
+            Arc::new(RemoteTool { delay, detachable }) as Arc<dyn crate::tool::Tool>
+        ]));
+        let agent = AgentLoopBuilder::new(client.clone(), Arc::new(AllowAll), tools)
+            .with_task_manager(Arc::clone(&manager))
+            .with_main_context()
+            .build();
+        (agent, client, manager)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_long_detachable_tool_call_yields_a_task_handle_and_keeps_running() {
+        let (agent, client, manager) = remote_run(Duration::from_secs(120), true);
+        let mut history = vec![Message::user("go")];
+        agent.run(&mut history, &NullSink, None, CancellationToken::new()).await.unwrap();
+
+        let (content, is_error) = tool_result_text(&client.requests.lock().unwrap()[1], "r1");
+        assert!(!is_error, "{content}");
+        assert!(content.starts_with("Still running as task "), "{content}");
+        let task = manager
+            .list()
+            .into_iter()
+            .find(|t| t.kind == crate::tasks::TaskKind::Tool)
+            .expect("the call runs as a tool task");
+        assert_eq!(task.description, "mcp__remote__query");
+        assert_eq!(task.status, crate::tasks::TaskRunStatus::Running, "yielding never stops the call");
+        assert_eq!(task.mode, crate::tasks::TaskExecutionMode::Background);
+
+        tokio::time::sleep(Duration::from_secs(200)).await;
+        let finished = manager.get(&task.id).unwrap();
+        assert_eq!(finished.status, crate::tasks::TaskRunStatus::Completed);
+        assert_eq!(finished.result.as_deref(), Some("remote result"), "the report is the call's result");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_quick_detachable_tool_call_returns_its_result_inline() {
+        let (agent, client, _manager) = remote_run(Duration::from_secs(2), true);
+        let mut history = vec![Message::user("go")];
+        agent.run(&mut history, &NullSink, None, CancellationToken::new()).await.unwrap();
+        let (content, is_error) = tool_result_text(&client.requests.lock().unwrap()[1], "r1");
+        assert_eq!((content.as_str(), is_error), ("remote result", false));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_tool_that_is_not_detachable_never_becomes_a_task() {
+        let (agent, client, manager) = remote_run(Duration::from_secs(120), false);
+        let mut history = vec![Message::user("go")];
+        agent.run(&mut history, &NullSink, None, CancellationToken::new()).await.unwrap();
+        let (content, _) = tool_result_text(&client.requests.lock().unwrap()[1], "r1");
+        assert_eq!(content, "remote result", "it ran inline to the end");
+        assert!(manager.list().is_empty());
     }
 }
 

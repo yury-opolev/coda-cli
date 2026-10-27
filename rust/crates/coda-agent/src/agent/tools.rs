@@ -311,22 +311,25 @@ async fn run_tools_body(
             correlation: correlation.clone(),
         });
 
-        let tool_result = match execute_with_ceiling(
-            &*tool,
-            &input_value,
-            &tool_ctx,
-            cancel.clone(),
-            ctx.tool_max_duration,
-            name,
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(AgentError::Cancelled) => {
-                cancel_remaining(&tool_uses[i..], true, sink, &mut results);
-                break;
-            }
-            Err(error) => return Err(error),
+        let tool_result = match start_tool_task(ctx, &tool, &input_value) {
+            Some(handle) => handle,
+            None => match execute_with_ceiling(
+                &*tool,
+                &input_value,
+                &tool_ctx,
+                cancel.clone(),
+                ctx.tool_max_duration,
+                name,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(AgentError::Cancelled) => {
+                    cancel_remaining(&tool_uses[i..], true, sink, &mut results);
+                    break;
+                }
+                Err(error) => return Err(error),
+            },
         };
 
         // A tool that handed back a running managed task: wait for it under
@@ -538,6 +541,81 @@ enum YieldReason {
 
 /// Longest output tail included in a yield handle.
 const YIELD_TAIL_CHARS: usize = 4_000;
+
+/// Generic fallback of the non-blocking runtime (§6.1): a call of a
+/// [`detachable`](crate::tool::Tool::detachable) tool (a remote MCP call)
+/// runs as a [`TaskKind::Tool`](crate::tasks::TaskKind::Tool) task, so the
+/// executor awaits it under the yield contract like a shell command —
+/// cut short by steering or "background now", reported later when it ends.
+///
+/// Only where a completion can be pushed back (see [`receives_completions`])
+/// and a task manager exists; otherwise, or when the task cannot be
+/// registered, `None` and the call runs inline exactly as before. The task's
+/// work deadline is the per-tool ceiling, which still terminates the call.
+fn start_tool_task(
+    ctx: &BatchContext<'_>,
+    tool: &Arc<dyn crate::tool::Tool>,
+    input: &serde_json::Value,
+) -> Option<ToolResult> {
+    use crate::tasks::{TaskExecutionMode, TaskKind};
+
+    if !tool.detachable() || !receives_completions(ctx) {
+        return None;
+    }
+    let manager = Arc::clone(ctx.task_manager.as_ref()?);
+    let task = manager
+        .register(TaskKind::Tool, tool.name(), ctx.caller_task_id.as_deref(), TaskExecutionMode::Foreground)
+        .ok()?;
+    let tool = Arc::clone(tool);
+    let input = input.clone();
+    let tool_ctx = ctx.make_tool_context();
+    let deadline = ctx.tool_max_duration;
+    let running = Arc::clone(&task);
+    tokio::spawn(async move {
+        let id = running.id.clone();
+        let deadline_sleep = async {
+            match deadline {
+                Some(d) => tokio::time::sleep(d).await,
+                None => std::future::pending().await,
+            }
+        };
+        let outcome = tokio::select! {
+            biased;
+            _ = running.cancel.cancelled() => None,
+            result = tool.execute(&input, &tool_ctx, running.cancel.child_token()) => Some(result),
+            _ = deadline_sleep => Some(ToolResult::error(format!(
+                "Tool '{}' exceeded the {}s maximum run time and was terminated.",
+                tool.name(),
+                deadline.map(|d| d.as_secs()).unwrap_or_default()
+            ))),
+        };
+        match outcome {
+            None => {
+                manager.stop(&id);
+            }
+            Some(result) => {
+                // The registry keeps a bounded copy (it is the report pushed
+                // to the owner when the call finished in the background); the
+                // waiting call takes the full result.
+                let report: String = result.content.chars().take(TOOL_TASK_REPORT_CHARS).collect();
+                running.set_tool_output(result.content);
+                if result.is_error {
+                    manager.fail(&id, Some(report));
+                } else {
+                    manager.complete(&id, Some(report));
+                }
+            }
+        }
+        if running.mode() == TaskExecutionMode::Background {
+            running.take_tool_output();
+        }
+    });
+    let wait = Some(Duration::from_secs(crate::tools::DEFAULT_TOOL_WAIT_SECS));
+    Some(ToolResult::running_task(task.id.clone(), wait))
+}
+
+/// Longest report a wrapped tool call keeps in the task registry.
+const TOOL_TASK_REPORT_CHARS: usize = 12_000;
 
 /// The yield contract (§6.2): wait for a running task until it finishes, its
 /// yield budget expires, operator steering arrives, the user asks for

@@ -29,6 +29,16 @@ impl TaskRunStatus {
     pub fn is_terminal(self) -> bool {
         !matches!(self, TaskRunStatus::Running)
     }
+
+    /// The wire spelling (`session/listTasks`, task events).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TaskRunStatus::Running => "running",
+            TaskRunStatus::Completed => "completed",
+            TaskRunStatus::Failed => "failed",
+            TaskRunStatus::Stopped => "stopped",
+        }
+    }
 }
 
 /// The kind of work a managed task represents.
@@ -38,6 +48,27 @@ pub enum TaskKind {
     Subagent,
     Shell,
     Scheduled,
+    /// A long tool call (e.g. an MCP tool) wrapped as a task by the batch
+    /// executor so it can be awaited under the yield contract.
+    Tool,
+}
+
+impl TaskKind {
+    /// The wire spelling (`session/listTasks`, task events).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TaskKind::Subagent => "subagent",
+            TaskKind::Shell => "shell",
+            TaskKind::Scheduled => "scheduled",
+            TaskKind::Tool => "tool",
+        }
+    }
+
+    /// Kinds a loop awaits in the foreground and the user can release with
+    /// "background now".
+    pub fn is_backgroundable(self) -> bool {
+        matches!(self, TaskKind::Shell | TaskKind::Tool)
+    }
 }
 
 /// Whether a managed task runs in the foreground or the background.
@@ -46,6 +77,16 @@ pub enum TaskKind {
 pub enum TaskExecutionMode {
     Foreground,
     Background,
+}
+
+impl TaskExecutionMode {
+    /// The wire spelling (`session/listTasks`, task events).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TaskExecutionMode::Foreground => "foreground",
+            TaskExecutionMode::Background => "background",
+        }
+    }
 }
 
 /// Outcome of a lifecycle request so tools can produce precise messages.
@@ -439,6 +480,13 @@ impl ManagedTask {
     /// client without passing through the original tool's own path.
     pub fn redacted_peek(&self, max_chars: usize) -> String {
         self.redacted_output.peek(max_chars)
+    }
+
+    /// Redacted output at or after the absolute `cursor`: `(text, next
+    /// cursor, truncated)`, where `truncated` means part of the span between
+    /// `cursor` and the oldest retained character was already evicted.
+    pub fn redacted_read_from(&self, cursor: u64) -> (String, u64, bool) {
+        self.redacted_output.read_from(cursor)
     }
 
     /// Reads output since the given consumer's server-side cursor and advances it.

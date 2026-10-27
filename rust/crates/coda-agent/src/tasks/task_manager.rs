@@ -56,6 +56,26 @@ pub trait TaskCompletionListener: Send + Sync {
     fn on_terminal(&self, task: &Arc<ManagedTask>, status: TaskRunStatus);
 }
 
+/// Observes every task's lifecycle for client-facing events (non-blocking
+/// runtime, Phase 3: `event/taskStarted`, `event/taskOutput`,
+/// `event/taskCompleted`).
+///
+/// Called synchronously, without any registry lock held, from the thread
+/// doing the work: after a task is registered, after output was appended
+/// (and redacted into the task's tail), and once at the terminal transition
+/// (before the completion is pushed anywhere). Must never block — an
+/// implementation only records, it does not format or send output inline.
+pub trait TaskEventObserver: Send + Sync {
+    fn on_started(&self, task: &Arc<ManagedTask>);
+    fn on_output(&self, task: &Arc<ManagedTask>);
+    fn on_terminal(&self, task: &Arc<ManagedTask>, status: TaskRunStatus);
+}
+
+/// How many shell commands may be running at once (§6.9 resource bounds).
+/// A command started beyond it is refused, never queued and never evicting
+/// a running one; finished commands do not count.
+pub const DEFAULT_MAX_LIVE_SHELL_TASKS: usize = 32;
+
 // ── Internal registry state ───────────────────────────────────────────────────
 
 struct ManagerState {
@@ -103,6 +123,8 @@ pub struct TaskManager {
     max_retained_terminal_tasks: usize,
     state: Mutex<ManagerState>,
     completion_listener: Mutex<Option<Arc<dyn TaskCompletionListener>>>,
+    event_observer: Mutex<Option<Arc<dyn TaskEventObserver>>>,
+    max_live_shell_tasks: std::sync::atomic::AtomicUsize,
     /// Signalled after every task settles (its terminal transition has been
     /// fully reported). A parked agent waits on it to re-check its live tasks.
     settle_signal: tokio::sync::Notify,
@@ -137,6 +159,8 @@ impl TaskManager {
                 disposed: false,
             }),
             completion_listener: Mutex::new(None),
+            event_observer: Mutex::new(None),
+            max_live_shell_tasks: std::sync::atomic::AtomicUsize::new(DEFAULT_MAX_LIVE_SHELL_TASKS),
             settle_signal: tokio::sync::Notify::new(),
             session_id,
         })
@@ -148,7 +172,25 @@ impl TaskManager {
         *self.completion_listener.lock().unwrap() = Some(listener);
     }
 
+    /// Installs the observer told about every task's start, output and end
+    /// (see [`TaskEventObserver`]). Replaces any previous observer.
+    pub fn set_event_observer(&self, observer: Arc<dyn TaskEventObserver>) {
+        *self.event_observer.lock().unwrap() = Some(observer);
+    }
+
+    fn event_observer(&self) -> Option<Arc<dyn TaskEventObserver>> {
+        self.event_observer.lock().unwrap().clone()
+    }
+
+    /// Overrides the cap on concurrently running shell commands.
+    pub fn set_max_live_shell_tasks(&self, cap: usize) {
+        self.max_live_shell_tasks.store(cap.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn notify_terminal(&self, task: &Arc<ManagedTask>, status: TaskRunStatus) {
+        if let Some(observer) = self.event_observer() {
+            observer.on_terminal(task, status);
+        }
         // An owner waiting on this task inline (`task_wait`) receives the
         // completion there; it is then pushed nowhere.
         task.claim_delivery_for_attached_owner();
@@ -236,12 +278,12 @@ impl TaskManager {
 
     /// Stops awaiting one task in the foreground; the work keeps running.
     ///
-    /// Only shell tasks are ever awaited in the foreground: subagents always
-    /// start in the background (Phase 2), so for them this reports
-    /// `InvalidState` (nothing is waiting on them).
+    /// Only shell commands and wrapped tool calls are ever awaited in the
+    /// foreground: subagents always start in the background (Phase 2), so for
+    /// them this reports `InvalidState` (nothing is waiting on them).
     pub fn background(&self, id: &str) -> TaskActionResult {
         let Some(task) = self.find_task(id) else { return TaskActionResult::NotFound };
-        if task.kind != TaskKind::Shell {
+        if !task.kind.is_backgroundable() {
             return if task.mode() == TaskExecutionMode::Background {
                 TaskActionResult::InvalidState
             } else {
@@ -261,7 +303,7 @@ impl TaskManager {
         let running = self.state.lock().unwrap().running_tasks();
         running
             .iter()
-            .filter(|task| task.kind == TaskKind::Shell && task.request_background())
+            .filter(|task| task.kind.is_backgroundable() && task.request_background())
             .count()
     }
 
@@ -345,6 +387,21 @@ impl TaskManager {
         if s.shutting_down || s.disposed {
             return Err("Task manager is shutting down; no new tasks may be registered.".into());
         }
+        if kind == TaskKind::Shell {
+            let cap = self.max_live_shell_tasks.load(std::sync::atomic::Ordering::Relaxed);
+            let live = s
+                .order
+                .iter()
+                .filter(|t| t.kind == TaskKind::Shell && t.status() == TaskRunStatus::Running)
+                .count();
+            if live >= cap {
+                return Err(format!(
+                    "{live} shell commands are already running, the most allowed at once. \
+                     Stop one you no longer need (task_stop) or wait for one to finish, \
+                     then try again."
+                ));
+            }
+        }
 
         s.next_id += 1;
         let id = format!("task-{:04}", s.next_id);
@@ -385,6 +442,9 @@ impl TaskManager {
 
         for sub in &subs {
             sub.post(change.clone());
+        }
+        if let Some(observer) = self.event_observer() {
+            observer.on_started(&task);
         }
 
         Ok(task)
@@ -461,6 +521,9 @@ impl TaskManager {
         };
         for sub in &subs {
             sub.post(change.clone());
+        }
+        if let Some(observer) = self.event_observer() {
+            observer.on_output(&task);
         }
     }
 
@@ -1442,5 +1505,72 @@ mod tests {
         let (found, text, _, _) = m.read_output(&child.id, Some(&parent.id));
         assert!(found);
         assert_eq!(text, "child output");
+    }
+
+    // ── Phase 3: live shell cap and lifecycle observer ──────────────────
+
+    #[test]
+    fn shell_commands_beyond_the_cap_are_refused_and_finished_ones_free_a_slot() {
+        let m = mgr();
+        m.set_max_live_shell_tasks(2);
+        let first = m.register(TaskKind::Shell, "a", None, TaskExecutionMode::Foreground).unwrap();
+        m.register(TaskKind::Shell, "b", None, TaskExecutionMode::Background).unwrap();
+        // Other kinds are bounded elsewhere and never count against the cap.
+        m.register(TaskKind::Subagent, "agent", None, TaskExecutionMode::Background).unwrap();
+
+        let Err(message) = m.register(TaskKind::Shell, "c", None, TaskExecutionMode::Foreground) else {
+            panic!("a third live shell is refused");
+        };
+        assert!(message.contains("2 shell commands are already running"), "{message}");
+        assert!(message.contains("task_stop"), "the refusal says how to free a slot: {message}");
+        assert!(m.list().iter().all(|t| t.description != "c"), "nothing was registered");
+
+        m.complete(&first.id, Some("exit code: 0".into()));
+        assert!(
+            m.register(TaskKind::Shell, "c", None, TaskExecutionMode::Foreground).is_ok(),
+            "a finished command no longer counts"
+        );
+    }
+
+    #[test]
+    fn the_default_cap_is_thirty_two_live_shells() {
+        let m = mgr();
+        for i in 0..DEFAULT_MAX_LIVE_SHELL_TASKS {
+            m.register(TaskKind::Shell, format!("s{i}"), None, TaskExecutionMode::Background).unwrap();
+        }
+        assert!(m.register(TaskKind::Shell, "one more", None, TaskExecutionMode::Background).is_err());
+    }
+
+    #[derive(Default)]
+    struct RecordingObserver(Mutex<Vec<String>>);
+
+    impl TaskEventObserver for RecordingObserver {
+        fn on_started(&self, task: &Arc<ManagedTask>) {
+            self.0.lock().unwrap().push(format!("started {}", task.id));
+        }
+        fn on_output(&self, task: &Arc<ManagedTask>) {
+            self.0.lock().unwrap().push(format!("output {}", task.id));
+        }
+        fn on_terminal(&self, task: &Arc<ManagedTask>, status: TaskRunStatus) {
+            self.0.lock().unwrap().push(format!("{} {}", status.as_str(), task.id));
+        }
+    }
+
+    #[test]
+    fn the_event_observer_sees_start_output_and_one_terminal_transition() {
+        let m = mgr();
+        let observer = Arc::new(RecordingObserver::default());
+        m.set_event_observer(observer.clone());
+        let t = m.register(TaskKind::Shell, "x", None, TaskExecutionMode::Foreground).unwrap();
+        m.append_output(&t.id, "hello\n");
+        m.fail(&t.id, Some("exit code: 1".into()));
+        m.complete(&t.id, None);
+        m.append_output(&t.id, "late");
+        let seen = observer.0.lock().unwrap().clone();
+        assert_eq!(seen, vec![
+            format!("started {}", t.id),
+            format!("output {}", t.id),
+            format!("failed {}", t.id),
+        ]);
     }
 }

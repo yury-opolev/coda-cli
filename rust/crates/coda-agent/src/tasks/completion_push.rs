@@ -59,7 +59,7 @@ impl MainInboxCompletionPush {
     /// start a turn right after being told to stop — and might restart the
     /// very work it was told to drop.
     pub fn applies_to(task: &ManagedTask, status: TaskRunStatus) -> bool {
-        matches!(task.kind, TaskKind::Shell | TaskKind::Subagent)
+        matches!(task.kind, TaskKind::Shell | TaskKind::Subagent | TaskKind::Tool)
             && task.parent_id.is_none()
             && task.mode() == TaskExecutionMode::Background
             && !task.delivered_inline_to_owner()

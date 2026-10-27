@@ -169,6 +169,15 @@ pub trait Tool: Send + Sync {
     fn search_hint(&self) -> Option<&str> {
         None
     }
+    /// Whether the agent loop may run a call of this tool as a managed task
+    /// (non-blocking runtime, generic fallback): awaited under the yield
+    /// contract and handed to the background when it runs long. Only for
+    /// tools whose work is self-contained and may finish after the model has
+    /// moved on (e.g. a remote MCP call); never for tools that edit files or
+    /// talk to the operator inline.
+    fn detachable(&self) -> bool {
+        false
+    }
     async fn execute(
         &self,
         input: &serde_json::Value,

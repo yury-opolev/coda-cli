@@ -110,6 +110,12 @@ impl Tool for McpTool {
         false
     }
 
+    // A remote call can take arbitrarily long; the agent loop runs it as a
+    // managed task so a slow server cannot hold the conversation hostage.
+    fn detachable(&self) -> bool {
+        true
+    }
+
     // MCP tools are deferred: they do not appear in the inline tool list but
     // are discoverable via `tool_search`. This keeps the default context
     // window manageable when many servers are connected.

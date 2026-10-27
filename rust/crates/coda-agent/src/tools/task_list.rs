@@ -62,11 +62,7 @@ impl Tool for TaskListTool {
                 crate::tasks::TaskExecutionMode::Foreground => "foreground",
                 crate::tasks::TaskExecutionMode::Background => "background",
             };
-            let kind = match t.kind {
-                crate::tasks::TaskKind::Subagent => "subagent",
-                crate::tasks::TaskKind::Shell => "shell",
-                crate::tasks::TaskKind::Scheduled => "scheduled",
-            };
+            let kind = t.kind.as_str();
             lines.push(format!(
                 "{} [{kind}/{mode}] {status} — {}",
                 t.id, t.description
