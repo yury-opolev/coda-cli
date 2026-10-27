@@ -93,6 +93,10 @@ pub(super) fn document() -> Value {
         rpc(m::CONFIG_SET, Some("ConfigSetParams"), Some("ConfigSetResult"), S, S),
         rpc(m::MCP_LIST, None, Some("McpListResult"), S, S),
         rpc(m::PENDING_MESSAGES, Some("PendingMessagesParams"), Some("PendingMessagesResult"), S, S),
+        rpc(m::BACKGROUND_ALL, None, Some("TaskBulkControlResult"), S, S),
+        rpc(m::STOP_ALL_TASKS, None, Some("TaskBulkControlResult"), S, S),
+        rpc(m::TASK_BACKGROUND, Some("TaskIdParams"), Some("TaskControlResult"), S, S),
+        rpc(m::TASK_STOP, Some("TaskIdParams"), Some("TaskControlResult"), S, S),
     ];
     let mut events: Vec<_> = [
         e::ASSISTANT_TEXT, e::ASSISTANT_TEXT_COMPLETE, e::THINKING, e::THINKING_COMPLETE,

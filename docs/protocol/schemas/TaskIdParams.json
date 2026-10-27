@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "properties": {
+    "taskId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "taskId"
+  ],
+  "description": "Names one registered task (`task/background`, `task/stop`).",
+  "title": "TaskIdParams",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

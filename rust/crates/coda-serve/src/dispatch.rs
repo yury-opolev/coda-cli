@@ -11,7 +11,7 @@ use serde_json::Value;
 pub use coda_proto::requests::{
     CancelRequestParams, ConfigSetParams, GetEventsParams, GetHistoryParams,
     GetStateParams, ListSessionsParams, PendingMessagesParams, ResolveRequestParams, SetModelParams,
-    HooksInfoParams, HooksTrustParams, ForkParams, RewindParams,
+    HooksInfoParams, HooksTrustParams, ForkParams, RewindParams, TaskIdParams,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -449,6 +449,18 @@ pub trait ServeBackend: Send + Sync {
     /// discovery rationale as `session/getHistory`/`session/listSessions`).
     async fn session_pending_messages(&self, p: PendingMessagesParams) -> Result<Value, RpcError>;
 
+    // ── Non-blocking runtime (Phase 1) ───────────────────────────────────
+    /// Stop waiting on every foreground task; the work keeps running.
+    /// Requires initialization.
+    async fn session_background_all(&self) -> Result<Value, RpcError>;
+    /// Stop every running task and its process tree. Requires initialization.
+    async fn session_stop_all_tasks(&self) -> Result<Value, RpcError>;
+    /// Stop waiting on one foreground task; it keeps running. Requires
+    /// initialization.
+    async fn task_background(&self, p: TaskIdParams) -> Result<Value, RpcError>;
+    /// Stop one running task and its process tree. Requires initialization.
+    async fn task_stop(&self, p: TaskIdParams) -> Result<Value, RpcError>;
+
     /// Whether `initialize` has completed on this connection.
     ///
     /// The gate is enforced in [`dispatch`] rather than in each handler so
@@ -580,6 +592,10 @@ pub async fn dispatch(
             p.normalise()?;
             backend.session_pending_messages(p).await
         }
+        "session/backgroundAll" => backend.session_background_all().await,
+        "session/stopAllTasks" => backend.session_stop_all_tasks().await,
+        "task/background" => backend.task_background(required(params)?).await,
+        "task/stop" => backend.task_stop(required(params)?).await,
         _ => Err(RpcError::method_not_found(method)),
     }
 }
@@ -758,6 +774,18 @@ mod tests {
         async fn session_pending_messages(&self, p: PendingMessagesParams) -> Result<Value, RpcError> {
             Ok(json!({ "messages": [], "nextCursor": p.after_cursor, "gap": false, "truncated": false }))
         }
+        async fn session_background_all(&self) -> Result<Value, RpcError> {
+            Ok(json!({ "ok": true, "count": 0 }))
+        }
+        async fn session_stop_all_tasks(&self) -> Result<Value, RpcError> {
+            Ok(json!({ "ok": true, "count": 0 }))
+        }
+        async fn task_background(&self, p: TaskIdParams) -> Result<Value, RpcError> {
+            Ok(json!({ "ok": true, "taskId": p.task_id }))
+        }
+        async fn task_stop(&self, p: TaskIdParams) -> Result<Value, RpcError> {
+            Ok(json!({ "ok": true, "taskId": p.task_id }))
+        }
         fn is_initialized(&self) -> bool {
             true
         }
@@ -899,6 +927,18 @@ mod tests {
         }
         async fn session_pending_messages(&self, p: PendingMessagesParams) -> Result<Value, RpcError> {
             self.0.session_pending_messages(p).await
+        }
+        async fn session_background_all(&self) -> Result<Value, RpcError> {
+            self.0.session_background_all().await
+        }
+        async fn session_stop_all_tasks(&self) -> Result<Value, RpcError> {
+            self.0.session_stop_all_tasks().await
+        }
+        async fn task_background(&self, p: TaskIdParams) -> Result<Value, RpcError> {
+            self.0.task_background(p).await
+        }
+        async fn task_stop(&self, p: TaskIdParams) -> Result<Value, RpcError> {
+            self.0.task_stop(p).await
         }
         fn is_initialized(&self) -> bool {
             false
@@ -1099,7 +1139,7 @@ mod tests {
     async fn an_initialized_backend_passes_the_gate() {
         for method in INITIALIZATION_GATED_METHODS {
             let result =
-                dispatch(method, Some(json!({ "requestId": "req-x-1", "key": "model" })), &FakeBackend)
+                dispatch(method, Some(json!({ "requestId": "req-x-1", "key": "model", "taskId": "task-0001" })), &FakeBackend)
                     .await;
             assert!(result.is_ok(), "{method} must be routed once initialized: {result:?}");
         }
@@ -1596,6 +1636,18 @@ mod tests {
             Err(RpcError::internal("boom"))
         }
         async fn session_pending_messages(&self, _p: PendingMessagesParams) -> Result<Value, RpcError> {
+            Err(RpcError { code: self.0, message: self.1.into() })
+        }
+        async fn session_background_all(&self) -> Result<Value, RpcError> {
+            Err(RpcError { code: self.0, message: self.1.into() })
+        }
+        async fn session_stop_all_tasks(&self) -> Result<Value, RpcError> {
+            Err(RpcError { code: self.0, message: self.1.into() })
+        }
+        async fn task_background(&self, _p: TaskIdParams) -> Result<Value, RpcError> {
+            Err(RpcError { code: self.0, message: self.1.into() })
+        }
+        async fn task_stop(&self, _p: TaskIdParams) -> Result<Value, RpcError> {
             Err(RpcError { code: self.0, message: self.1.into() })
         }
         fn is_initialized(&self) -> bool {

@@ -1,0 +1,24 @@
+{
+  "type": "object",
+  "properties": {
+    "ok": {
+      "type": "boolean"
+    },
+    "taskId": {
+      "type": "string"
+    },
+    "reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "ok",
+    "taskId"
+  ],
+  "description": "Outcome of `task/background` or `task/stop` for one task.\n\n`ok:false` carries a stable `reason`: `notFound` (no such task),\n`notRunning` (already finished), or `notForeground` (`task/background`\nonly: nothing is waiting on it — it is already in the background).",
+  "title": "TaskControlResult",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

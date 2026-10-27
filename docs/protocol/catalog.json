@@ -372,6 +372,42 @@
       "resultContract": "sharedServerDto",
       "requiresInitialize": false,
       "availability": "reusable"
+    },
+    {
+      "method": "session/backgroundAll",
+      "paramsSchema": null,
+      "resultSchema": "schemas/TaskBulkControlResult.json",
+      "paramsContract": null,
+      "resultContract": "sharedServerDto",
+      "requiresInitialize": true,
+      "availability": "reusable"
+    },
+    {
+      "method": "session/stopAllTasks",
+      "paramsSchema": null,
+      "resultSchema": "schemas/TaskBulkControlResult.json",
+      "paramsContract": null,
+      "resultContract": "sharedServerDto",
+      "requiresInitialize": true,
+      "availability": "reusable"
+    },
+    {
+      "method": "task/background",
+      "paramsSchema": "schemas/TaskIdParams.json",
+      "resultSchema": "schemas/TaskControlResult.json",
+      "paramsContract": "sharedParser",
+      "resultContract": "sharedServerDto",
+      "requiresInitialize": true,
+      "availability": "reusable"
+    },
+    {
+      "method": "task/stop",
+      "paramsSchema": "schemas/TaskIdParams.json",
+      "resultSchema": "schemas/TaskControlResult.json",
+      "paramsContract": "sharedParser",
+      "resultContract": "sharedServerDto",
+      "requiresInitialize": true,
+      "availability": "reusable"
     }
   ],
   "serverRequests": [

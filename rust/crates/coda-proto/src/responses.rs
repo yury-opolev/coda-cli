@@ -26,6 +26,31 @@ pub struct TaskSummaryDto {
     pub report: Option<String>,
 }
 
+/// Outcome of `task/background` or `task/stop` for one task.
+///
+/// `ok:false` carries a stable `reason`: `notFound` (no such task),
+/// `notRunning` (already finished), or `notForeground` (`task/background`
+/// only: nothing is waiting on it — it is already in the background).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TaskControlResult {
+    pub ok: bool,
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Outcome of `session/backgroundAll` or `session/stopAllTasks`: how many
+/// running tasks the request applied to (`0` is a success, not an error).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TaskBulkControlResult {
+    pub ok: bool,
+    pub count: usize,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
