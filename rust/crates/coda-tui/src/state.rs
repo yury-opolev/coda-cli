@@ -455,6 +455,9 @@ pub struct UiState {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub display_mode: ToolDisplayMode,
+    /// Tasks the engine reported started and not yet finished
+    /// (`event/taskStarted` / `event/taskCompleted`), for the status row.
+    pub running_tasks: std::collections::BTreeSet<String>,
     /// Messages typed while a turn was running.
     pub queued: Vec<QueuedMessage>,
     /// Queued messages that never reached the model before the turn ended
@@ -604,6 +607,7 @@ impl UiState {
             model: None,
             effort: None,
             display_mode: ToolDisplayMode::default(),
+            running_tasks: Default::default(),
             queued: Vec::new(),
             unsent: Vec::new(),
             pending_deliveries: Vec::new(),
@@ -1080,6 +1084,7 @@ impl UiState {
                 self.turn_id = None;
                 self.thinking_clock = None;
                 self.core_lifecycle = None;
+                self.running_tasks.clear();
             }
             UiEvent::EngineAdopted => {
                 // A different process, with no turn of its own yet.
@@ -1089,6 +1094,8 @@ impl UiState {
                 self.turn_progress = None;
                 self.turn_id = None;
                 self.core_lifecycle = None;
+                // Tasks die with the process that ran them.
+                self.running_tasks.clear();
                 // Whatever this cache learned belonged to the process that
                 // is gone: a replacement can reuse the same provider id for
                 // a differently named model, and must re-earn its labels
@@ -1602,11 +1609,23 @@ impl UiState {
                 let late = self.materialize_all(delivered);
                 self.note_late_placement(late, corrected);
             }
+            Event::TaskStarted { task_id, .. } | Event::TaskOutput { task_id, .. } => {
+                // Output is not echoed into the transcript; `/tasks` shows it.
+                self.running_tasks.insert(task_id);
+            }
             Event::TaskCompleted {
+                task_id,
                 description,
                 status,
+                mode,
                 ..
             } => {
+                self.running_tasks.remove(&task_id);
+                // Work an agent waited for in the foreground already reported
+                // through its own tool result; saying it again is noise.
+                if mode.as_deref() == Some("foreground") {
+                    return;
+                }
                 let level = if status == "failed" {
                     NoticeLevel::Error
                 } else {

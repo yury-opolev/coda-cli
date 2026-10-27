@@ -127,6 +127,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         scope: Scope::Engine,
     },
     CommandSpec {
+        name: "btw",
+        aliases: &["ask"],
+        args: "<question>",
+        summary: "Ask a side question about the session and its running tasks; works while the agent is busy and is never added to the conversation.",
+        scope: Scope::Engine,
+    },
+    CommandSpec {
         name: "history",
         aliases: &[],
         args: "",

@@ -215,6 +215,37 @@ mod tests {
         assert!(refusal("task-1", Some("notAgent")).contains("cannot receive messages"));
     }
 
+    #[tokio::test]
+    async fn task_events_drive_the_running_task_count() {
+        use crate::app::serve::tests::app_with;
+        use serde_json::json;
+
+        let mut harness = app_with(crate::local::AccessMode::TrustedLocal, |_, _| json!({}));
+        let app = &mut harness.app;
+        app.needs_rehydrate = false;
+        app.needs_resync = false;
+        let frames = [
+            ("event/taskStarted", json!({ "taskId": "task-0001", "kind": "shell", "description": "build", "mode": "foreground" })),
+            ("event/taskStarted", json!({ "taskId": "task-0002", "kind": "subagent", "description": "review", "mode": "background" })),
+            ("event/taskOutput", json!({ "taskId": "task-0001", "text": "Compiling\n", "truncated": false })),
+            ("event/taskCompleted", json!({ "taskId": "task-0001", "status": "completed", "description": "build", "mode": "foreground" })),
+        ];
+        let mut counts = Vec::new();
+        for (seq, (method, mut params)) in frames.into_iter().enumerate() {
+            params["seq"] = json!(seq as i64 + 1);
+            params["engineInstanceId"] = json!("e1");
+            for frame in app.accept(method.to_owned(), Some(params)) {
+                app.dispatch_frame(frame);
+            }
+            counts.push(app.state.running_tasks.len());
+        }
+        assert_eq!(counts, [1, 2, 2, 1]);
+        assert!(
+            crate::app::serve::tests::notices(app).iter().all(|n| !n.contains("build")),
+            "a command the agent waited for is not announced twice"
+        );
+    }
+
     #[test]
     fn the_tasks_browser_backgrounds_and_stops_the_selected_task() {
         use crate::surface::browser::BrowserKind;

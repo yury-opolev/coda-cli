@@ -17,6 +17,7 @@ use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 
+pub mod aside;
 pub mod auth;
 pub mod browser;
 pub mod context_menu;
@@ -173,6 +174,8 @@ pub enum SurfaceAction {
     StopTask(String),
     /// Start a message to a running subagent (prefills `/send <task> `).
     MessageTask(String),
+    /// Send a `/btw` side question to the agent as an ordinary message.
+    PromoteAside(String),
     /// Explain that creating a schedule needs arguments.
     ExplainScheduleCreation,
     /// Explain that a skill cannot be toggled from the browser.

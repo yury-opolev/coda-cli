@@ -17,6 +17,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
+mod aside;
 mod auth;
 mod browsers;
 mod slash;
@@ -292,6 +293,8 @@ pub struct App {
     auth: auth::AuthState,
     /// How a login opens this profile.
     auth_port: crate::local::auth::AuthPort,
+    /// Side questions (`/btw`) in flight and the channel their answers return on.
+    asides: aside::Asides,
 }
 
 
@@ -368,6 +371,7 @@ impl App {
     ) -> Result<()> {
         let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<TurnOutcome>();
         let mut auth_events = self.auth.take_events();
+        let mut aside_replies = self.asides.take_replies();
 
         // The screen first, before anything off this machine is awaited. The
         // model list is a round-trip and the preflight opens a credential
@@ -408,6 +412,9 @@ impl App {
 
                 // An authentication task has something to report.
                 Some(event) = auth_events.recv() => self.on_auth_event(event).await,
+
+                // A `/btw` side question was answered.
+                Some(reply) = aside_replies.recv() => self.on_aside_reply(reply),
 
                 // Terminal input.
                 event = crate::terminal::read_event() => match event {
@@ -1495,6 +1502,7 @@ impl App {
             SurfaceAction::DeleteSchedule(id) => self.delete_schedule(&id).await,
             action @ (SurfaceAction::BackgroundTask(_) | SurfaceAction::StopTask(_)
             | SurfaceAction::MessageTask(_)) => self.task_row_action(action).await,
+            SurfaceAction::PromoteAside(question) => self.promote_aside(question).await,
             SurfaceAction::NewMcpServer => {
                 if self.allow_local_maintenance("MCP server configuration") {
                     self.surfaces.push(Box::new(
@@ -1575,26 +1583,4 @@ impl App {
             }),
         }
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    // -- Session management commands -----------------------------------------
-
-
-
-
-
-
 }

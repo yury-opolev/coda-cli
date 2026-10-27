@@ -194,8 +194,11 @@ impl Control for StaticText {
 
     fn render(&self, width: u16, _focused: bool, theme: &Theme) -> Vec<Line<'static>> {
         let style = theme.style(self.role);
-        text::wrap(&text::sanitize(&self.text), content_width(width))
-            .into_iter()
+        // Wrapped line by line: a newline is a line break, not a character
+        // the terminal would silently drop mid-span.
+        text::sanitize(&self.text)
+            .split('\n')
+            .flat_map(|line| text::wrap(line, content_width(width)))
             .map(|row| Line::from(vec![Span::raw(FOCUS_BLANK), Span::styled(row, style)]))
             .collect()
     }
