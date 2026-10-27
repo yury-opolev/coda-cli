@@ -24,11 +24,26 @@
 
 use std::sync::{Arc, Mutex};
 
-/// A single operator message queued for delivery.
+/// What an inbox item is (non-blocking runtime, Phase 2). Every agent's inbox
+/// carries more than steering: a subagent's inbox also receives the
+/// completions of the tasks it started and its own deadline notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InboxItemKind {
+    /// A user (main) or parent (`task_send`) message. Cuts a running wait short.
+    #[default]
+    Message,
+    /// A task this agent started has finished; the text is a framed data block.
+    TaskCompleted,
+    /// The agent's lifetime or parked-time limit was reached.
+    Deadline,
+}
+
+/// A single item queued for delivery.
 #[derive(Debug, Clone)]
 pub struct SteeringEntry {
     pub id: String,
     pub text: String,
+    pub kind: InboxItemKind,
 }
 
 /// Why an `enqueue` was refused. Distinguishes "no turn is running" (sealed)
@@ -97,9 +112,11 @@ impl SteeringInbox {
         }
     }
 
-    /// Resolves once at least one undelivered message is waiting. Returns
+    /// Resolves once at least one undelivered *message* is waiting. Returns
     /// immediately when one already is. Never consumes anything: delivery
-    /// stays with [`SteeringInbox::take_all_for_delivery`].
+    /// stays with [`SteeringInbox::take_all_for_delivery`]. Task completions
+    /// do not count: they wait for the next boundary instead of cutting a
+    /// running tool's wait short.
     pub async fn wait_for_pending(&self) {
         loop {
             let notified = self.arrived.notified();
@@ -112,9 +129,51 @@ impl SteeringInbox {
         }
     }
 
-    /// Returns `true` when undelivered messages are waiting.
+    /// Resolves once any undelivered item (message, completion, deadline) is
+    /// waiting. Used by a parked agent.
+    pub async fn wait_for_any(&self) {
+        loop {
+            let notified = self.arrived.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.has_any() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Returns `true` when undelivered user/parent messages are waiting.
     pub fn has_pending(&self) -> bool {
+        self.gate
+            .lock()
+            .unwrap()
+            .pending
+            .iter()
+            .any(|e| e.kind == InboxItemKind::Message)
+    }
+
+    /// Returns `true` when any undelivered item is waiting.
+    pub fn has_any(&self) -> bool {
         !self.gate.lock().unwrap().pending.is_empty()
+    }
+
+    /// Queues a runtime item (a task completion or a deadline notice).
+    ///
+    /// Unlike a message, it is accepted even when the inbox is sealed: the
+    /// seal protects a user's words from being dropped after the last
+    /// delivery boundary, while a runtime item is re-checked by the owner
+    /// after sealing (see the parked state in `agent::park`). The observer
+    /// is not told: it mirrors operator steering only.
+    pub fn push_item(&self, kind: InboxItemKind, text: impl Into<String>) -> SteeringEntry {
+        let entry = SteeringEntry {
+            id: uuid::Uuid::new_v4().to_string().replace('-', ""),
+            text: text.into(),
+            kind,
+        };
+        self.gate.lock().unwrap().pending.push(entry.clone());
+        self.arrived.notify_waiters();
+        entry
     }
 
     /// Enqueue a message.  Returns the accepted entry, or `None` when the
@@ -148,6 +207,7 @@ impl SteeringInbox {
         let entry = SteeringEntry {
             id: uuid::Uuid::new_v4().to_string().replace('-', ""),
             text,
+            kind: InboxItemKind::Message,
         };
         inner.pending.push(entry.clone());
         // Observer runs while `inner` is still held (INBOX -> STATE -> BUS).
@@ -441,6 +501,42 @@ mod tests {
 
         assert_eq!(obs.dropped.lock().unwrap().len(), 1, "must report exactly once");
         assert_eq!(obs.dropped.lock().unwrap()[0].len(), 1);
+    }
+
+    // ── Typed runtime items (non-blocking runtime, Phase 2) ──────────────────
+
+    #[test]
+    fn a_completion_is_accepted_when_sealed_but_is_not_a_pending_message() {
+        let inbox = SteeringInbox::new();
+        assert!(inbox.try_seal_empty());
+        inbox.push_item(InboxItemKind::TaskCompleted, "[task-completed] task-0002");
+        assert!(inbox.has_any());
+        assert!(!inbox.has_pending(), "a completion must not cut a running wait short");
+        assert!(!inbox.try_seal_empty(), "an undelivered completion keeps the agent going");
+        let items = inbox.take_all_for_delivery();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, InboxItemKind::TaskCompleted);
+    }
+
+    #[tokio::test]
+    async fn wait_for_any_wakes_on_a_completion_and_wait_for_pending_does_not() {
+        let inbox = Arc::new(SteeringInbox::new());
+        let waiter = {
+            let inbox = Arc::clone(&inbox);
+            tokio::spawn(async move { inbox.wait_for_any().await })
+        };
+        tokio::task::yield_now().await;
+        inbox.push_item(InboxItemKind::TaskCompleted, "done");
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("wait_for_any must wake")
+            .unwrap();
+        let pending = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            inbox.wait_for_pending(),
+        )
+        .await;
+        assert!(pending.is_err(), "only a message satisfies wait_for_pending");
     }
 
     #[test]

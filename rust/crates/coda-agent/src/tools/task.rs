@@ -1,8 +1,16 @@
-//! `task` — launch a foreground subagent task.
+//! `task` — start a subagent (always in the background).
+//!
+//! Non-blocking runtime, Phase 2 (decision D2): a subagent never holds its
+//! caller's turn hostage. `task` registers the subagent as a background task
+//! and returns its handle immediately; the subagent's final report is pushed
+//! into the caller's inbox when it finishes (see `tasks::completion_push`).
+//! `task_start` is a deprecated alias with the same behaviour (D3).
 //!
 //! The tool delegates to the `SubagentFactory` seam in `ToolContext`.  When
 //! the factory is absent (headless, no subagent wiring) the tool returns an
-//! informative error rather than panicking.
+//! informative error rather than panicking. A context with a factory but no
+//! task manager (direct callers, unit tests) cannot track a background task,
+//! so it runs the subagent inline and returns its report, as before.
 //!
 //! Nesting depth and concurrency limits are enforced by the factory
 //! implementation (`SubagentHost`); this tool only passes the parameters
@@ -30,10 +38,13 @@ impl Tool for TaskTool {
     }
 
     fn description(&self) -> &str {
-        "Launch a subagent to complete a focused, self-contained task. The subagent runs with a \
-         restricted tool set and returns its report as a string. For long-running work, prefer \
-         background_task_start. Nesting is limited to two levels: a subagent may spawn one \
-         generation of children, but grandchildren cannot spawn further."
+        "Start a subagent on a focused, self-contained task. It runs in the background with a \
+         restricted tool set and this call returns its task id immediately. Its final report is \
+         delivered to you automatically when it finishes: do not poll, sleep or wait for it — \
+         continue with other work, or end your turn. Start several in one response to run them \
+         in parallel. Use task_send to give it more instructions, task_peek to look at its \
+         progress, task_stop to stop it. Nesting is limited to two levels: a subagent may spawn \
+         one generation of children, but grandchildren cannot spawn further."
     }
 
     fn input_schema_json(&self) -> &str {
@@ -62,98 +73,102 @@ impl Tool for TaskTool {
     }
 
     async fn execute(&self, input: &Value, ctx: &ToolContext, cancel: CancellationToken) -> ToolOutcome {
-        let prompt = match input.get("prompt").and_then(Value::as_str) {
-            Some(p) if !p.trim().is_empty() => p.to_owned(),
-            _ => return ToolResult::error("Missing required 'prompt'."),
-        };
+        start_subagent(input, ctx, cancel).await
+    }
+}
 
-        let agent_type = input
-            .get("subagentType")
-            .and_then(Value::as_str)
-            .unwrap_or("general-purpose")
-            .to_owned();
+/// The text the model receives for a subagent that is now running.
+pub(crate) fn started_handle(task_id: &str) -> String {
+    format!(
+        "Started subagent task {task_id} in the background. Its final report will be delivered \
+         to you automatically when it finishes — do not poll, sleep or wait for it; continue \
+         with other work or end your turn. Use task_send to give it more instructions, task_peek \
+         to look at its progress, task_stop to stop it."
+    )
+}
 
-        let model = input
-            .get("model")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+/// Shared by `task` and its deprecated alias `task_start`.
+pub(crate) async fn start_subagent(
+    input: &Value,
+    ctx: &ToolContext,
+    cancel: CancellationToken,
+) -> ToolOutcome {
+    let prompt = match input.get("prompt").and_then(Value::as_str) {
+        Some(p) if !p.trim().is_empty() => p.to_owned(),
+        _ => return ToolResult::error("Missing required 'prompt'."),
+    };
 
-        let factory = match ctx.get_subagent_factory() {
-            Some(f) => f,
-            None => {
-                return ToolResult::error(
-                    "Subagent factory is not available in this context. \
-                     The `task` tool requires a fully wired agent loop.",
-                );
-            }
-        };
+    let agent_type = input
+        .get("subagentType")
+        .or_else(|| input.get("subagent_type"))
+        .and_then(Value::as_str)
+        .unwrap_or("general-purpose")
+        .to_owned();
 
-        // Derive the caller's depth so the child depth is caller + 1.
-        //
-        // A caller id that cannot be verified against the task manager is a
-        // hard refusal, never "assume depth 0". Treating an unknown id as the
-        // main agent would let any unwired or forged identity mint an endless
-        // chain of depth-1 children and would silently grant it the main
-        // agent's session-wide authority.
-        let caller_depth = match caller_depth(ctx) {
-            Ok(d) => d,
-            Err(e) => return ToolResult::error(e),
-        };
-        let child_depth = caller_depth + 1;
+    let model = input
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
 
-        if child_depth > MAX_SUBAGENT_DEPTH {
-            return ToolResult::error(format!(
-                "Subagent nesting depth {child_depth} exceeds the maximum of {}. \
-                 Grandchildren cannot spawn further subagents.",
-                MAX_SUBAGENT_DEPTH
-            ));
+    let factory = match ctx.get_subagent_factory() {
+        Some(f) => f,
+        None => {
+            return ToolResult::error(
+                "Subagent factory is not available in this context. \
+                 The `task` tool requires a fully wired agent loop.",
+            );
         }
+    };
 
-        // Generate a task id for this invocation.
-        let task_id = if let Some(mgr) = ctx.get_task_manager() {
-            match mgr.register(
-                crate::tasks::TaskKind::Subagent,
-                &prompt,
-                ctx.caller_task_id.as_deref(),
-                crate::tasks::TaskExecutionMode::Foreground,
-            ) {
-                Ok(t) => t.id.clone(),
-                Err(e) => return ToolResult::error(e),
-            }
-        } else {
-            uuid::Uuid::new_v4().to_string()
+    // Derive the caller's depth so the child depth is caller + 1.
+    //
+    // A caller id that cannot be verified against the task manager is a
+    // hard refusal, never "assume depth 0". Treating an unknown id as the
+    // main agent would let any unwired or forged identity mint an endless
+    // chain of depth-1 children and would silently grant it the main
+    // agent's session-wide authority.
+    let caller_depth = match caller_depth(ctx) {
+        Ok(d) => d,
+        Err(e) => return ToolResult::error(e),
+    };
+    let child_depth = caller_depth + 1;
+
+    if child_depth > MAX_SUBAGENT_DEPTH {
+        return ToolResult::error(format!(
+            "Subagent nesting depth {child_depth} exceeds the maximum of {}. \
+             Grandchildren cannot spawn further subagents.",
+            MAX_SUBAGENT_DEPTH
+        ));
+    }
+
+    // Trusted fields come from the context, never from `input`: the model
+    // cannot choose its own caller identity, depth, task id, or claim that
+    // its work belongs to somebody else's scheduled job.
+    let background = ctx.get_task_manager().is_some();
+    let request = SubagentRequest {
+        agent_type,
+        prompt,
+        // Background: the host registers the task and assigns the id.
+        task_id: if background { String::new() } else { uuid::Uuid::new_v4().to_string() },
+        depth: child_depth,
+        model,
+        foreground: !background,
+        caller_task_id: ctx.caller_task_id.clone(),
+        schedule_origin: ctx.schedule_origin.clone(),
+    };
+
+    let sink = std::sync::Arc::new(NullSink);
+    if background {
+        // The subagent outlives this turn: it is stopped through its own task
+        // (task_stop, /stop), never by the caller's turn being interrupted.
+        return match factory.spawn(request, sink, CancellationToken::new()).await {
+            Ok(task_id) => ToolResult::ok(started_handle(&task_id)),
+            Err(e) => ToolResult::error(e),
         };
-
-        // Trusted fields come from the context, never from `input`: the model
-        // cannot choose its own caller identity, depth, task id, or claim that
-        // its work belongs to somebody else's scheduled job.
-        let request = SubagentRequest {
-            agent_type,
-            prompt,
-            task_id: task_id.clone(),
-            depth: child_depth,
-            model,
-            foreground: true,
-            caller_task_id: ctx.caller_task_id.clone(),
-            schedule_origin: ctx.schedule_origin.clone(),
-        };
-
-        let sink = std::sync::Arc::new(NullSink);
-        match factory.spawn(request, sink, cancel).await {
-            Ok(result) => {
-                // Mark the task as completed if we registered it.
-                if let Some(mgr) = ctx.get_task_manager() {
-                    mgr.complete(&task_id, Some(result.clone()));
-                }
-                ToolResult::ok(result)
-            }
-            Err(e) => {
-                if let Some(mgr) = ctx.get_task_manager() {
-                    mgr.fail(&task_id, Some(e.clone()));
-                }
-                ToolResult::error(e)
-            }
-        }
+    }
+    match factory.spawn(request, sink, cancel).await {
+        Ok(result) => ToolResult::ok(result),
+        Err(e) => ToolResult::error(e),
     }
 }
 

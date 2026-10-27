@@ -33,7 +33,7 @@ mod task_recall;
 mod task_remove;
 mod task_send;
 mod task_stop;
-mod task_wait;
+pub(crate) mod task_wait;
 mod todo_write;
 mod tool_search_tool;
 mod web_fetch;
@@ -141,7 +141,7 @@ pub fn built_in_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(TaskRecallTool),
         Arc::new(BackgroundTaskStartTool),
         Arc::new(BackgroundTaskOutputTool),
-        // ── foreground subagent task ───────────────────────────────────────────
+        // ── subagents (always started in the background) ───────────────────────
         Arc::new(TaskTool),
         // ── scheduling ─────────────────────────────────────────────────────────
         Arc::new(ScheduleCreateTool),

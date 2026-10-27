@@ -53,9 +53,8 @@ pub const DEFAULT_WAIT_SECS: u64 = 20;
 pub const MAX_WAIT_SECS: u64 = 30;
 
 /// Set to `0`/`false`/`off` to make the main conversation wait for commands
-/// to finish instead of yielding (used by headless `coda run`, where nothing
-/// would be left to receive a completion after the turn ends). An explicit
-/// `waitSeconds` still applies.
+/// to finish instead of yielding. An explicit `waitSeconds` still applies.
+/// Headless `coda run` no longer needs it: it parks until its tasks finish.
 pub const YIELD_ENV: &str = "CODA_RUN_COMMAND_YIELD";
 
 /// Hard cap on combined stdout + stderr, matching the C# `MaxChars`.
@@ -153,7 +152,16 @@ impl Tool for RunCommandTool {
         };
 
         let requested_wait = input.get("waitSeconds").and_then(parse_seconds);
-        let yields = ctx.is_main_context && yield_enabled(std::env::var(YIELD_ENV).ok().as_deref());
+        // Yield whenever the caller can be told about the completion later:
+        // the main conversation (unless yielding is switched off) and every
+        // agent running as a task with an inbox (subagents, scheduled runs).
+        let owner_has_inbox = ctx
+            .caller_task_id
+            .as_deref()
+            .and_then(|id| manager.find_task(id))
+            .is_some_and(|t| t.steering().is_some());
+        let yields = owner_has_inbox
+            || (ctx.is_main_context && yield_enabled(std::env::var(YIELD_ENV).ok().as_deref()));
         let wait = resolve_wait(requested_wait, yields);
         let deadline = resolve_work_deadline(per_call, env_timeout.as_deref());
 
@@ -177,7 +185,7 @@ fn parse_seconds(value: &serde_json::Value) -> Option<i64> {
 /// The yield budget for one call, clamped to `[0, MAX_WAIT_SECS]` (D1).
 ///
 /// `None` means "wait until the command finishes" and is only chosen when the
-/// caller cannot receive a pushed completion (a subagent in Phase 1, or the
+/// caller cannot receive a pushed completion (a context with no inbox, or the
 /// main conversation with yielding disabled) and did not ask for a budget.
 pub fn resolve_wait(requested: Option<i64>, yields_by_default: bool) -> Option<Duration> {
     let secs = match requested {

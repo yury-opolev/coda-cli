@@ -45,6 +45,13 @@ pub enum ToolControl {
     /// task finishes (still bounded by the per-tool ceiling and cut short by
     /// a user "background now"). `content` of the carrying result is unused.
     RunningTask { task_id: String, wait: Option<std::time::Duration> },
+    /// Attach to an already running task (`task_wait`): the executor waits up
+    /// to `wait` for it under the same rules as `RunningTask` — cut short by
+    /// a user/parent message or a cancelled turn — but never stops, promotes
+    /// or otherwise touches the task, and never skips the rest of the batch.
+    /// `content` of the carrying result is what the model sees when the wait
+    /// ends before the task does.
+    AttachTask { task_id: String, wait: std::time::Duration },
 }
 
 /// The output of running a tool, fed back to the model as a content block.
@@ -84,7 +91,31 @@ impl ToolResult {
     pub fn abort_reason(&self) -> Option<&str> {
         match &self.control {
             Some(ToolControl::AbortRun { reason }) => Some(reason.as_str()),
-            Some(ToolControl::RunningTask { .. }) | None => None,
+            Some(ToolControl::RunningTask { .. }) | Some(ToolControl::AttachTask { .. }) | None => {
+                None
+            }
+        }
+    }
+
+    /// A result asking the executor to wait (bounded) on a running task.
+    /// `content` is the answer used if the wait ends first.
+    pub fn attach_task(
+        task_id: impl Into<String>,
+        wait: std::time::Duration,
+        content: impl Into<String>,
+    ) -> Self {
+        Self {
+            content: content.into(),
+            is_error: false,
+            control: Some(ToolControl::AttachTask { task_id: task_id.into(), wait }),
+        }
+    }
+
+    /// The task id and wait, when this result attaches to a running task.
+    pub fn attached_task(&self) -> Option<(&str, std::time::Duration)> {
+        match &self.control {
+            Some(ToolControl::AttachTask { task_id, wait }) => Some((task_id.as_str(), *wait)),
+            _ => None,
         }
     }
 

@@ -17,9 +17,9 @@ impl Tool for TaskSendTool {
     }
 
     fn description(&self) -> &str {
-        "Deliver a steering message to a running subagent task. The message is enqueued in the \
-         task's steering inbox and delivered before the agent's next model call. No-op when the \
-         task has no steering inbox (shell tasks) or is already terminal."
+        "Deliver a message to a running subagent task. It goes to the subagent's inbox: a \
+         wait on a running command is cut short, a parked subagent wakes up, and the message is \
+         delivered before its next model call. Fails for shell tasks and finished tasks."
     }
 
     fn input_schema_json(&self) -> &str {
@@ -71,12 +71,16 @@ impl Tool for TaskSendTool {
             ));
         }
 
-        // Deliver via the steering inbox if one is attached (subagent tasks only).
-        match &task.steering {
-            Some(inbox) => {
-                inbox.enqueue(message.to_owned());
-                ToolResult::ok(format!("Message delivered to task '{task_id}'."))
-            }
+        // Deliver via the agent's inbox if one is attached (subagent tasks only).
+        // A message cuts the subagent's current wait short and wakes it when
+        // it is parked.
+        match task.steering() {
+            Some(inbox) => match inbox.enqueue(message.to_owned()) {
+                Some(_) => ToolResult::ok(format!("Message delivered to task '{task_id}'.")),
+                None => ToolResult::error(format!(
+                    "Task '{task_id}' is finishing and no longer accepts messages."
+                )),
+            },
             None => ToolResult::error(format!(
                 "Task '{task_id}' does not have a steering inbox (not a subagent task)."
             )),

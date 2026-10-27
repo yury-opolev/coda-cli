@@ -103,6 +103,9 @@ pub struct TaskManager {
     max_retained_terminal_tasks: usize,
     state: Mutex<ManagerState>,
     completion_listener: Mutex<Option<Arc<dyn TaskCompletionListener>>>,
+    /// Signalled after every task settles (its terminal transition has been
+    /// fully reported). A parked agent waits on it to re-check its live tasks.
+    settle_signal: tokio::sync::Notify,
 }
 
 impl TaskManager {
@@ -134,6 +137,7 @@ impl TaskManager {
                 disposed: false,
             }),
             completion_listener: Mutex::new(None),
+            settle_signal: tokio::sync::Notify::new(),
             session_id,
         })
     }
@@ -145,23 +149,98 @@ impl TaskManager {
     }
 
     fn notify_terminal(&self, task: &Arc<ManagedTask>, status: TaskRunStatus) {
+        self.push_to_owner_inbox(task, status);
         let listener = self.completion_listener.lock().unwrap().clone();
         if let Some(listener) = listener {
             listener.on_terminal(task, status);
         }
+        self.settle(task);
+    }
+
+    /// Marks a terminal task as fully reported and wakes parked owners.
+    fn settle(&self, task: &Arc<ManagedTask>) {
+        task.mark_settled();
+        self.settle_signal.notify_waiters();
+    }
+
+    /// Delivers a finished task's completion to the inbox of the agent that
+    /// started it, when that agent is a subagent (or scheduled run) with an
+    /// inbox (non-blocking runtime, Phase 2). The main agent's completions go
+    /// through the installed [`TaskCompletionListener`] instead.
+    ///
+    /// Exactly once: called once per terminal transition, and a task still in
+    /// the foreground was observed inline by the call that awaited it.
+    /// Unlike the main inbox, operator stops are delivered too: the owner is
+    /// still running (or parked waiting on this very task) and must learn
+    /// that the work it is waiting for will never report.
+    fn push_to_owner_inbox(&self, task: &Arc<ManagedTask>, status: TaskRunStatus) {
+        if task.mode() != TaskExecutionMode::Background {
+            return;
+        }
+        let Some(parent_id) = task.parent_id.as_deref() else { return };
+        let Some(parent) = self.find_task(parent_id) else { return };
+        let Some(inbox) = parent.steering() else { return };
+        if parent.status() != TaskRunStatus::Running {
+            return;
+        }
+        inbox.push_item(
+            crate::steering::InboxItemKind::TaskCompleted,
+            super::completion_push::owner_completion_text(task, status),
+        );
+        task.mark_completion_pushed();
+    }
+
+    /// Signalled after any task settles; see [`TaskManager::live_children`].
+    pub fn settle_signal(&self) -> &tokio::sync::Notify {
+        &self.settle_signal
+    }
+
+    /// The tasks `owner` started that have not settled yet — the work a
+    /// parked agent is waiting for. `None` is the main agent; scheduled runs
+    /// are independent of it and never count as its children.
+    pub fn live_children(&self, owner: Option<&str>) -> Vec<Arc<ManagedTask>> {
+        self.state
+            .lock()
+            .unwrap()
+            .order
+            .iter()
+            .filter(|t| t.parent_id.as_deref() == owner)
+            .filter(|t| !(owner.is_none() && t.kind == TaskKind::Scheduled))
+            .filter(|t| !t.is_settled())
+            .cloned()
+            .collect()
+    }
+
+    /// Stops every running strict descendant of `id` (and their process
+    /// trees). Used when a subagent ends: nothing it started may outlive it.
+    pub fn stop_descendants(&self, id: &str) -> usize {
+        let running = self.state.lock().unwrap().running_tasks();
+        let mut stopped = 0;
+        for task in &running {
+            if task.id != id && self.is_authorized_caller(&task.id, Some(id)) {
+                task.cancel_task();
+                task.kill_attached_shell();
+                stopped += 1;
+            }
+        }
+        stopped
     }
 
     // ── User controls (non-blocking runtime, Phase 1) ─────────────────────────
 
     /// Stops awaiting one task in the foreground; the work keeps running.
     ///
-    /// Only shell tasks can be released this way in Phase 1: a foreground
-    /// subagent is still awaited directly by its `task` call, so asking would
-    /// promise something nothing honours (`Rejected`).
+    /// Only shell tasks are ever awaited in the foreground: subagents always
+    /// start in the background (Phase 2), so for them this reports
+    /// `InvalidState` (nothing is waiting on them).
     pub fn background(&self, id: &str) -> TaskActionResult {
         let Some(task) = self.find_task(id) else { return TaskActionResult::NotFound };
         if task.kind != TaskKind::Shell {
-            return TaskActionResult::Rejected;
+            return if task.mode() == TaskExecutionMode::Background {
+                TaskActionResult::InvalidState
+            } else {
+                TaskActionResult::Rejected
+            };
         }
         if task.request_background() {
             TaskActionResult::Ok
@@ -643,6 +722,7 @@ impl TaskManager {
                 t.try_stop();
                 self.on_task_terminal(t);
             }
+            self.settle(t);
         }
 
         // Hard teardown: close subscriptions, flush logs, release resources.

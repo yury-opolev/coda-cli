@@ -10,7 +10,8 @@ use crate::tasks::TaskRunStatus;
 use crate::tool::{Tool, ToolContext, ToolOutcome, ToolResult};
 use crate::tool::ToolContextServiceExt as _;
 
-const DEFAULT_TIMEOUT_SECS: u64 = 300;
+/// Longest a single `task_wait` may wait (the yield contract's cap, D1).
+pub const MAX_WAIT_SECS: u64 = 30;
 
 pub struct TaskWaitTool;
 
@@ -21,8 +22,10 @@ impl Tool for TaskWaitTool {
     }
 
     fn description(&self) -> &str {
-        "Wait for a task to reach a terminal state (completed/failed/stopped) and return its \
-         final status and result. Times out after `timeoutSeconds` (default 300)."
+        "Wait briefly (at most 30 seconds) for a task to finish and return its final status \
+         and result. Rarely needed: completions are delivered to you automatically, so the \
+         preferred way to wait is to end your turn. The wait ends early when a new message \
+         arrives and never stops the task."
     }
 
     fn input_schema_json(&self) -> &str {
@@ -32,7 +35,9 @@ impl Tool for TaskWaitTool {
             "taskId":{"type":"string","description":"The task id to wait for"},
             "timeoutSeconds":{
               "type":"integer",
-              "description":"Maximum seconds to wait (default 300)"
+              "minimum":0,
+              "maximum":30,
+              "description":"Seconds to wait (default and maximum 30)"
             }
           },
           "required":["taskId"]
@@ -43,16 +48,16 @@ impl Tool for TaskWaitTool {
         true
     }
 
-    async fn execute(&self, input: &Value, ctx: &ToolContext, cancel: CancellationToken) -> ToolOutcome {
+    async fn execute(&self, input: &Value, ctx: &ToolContext, _cancel: CancellationToken) -> ToolOutcome {
         let task_id = match input.get("taskId").and_then(Value::as_str) {
             Some(id) => id,
             None => return ToolResult::error("Missing required 'taskId'."),
         };
 
-        let timeout_secs = input
+        let wait_secs = input
             .get("timeoutSeconds")
-            .and_then(Value::as_u64)
-            .unwrap_or(DEFAULT_TIMEOUT_SECS);
+            .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f.floor() as i64)))
+            .map_or(MAX_WAIT_SECS, |n| n.clamp(0, MAX_WAIT_SECS as i64) as u64);
 
         let mgr = match ctx.get_task_manager() {
             Some(m) => m,
@@ -76,26 +81,21 @@ impl Tool for TaskWaitTool {
             return format_terminal_result(&task.to_snapshot());
         }
 
-        let timeout = Duration::from_secs(timeout_secs);
-        let wait_fut = task.wait_for_completion();
-
-        tokio::select! {
-            _ = wait_fut => {
-                format_terminal_result(&task.to_snapshot())
-            }
-            _ = tokio::time::sleep(timeout) => {
-                ToolResult::error(format!(
-                    "Task '{task_id}' did not complete within {timeout_secs}s."
-                ))
-            }
-            _ = cancel.cancelled() => {
-                ToolResult::error("Cancelled.")
-            }
-        }
+        // Still running: the batch executor attaches to it with the yield
+        // contract (bounded, cut short by a new message, never kills).
+        ToolResult::attach_task(
+            task_id,
+            Duration::from_secs(wait_secs),
+            format!(
+                "Task '{task_id}' is still running after waiting {wait_secs}s; it keeps running. \
+                 Its completion will be delivered to you automatically: end your turn to wait \
+                 for it instead of calling task_wait again."
+            ),
+        )
     }
 }
 
-fn format_terminal_result(snap: &crate::tasks::TaskSnapshot) -> ToolOutcome {
+pub(crate) fn format_terminal_result(snap: &crate::tasks::TaskSnapshot) -> ToolOutcome {
     let status = match snap.status {
         TaskRunStatus::Completed => "completed",
         TaskRunStatus::Failed => "failed",
@@ -160,44 +160,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_for_task_that_completes_async() {
-        use tokio::time::Duration;
-
+    async fn a_running_task_is_handed_to_the_executor_with_a_wait_capped_at_30s() {
         let m = TaskManager::with_defaults("session");
         let t = m
             .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
             .unwrap();
-        let m2 = m.clone();
-        let id = t.id.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            m2.complete(&id, Some("async done".into()));
-        });
-        let result = TaskWaitTool
-            .execute(
-                &serde_json::json!({"taskId": t.id, "timeoutSeconds": 5}),
-                &ctx(m),
-                CancellationToken::new(),
-            )
-            .await;
-        assert!(!result.is_error, "{}", result.content);
-        assert!(result.content.contains("async done"), "{}", result.content);
-    }
-
-    #[tokio::test]
-    async fn wait_times_out_for_non_completing_task() {
-        let m = TaskManager::with_defaults("session");
-        let t = m
-            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
-            .unwrap();
-        let result = TaskWaitTool
-            .execute(
-                &serde_json::json!({"taskId": t.id, "timeoutSeconds": 0}),
-                &ctx(m),
-                CancellationToken::new(),
-            )
-            .await;
-        assert!(result.is_error, "expected timeout error: {}", result.content);
+        for (requested, expected) in [(None, 30), (Some(300), 30), (Some(5), 5), (Some(-1), 0)] {
+            let mut input = serde_json::json!({"taskId": t.id});
+            if let Some(n) = requested {
+                input["timeoutSeconds"] = serde_json::json!(n);
+            }
+            let result = TaskWaitTool.execute(&input, &ctx(m.clone()), CancellationToken::new()).await;
+            let (id, wait) = result.attached_task().expect("a running task is attached");
+            assert_eq!(id, t.id);
+            assert_eq!(wait, Duration::from_secs(expected), "requested {requested:?}");
+            assert!(result.content.contains("end your turn"), "{}", result.content);
+        }
+        assert_eq!(t.status(), TaskRunStatus::Running, "waiting never touches the task");
     }
 
     // ── SECURITY: authorization gate ─────────────────────────────────────────

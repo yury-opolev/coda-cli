@@ -203,7 +203,9 @@ async fn run_tools_body(
         };
 
         // --- Steering pre-empt (§1.6 step 2) ---
-        if let Some(steering) = ctx.steering {
+        // Only a user/parent message pre-empts the batch; a pushed task
+        // completion waits for the next iteration boundary.
+        if let Some(steering) = ctx.steering.filter(|s| s.has_pending()) {
             let delivered = steering.take_all_for_delivery();
             if !delivered.is_empty() {
                 for j in i..tool_uses.len() {
@@ -222,7 +224,11 @@ async fn run_tools_body(
                 let steering_text = delivered.iter().map(|e| e.text.as_str()).collect::<Vec<_>>().join("\n\n");
                 results.push(Content::Text(steering_text));
                 sink.emit(AgentEvent::SteeringDelivered {
-                    message_ids: delivered.iter().map(|e| e.id.clone()).collect(),
+                    message_ids: delivered
+                        .iter()
+                        .filter(|e| e.kind == crate::steering::InboxItemKind::Message)
+                        .map(|e| e.id.clone())
+                        .collect(),
                 });
                 break;
             }
@@ -326,6 +332,18 @@ async fn run_tools_body(
         // A tool that handed back a running managed task: wait for it under
         // the yield contract (non-blocking runtime, §6.2).
         let mut yielded_task: Option<String> = None;
+        let tool_result = if let Some((task_id, wait)) = tool_result.attached_task() {
+            // `task_wait`: a bounded attach that never touches the task.
+            match await_attached_task(ctx, task_id, wait, &tool_result.content, &cancel).await {
+                Some(result) => result,
+                None => {
+                    cancel_remaining(&tool_uses[i..], true, sink, &mut results);
+                    break;
+                }
+            }
+        } else {
+            tool_result
+        };
         let tool_result = match tool_result.running_task_handle() {
             None => tool_result,
             Some((task_id, wait)) => {
@@ -579,11 +597,59 @@ async fn await_running_task(
             if task.try_promote_to_background().is_some()
                 || task.status() == crate::tasks::TaskRunStatus::Running =>
         {
-            TaskWaitOutcome::Yielded(yield_handle(&task, reason, ctx.caller_task_id.is_none()))
+            TaskWaitOutcome::Yielded(yield_handle(&task, reason, receives_completions(ctx)))
         }
         // Finished, or finished in the instant before it could be promoted:
         // either way the loop observed it, so it is reported inline.
         Some(_) => TaskWaitOutcome::Finished(finished_result(&task)),
+    }
+}
+
+/// Whether completions of tasks this agent starts are pushed to it: the main
+/// agent (its inbox is the main message bus) and any agent running as a task
+/// with an inbox attached (subagents, scheduled runs).
+pub(crate) fn receives_completions(ctx: &BatchContext<'_>) -> bool {
+    match ctx.caller_task_id.as_deref() {
+        None => true,
+        Some(id) => ctx
+            .task_manager
+            .as_ref()
+            .and_then(|m| m.find_task(id))
+            .is_some_and(|t| t.steering().is_some()),
+    }
+}
+
+/// `task_wait` (§6.6): attach to a running task with the normal yield
+/// contract. Ends when the task finishes (its final status), when `wait`
+/// expires or a user/parent message arrives (`pending`, the tool's own
+/// answer), and returns `None` when the turn is cancelled. Never stops,
+/// promotes or otherwise changes the task.
+async fn await_attached_task(
+    ctx: &BatchContext<'_>,
+    task_id: &str,
+    wait: Duration,
+    pending: &str,
+    cancel: &CancellationToken,
+) -> Option<ToolResult> {
+    let Some(task) = ctx.task_manager.as_ref().and_then(|m| m.find_task(task_id)) else {
+        return Some(ToolResult::error(format!("Task '{task_id}' not found.")));
+    };
+    let steering_arrived = async {
+        match ctx.steering {
+            Some(inbox) => inbox.wait_for_pending().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => None,
+        _ = task.wait_for_completion() => {
+            Some(crate::tools::task_wait::format_terminal_result(&task.to_snapshot()))
+        }
+        _ = steering_arrived => Some(ToolResult::ok(format!(
+            "{pending} The wait ended early because a new message arrived."
+        ))),
+        _ = tokio::time::sleep(wait) => Some(ToolResult::ok(pending.to_owned())),
     }
 }
 
