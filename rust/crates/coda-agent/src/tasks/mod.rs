@@ -9,6 +9,7 @@
 //! - [`task_subscription`]: Change subscription with initial snapshot.
 //! - [`task_manager`]: Central registry owning all tasks in a session.
 
+pub mod completion_push;
 pub mod log_retention;
 pub mod log_writer;
 pub mod managed_task;
@@ -22,8 +23,9 @@ pub use managed_task::{
     ManagedTask, TaskActionResult, TaskExecutionMode, TaskKind, TaskRunStatus, TaskSnapshot,
     MAIN_CONSUMER_ID,
 };
+pub use completion_push::MainInboxCompletionPush;
 pub use task_manager::{
-    TaskCompletionEntry, TaskManager, DEFAULT_MAX_RETAINED_TERMINAL_TASKS,
+    TaskCompletionEntry, TaskCompletionListener, TaskManager, DEFAULT_MAX_RETAINED_TERMINAL_TASKS,
     DEFAULT_SHUTDOWN_BUDGET,
 };
 pub use task_subscription::{TaskChange, TaskChangeKind, TaskSubscription};

@@ -4057,6 +4057,296 @@ mod tests {
         assert!(matches!(result, Err(AgentError::Cancelled)));
         assert_eq!(bus.pending_main_len(), 1, "a pre-cancelled run must never drain the main inbox");
     }
+
+    // ── Non-blocking runtime: the yield contract (§6.2) ─────────────────────
+    //
+    // A fake tool hands back a running managed task exactly like
+    // `run_command` does; its completion is driven by the test. The clock is
+    // paused, so budgets of tens of seconds elapse deterministically.
+
+    struct TaskTool {
+        tool_name: &'static str,
+        wait: Option<Duration>,
+        /// Completes the task with this exit code after the delay.
+        finish_after: Option<(Duration, i32)>,
+        started: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl crate::tool::Tool for TaskTool {
+        fn name(&self) -> &str { self.tool_name }
+        fn description(&self) -> &str { self.tool_name }
+        fn input_schema_json(&self) -> &str { "{}" }
+        fn is_read_only(&self) -> bool { true }
+        async fn execute(&self, _: &serde_json::Value, ctx: &ToolContext, _: CancellationToken) -> ToolOutcome {
+            use crate::tool::ToolContextServiceExt;
+            let manager = Arc::clone(ctx.get_task_manager().expect("task manager wired"));
+            let task = manager
+                .register(
+                    crate::tasks::TaskKind::Shell,
+                    self.tool_name,
+                    None,
+                    crate::tasks::TaskExecutionMode::Foreground,
+                )
+                .unwrap();
+            self.started.lock().unwrap().push(task.id.clone());
+            manager.append_output(&task.id, "partial output\n");
+            let finish_after = self.finish_after;
+            let (runner_task, runner_manager) = (Arc::clone(&task), Arc::clone(&manager));
+            tokio::spawn(async move {
+                let finished = async {
+                    match finish_after {
+                        Some((d, code)) => {
+                            tokio::time::sleep(d).await;
+                            code
+                        }
+                        None => std::future::pending().await,
+                    }
+                };
+                tokio::select! {
+                    code = finished => {
+                        runner_task.set_tool_output(format!("exit code: {code}\nquick"));
+                        if code == 0 {
+                            runner_manager.complete(&runner_task.id, Some("exit code: 0".into()));
+                        } else {
+                            runner_manager.fail(&runner_task.id, Some(format!("exit code: {code}")));
+                        }
+                    }
+                    _ = runner_task.cancel.cancelled() => { runner_manager.stop(&runner_task.id); }
+                }
+            });
+            ToolResult::running_task(task.id.clone(), self.wait)
+        }
+    }
+
+    fn task_tool(
+        name: &'static str,
+        wait: Option<Duration>,
+        finish_after: Option<(Duration, i32)>,
+        started: &Arc<Mutex<Vec<String>>>,
+    ) -> Arc<dyn crate::tool::Tool> {
+        Arc::new(TaskTool { tool_name: name, wait, finish_after, started: Arc::clone(started) })
+    }
+
+    fn task_manager_for_test() -> Arc<TaskManager> {
+        TaskManager::new(
+            "yield-tests",
+            Some(std::env::temp_dir().join("coda-yield-tests")),
+            64 * 1024,
+            64,
+        )
+    }
+
+    fn tool_result_text(request: &ChatRequest, tool_use_id: &str) -> (String, bool) {
+        request
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .find_map(|block| match block {
+                Content::ToolResult { tool_use_id: id, content, is_error, .. } if id == tool_use_id => {
+                    Some((content.clone(), *is_error))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no tool result for {tool_use_id}"))
+    }
+
+    fn two_turn_script(calls: &[(&str, &str)]) -> Vec<Vec<Result<StreamEvent, LlmError>>> {
+        let mut first: Vec<_> = calls.iter().map(|(id, name)| Ok(tool_use_event(id, name))).collect();
+        first.push(Ok(done()));
+        vec![first, vec![Ok(StreamEvent::TextDelta("ok".into())), Ok(done())]]
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_command_that_finishes_within_its_budget_returns_inline_unchanged() {
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let manager = task_manager_for_test();
+        let client = MockLlmClient::new(two_turn_script(&[("t1", "quick")]));
+        let tools = Arc::new(ToolRegistry::new([task_tool(
+            "quick", Some(Duration::from_secs(20)), Some((Duration::from_secs(3), 0)), &started,
+        )]));
+        let agent = AgentLoopBuilder::new(client.clone(), Arc::new(AllowAll), tools)
+            .with_task_manager(Arc::clone(&manager))
+            .with_main_context()
+            .build();
+
+        let mut history = vec![Message::user("go")];
+        agent.run(&mut history, &NullSink, None, CancellationToken::new()).await.unwrap();
+
+        let (content, is_error) = tool_result_text(&client.requests.lock().unwrap()[1], "t1");
+        assert_eq!(content, "exit code: 0\nquick", "the inline result keeps today's shape");
+        assert!(!is_error);
+        let task_id = started.lock().unwrap()[0].clone();
+        assert_eq!(manager.get(&task_id).unwrap().mode, crate::tasks::TaskExecutionMode::Foreground,
+            "a task observed inline is never handed to the background");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_command_within_budget_is_an_inline_error() {
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let client = MockLlmClient::new(two_turn_script(&[("t1", "failing")]));
+        let tools = Arc::new(ToolRegistry::new([task_tool(
+            "failing", Some(Duration::from_secs(20)), Some((Duration::from_secs(1), 2)), &started,
+        )]));
+        let agent = AgentLoopBuilder::new(client.clone(), Arc::new(AllowAll), tools)
+            .with_task_manager(task_manager_for_test())
+            .build();
+        let mut history = vec![Message::user("go")];
+        agent.run(&mut history, &NullSink, None, CancellationToken::new()).await.unwrap();
+
+        let (content, is_error) = tool_result_text(&client.requests.lock().unwrap()[1], "t1");
+        assert_eq!(content, "exit code: 2\nquick");
+        assert!(is_error);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_yield_returns_a_handle_and_skips_the_rest_of_the_batch() {
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let manager = task_manager_for_test();
+        let client = MockLlmClient::new(two_turn_script(&[("t1", "build"), ("t2", "test_after")]));
+        let tools = Arc::new(ToolRegistry::new([
+            task_tool("build", Some(Duration::from_secs(20)), None, &started),
+            dyn_tool(MockTool::new("test_after", true, log.clone())),
+        ]));
+        let agent = AgentLoopBuilder::new(client.clone(), Arc::new(AllowAll), tools)
+            .with_task_manager(Arc::clone(&manager))
+            .with_main_context()
+            .build();
+
+        let begun = tokio::time::Instant::now();
+        let mut history = vec![Message::user("go")];
+        agent.run(&mut history, &NullSink, None, CancellationToken::new()).await.unwrap();
+        assert!(begun.elapsed() < Duration::from_secs(25), "the wait is bounded by the budget");
+
+        let task_id = started.lock().unwrap()[0].clone();
+        let request = client.requests.lock().unwrap()[1].clone();
+        let (handle, is_error) = tool_result_text(&request, "t1");
+        assert!(handle.starts_with(&format!("Still running as task {task_id} (started ")), "{handle}");
+        assert!(handle.contains("Output so far:\npartial output"), "{handle}");
+        assert!(handle.contains("do not poll or sleep"), "{handle}");
+        assert!(!is_error);
+        let (skipped, _) = tool_result_text(&request, "t2");
+        assert_eq!(skipped, format!("Skipped: an earlier tool is still running as task {task_id}; re-plan."));
+        assert!(log.lock().unwrap().is_empty(), "nothing planned after a yielded tool may run");
+
+        let task = manager.find_task(&task_id).unwrap();
+        assert_eq!(task.status(), crate::tasks::TaskRunStatus::Running, "yielding never stops the work");
+        assert_eq!(task.mode(), crate::tasks::TaskExecutionMode::Background);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn steering_cuts_a_long_wait_short_and_reaches_the_model_while_the_work_continues() {
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let manager = task_manager_for_test();
+        let steering = Arc::new(SteeringInbox::new());
+        let client = MockLlmClient::new(two_turn_script(&[("t1", "review")]));
+        let tools = Arc::new(ToolRegistry::new([task_tool(
+            "review", Some(Duration::from_secs(30)), None, &started,
+        )]));
+        let agent = AgentLoopBuilder::new(client.clone(), Arc::new(AllowAll), tools)
+            .with_task_manager(Arc::clone(&manager))
+            .with_steering(Arc::clone(&steering))
+            .with_main_context()
+            .build();
+
+        let inbox = Arc::clone(&steering);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            inbox.enqueue("for OWASP it will be dry-run").unwrap();
+        });
+
+        let begun = tokio::time::Instant::now();
+        let mut history = vec![Message::user("go")];
+        agent.run(&mut history, &NullSink, None, CancellationToken::new()).await.unwrap();
+        assert!(begun.elapsed() < Duration::from_secs(5), "steering must not wait out the budget");
+
+        let request = client.requests.lock().unwrap()[1].clone();
+        let (handle, _) = tool_result_text(&request, "t1");
+        assert!(handle.contains("a new user message arrived"), "{handle}");
+        assert!(
+            request.messages.iter().any(|m| m.role == Role::User && m.text().contains("for OWASP it will be dry-run")),
+            "the steering reaches the very next model request"
+        );
+        let task = manager.find_task(&started.lock().unwrap()[0]).unwrap();
+        assert_eq!(task.status(), crate::tasks::TaskRunStatus::Running, "the process stays alive");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn background_now_ends_the_wait_without_stopping_the_work() {
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let manager = task_manager_for_test();
+        let client = MockLlmClient::new(two_turn_script(&[("t1", "server")]));
+        let tools = Arc::new(ToolRegistry::new([task_tool("server", None, None, &started)]));
+        let agent = AgentLoopBuilder::new(client.clone(), Arc::new(AllowAll), tools)
+            .with_task_manager(Arc::clone(&manager))
+            .with_tool_max_duration(None)
+            .build();
+
+        let controls = Arc::clone(&manager);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            assert_eq!(controls.background_all(), 1);
+        });
+
+        let mut history = vec![Message::user("go")];
+        agent.run(&mut history, &NullSink, None, CancellationToken::new()).await.unwrap();
+
+        let (handle, _) = tool_result_text(&client.requests.lock().unwrap()[1], "t1");
+        assert!(handle.contains("the user moved it to the background"), "{handle}");
+        let task = manager.find_task(&started.lock().unwrap()[0]).unwrap();
+        assert_eq!(task.status(), crate::tasks::TaskRunStatus::Running);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn interrupt_stops_only_the_task_awaited_in_the_foreground() {
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let manager = task_manager_for_test();
+        let earlier = manager
+            .register(crate::tasks::TaskKind::Shell, "earlier", None, crate::tasks::TaskExecutionMode::Foreground)
+            .unwrap();
+        earlier.try_promote_to_background().unwrap();
+
+        let client = MockLlmClient::new(two_turn_script(&[("t1", "awaited")]));
+        let tools = Arc::new(ToolRegistry::new([task_tool(
+            "awaited", Some(Duration::from_secs(30)), None, &started,
+        )]));
+        let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
+            .with_task_manager(Arc::clone(&manager))
+            .with_main_context()
+            .build();
+
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            trigger.cancel();
+        });
+        let mut history = vec![Message::user("go")];
+        let result = agent.run(&mut history, &NullSink, None, cancel).await;
+        assert!(matches!(result, Err(AgentError::Cancelled)));
+
+        let awaited = manager.find_task(&started.lock().unwrap()[0]).unwrap();
+        assert!(awaited.cancel.is_cancelled(), "Esc stops the task it was waiting on (D4)");
+        assert!(!earlier.cancel.is_cancelled(), "already-backgrounded work keeps running (D4)");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_subagent_context_waits_for_the_command_without_a_budget() {
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let client = MockLlmClient::new(two_turn_script(&[("t1", "slow")]));
+        let tools = Arc::new(ToolRegistry::new([task_tool(
+            "slow", None, Some((Duration::from_secs(300), 0)), &started,
+        )]));
+        let agent = AgentLoopBuilder::new(client.clone(), Arc::new(AllowAll), tools)
+            .with_task_manager(task_manager_for_test())
+            .build();
+        let mut history = vec![Message::user("go")];
+        agent.run(&mut history, &NullSink, None, CancellationToken::new()).await.unwrap();
+
+        let (content, _) = tool_result_text(&client.requests.lock().unwrap()[1], "t1");
+        assert_eq!(content, "exit code: 0\nquick", "no budget: the result arrives inline");
+    }
 }
 
 

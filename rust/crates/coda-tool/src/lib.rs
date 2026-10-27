@@ -38,6 +38,13 @@ pub enum ToolControl {
     /// `reason` is a stable classification token (e.g.
     /// `"question.noAnswer.disconnected"`), never free provider text.
     AbortRun { reason: String },
+    /// The tool registered its work as a managed task that keeps running
+    /// after `execute` returns. The batch executor waits for it under the
+    /// yield contract: it returns the task's own result when it finishes
+    /// within `wait`, and a task handle otherwise. `None` waits until the
+    /// task finishes (still bounded by the per-tool ceiling and cut short by
+    /// a user "background now"). `content` of the carrying result is unused.
+    RunningTask { task_id: String, wait: Option<std::time::Duration> },
 }
 
 /// The output of running a tool, fed back to the model as a content block.
@@ -77,7 +84,25 @@ impl ToolResult {
     pub fn abort_reason(&self) -> Option<&str> {
         match &self.control {
             Some(ToolControl::AbortRun { reason }) => Some(reason.as_str()),
-            None => None,
+            Some(ToolControl::RunningTask { .. }) | None => None,
+        }
+    }
+
+    /// A placeholder result handing a running managed task to the executor.
+    pub fn running_task(task_id: impl Into<String>, wait: Option<std::time::Duration>) -> Self {
+        let task_id = task_id.into();
+        Self {
+            content: format!("Running as task {task_id}."),
+            is_error: false,
+            control: Some(ToolControl::RunningTask { task_id, wait }),
+        }
+    }
+
+    /// The task id and wait budget, when this result hands over a running task.
+    pub fn running_task_handle(&self) -> Option<(&str, Option<std::time::Duration>)> {
+        match &self.control {
+            Some(ToolControl::RunningTask { task_id, wait }) => Some((task_id.as_str(), *wait)),
+            _ => None,
         }
     }
 }

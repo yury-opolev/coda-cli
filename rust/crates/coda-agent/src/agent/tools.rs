@@ -323,6 +323,27 @@ async fn run_tools_body(
             Err(error) => return Err(error),
         };
 
+        // A tool that handed back a running managed task: wait for it under
+        // the yield contract (non-blocking runtime, §6.2).
+        let mut yielded_task: Option<String> = None;
+        let tool_result = match tool_result.running_task_handle() {
+            None => tool_result,
+            Some((task_id, wait)) => {
+                let task_id = task_id.to_owned();
+                match await_running_task(ctx, &task_id, wait, &cancel).await {
+                    TaskWaitOutcome::Finished(result) => result,
+                    TaskWaitOutcome::Yielded(result) => {
+                        yielded_task = Some(task_id);
+                        result
+                    }
+                    TaskWaitOutcome::Interrupted => {
+                        cancel_remaining(&tool_uses[i..], true, sink, &mut results);
+                        break;
+                    }
+                }
+            }
+        };
+
         let terminal_status = if tool_result.is_error { ToolCallStatus::Failed } else { ToolCallStatus::Succeeded };
 
         sink.emit(AgentEvent::ToolResult {
@@ -334,6 +355,28 @@ async fn run_tools_body(
         });
 
         results.push(make_result_block(id, &tool_result.content, tool_result.is_error, terminal_status, correlation.clone()));
+
+        // Batch rule (§6.2, P6): once a tool is still running in the
+        // background, nothing planned after it may run against its unfinished
+        // effects. The model re-plans with the handle in hand.
+        if let Some(task_id) = &yielded_task {
+            let msg = format!(
+                "Skipped: an earlier tool is still running as task {task_id}; re-plan."
+            );
+            for later in tool_uses.iter().skip(i + 1) {
+                if let Content::ToolUse { id: sid, name: sname, correlation: scorr, .. } = later {
+                    sink.emit(AgentEvent::ToolResult {
+                        tool_name: sname.clone(),
+                        content: msg.clone(),
+                        is_error: true,
+                        status: ToolCallStatus::Skipped,
+                        correlation: scorr.clone(),
+                    });
+                    results.push(make_result_block(sid, &msg, true, ToolCallStatus::Skipped, scorr.clone()));
+                }
+            }
+            break;
+        }
 
         // A typed terminal control signal (today: an unanswered operator
         // question). The result block above is still recorded — a `tool_use`
@@ -453,6 +496,135 @@ pub(super) fn recover_interrupted_history(history: &mut Vec<coda_llm::Message>) 
         index += 1;
     }
     recovered
+}
+
+/// How a wait on a running managed task ended.
+enum TaskWaitOutcome {
+    /// The task reached a terminal state while awaited: its own result, shaped
+    /// exactly as the tool always returned it.
+    Finished(ToolResult),
+    /// The wait ended first; the task keeps running in the background and the
+    /// result is a handle the model can act on.
+    Yielded(ToolResult),
+    /// The turn was cancelled. The awaited task was stopped (D4).
+    Interrupted,
+}
+
+/// Why a wait ended before the task did.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum YieldReason {
+    Budget,
+    Steering,
+    UserBackground,
+}
+
+/// Longest output tail included in a yield handle.
+const YIELD_TAIL_CHARS: usize = 4_000;
+
+/// The yield contract (§6.2): wait for a running task until it finishes, its
+/// yield budget expires, operator steering arrives, the user asks for
+/// "background now", or the turn is cancelled — whichever is first.
+///
+/// Ending the wait never stops the work, with one exception: an interrupted
+/// turn stops the task it was awaiting in the foreground (D4). Tasks already
+/// in the background are never touched here.
+async fn await_running_task(
+    ctx: &BatchContext<'_>,
+    task_id: &str,
+    wait: Option<Duration>,
+    cancel: &CancellationToken,
+) -> TaskWaitOutcome {
+    let Some(task) = ctx.task_manager.as_ref().and_then(|m| m.find_task(task_id)) else {
+        return TaskWaitOutcome::Finished(ToolResult::error(format!(
+            "Task {task_id} is no longer registered; its outcome is unknown."
+        )));
+    };
+    // Without a budget (a context that cannot receive a pushed completion),
+    // the per-tool ceiling still bounds the wait — by yielding, never killing.
+    let budget = wait.or(ctx.tool_max_duration);
+    let budget_expired = async {
+        match budget {
+            Some(d) => tokio::time::sleep(d).await,
+            None => std::future::pending().await,
+        }
+    };
+    let steering_arrived = async {
+        match ctx.steering {
+            Some(inbox) => inbox.wait_for_pending().await,
+            None => std::future::pending().await,
+        }
+    };
+
+    let reason = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => None,
+        _ = task.wait_for_completion() => Some(None),
+        _ = task.background_requested() => Some(Some(YieldReason::UserBackground)),
+        _ = steering_arrived => Some(Some(YieldReason::Steering)),
+        _ = budget_expired => Some(Some(YieldReason::Budget)),
+    };
+
+    match reason {
+        None => {
+            if !task.is_terminal() {
+                task.cancel_task();
+                task.kill_attached_shell();
+            }
+            TaskWaitOutcome::Interrupted
+        }
+        Some(Some(reason))
+            if task.try_promote_to_background().is_some() || !task.is_terminal() =>
+        {
+            TaskWaitOutcome::Yielded(yield_handle(&task, reason, ctx.caller_task_id.is_none()))
+        }
+        // Finished, or finished in the instant before it could be promoted:
+        // either way the loop observed it, so it is reported inline.
+        Some(_) => TaskWaitOutcome::Finished(finished_result(&task)),
+    }
+}
+
+fn finished_result(task: &crate::tasks::ManagedTask) -> ToolResult {
+    use crate::tasks::TaskRunStatus;
+    let snapshot = task.to_snapshot();
+    let output = task.take_tool_output();
+    match snapshot.status {
+        TaskRunStatus::Completed => {
+            ToolResult::ok(output.or(snapshot.result).unwrap_or_default())
+        }
+        TaskRunStatus::Stopped => {
+            let tail = task.redacted_peek(YIELD_TAIL_CHARS);
+            let mut text = format!("Stopped: task {} was stopped before it finished.", task.id);
+            if !tail.trim().is_empty() {
+                text.push_str(&format!("\nOutput before it stopped:\n{}", tail.trim_end()));
+            }
+            ToolResult::error(text)
+        }
+        TaskRunStatus::Failed | TaskRunStatus::Running => ToolResult::error(
+            output.or(snapshot.error).unwrap_or_else(|| format!("Task {} failed.", task.id)),
+        ),
+    }
+}
+
+/// The handle the model receives for work that keeps running.
+fn yield_handle(task: &crate::tasks::ManagedTask, reason: YieldReason, pushed: bool) -> ToolResult {
+    let age = task.started_at.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+    let why = match reason {
+        YieldReason::Budget => "",
+        YieldReason::Steering => "; the wait ended early because a new user message arrived",
+        YieldReason::UserBackground => "; the user moved it to the background",
+    };
+    let tail = task.redacted_peek(YIELD_TAIL_CHARS);
+    let output = if tail.trim().is_empty() { "(none yet)".to_owned() } else { tail.trim_end().to_owned() };
+    let follow_up = if pushed {
+        "You will be notified when it finishes; do not poll or sleep. \
+         Use task_stop to stop it, task_peek to read more output."
+    } else {
+        "Use task_wait to wait for it, task_peek to read its output, or task_stop to stop it."
+    };
+    ToolResult::ok(format!(
+        "Still running as task {} (started {age}s ago){why}. Output so far:\n{output}\n\n{follow_up}",
+        task.id
+    ))
 }
 
 /// Execute a tool with an optional wall-clock ceiling.
