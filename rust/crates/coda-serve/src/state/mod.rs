@@ -1019,6 +1019,7 @@ impl EngineState {
             let started_instant = Instant::now();
             let mut live = LiveTurnAccumulator::new();
             live.push_user_text(&user_text);
+            let was_stale = s.last_response_stale();
             s.turn = Some(TurnTracking {
                 turn_id,
                 started_at: now.clone(),
@@ -1034,7 +1035,11 @@ impl EngineState {
                 phase_before_awaiting: None,
                 tool_call_started_at: HashMap::new(),
             });
-            s.activity_event()
+            let mut events = s.activity_event();
+            if s.last_response_stale() != was_stale {
+                events.extend(s.usage_event());
+            }
+            events
         });
         admitted
     }
@@ -1050,12 +1055,18 @@ impl EngineState {
             if t.turn_id != turn_id || t.active_config == active_config {
                 return Vec::new();
             }
+            let was_stale = s.last_response_stale();
+            let Some(t) = s.turn.as_mut() else { return Vec::new() };
             t.active_config = active_config;
             let params = serde_json::json!(wire::ConfigChangedEvent::Active(wire::ActiveConfigChanged {
                 turn_id,
                 active: t.active_config.clone(),
             }));
-            vec![gated(coda_proto::events::event_method::CONFIG_CHANGED, params)]
+            let mut events = vec![gated(coda_proto::events::event_method::CONFIG_CHANGED, params)];
+            if s.last_response_stale() != was_stale {
+                events.extend(s.usage_event());
+            }
+            events
         });
     }
 
@@ -1215,6 +1226,7 @@ impl EngineState {
             if let Some(len) = end.history_length {
                 s.history_length = len;
             }
+            let was_stale = s.last_response_stale();
             s.turn = None;
 
             let mut events: Vec<PendingEvent> = Vec::new();
@@ -1241,6 +1253,11 @@ impl EngineState {
                     tools_truncated: s.tools_evicted,
                 }),
             ));
+            // A model switched mid-turn takes effect for the context only now
+            // that the turn's own model is no longer the current one.
+            if s.last_response_stale() != was_stale {
+                events.extend(s.usage_event());
+            }
             events
         });
         ended.load(std::sync::atomic::Ordering::SeqCst)
@@ -3183,6 +3200,35 @@ pub(crate) mod tests {
             .find(|(method, _)| method == coda_proto::events::event_method::USAGE_UPDATED)
             .map(|(_, params)| params)
             .expect("the staleness is pushed, not only polled");
+        assert_eq!(usage["lastResponseStale"], true);
+    }
+
+    #[test]
+    fn a_model_switched_mid_turn_is_reported_stale_when_the_turn_ends() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let bus = Arc::new(EventBus::new(tx, "engine-1"));
+        let state =
+            Arc::new(EngineState::new(Arc::clone(&bus), "s1", "/work", HashMap::new(), active_config()));
+        bus.enable_state_events();
+        state.begin_turn("t1", "go", active_config(), ActivityPhase::Preparing);
+        state.usage_updated(pair(0, 200_000, 0, 75));
+        let mut next = active_config();
+        next.model = "claude-sonnet-4-5".into();
+        assert!(state.commit_next_config("model", || next));
+        assert!(
+            !state.project("v1", limits()).usage.last_response_stale,
+            "the running turn still uses the model that measured it"
+        );
+        drain_methods(&mut rx);
+
+        state.end_turn(ended("t1"));
+        assert!(state.project("v1", limits()).usage.last_response_stale);
+        let frames = drain_methods(&mut rx);
+        let usage = frames
+            .iter()
+            .find(|(method, _)| method == coda_proto::events::event_method::USAGE_UPDATED)
+            .map(|(_, params)| params)
+            .expect("the change at turn end is pushed, so push and poll agree");
         assert_eq!(usage["lastResponseStale"], true);
     }
 
