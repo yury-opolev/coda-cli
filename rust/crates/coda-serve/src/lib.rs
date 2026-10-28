@@ -41,6 +41,7 @@ pub mod state_sink;
 pub mod task_events;
 pub mod transport;
 pub mod turn_scope;
+pub mod usage;
 
 pub use dispatch::{dispatch, RpcError, ServeBackend};
 pub use transport::serve_stdio;

@@ -13,14 +13,30 @@
 //! | `ToolQueued` | — | No proto event; silently dropped by the adapter. |
 //! | `ToolStatus` | — | No dedicated proto event; status rides on `ToolResult`. |
 //! | `Warning` | — | No proto event; silently dropped. |
-//! | `Usage` | `Usage{input_tokens, output_tokens}` | Cache fields dropped — the C# `event/usage` carries only these two, so this is parity, not loss. |
+//! | `Usage` | `Usage(UsagePair)` | None: uncached input, cache reads, cache writes per TTL and output all travel; see [`usage_pair`]. |
 //! | `ThinkingComplete` | `ThinkingComplete{elapsed_ms, thinking_tokens}` | `thinking_tokens` always `None`; Rust stream carries no per-burst token count. |
 use coda_llm::Usage;
 use coda_llm::Correlation as LlmCorrelation;
 use coda_proto::events::{Event as ProtoEvent};
 use coda_proto::messages::Correlation as ProtoCorrelation;
+use coda_proto::state::UsagePair;
 
 pub use coda_proto::events::ToolCallStatus;
+
+/// One response's usage in its wire form, every category itemised.
+///
+/// The single conversion both the legacy `event/usage` frame and the engine's
+/// authoritative accounting use, so the two cannot disagree about what a
+/// response cost.
+pub fn usage_pair(usage: &Usage) -> UsagePair {
+    UsagePair::from_counts(
+        i64::from(usage.input_tokens),
+        i64::from(usage.cache_read_tokens),
+        i64::from(usage.cache_write_5m_tokens),
+        i64::from(usage.cache_write_1h_tokens),
+        i64::from(usage.output_tokens),
+    )
+}
 
 /// Convert a `coda_llm::Correlation` to the wire `coda_proto::messages::Correlation`.
 fn to_proto_correlation(c: &LlmCorrelation) -> ProtoCorrelation {
@@ -212,11 +228,7 @@ pub fn to_proto_event(event: &AgentEvent) -> Option<ProtoEvent> {
         AgentEvent::Stop { stop_reason } => {
             Some(ProtoEvent::Stop { stop_reason: stop_reason.clone() })
         }
-        // Mismatch: proto Usage drops cache fields.
-        AgentEvent::Usage { usage } => Some(ProtoEvent::Usage {
-            input_tokens: usage.input_tokens as i64,
-            output_tokens: usage.output_tokens as i64,
-        }),
+        AgentEvent::Usage { usage } => Some(ProtoEvent::Usage(usage_pair(usage))),
         AgentEvent::Error { message } => Some(ProtoEvent::Error { message: message.clone() }),
         AgentEvent::LimitReached { kind, message } => {
             Some(ProtoEvent::LimitReached { kind: kind.clone(), message: message.clone() })
@@ -442,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_adapter_drops_cache_fields() {
+    fn usage_adapter_carries_every_cache_category() {
         let received = std::sync::Arc::new(std::sync::Mutex::new(None::<ProtoEvent>));
         let r = received.clone();
         let sink = ProtoAdapter::new(move |e| *r.lock().unwrap() = Some(e));
@@ -450,9 +462,15 @@ mod tests {
 
         let guard = received.lock().unwrap();
         match guard.as_ref().unwrap() {
-            ProtoEvent::Usage { input_tokens, output_tokens } => {
-                assert_eq!(*input_tokens, 100);
-                assert_eq!(*output_tokens, 50);
+            ProtoEvent::Usage(pair) => {
+                assert_eq!(pair.input_tokens, 100, "inputTokens stays uncached");
+                assert_eq!(pair.output_tokens, 50);
+                assert_eq!(pair.cache_read_tokens, Some(900));
+                assert_eq!(pair.cache_write_5m_tokens, Some(10));
+                assert_eq!(pair.cache_write_1h_tokens, Some(5));
+                assert_eq!(pair.cache_write_tokens, Some(15));
+                assert_eq!(pair.total_input(), 1015);
+                assert_eq!(pair.total_input(), i64::from(usage().total_input_tokens()));
             }
             other => panic!("unexpected {other:?}"),
         }

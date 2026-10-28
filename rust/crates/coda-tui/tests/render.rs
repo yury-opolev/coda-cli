@@ -569,15 +569,51 @@ fn the_status_bar_shows_the_model_and_context_usage() {
         id: "claude-opus-5".into(),
         context_limit: Some(200_000),
     });
-    state.apply(UiEvent::Engine(Event::Usage {
-        input_tokens: 50_000,
-        output_tokens: 1_000,
-    }));
+    state.apply(UiEvent::Engine(Event::Usage(coda_proto::state::UsagePair::from_counts(
+        2_000, 48_000, 0, 0, 1_000,
+    ))));
 
     let rows = render(&state, &Composer::new(), 80, 24);
     let status = rows.last().expect("a status bar");
     assert!(status.contains("claude-opus-5"), "status: {status:?}");
-    assert!(status.contains("context 25%"), "status: {status:?}");
+    assert!(status.contains("context 25%"), "cached input counts: {status:?}");
+}
+
+/// The reported bug: a wholly-cached request must still fill the gauge, and
+/// the counters are the session's cumulative traffic, cache included.
+#[test]
+fn the_status_bar_counts_cached_input_and_marks_partial_totals() {
+    use coda_proto::state::{CostEstimate, UsageCoverage, UsagePair, UsageState};
+    let mut state = session();
+    state.apply(UiEvent::ModelChanged { id: "claude-opus-5".into(), context_limit: Some(1_000_000) });
+    let last = UsagePair::from_counts(0, 200_000, 0, 0, 75);
+    state.apply(UiEvent::UsageTotals(UsageState {
+        last_response: Some(last),
+        session: Some(UsagePair::from_counts(10, 565_000, 20_000, 0, 624)),
+        session_coverage: Some(UsageCoverage::Complete),
+        cost: Some(CostEstimate { total_usd: 0.5, complete: true, ..Default::default() }),
+        ..Default::default()
+    }));
+    let rows = render(&state, &Composer::new(), 120, 24);
+    let status = rows.last().expect("a status bar");
+    assert!(status.contains("context 20%"), "status: {status:?}");
+    assert!(status.contains("585k in"), "status: {status:?}");
+    assert!(status.contains("624 out"), "status: {status:?}");
+    assert!(status.contains("$0.50"), "status: {status:?}");
+
+    state.apply(UiEvent::UsageTotals(UsageState {
+        last_response: Some(last),
+        last_response_stale: true,
+        session: Some(UsagePair::from_counts(10, 565_000, 20_000, 0, 624)),
+        session_coverage: Some(UsageCoverage::Partial),
+        cost: Some(CostEstimate { total_usd: 0.5, complete: false, ..Default::default() }),
+        ..Default::default()
+    }));
+    let rows = render(&state, &Composer::new(), 120, 24);
+    let status = rows.last().expect("a status bar");
+    assert!(status.contains("context ~20%"), "a past measurement is marked: {status:?}");
+    assert!(status.contains("585k+ in"), "partial totals are a lower bound: {status:?}");
+    assert!(status.contains("$0.50+"), "status: {status:?}");
 }
 
 #[test]

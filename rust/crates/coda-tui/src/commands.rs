@@ -102,7 +102,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "context",
         aliases: &[],
         args: "",
-        summary: "Show context window usage.",
+        summary: "Show how full the context window is (last request, cache included).",
         scope: Scope::Local,
     },
     CommandSpec {
@@ -207,7 +207,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "cost",
         aliases: &[],
         args: "",
-        summary: "Show token usage for this session.",
+        summary: "Show cumulative session token totals by category, and the cost estimate.",
         scope: Scope::Local,
     },
     CommandSpec {

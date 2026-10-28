@@ -588,6 +588,40 @@ mod tests {
         assert_eq!(usage.output_tokens, 20);
     }
 
+    /// `prompt_tokens` already includes the cached part, so the cache count
+    /// must be split out of it rather than added on top.
+    #[test]
+    fn a_wholly_cached_prompt_is_not_counted_twice() {
+        let usage_chunk = json!({
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 200_000,
+                "completion_tokens": 75,
+                "prompt_tokens_details": { "cached_tokens": 200_000 }
+            }
+        })
+        .to_string();
+        let (events, _) = run(&[&usage_chunk, "[DONE]"]);
+        let Some(StreamEvent::Done { usage, .. }) = events.last() else { panic!() };
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.cache_read_tokens, 200_000);
+        assert_eq!(usage.total_input_tokens(), 200_000);
+    }
+
+    #[test]
+    fn a_prompt_without_cache_details_is_all_uncached() {
+        let usage_chunk = json!({
+            "choices": [],
+            "usage": { "prompt_tokens": 50, "completion_tokens": 20 }
+        })
+        .to_string();
+        let (events, _) = run(&[&usage_chunk, "[DONE]"]);
+        let Some(StreamEvent::Done { usage, .. }) = events.last() else { panic!() };
+        assert_eq!(usage.input_tokens, 50);
+        assert!(!usage.has_cache_activity());
+        assert_eq!(usage.total_input_tokens(), 50);
+    }
+
     #[test]
     fn a_stream_without_done_is_not_finished() {
         let (_, decoder) = run(&[&text_chunk("partial")]);

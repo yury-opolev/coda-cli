@@ -25,10 +25,14 @@ pub struct ModelCost {
     pub input: f64,
     #[serde(default)]
     pub output: f64,
+    /// Absent for a model the catalogue does not price cache reads for:
+    /// unknown, which is not free.
     #[serde(default)]
-    pub cache_read: f64,
+    pub cache_read: Option<f64>,
+    /// The (five-minute) cache-write price; absent where writes are not
+    /// priced separately.
     #[serde(default)]
-    pub cache_write: f64,
+    pub cache_write: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -226,6 +230,22 @@ mod tests {
             "output should cost more than input: {cost:?}"
         );
         assert_eq!(model.context_limit, Some(200_000));
+    }
+
+    #[test]
+    fn a_missing_cache_price_is_unknown_rather_than_free() {
+        let catalog = ModelCatalog::parse(BUNDLED);
+        let gpt = catalog
+            .find(Some("github-copilot"), "gpt-4.1")
+            .and_then(|m| m.cost)
+            .expect("gpt-4.1 is priced");
+        assert_eq!(gpt.cache_read, Some(0.5));
+        assert_eq!(gpt.cache_write, None, "no write price, not a zero one");
+        let opus = catalog
+            .find(Some("anthropic"), "claude-opus-4-5")
+            .and_then(|m| m.cost)
+            .unwrap();
+        assert!(opus.cache_write.is_some_and(|w| w > opus.input));
     }
 
     #[test]

@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::state_events::{
     ActivityEvent, AgentMessageDeliveredEvent, AgentMessageEvent, ConfigChangedEvent,
     EventsDroppedEvent, LifecycleEvent, RequestPendingEvent, RequestResolvedEvent, Sequenced,
-    SessionChangedEvent, SteeringQueueEvent, TurnEndedEvent,
+    SessionChangedEvent, SteeringQueueEvent, TurnEndedEvent, UsageUpdatedEvent,
 };
 
 pub fn catalog_document() -> Value {
@@ -62,6 +62,7 @@ pub fn documents() -> BTreeMap<&'static str, Value> {
         ("EventsDroppedEvent.json", schemars::schema_for!(Sequenced<EventsDroppedEvent>).to_value()),
         ("AgentMessageEvent.json", schemars::schema_for!(Sequenced<AgentMessageEvent>).to_value()),
         ("AgentMessageDeliveredEvent.json", schemars::schema_for!(Sequenced<AgentMessageDeliveredEvent>).to_value()),
+        ("UsageUpdatedEvent.json", schemars::schema_for!(Sequenced<UsageUpdatedEvent>).to_value()),
         ("PendingMessagesParams.json", schemars::schema_for!(crate::requests::PendingMessagesParams).to_value()),
         ("PendingMessagesResult.json", schemars::schema_for!(crate::responses::PendingMessagesResult).to_value()),
         ("ListTasksParams.json", schemars::schema_for!(crate::requests::ListTasksParams).to_value()),

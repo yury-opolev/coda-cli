@@ -248,7 +248,12 @@ impl ChatRequest {
 
 /// Token counts for one request.
 ///
-/// Cache writes are split by TTL because they are billed differently.
+/// Normalised at the provider boundary so every decoder means the same thing:
+/// `input_tokens` is **uncached** input only. Providers whose reported input
+/// already includes cached tokens (OpenAI-style `prompt_tokens` /
+/// `input_tokens` with a `cached_tokens` detail) have the cached part split out
+/// into `cache_read_tokens`, so [`Usage::total_input_tokens`] never counts it
+/// twice. Cache writes are split by TTL because they are billed differently.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Usage {
     pub input_tokens: u32,

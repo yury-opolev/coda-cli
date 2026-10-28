@@ -2,7 +2,9 @@
 //!
 //! Mirrors C# `Coda.Sdk.SessionTranscriptStore` exactly in:
 //! - on-disk location
-//! - JSON format (`{id, createdUtc, messages, systemPromptOverride?}`)
+//! - JSON format (`{id, createdUtc, messages, systemPromptOverride?}`), plus an
+//!   optional `usage` accounting record ([`StoredUsage`]) that older readers
+//!   ignore and whose absence means "historical usage unknown"
 //! - atomic write (temp-then-rename; stray `.tmp` removed on failure)
 //! - corrupt-tolerant load (returns `None`, never panics)
 //! - `createdUtc` is preserved across incremental saves
@@ -11,6 +13,8 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use coda_llm::Message;
+use coda_proto::state::{CostEstimate, ModelUsage, UsagePair};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::ids;
@@ -26,6 +30,40 @@ pub struct StoredSession {
     pub messages: Vec<Message>,
     /// When present, overrides the default system prompt for the session.
     pub system_prompt_override: Option<String>,
+    /// The session's usage accounting, when it was saved with one.
+    ///
+    /// `None` for a transcript written before accounting was persisted (or
+    /// whose record is unreadable): its historical usage is **unknown**, which
+    /// a reader must not present as a measured zero.
+    pub usage: Option<StoredUsage>,
+}
+
+/// Usage accounting persisted with a session (the transcript's `usage` key),
+/// so a resumed session continues its totals instead of restarting at zero.
+///
+/// Assigned, never added, on restore: loading the same record twice cannot
+/// inflate anything.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredUsage {
+    /// Cumulative totals of every measured request, by category.
+    #[serde(default)]
+    pub session: UsagePair,
+    /// `false` when the totals do not cover the whole conversation — the
+    /// session began before accounting was persisted. A missing flag reads
+    /// as partial, the conservative answer.
+    #[serde(default)]
+    pub complete: bool,
+    /// The last measured request: the last known context occupancy. A
+    /// restored value is a past measurement, not the current context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_response: Option<UsagePair>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_response_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub by_model: Vec<ModelUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<CostEstimate>,
 }
 
 /// Lightweight description of one persisted session, returned by
@@ -74,12 +112,34 @@ impl SessionTranscriptStore {
         messages: &[Message],
         system_prompt_override: Option<&str>,
     ) -> std::io::Result<()> {
+        self.save_with_usage(session_id, messages, system_prompt_override, None).await
+    }
+
+    /// [`Self::save`], also recording the session's usage accounting.
+    ///
+    /// `usage: None` keeps whatever accounting the file already holds, so a
+    /// save that only rewrites the conversation (rewind, import) never
+    /// erases the totals.
+    pub async fn save_with_usage(
+        &self,
+        session_id: &str,
+        messages: &[Message],
+        system_prompt_override: Option<&str>,
+        usage: Option<&StoredUsage>,
+    ) -> std::io::Result<()> {
         if messages.is_empty() || !ids::is_valid(session_id) {
             return Ok(());
         }
 
         let path = self.file_path(session_id);
-        let created_utc = resolve_created_utc(&path).await;
+        let existing = read_root(&path).await;
+        let created_utc = existing
+            .as_ref()
+            .and_then(|v| v.get("createdUtc"))
+            .and_then(Value::as_str)
+            .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(Utc::now);
 
         let mut root = json!({
             "id": session_id,
@@ -91,9 +151,39 @@ impl SessionTranscriptStore {
             root["systemPromptOverride"] = json!(override_prompt);
         }
 
+        let usage = match usage {
+            Some(usage) => serde_json::to_value(usage).ok(),
+            None => existing.as_ref().and_then(|v| v.get("usage")).cloned(),
+        };
+        if let Some(usage) = usage {
+            root["usage"] = usage;
+        }
+
         let text = serde_json::to_string(&root)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
+        write_atomic(&path, &text).await
+    }
+
+    /// Records usage accounting on an **existing** transcript, leaving the
+    /// conversation and every other field as they are. Does nothing when the
+    /// session has no transcript (or an unreadable one): accounting alone is
+    /// not a session.
+    pub async fn save_usage(&self, session_id: &str, usage: &StoredUsage) -> std::io::Result<()> {
+        if !ids::is_valid(session_id) {
+            return Ok(());
+        }
+        let path = self.file_path(session_id);
+        let Some(mut root) = read_root(&path).await else {
+            return Ok(());
+        };
+        if !root.is_object() || root.get("messages").is_none() {
+            return Ok(());
+        }
+        root["usage"] = serde_json::to_value(usage)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let text = serde_json::to_string(&root)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         write_atomic(&path, &text).await
     }
 
@@ -150,22 +240,11 @@ impl SessionTranscriptStore {
 // Private helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Resolve the `createdUtc` to use for a save: the value already on disk (so
-/// it persists across incremental saves) or `Utc::now()` for a brand-new
-/// session.  Corrupt existing files fall back to now.
-async fn resolve_created_utc(path: &Path) -> DateTime<Utc> {
-    if path.exists() {
-        if let Ok(text) = tokio::fs::read_to_string(path).await {
-            if let Ok(v) = serde_json::from_str::<Value>(&text) {
-                if let Some(raw) = v.get("createdUtc").and_then(|v| v.as_str()) {
-                    if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
-                        return dt.with_timezone(&Utc);
-                    }
-                }
-            }
-        }
-    }
-    Utc::now()
+/// The transcript currently on disk, parsed, or `None` when it is missing or
+/// corrupt (a corrupt file is overwritten by the next save, as before).
+async fn read_root(path: &Path) -> Option<Value> {
+    let text = tokio::fs::read_to_string(path).await.ok()?;
+    serde_json::from_str::<Value>(&text).ok()
 }
 
 /// Load a stored session from an arbitrary path (used by load_session and bundle import).
@@ -178,7 +257,10 @@ pub(super) async fn load_session_from_path(path: &Path) -> Option<StoredSession>
         .get("systemPromptOverride")
         .and_then(|v| v.as_str())
         .map(|s| s.to_owned());
-    Some(StoredSession { messages, system_prompt_override })
+    let usage = root
+        .get("usage")
+        .and_then(|v| serde_json::from_value::<StoredUsage>(v.clone()).ok());
+    Some(StoredSession { messages, system_prompt_override, usage })
 }
 
 fn read_summary_from_path(path: &Path) -> Option<SessionSummary> {
@@ -412,6 +494,83 @@ mod tests {
         store.save("abc123456789", &msgs, Some("custom prompt")).await.unwrap();
         let stored = store.load_session("abc123456789").await.unwrap();
         assert_eq!(stored.system_prompt_override.as_deref(), Some("custom prompt"));
+    }
+
+    fn accounting() -> StoredUsage {
+        use coda_proto::state::UsagePair;
+        StoredUsage {
+            session: UsagePair::from_counts(10, 565_000, 20_000, 0, 624),
+            complete: true,
+            last_response: Some(UsagePair::from_counts(0, 200_000, 0, 0, 75)),
+            last_response_model: Some("claude-opus-5.5".into()),
+            ..StoredUsage::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_accounting_round_trips_with_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(&dir);
+        let id = "abc123456789";
+        store
+            .save_with_usage(id, &[Message::user("hi")], None, Some(&accounting()))
+            .await
+            .unwrap();
+        let stored = store.load_session(id).await.unwrap();
+        assert_eq!(stored.usage, Some(accounting()));
+    }
+
+    #[tokio::test]
+    async fn a_save_without_accounting_keeps_what_is_on_disk() {
+        // Rewind and the other message-only saves must not erase the totals
+        // the session has already accumulated.
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(&dir);
+        let id = "abc123456789";
+        store
+            .save_with_usage(id, &[Message::user("hi")], None, Some(&accounting()))
+            .await
+            .unwrap();
+        store.save(id, &[Message::user("hi"), Message::assistant("yo")], None).await.unwrap();
+        let stored = store.load_session(id).await.unwrap();
+        assert_eq!(stored.messages.len(), 2);
+        assert_eq!(stored.usage, Some(accounting()));
+    }
+
+    #[tokio::test]
+    async fn accounting_can_be_attached_to_an_existing_session_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(&dir);
+        let id = "abc123456789";
+        store.save_usage(id, &accounting()).await.unwrap();
+        assert!(store.load_session(id).await.is_none(), "no transcript is invented");
+
+        store.save(id, &[Message::user("hi")], Some("p")).await.unwrap();
+        store.save_usage(id, &accounting()).await.unwrap();
+        let stored = store.load_session(id).await.unwrap();
+        assert_eq!(stored.usage, Some(accounting()));
+        assert_eq!(stored.system_prompt_override.as_deref(), Some("p"));
+        assert_eq!(stored.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_transcript_from_before_accounting_loads_without_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(&dir);
+        let id = "abc123456789";
+        store.save(id, &[Message::user("hi")], None).await.unwrap();
+        let stored = store.load_session(id).await.unwrap();
+        assert_eq!(stored.usage, None, "unknown history, not a measured zero");
+
+        // A malformed record is unknown too, and costs nothing else.
+        let path = dir.path().join(".coda").join("sessions").join(format!("{id}.json"));
+        let mut root: Value =
+            serde_json::from_str(&tokio::fs::read_to_string(&path).await.unwrap()).unwrap();
+        root["usage"] = json!("garbage");
+        tokio::fs::write(&path, root.to_string()).await.unwrap();
+        let stored = store.load_session(id).await.unwrap();
+        assert_eq!(stored.usage, None);
+        assert_eq!(stored.messages.len(), 1);
     }
 
     #[tokio::test]

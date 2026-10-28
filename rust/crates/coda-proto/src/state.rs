@@ -367,22 +367,204 @@ pub struct PendingRequestDto {
 
 
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+/// Token counts for one response, or a running sum of them.
+///
+/// `inputTokens` is **uncached** input only — the meaning it has always had.
+/// The cache categories are additive fields: an engine that predates them
+/// omits them, and a reader must then treat the cache counts as *unknown*
+/// (so [`UsagePair::total_input`] is a lower bound), never as zero. Every
+/// engine that knows about them always sends them, zeros included, so their
+/// presence is itself the signal ([`UsagePair::reports_cache`]).
+///
+/// Providers that report input *including* cached tokens (OpenAI-style
+/// `prompt_tokens` with a `cached_tokens` detail) are normalised at the
+/// provider boundary, so `inputTokens` never double-counts the cache.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UsagePair {
+    /// Uncached input tokens.
     pub input_tokens: i64,
     pub output_tokens: i64,
+    /// Input tokens served from the prompt cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<i64>,
+    /// Input tokens written to the prompt cache, every TTL together.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<i64>,
+    /// The part of `cacheWriteTokens` written with the five-minute TTL (also
+    /// where a provider that does not itemise by TTL is attributed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_5m_tokens: Option<i64>,
+    /// The part of `cacheWriteTokens` written with the one-hour TTL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_1h_tokens: Option<i64>,
+    /// `inputTokens + cacheReadTokens + cacheWriteTokens`: everything the
+    /// request(s) carried as input. For one request this is what occupied the
+    /// context window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_input_tokens: Option<i64>,
 }
 
+impl UsagePair {
+    /// A fully itemised pair, as a cache-aware engine reports it.
+    pub fn from_counts(
+        uncached_input: i64,
+        cache_read: i64,
+        cache_write_5m: i64,
+        cache_write_1h: i64,
+        output: i64,
+    ) -> Self {
+        let cache_write = cache_write_5m + cache_write_1h;
+        Self {
+            input_tokens: uncached_input,
+            output_tokens: output,
+            cache_read_tokens: Some(cache_read),
+            cache_write_tokens: Some(cache_write),
+            cache_write_5m_tokens: Some(cache_write_5m),
+            cache_write_1h_tokens: Some(cache_write_1h),
+            total_input_tokens: Some(uncached_input + cache_read + cache_write),
+        }
+    }
+
+    /// Whether the sender reported the cache categories at all.
+    pub fn reports_cache(&self) -> bool {
+        self.cache_read_tokens.is_some()
+            || self.cache_write_tokens.is_some()
+            || self.total_input_tokens.is_some()
+    }
+
+    pub fn cache_read(&self) -> i64 {
+        self.cache_read_tokens.unwrap_or(0)
+    }
+
+    pub fn cache_write_5m(&self) -> i64 {
+        self.cache_write_5m_tokens
+            .unwrap_or_else(|| self.cache_write_tokens.unwrap_or(0) - self.cache_write_1h())
+    }
+
+    pub fn cache_write_1h(&self) -> i64 {
+        self.cache_write_1h_tokens.unwrap_or(0)
+    }
+
+    pub fn cache_write(&self) -> i64 {
+        self.cache_write_tokens
+            .unwrap_or_else(|| self.cache_write_5m_tokens.unwrap_or(0) + self.cache_write_1h())
+    }
+
+    /// All input, cached or not. A lower bound when the sender did not report
+    /// the cache categories (see [`UsagePair::reports_cache`]).
+    pub fn total_input(&self) -> i64 {
+        self.total_input_tokens
+            .unwrap_or_else(|| self.input_tokens + self.cache_read() + self.cache_write())
+    }
+
+}
+
+/// Adds another pair. The result reports the cache categories only when both
+/// sides did: a sum that included an unknown is not itemised.
+impl std::ops::Add for UsagePair {
+    type Output = UsagePair;
+
+    fn add(self, other: UsagePair) -> UsagePair {
+        let input = self.input_tokens + other.input_tokens;
+        let output = self.output_tokens + other.output_tokens;
+        if self.reports_cache() && other.reports_cache() {
+            UsagePair::from_counts(
+                input,
+                self.cache_read() + other.cache_read(),
+                self.cache_write_5m() + other.cache_write_5m(),
+                self.cache_write_1h() + other.cache_write_1h(),
+                output,
+            )
+        } else {
+            UsagePair { input_tokens: input, output_tokens: output, ..Default::default() }
+        }
+    }
+}
+
+/// Whether the session totals cover the whole conversation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub enum UsageCoverage {
+    /// Every request of this session was measured.
+    Complete,
+    /// Some of the conversation predates the measurement — typically a
+    /// session saved by an older version without usage accounting. The totals
+    /// cover only the requests measured since, and the real figure is higher.
+    Partial,
+}
+
+/// An estimated price for the session totals, in US dollars.
+///
+/// Each category is priced at its own rate — cache reads and cache writes
+/// (per TTL) are not charged at the uncached input price — using the price
+/// of the model that served each request at the time it was served.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct CostEstimate {
+    pub total_usd: f64,
+    pub input_usd: f64,
+    pub cache_read_usd: f64,
+    pub cache_write_usd: f64,
+    pub output_usd: f64,
+    /// `false` when some measured tokens had no known price (or the history
+    /// is [`UsageCoverage::Partial`]): the figure is then a lower bound, not
+    /// the cost.
+    pub complete: bool,
+}
+
+/// One model's share of the session totals.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ModelUsage {
+    pub model: String,
+    pub usage: UsagePair,
+}
+
+/// The engine's usage accounting.
+///
+/// Three different quantities, deliberately kept apart:
+///
+/// - **Context occupancy** — `lastResponse.totalInputTokens` against
+///   `contextLimit`. One request re-sends the whole conversation, cached or
+///   not, so its total input is what is in the window.
+/// - **Cumulative traffic** — `session`: every request's tokens summed. It
+///   passes the window size after a few turns and says nothing about how full
+///   the window is.
+/// - **Estimated cost** — `cost`, priced per category.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UsageState {
+    /// The most recent measured request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_response: Option<UsagePair>,
+    /// The model that served `lastResponse`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_response_model: Option<String>,
+    /// `true` when `lastResponse` no longer describes the current context: it
+    /// was restored from a saved session, or the conversation (rewind,
+    /// compaction, fork) or the model changed since it was measured. It is the
+    /// last known measurement, not the current one, until the next request.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub last_response_stale: bool,
+    /// Cumulative totals for the session, restored across resumes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<UsagePair>,
+    /// Absent from engines that predate it: coverage unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_coverage: Option<UsageCoverage>,
+    /// Per-model share of `session`, so the cost stays attributable after a
+    /// model switch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub by_model: Vec<ModelUsage>,
+    /// Absent when nothing has been priced: unknown, never a free session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<CostEstimate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_limit: Option<i64>,
     #[serde(default)]
@@ -526,6 +708,45 @@ pub struct StateSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn total_input_counts_every_cache_category() {
+        let usage = UsagePair::from_counts(4, 170_000, 15_000, 5_000, 449);
+        assert_eq!(usage.cache_write(), 20_000);
+        assert_eq!(usage.total_input(), 190_004);
+        // All cached: no uncached input at all, still a full window.
+        assert_eq!(UsagePair::from_counts(0, 200_000, 0, 0, 75).total_input(), 200_000);
+        // No cache at all.
+        assert_eq!(UsagePair::from_counts(1_000, 0, 0, 0, 10).total_input(), 1_000);
+    }
+
+    #[test]
+    fn pairs_accumulate_by_category() {
+        let total = UsagePair::from_counts(4, 170_000, 20_000, 0, 449)
+            + UsagePair::from_counts(6, 195_000, 0, 0, 100)
+            + UsagePair::from_counts(0, 200_000, 0, 0, 75);
+        assert_eq!(total.total_input(), 585_010);
+        assert_eq!(total.output_tokens, 624);
+        assert_eq!(total.input_tokens, 10);
+        assert_eq!(total.cache_read(), 565_000);
+        assert_eq!(total.cache_write_5m(), 20_000);
+    }
+
+    #[test]
+    fn a_pair_without_cache_fields_is_a_lower_bound_not_itemised() {
+        let legacy: UsagePair =
+            serde_json::from_value(serde_json::json!({ "inputTokens": 4, "outputTokens": 449 }))
+                .unwrap();
+        assert!(!legacy.reports_cache());
+        assert_eq!(legacy.total_input(), 4);
+        let summed = UsagePair::from_counts(1, 2, 3, 4, 5) + legacy;
+        assert!(!summed.reports_cache(), "a sum including an unknown is not itemised");
+        assert_eq!(
+            serde_json::to_value(legacy).unwrap(),
+            serde_json::json!({ "inputTokens": 4, "outputTokens": 449 }),
+            "absent categories stay absent on the wire",
+        );
+    }
 
     #[test]
     fn snapshot_round_trips_through_json() {

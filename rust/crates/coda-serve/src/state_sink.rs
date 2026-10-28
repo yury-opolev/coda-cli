@@ -147,9 +147,10 @@ impl AgentSink for StateSink {
                 // event. Without this the snapshot reported `usage: unknown`
                 // for the whole life of the process.
                 AgentEvent::Usage { usage } => {
-                    events.extend(
-                        s.usage_updated(usage.input_tokens as i64, usage.output_tokens as i64),
-                    );
+                    // The same conversion the legacy frame above used, so
+                    // `event/usage` and `event/usageUpdated` agree on every
+                    // category of this response.
+                    events.extend(s.usage_updated(coda_agent::events::usage_pair(usage)));
                 }
                 _ => {}
             }
@@ -418,6 +419,39 @@ mod tests {
         assert_eq!((last.input_tokens, last.output_tokens), (1200, 300));
         let frames = drain(&mut h.rx);
         assert!(frames.iter().any(|(_, m, p)| m == "event/usage" && p["inputTokens"] == 1200));
+    }
+
+    /// The reported reproduction, through the real sink: the legacy per-response
+    /// frame and the authoritative totals carry the cached input, and agree.
+    #[test]
+    fn cached_input_reaches_both_usage_frames_and_they_agree() {
+        let mut h = harness();
+        let responses = [(4, 170_000, 20_000, 449), (6, 195_000, 0, 100), (0, 200_000, 0, 75)];
+        let mut running = 0;
+        for (uncached, read, write, output) in responses {
+            h.sink.emit(AgentEvent::Usage {
+                usage: coda_llm::Usage {
+                    input_tokens: uncached,
+                    cache_read_tokens: read,
+                    cache_write_5m_tokens: write,
+                    output_tokens: output,
+                    ..coda_llm::Usage::ZERO
+                },
+            });
+            let full = i64::from(uncached + read + write);
+            running += full;
+            let frames = drain(&mut h.rx);
+            let legacy = frames.iter().find(|(_, m, _)| m == "event/usage").expect("event/usage");
+            let totals =
+                frames.iter().find(|(_, m, _)| m == "event/usageUpdated").expect("event/usageUpdated");
+            assert_eq!(legacy.2["totalInputTokens"], full);
+            assert_eq!(legacy.2["inputTokens"], i64::from(uncached));
+            assert_eq!(totals.2["lastResponse"]["totalInputTokens"], full);
+            assert_eq!(totals.2["session"]["totalInputTokens"], running);
+        }
+        assert_eq!(running, 585_010);
+        let session = h.state.project("v1", limits()).usage.session.unwrap();
+        assert_eq!((session.total_input(), session.output_tokens), (585_010, 624));
     }
 
     // ── Canonical turnId on tool payloads, legacy aliases untouched ───────
