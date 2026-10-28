@@ -133,7 +133,7 @@ mod tests {
             )
             .await;
         assert!(!result.is_error, "{}", result.content);
-        assert!(result.content.contains("task-0001"), "{}", result.content);
+        assert!(result.content.contains("task-00000001"), "{}", result.content);
         assert!(result.content.contains("running"), "{}", result.content);
         assert!(result.content.contains("hello task"), "{}", result.content);
     }

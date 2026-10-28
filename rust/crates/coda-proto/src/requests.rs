@@ -21,6 +21,54 @@ pub const INITIALIZATION_GATED_METHODS: &[&str] = &[
     crate::messages::method::ASK_ASIDE,
 ];
 
+/// Which tasks `session/listTasks` (and the model's `task_list`) return.
+///
+/// `active` is every task still `running` — foreground or background, with
+/// or without output, including parked subagents. `terminal` is `completed`,
+/// `failed` and `stopped`. `all` is both, the behaviour when no filter is
+/// given. Filtering is presentation only: no record, output or completion is
+/// affected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub enum TaskStatusFilter {
+    Active,
+    Terminal,
+    #[default]
+    All,
+}
+
+impl TaskStatusFilter {
+    /// Whether a task in a terminal (`true`) or running (`false`) state passes.
+    pub fn admits(self, terminal: bool) -> bool {
+        match self {
+            TaskStatusFilter::Active => !terminal,
+            TaskStatusFilter::Terminal => terminal,
+            TaskStatusFilter::All => true,
+        }
+    }
+
+    /// Parses the wire spelling; `None` for anything else.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "active" => Some(TaskStatusFilter::Active),
+            "terminal" => Some(TaskStatusFilter::Terminal),
+            "all" => Some(TaskStatusFilter::All),
+            _ => None,
+        }
+    }
+}
+
+/// `session/listTasks`. Every field is optional; `{}` lists all tasks.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ListTasksParams {
+    /// Absent means `all`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_filter: Option<TaskStatusFilter>,
+}
+
 /// A side question (`session/askAside`).
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -229,4 +277,34 @@ pub struct CancelRequestResult {
     pub outcome: String,
     /// Echoes the optional reason; the existing response uses null when absent.
     pub reason: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_tasks_params_accept_the_three_filters_and_refuse_others() {
+        let parse = |v: Value| serde_json::from_value::<ListTasksParams>(v);
+        assert_eq!(parse(serde_json::json!({})).unwrap().status_filter, None);
+        for (wire, filter) in [
+            ("active", TaskStatusFilter::Active),
+            ("terminal", TaskStatusFilter::Terminal),
+            ("all", TaskStatusFilter::All),
+        ] {
+            let params = parse(serde_json::json!({ "statusFilter": wire })).unwrap();
+            assert_eq!(params.status_filter, Some(filter));
+            assert_eq!(TaskStatusFilter::parse(wire), Some(filter));
+        }
+        let error = parse(serde_json::json!({ "statusFilter": "done" })).unwrap_err().to_string();
+        assert!(error.contains("done") && error.contains("active"), "{error}");
+        assert_eq!(TaskStatusFilter::parse("Active"), None);
+    }
+
+    #[test]
+    fn active_admits_only_running_and_terminal_only_finished_tasks() {
+        assert!(TaskStatusFilter::Active.admits(false) && !TaskStatusFilter::Active.admits(true));
+        assert!(TaskStatusFilter::Terminal.admits(true) && !TaskStatusFilter::Terminal.admits(false));
+        assert!(TaskStatusFilter::All.admits(true) && TaskStatusFilter::All.admits(false));
+    }
 }

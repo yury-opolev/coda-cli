@@ -88,7 +88,9 @@ struct ManagerState {
     /// lazily during publish so no live work is skipped.
     subscriptions: Vec<Weak<TaskSubscription>>,
     outbox: HashMap<String, std::collections::VecDeque<TaskCompletionEntry>>,
-    next_id: u32,
+    /// The number of the most recently issued task id. Ids are never reused
+    /// within a session; see [`TaskManager::register`].
+    next_id: u64,
     shutting_down: bool,
     disposed: bool,
 }
@@ -352,6 +354,13 @@ impl TaskManager {
         running.len()
     }
 
+    /// Test hook: makes the next registration take number `last + 1`, so the
+    /// id boundaries can be reached without registering millions of tasks.
+    #[cfg(test)]
+    pub(crate) fn seed_last_task_number(&self, last: u64) {
+        self.state.lock().unwrap().next_id = last;
+    }
+
     pub fn with_defaults(session_id: impl Into<String>) -> Arc<Self> {
         Self::new(
             session_id,
@@ -403,8 +412,17 @@ impl TaskManager {
             }
         }
 
-        s.next_id += 1;
-        let id = format!("task-{:04}", s.next_id);
+        // Checked, never wrapping: a reused id would alias a retained task's
+        // record, log file and parent/control identity. Nothing is mutated,
+        // inserted, logged or announced when the sequence is exhausted.
+        let Some(number) = s.next_id.checked_add(1) else {
+            return Err("This session has used up its task ids; no new tasks may be registered. \
+                        Start a new session to continue."
+                .into());
+        };
+        s.next_id = number;
+        // Eight digits minimum; larger numbers simply grow wider.
+        let id = format!("task-{number:08}");
         let log_path = self.log_root.join(&self.session_id).join(format!("{id}.log"));
 
         let task = ManagedTask::new(
@@ -472,6 +490,24 @@ impl TaskManager {
         let tasks = self.state.lock().unwrap().order.clone();
         tasks.into_iter()
             .map(|task| (task.to_snapshot(), task.redacted_output.peek(max_chars)))
+            .collect()
+    }
+
+    /// [`Self::list_with_output`] limited to the tasks `filter` admits. The
+    /// status is checked before the tail and report are copied, and again on
+    /// the snapshot, so a task that settles mid-read is never returned under
+    /// the wrong filter.
+    pub fn list_with_output_matching(
+        &self,
+        max_chars: usize,
+        filter: coda_proto::requests::TaskStatusFilter,
+    ) -> Vec<(TaskSnapshot, String)> {
+        let tasks = self.state.lock().unwrap().order.clone();
+        tasks.into_iter()
+            .filter(|task| filter.admits(task.status().is_terminal()))
+            .map(|task| (task.to_snapshot(), task))
+            .filter(|(snapshot, _)| filter.admits(snapshot.status.is_terminal()))
+            .map(|(snapshot, task)| (snapshot, task.redacted_output.peek(max_chars)))
             .collect()
     }
 
@@ -1005,8 +1041,96 @@ mod tests {
         let t2 = m
             .register(TaskKind::Subagent, "b", None, TaskExecutionMode::Background)
             .unwrap();
-        assert_eq!(t1.id, "task-0001");
-        assert_eq!(t2.id, "task-0002");
+        assert_eq!(t1.id, "task-00000001");
+        assert_eq!(t2.id, "task-00000002");
+    }
+
+    #[test]
+    fn ids_cross_the_eight_digit_boundary_without_wrapping() {
+        let m = mgr();
+        m.seed_last_task_number(99_999_998);
+        let ids: Vec<_> = (0..2)
+            .map(|_| m.register(TaskKind::Shell, "x", None, TaskExecutionMode::Background).unwrap().id.clone())
+            .collect();
+        assert_eq!(ids, ["task-99999999", "task-100000000"]);
+    }
+
+    #[test]
+    fn the_last_u64_id_is_issued_and_the_next_registration_fails_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = TaskManager::new("s", Some(dir.path().to_path_buf()), 4096, 10);
+        let observer = Arc::new(RecordingObserver::default());
+        m.set_event_observer(observer.clone());
+        let sub = m.subscribe();
+        m.seed_last_task_number(u64::MAX - 1);
+
+        let last = m.register(TaskKind::Shell, "last", None, TaskExecutionMode::Background).unwrap();
+        assert_eq!(last.id, format!("task-{}", u64::MAX));
+        m.append_output(&last.id, "hello\n");
+        let log_files = || std::fs::read_dir(dir.path().join("s")).map(|d| d.count()).unwrap_or(0);
+        let logs_before = log_files();
+        assert!(!sub.drain().0.is_empty(), "the last task was announced");
+
+        let error = m
+            .register(TaskKind::Subagent, "overflow", None, TaskExecutionMode::Background)
+            .err()
+            .expect("allocation past u64::MAX must fail");
+        assert!(error.contains("task ids"), "{error}");
+        assert_eq!(m.list().len(), 1, "no partial registration");
+        assert_eq!(m.state.lock().unwrap().next_id, u64::MAX, "the counter does not wrap");
+        assert_eq!(m.state.lock().unwrap().logs.len(), 1, "no log writer for a refused task");
+        assert_eq!(log_files(), logs_before);
+        assert!(sub.drain().0.is_empty(), "no change posted for a refused task");
+        assert_eq!(
+            observer.0.lock().unwrap().iter().filter(|e| e.starts_with("started")).count(),
+            1,
+            "no start event for a refused task"
+        );
+        assert!(m.register(TaskKind::Shell, "again", None, TaskExecutionMode::Background).is_err());
+        assert_eq!(m.state.lock().unwrap().next_id, u64::MAX);
+    }
+
+    #[test]
+    fn concurrent_registrations_get_unique_ids() {
+        let m = mgr();
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let m = m.clone();
+                std::thread::spawn(move || {
+                    (0..25)
+                        .map(|_| m.register(TaskKind::Subagent, "c", None, TaskExecutionMode::Background).unwrap().id.clone())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut ids: Vec<String> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 200);
+        assert!(ids.iter().all(|id| id.len() == "task-00000001".len()));
+    }
+
+    #[test]
+    fn filtered_listing_returns_exactly_the_requested_statuses_and_keeps_the_rest() {
+        use coda_proto::requests::TaskStatusFilter as F;
+        let m = mgr();
+        let running = m.register(TaskKind::Shell, "r", None, TaskExecutionMode::Foreground).unwrap();
+        let done = m.register(TaskKind::Shell, "c", None, TaskExecutionMode::Background).unwrap();
+        let failed = m.register(TaskKind::Shell, "f", None, TaskExecutionMode::Background).unwrap();
+        let parked = m.register(TaskKind::Subagent, "p", None, TaskExecutionMode::Background).unwrap();
+        m.append_output(&done.id, "done output");
+        m.complete(&done.id, Some("report".into()));
+        m.fail(&failed.id, Some("boom".into()));
+        let ids = |filter| -> Vec<String> {
+            m.list_with_output_matching(4000, filter).into_iter().map(|(t, _)| t.id).collect()
+        };
+        assert_eq!(ids(F::Active), [running.id.clone(), parked.id.clone()]);
+        assert_eq!(ids(F::Terminal), [done.id.clone(), failed.id.clone()]);
+        assert_eq!(ids(F::All).len(), 4);
+        assert_eq!(m.list().len(), 4, "filtering never removes records");
+        let (_, tail) = m.list_with_output_matching(4000, F::Terminal).remove(0);
+        assert_eq!(tail, "done output", "output is peeked, not consumed");
+        assert_eq!(m.list_with_output_matching(4000, F::Terminal).remove(0).1, "done output");
     }
 
     #[test]

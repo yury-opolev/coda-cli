@@ -1,6 +1,7 @@
 //! `task_list` — list all managed tasks with their current status.
 
 use async_trait::async_trait;
+use coda_proto::requests::TaskStatusFilter;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -17,19 +18,47 @@ impl Tool for TaskListTool {
     }
 
     fn description(&self) -> &str {
-        "List all background tasks for the current session with their id, description, status, \
-         and kind. Returns an empty list when no tasks exist."
+        "List background tasks for the current session with their id, description, status, \
+         and kind. Lists all tasks by default; statusFilter \"active\" lists only running work \
+         and \"terminal\" only completed, failed or stopped tasks. Returns an empty list when \
+         no tasks match."
     }
 
     fn input_schema_json(&self) -> &str {
-        r#"{"type":"object","properties":{}}"#
+        r#"{
+          "type":"object",
+          "properties":{
+            "statusFilter":{
+              "type":"string",
+              "enum":["active","terminal","all"],
+              "description":"Which tasks to list: active (running), terminal (completed, failed or stopped) or all (default)"
+            }
+          }
+        }"#
     }
 
     fn is_read_only(&self) -> bool {
         true
     }
 
-    async fn execute(&self, _input: &Value, ctx: &ToolContext, _cancel: CancellationToken) -> ToolOutcome {
+    async fn execute(&self, input: &Value, ctx: &ToolContext, _cancel: CancellationToken) -> ToolOutcome {
+        let filter = match input.get("statusFilter") {
+            None | Some(Value::Null) => TaskStatusFilter::All,
+            Some(value) => match value.as_str().and_then(TaskStatusFilter::parse) {
+                Some(filter) => filter,
+                None => {
+                    return ToolResult::error(format!(
+                        "Invalid statusFilter {value}; expected one of: active, terminal, all."
+                    ))
+                }
+            },
+        };
+        let empty = match filter {
+            TaskStatusFilter::Active => "No active tasks.",
+            TaskStatusFilter::Terminal => "No finished tasks.",
+            TaskStatusFilter::All => "No tasks.",
+        };
+
         let mgr = match ctx.get_task_manager() {
             Some(m) => m,
             None => return ToolResult::error("Task manager is not available."),
@@ -37,17 +66,18 @@ impl Tool for TaskListTool {
 
         let tasks = mgr.list();
         if tasks.is_empty() {
-            return ToolResult::ok("No tasks.");
+            return ToolResult::ok(empty);
         }
 
         // Only show tasks visible to the caller.
         let visible: Vec<_> = tasks
             .iter()
+            .filter(|t| filter.admits(t.status.is_terminal()))
             .filter(|t| is_visible(ctx.caller_task_id.as_deref(), t, mgr))
             .collect();
 
         if visible.is_empty() {
-            return ToolResult::ok("No tasks.");
+            return ToolResult::ok(empty);
         }
 
         let mut lines = Vec::new();
@@ -136,8 +166,58 @@ mod tests {
             .execute(&Value::Object(Default::default()), &ctx(m), CancellationToken::new())
             .await;
         assert!(!result.is_error);
-        assert!(result.content.contains("task-0001"), "{}", result.content);
+        assert!(result.content.contains("task-00000001"), "{}", result.content);
         assert!(result.content.contains("my-task"), "{}", result.content);
         assert!(result.content.contains("running"), "{}", result.content);
+    }
+
+    async fn list(m: &Arc<TaskManager>, input: Value) -> ToolResult {
+        TaskListTool.execute(&input, &ctx(m.clone()), CancellationToken::new()).await
+    }
+
+    #[tokio::test]
+    async fn the_status_filter_selects_active_or_finished_tasks_and_defaults_to_all() {
+        let m = TaskManager::with_defaults("session");
+        let live = m.register(TaskKind::Shell, "live-one", None, TaskExecutionMode::Background).unwrap();
+        let done = m.register(TaskKind::Shell, "done-one", None, TaskExecutionMode::Background).unwrap();
+        let stopped = m.register(TaskKind::Shell, "stopped-one", None, TaskExecutionMode::Background).unwrap();
+        m.complete(&done.id, None);
+        m.stop(&stopped.id);
+
+        let all = list(&m, serde_json::json!({})).await.content;
+        assert!(all.contains("live-one") && all.contains("done-one") && all.contains("stopped-one"), "{all}");
+        let active = list(&m, serde_json::json!({ "statusFilter": "active" })).await.content;
+        assert!(active.contains(&live.id) && !active.contains("done-one") && !active.contains("stopped-one"), "{active}");
+        let terminal = list(&m, serde_json::json!({ "statusFilter": "terminal" })).await.content;
+        assert!(!terminal.contains("live-one") && terminal.contains("done-one") && terminal.contains("stopped-one"), "{terminal}");
+        assert_eq!(list(&m, serde_json::json!({ "statusFilter": "all" })).await.content, all);
+        assert_eq!(m.list().len(), 3);
+
+        m.complete(&live.id, None);
+        let none = list(&m, serde_json::json!({ "statusFilter": "active" })).await;
+        assert!(!none.is_error && none.content.contains("No active tasks"), "{}", none.content);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_status_filter_is_refused() {
+        let m = TaskManager::with_defaults("session");
+        for bad in [serde_json::json!("finished"), serde_json::json!(3)] {
+            let result = list(&m, serde_json::json!({ "statusFilter": bad })).await;
+            assert!(result.is_error, "{}", result.content);
+            assert!(result.content.contains("active, terminal, all"), "{}", result.content);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_subagent_still_sees_only_its_own_tasks_under_a_filter() {
+        let m = TaskManager::with_defaults("session");
+        let agent = m.register(TaskKind::Subagent, "agent", None, TaskExecutionMode::Background).unwrap();
+        let mine = m.register(TaskKind::Shell, "mine", Some(&agent.id), TaskExecutionMode::Background).unwrap();
+        m.register(TaskKind::Shell, "other", None, TaskExecutionMode::Background).unwrap();
+        let ctx = ToolContext::new(".").with_task_manager(m.clone()).with_caller_task_id(agent.id.clone());
+        let result = TaskListTool
+            .execute(&serde_json::json!({ "statusFilter": "active" }), &ctx, CancellationToken::new())
+            .await;
+        assert!(result.content.contains(&mine.id) && !result.content.contains("other"), "{}", result.content);
     }
 }
