@@ -10,7 +10,7 @@ use serde_json::Value;
 
 pub use coda_proto::requests::{
     CancelRequestParams, ConfigSetParams, GetEventsParams, GetHistoryParams,
-    GetStateParams, ListSessionsParams, PendingMessagesParams, ResolveRequestParams, SetModelParams,
+    GetStateParams, ListSessionsParams, ListTasksParams, PendingMessagesParams, ResolveRequestParams, SetModelParams,
     HooksInfoParams, HooksTrustParams, ForkParams, RewindParams, TaskIdParams, TaskSendParams, AskAsideParams,
 };
 
@@ -431,7 +431,7 @@ pub trait ServeBackend: Send + Sync {
     /// resume without starting one first.
     async fn session_list_sessions(&self, p: ListSessionsParams) -> Result<Value, RpcError>;
     /// Read-only task registry and bounded output. Valid before initialization.
-    async fn session_list_tasks(&self) -> Result<Value, RpcError>;
+    async fn session_list_tasks(&self, p: ListTasksParams) -> Result<Value, RpcError>;
     /// Outstanding server-initiated requests. Requires initialization.
     async fn session_get_pending_requests(&self) -> Result<Value, RpcError>;
     /// Answer a pending request out of band. Requires initialization.
@@ -592,7 +592,15 @@ pub async fn dispatch(
         "session/cancelRequest" => backend.session_cancel_request(required(params)?).await,
         "config/describe" => backend.config_describe().await,
         "config/set" => backend.config_set(required(params)?).await,
-        "session/listTasks" => backend.session_list_tasks().await,
+        "session/listTasks" => {
+            let p: ListTasksParams = optional_strict(params).map_err(|error| {
+                RpcError::invalid_params(format!(
+                    "{}; statusFilter must be one of: active, terminal, all",
+                    error.message
+                ))
+            })?;
+            backend.session_list_tasks(p).await
+        }
         "mcp/list" => backend.mcp_list().await,
         "session/pendingMessages" => {
             let mut p: PendingMessagesParams = optional_strict(params)?;
@@ -777,7 +785,7 @@ mod tests {
         async fn mcp_list(&self) -> Result<Value, RpcError> {
             Ok(json!({ "servers": [], "enabled": true, "managerAvailable": false }))
         }
-        async fn session_list_tasks(&self) -> Result<Value, RpcError> {
+        async fn session_list_tasks(&self, _p: ListTasksParams) -> Result<Value, RpcError> {
             Ok(json!({"sessionId": "test", "tasks": []}))
         }
         async fn session_pending_messages(&self, p: PendingMessagesParams) -> Result<Value, RpcError> {
@@ -937,8 +945,8 @@ mod tests {
         async fn mcp_list(&self) -> Result<Value, RpcError> {
             self.0.mcp_list().await
         }
-        async fn session_list_tasks(&self) -> Result<Value, RpcError> {
-            self.0.session_list_tasks().await
+        async fn session_list_tasks(&self, p: ListTasksParams) -> Result<Value, RpcError> {
+            self.0.session_list_tasks(p).await
         }
         async fn session_pending_messages(&self, p: PendingMessagesParams) -> Result<Value, RpcError> {
             self.0.session_pending_messages(p).await
@@ -1653,7 +1661,7 @@ mod tests {
         async fn mcp_list(&self) -> Result<Value, RpcError> {
             Err(RpcError { code: self.0, message: self.1.into() })
         }
-        async fn session_list_tasks(&self) -> Result<Value, RpcError> {
+        async fn session_list_tasks(&self, _p: ListTasksParams) -> Result<Value, RpcError> {
             Err(RpcError::internal("boom"))
         }
         async fn session_pending_messages(&self, _p: PendingMessagesParams) -> Result<Value, RpcError> {

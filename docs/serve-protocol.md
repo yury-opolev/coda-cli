@@ -161,7 +161,7 @@ re-fetches the catalog from models.dev first.
 |---|---|---|
 | `session/getHistory` | `{ sessionId?, historyEpoch?, expectedHistoryLength?, engineInstanceId?, sinceIndex?, limit?, includeLive? }` | `{ sessionId, engineInstanceId, isLiveSession, historyEpoch?, cursor?, historyLength, entries[], nextIndex, totalKnown, truncated, liveEntries?, liveTruncated?, liveOmittedBytes? }` |
 | `session/listSessions` | `{ limit? }` | `{ sessions: [{ sessionId, createdUtc, messageCount, preview, previewTruncated, isCurrent }], totalKnown, truncated }` |
-| `session/listTasks` | `{}` | `{ sessionId, tasks: [{ id, parentId, kind, description, status, mode, outputTail, report }] }` |
+| `session/listTasks` | `{ statusFilter? }` | `{ sessionId, tasks: [{ id, parentId, kind, description, status, mode, outputTail, report }] }` |
 | `session/getPendingRequests` | `{}` | `{ requests: PendingRequest[], engineInstanceId }` |
 | `session/resolveRequest` | `{ requestId, outcome }` | `{ ok, state, requestId, outcome }` |
 | `session/cancelRequest` | `{ requestId, reason? }` | `{ ok, requestId, appliedDefault, outcome }` |
@@ -192,8 +192,16 @@ clients must not infer task existence or status from local log files or completi
 notifications. `kind` is `subagent`, `shell`, `scheduled` or `tool` (a long MCP tool call
 the agent runs as a task); `status` is `running`,
 `completed`, `failed`, or `stopped`; `mode` is `foreground` or `background`.
-The session id namespaces the registry's task ids. This is runtime discovery, not an
-archive of task logs from earlier engine processes.
+`statusFilter` (optional) narrows the listing without affecting any task: `active` returns only
+`running` tasks (foreground or background, with or without output, including parked
+subagents), `terminal` only `completed`, `failed` and `stopped` ones, and `all` — the
+behaviour when it is omitted — both. Any other value is refused with `-32602` (invalid params).
+The full-screen TUI's `/tasks` asks for `active`; its history view (`h`, or `/tasks all`) asks
+for `all`.
+The session id namespaces the registry's task ids. Ids are opaque strings, unique within a
+session and never reused: the engine issues `task-00000001`, `task-00000002`, … (eight digits
+at minimum, wider past `task-99999999`), so clients must not parse them or assume a length.
+This is runtime discovery, not an archive of task logs from earlier engine processes.
 
 **Task controls (non-blocking runtime).** Every `run_command` runs as a `shell` task (at most
 32 run at once; another is refused with an explanatory tool error), every long MCP tool call
@@ -683,23 +691,23 @@ new **secret-redacted** output.
 
 ```jsonc
 event/taskStarted {
-  "taskId":      "task-0003",
+  "taskId":      "task-00000003",
   "kind":        "shell",        // "shell" | "subagent" | "scheduled" | "tool"
   "description": "cargo test",
-  "ownerTaskId": "task-0001",    // the agent that started it; absent for the main agent
+  "ownerTaskId": "task-00000001", // the agent that started it; absent for the main agent
   "mode":        "foreground"    // "foreground" (an agent waits on it) | "background"
 }
 event/taskOutput {
-  "taskId":    "task-0003",
+  "taskId":    "task-00000003",
   "text":      "running 12 tests\n",  // output since the previous frame (newest kept)
   "truncated": false                  // true when output before `text` was skipped
 }
 event/taskCompleted {
-  "taskId":      "task-0003",
+  "taskId":      "task-00000003",
   "status":      "failed",       // "completed" | "failed" | "stopped"
   "description": "cargo test",
   "report":      "exit code: 101", // result or error, ≤ 4 000 chars; absent when none
-  "ownerTaskId": "task-0001",    // absent for the main agent
+  "ownerTaskId": "task-00000001", // absent for the main agent
   "kind":        "shell",
   "mode":        "foreground"    // "foreground": the owner saw the end inline (its tool
                                  // result says so); "background": reported separately

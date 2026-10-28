@@ -209,7 +209,7 @@ The model can call these built-in tools (subject to the permission mode). MCP se
 | `schedule_cancel_self` | no | a scheduled run retires **its own** schedule once its job is done. Takes no schedule id or task id. Only the scheduled root run may call it; `stopRunning: true` also ends the current run, otherwise the run finishes normally. |
 | `task_output`, `task_stop`, `sleep` | mixed | read a task's new output; stop any task (and what it started) |
 | `task_start`, `task_recall` | mixed | **deprecated** aliases kept for one release: `task_start` = `task`; `task_recall` only returns completions that could not be pushed |
-| `task_list`, `task_get`, `task_peek`, `task_send` | yes | list all tasks, read one task, peek recent output, steer a running agent task (subagent or scheduled) |
+| `task_list`, `task_get`, `task_peek`, `task_send` | yes | list tasks (optional `statusFilter`: `active`, `terminal` or `all`, the default), read one task, peek recent output, steer a running agent task (subagent or scheduled) |
 | `task_wait`, `task_remove` | yes | wait briefly for a task (`timeoutSeconds`, default and max 30; not cut short by messages; never stops it — ending the turn is the preferred way to wait), remove a finished task (log preserved) |
 | `notebook_edit` | no (gated) | edit Jupyter notebook cells |
 | `git_worktree` | no (gated) | list/add/remove git worktrees |

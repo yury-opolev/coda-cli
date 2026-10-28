@@ -1,0 +1,30 @@
+{
+  "type": "object",
+  "properties": {
+    "statusFilter": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TaskStatusFilter"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Absent means `all`."
+    }
+  },
+  "description": "`session/listTasks`. Every field is optional; `{}` lists all tasks.",
+  "title": "ListTasksParams",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "TaskStatusFilter": {
+      "type": "string",
+      "enum": [
+        "active",
+        "terminal",
+        "all"
+      ],
+      "description": "Which tasks `session/listTasks` (and the model's `task_list`) return.\n\n`active` is every task still `running` — foreground or background, with\nor without output, including parked subagents. `terminal` is `completed`,\n`failed` and `stopped`. `all` is both, the behaviour when no filter is\ngiven. Filtering is presentation only: no record, output or completion is\naffected."
+    }
+  }
+}
