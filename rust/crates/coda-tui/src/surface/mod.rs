@@ -174,6 +174,8 @@ pub enum SurfaceAction {
     StopTask(String),
     /// Start a message to a running subagent (prefills `/send <task> `).
     MessageTask(String),
+    /// Switch `/tasks` between its active and history views.
+    ToggleTaskHistory,
     /// Send a `/btw` side question to the agent as an ordinary message.
     PromoteAside(String),
     /// Explain that creating a schedule needs arguments.

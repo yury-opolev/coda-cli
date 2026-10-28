@@ -107,6 +107,48 @@ impl App {
         self.dirty = true;
     }
 
+    /// `/tasks` `h`: switch between the active and history views, keeping
+    /// the selected task where it is still listed.
+    pub(super) async fn toggle_task_history(&mut self) {
+        let previous = self.task_view;
+        self.task_view = previous.toggled();
+        if !self.reload_browser_of(None, Some(String::new())).await {
+            // The old view is still on screen; keep asking for it.
+            self.task_view = previous;
+        }
+    }
+
+    /// `/tasks [all]`: opens the active view, or the history view with `all`.
+    pub(super) async fn open_tasks(&mut self, arg: Option<&str>) {
+        self.task_view = match arg {
+            None => crate::browsers::TaskView::Active,
+            Some("all" | "history") => crate::browsers::TaskView::History,
+            Some(other) => {
+                self.notice(
+                    format!("Unknown /tasks view '{other}'. Usage: /tasks [all]"),
+                    NoticeLevel::Warning,
+                );
+                return;
+            }
+        };
+        self.open_browser(crate::surface::browser::BrowserKind::Tasks).await;
+    }
+
+    /// Re-reads an open `/tasks` browser after a task started or ended (or a
+    /// resync). One read per owed refresh, keeping the selection by task id
+    /// and whatever status the browser was showing. A browser covered by a
+    /// prompt keeps the refresh owed until it is on top again; a failed read
+    /// is reported by the reload and not retried on its own (`r` retries).
+    pub(super) async fn refresh_task_browser(&mut self) {
+        use crate::surface::browser::BrowserKind;
+        if self.tasks_browser_on_top() {
+            self.needs_task_refresh = false;
+            self.reload_browser_of(Some(BrowserKind::Tasks), None).await;
+        } else {
+            self.needs_task_refresh = self.tasks_browser_on_stack();
+        }
+    }
+
     /// `/send <task-id> <message>`: deliver a message to a running subagent.
     /// It reaches the subagent's inbox, cutting its current wait short or
     /// waking it if it is parked.
@@ -227,6 +269,227 @@ mod tests {
         );
     }
 
+    /// A fake engine registry whose `session/listTasks` honours `statusFilter`
+    /// and records every filter it was asked for.
+    fn registry_engine(
+        tasks: std::sync::Arc<std::sync::Mutex<Vec<(&'static str, &'static str)>>>,
+        filters: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        cursor: std::sync::Arc<std::sync::atomic::AtomicI64>,
+    ) -> crate::app::serve::tests::Harness {
+        use serde_json::json;
+        crate::app::serve::tests::app_with(crate::local::AccessMode::TrustedLocal, move |method, params| {
+            if method == "session/getState" {
+                return crate::app::serve::tests::snapshot_value(cursor.load(std::sync::atomic::Ordering::SeqCst), 0, 500);
+            }
+            if method != "session/listTasks" {
+                return json!({});
+            }
+            let filter = params["statusFilter"].as_str().unwrap_or("all").to_owned();
+            filters.lock().unwrap().push(filter.clone());
+            let rows: Vec<_> = tasks.lock().unwrap().iter()
+                .filter(|(_, status)| match filter.as_str() {
+                    "active" => *status == "running",
+                    "terminal" => *status != "running",
+                    _ => true,
+                })
+                .map(|(id, status)| json!({
+                    "id": id, "parentId": null, "kind": "shell", "description": format!("{id} work"),
+                    "status": status, "mode": "background", "outputTail": "", "report": null,
+                }))
+                .collect();
+            json!({ "sessionId": "s1", "tasks": rows })
+        })
+    }
+
+    fn press(c: char) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char(c), crossterm::event::KeyModifiers::NONE)
+    }
+
+    fn deliver(app: &mut App, cursor: &std::sync::atomic::AtomicI64, seq: i64, method: &str, mut params: serde_json::Value) {
+        cursor.store(seq, std::sync::atomic::Ordering::SeqCst);
+        params["seq"] = serde_json::json!(seq);
+        params["engineInstanceId"] = serde_json::json!("e1");
+        for frame in app.accept(method.to_owned(), Some(params)) {
+            app.dispatch_frame(frame);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_tasks_browser_follows_task_lifecycle_events_and_keeps_the_selection() {
+        use serde_json::json;
+        use std::sync::{Arc, Mutex};
+
+        let tasks = Arc::new(Mutex::new(vec![
+            ("task-00000001", "running"),
+            ("task-00000002", "completed"),
+            ("task-00000003", "running"),
+            ("task-00000004", "running"),
+        ]));
+        let filters = Arc::new(Mutex::new(Vec::new()));
+        let cursor = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let mut harness = registry_engine(tasks.clone(), filters.clone(), cursor.clone());
+        let app = &mut harness.app;
+        app.needs_rehydrate = false;
+        app.needs_resync = false;
+        app.needs_pending_messages = false;
+
+        app.run_command(crate::commands::parse("/tasks").unwrap()).await;
+        assert_eq!(app.browser().unwrap().title(), "Tasks — active (3)");
+        assert_eq!(filters.lock().unwrap().as_slice(), ["active"]);
+        app.on_key(press('j')).await;
+        assert_eq!(app.browser().unwrap().selected_id(), Some("s1/task-00000003"));
+
+        // An unrelated task ends: the selection stays on its task.
+        tasks.lock().unwrap()[0].1 = "completed";
+        deliver(app, &cursor, 1, "event/taskCompleted", json!({ "taskId": "task-00000001", "status": "completed", "description": "x" }));
+        app.settle_with_engine().await;
+        let browser = app.browser().unwrap();
+        assert_eq!(browser.title(), "Tasks — active (2)");
+        assert_eq!(browser.selected_id(), Some("s1/task-00000003"));
+
+        // The selected task ends: the selection moves to a remaining one.
+        tasks.lock().unwrap()[2].1 = "failed";
+        deliver(app, &cursor, 2, "event/taskCompleted", json!({ "taskId": "task-00000003", "status": "failed", "description": "x" }));
+        app.settle_with_engine().await;
+        assert_eq!(app.browser().unwrap().selected_id(), Some("s1/task-00000004"));
+
+        // A new task appears without any polling.
+        tasks.lock().unwrap().push(("task-00000005", "running"));
+        deliver(app, &cursor, 3, "event/taskStarted", json!({ "taskId": "task-00000005", "kind": "shell", "description": "x", "mode": "background" }));
+        app.settle_with_engine().await;
+        assert_eq!(app.browser().unwrap().title(), "Tasks — active (2)");
+        assert_eq!(app.browser().unwrap().selected_id(), Some("s1/task-00000004"));
+
+        // The last active tasks end: the empty state, not a stale row.
+        for row in tasks.lock().unwrap().iter_mut() {
+            row.1 = "stopped";
+        }
+        deliver(app, &cursor, 4, "event/taskCompleted", json!({ "taskId": "task-00000004", "status": "stopped", "description": "x" }));
+        deliver(app, &cursor, 5, "event/taskCompleted", json!({ "taskId": "task-00000005", "status": "stopped", "description": "x" }));
+        app.settle_with_engine().await;
+        let browser = app.browser().unwrap();
+        assert_eq!(browser.title(), "Tasks — active (0)");
+        assert!(browser.is_empty() && browser.selected_id().is_none());
+        assert_eq!(browser.empty_message(), Some("No active tasks"));
+
+        let asked = filters.lock().unwrap().len();
+        app.settle_with_engine().await;
+        assert_eq!(filters.lock().unwrap().len(), asked, "no event, no re-read");
+    }
+
+    #[tokio::test]
+    async fn h_toggles_between_the_active_and_history_views() {
+        use std::sync::{Arc, Mutex};
+
+        let tasks = Arc::new(Mutex::new(vec![("task-00000001", "completed"), ("task-00000002", "running")]));
+        let filters = Arc::new(Mutex::new(Vec::new()));
+        let mut harness = registry_engine(tasks, filters.clone(), Default::default());
+        let app = &mut harness.app;
+
+        app.run_command(crate::commands::parse("/tasks").unwrap()).await;
+        assert_eq!(app.browser().unwrap().title(), "Tasks — active (1)");
+        app.on_key(press('h')).await;
+        assert_eq!(app.browser().unwrap().title(), "Tasks — history (2)");
+        assert_eq!(app.browser().unwrap().selected_id(), Some("s1/task-00000002"),
+            "the selected task stays selected across views");
+        app.on_key(press('h')).await;
+        assert_eq!(app.browser().unwrap().title(), "Tasks — active (1)");
+        app.close_browser();
+
+        app.run_command(crate::commands::parse("/tasks all").unwrap()).await;
+        assert_eq!(app.browser().unwrap().title(), "Tasks — history (2)");
+        app.close_browser();
+        app.run_command(crate::commands::parse("/tasks").unwrap()).await;
+        assert_eq!(app.browser().unwrap().title(), "Tasks — active (1)", "bare /tasks is the active view");
+        assert_eq!(filters.lock().unwrap().as_slice(), ["active", "all", "active", "all", "active"]);
+    }
+
+    #[tokio::test]
+    async fn a_resync_rereads_an_open_tasks_browser() {
+        use std::sync::{Arc, Mutex};
+
+        let tasks = Arc::new(Mutex::new(vec![("task-00000001", "running")]));
+        let filters = Arc::new(Mutex::new(Vec::new()));
+        let cursor = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let mut harness = registry_engine(tasks.clone(), filters.clone(), cursor.clone());
+        let app = &mut harness.app;
+        app.needs_rehydrate = false;
+        app.needs_pending_messages = false;
+        app.needs_resync = false;
+        app.run_command(crate::commands::parse("/tasks").unwrap()).await;
+        assert_eq!(app.browser().unwrap().title(), "Tasks — active (1)");
+
+        // The task ended while the client was not listening (a reconnect).
+        tasks.lock().unwrap()[0].1 = "completed";
+        app.needs_resync = true;
+        app.settle_with_engine().await;
+        assert_eq!(app.browser().unwrap().title(), "Tasks — active (0)");
+    }
+
+    #[tokio::test]
+    async fn a_refresh_owed_while_the_browser_is_covered_runs_once_it_is_on_top_again() {
+        use crate::surface::browser::{BrowserKind, BrowserSurface};
+        use serde_json::json;
+        use std::sync::{Arc, Mutex};
+
+        let tasks = Arc::new(Mutex::new(vec![("task-00000001", "running")]));
+        let filters = Arc::new(Mutex::new(Vec::new()));
+        let cursor = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let mut harness = registry_engine(tasks.clone(), filters.clone(), cursor.clone());
+        let app = &mut harness.app;
+        app.needs_rehydrate = false;
+        app.needs_resync = false;
+        app.needs_pending_messages = false;
+        app.run_command(crate::commands::parse("/tasks").unwrap()).await;
+        let other = crate::overlay::Browser::new("Other", vec![crate::overlay::Column::new("x", 4)]);
+        app.surfaces.push(Box::new(BrowserSurface::new(BrowserKind::Skills, other)));
+
+        tasks.lock().unwrap()[0].1 = "completed";
+        deliver(app, &cursor, 1, "event/taskCompleted", json!({ "taskId": "task-00000001", "status": "completed", "description": "x" }));
+        app.settle_with_engine().await;
+        assert_eq!(filters.lock().unwrap().len(), 1, "a covered browser is not reloaded under what covers it");
+        assert_eq!(app.browser().unwrap().title(), "Other");
+
+        app.surfaces.pop();
+        app.settle_with_engine().await;
+        assert_eq!(app.browser().unwrap().title(), "Tasks — active (0)", "the owed refresh was kept");
+        app.settle_with_engine().await;
+        assert_eq!(filters.lock().unwrap().len(), 2, "and it ran exactly once");
+    }
+
+    #[tokio::test]
+    async fn a_failed_history_toggle_leaves_the_view_as_it_was() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counter = reads.clone();
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = asked.clone();
+        let mut harness = crate::app::serve::tests::app_answering(
+            crate::local::AccessMode::TrustedLocal,
+            move |method, params| {
+                if method != "session/listTasks" {
+                    return Ok(serde_json::json!({}));
+                }
+                recorder.lock().unwrap().push(params["statusFilter"].as_str().unwrap_or("").to_owned());
+                if counter.fetch_add(1, Ordering::SeqCst) == 1 {
+                    return Err((-32000, "the engine is busy".into()));
+                }
+                Ok(serde_json::json!({ "sessionId": "s1", "tasks": [] }))
+            },
+        );
+        let app = &mut harness.app;
+        app.run_command(crate::commands::parse("/tasks").unwrap()).await;
+        app.on_key(press('h')).await;
+        assert_eq!(app.task_view, crate::browsers::TaskView::Active);
+        assert_eq!(app.browser().unwrap().title(), "Tasks — active (0)");
+        app.on_key(press('r')).await;
+        assert_eq!(reads.load(Ordering::SeqCst), 3);
+        assert_eq!(asked.lock().unwrap().as_slice(), ["active", "all", "active"],
+            "a reload still asks for the view on screen");
+    }
+
     #[test]
     fn the_tasks_browser_backgrounds_and_stops_the_selected_task() {
         use crate::surface::browser::BrowserKind;
@@ -247,7 +510,7 @@ mod tests {
                 report: None,
             }],
         };
-        let mut surface = App::browser_surface(BrowserKind::Tasks, crate::browsers::tasks(&listing));
+        let mut surface = App::browser_surface(BrowserKind::Tasks, crate::browsers::tasks(&listing, crate::browsers::TaskView::Active));
         let press = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
         match surface.handle_key(press('b')) {
             SurfaceOutcome::Emit(SurfaceAction::BackgroundTask(id)) => {

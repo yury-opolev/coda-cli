@@ -121,6 +121,9 @@ pub struct Browser {
     extra_keys: Vec<char>,
     /// Whether Enter opens a detail pane. Schedule has no detail view.
     has_detail: bool,
+    /// What an empty list says, when the browser has something better than
+    /// the generic text.
+    empty_message: Option<String>,
 }
 
 impl Browser {
@@ -139,6 +142,7 @@ impl Browser {
             footer: String::new(),
             extra_keys: Vec::new(),
             has_detail: true,
+            empty_message: None,
         }
     }
 
@@ -163,6 +167,17 @@ impl Browser {
                 self.extra_keys.push(*key);
             }
         }
+    }
+
+    /// Sets what the list says when there are no rows at all (a filter that
+    /// hides every row still gets the generic text).
+    pub fn with_empty_message(mut self, message: impl Into<String>) -> Self {
+        self.empty_message = Some(message.into());
+        self
+    }
+
+    pub fn empty_message(&self) -> Option<&str> {
+        self.empty_message.as_deref()
     }
 
     /// Marks this browser as list-only, so Enter activates instead of opening

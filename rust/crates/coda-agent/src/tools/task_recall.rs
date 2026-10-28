@@ -94,7 +94,7 @@ mod tests {
             .execute(&Value::Object(Default::default()), &ctx(m), CancellationToken::new())
             .await;
         assert!(!result.is_error, "{}", result.content);
-        assert!(result.content.contains("task-0001"), "{}", result.content);
+        assert!(result.content.contains("task-00000001"), "{}", result.content);
         assert!(result.content.contains("completed"), "{}", result.content);
         assert!(result.content.contains("done!"), "{}", result.content);
     }

@@ -65,7 +65,7 @@ use uuid::Uuid;
 use crate::dispatch::{
     CancelRequestParams, CompactParams, ConfigSetParams, ForkParams, GetEventsParams,
     GetHistoryParams, GetStateParams, HooksInfoParams, HooksTrustParams, ImportParams, InitParams,
-    ListSessionsParams, MessagesParams, ModelsParams, PendingMessagesParams, PromptParams,
+    ListSessionsParams, ListTasksParams, MessagesParams, ModelsParams, PendingMessagesParams, PromptParams,
     ResolveRequestParams, RewindParams, RpcError, ScheduleCreateParams, ScheduleDeleteParams,
     ServeBackend, SetEffortParams, SetGoalParams, SetModelParams, SetPermissionModeParams,
     SetSystemPromptParams, SteerParams,
@@ -4179,10 +4179,11 @@ impl ServeBackend for ServeHost {
         }
     }
 
-    async fn session_list_tasks(&self) -> Result<Value, RpcError> {
+    async fn session_list_tasks(&self, p: ListTasksParams) -> Result<Value, RpcError> {
         use coda_proto::responses::{TaskListResult, TaskSummaryDto};
 
-        let tasks = self.task_manager.list_with_output(4_000).into_iter()
+        let filter = p.status_filter.unwrap_or_default();
+        let tasks = self.task_manager.list_with_output_matching(4_000, filter).into_iter()
             .map(|(task, output_tail)| {
                 let report = task.result.or(task.error).map(|text| {
                     let (mut text, original_bytes) = coda_proto::history::truncate_text(&text, 16 * 1024);
@@ -11185,6 +11186,46 @@ mod tests {
         let (found, output, _, _) = host.task_manager.read_output(&task.id, None);
         assert!(found);
         assert_eq!(output, "progress\n", "browsing must not steal the agent's output");
+    }
+
+    #[tokio::test]
+    async fn task_listing_status_filter_returns_exactly_the_requested_statuses() {
+        use coda_agent::tasks::{TaskExecutionMode, TaskKind};
+        use serde_json::json;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (host, _rx) = host_with_events(dir.path());
+        let m = &host.task_manager;
+        let fg = m.register(TaskKind::Shell, "fg", None, TaskExecutionMode::Foreground).unwrap();
+        let done = m.register(TaskKind::Shell, "done", None, TaskExecutionMode::Background).unwrap();
+        let failed = m.register(TaskKind::Shell, "failed", None, TaskExecutionMode::Background).unwrap();
+        let stopped = m.register(TaskKind::Shell, "stopped", None, TaskExecutionMode::Background).unwrap();
+        let agent = m.register(TaskKind::Subagent, "agent", None, TaskExecutionMode::Background).unwrap();
+        m.complete(&done.id, Some("report".into()));
+        m.fail(&failed.id, Some("boom".into()));
+        m.stop(&stopped.id);
+
+        let ids = |listing: &serde_json::Value| -> Vec<String> {
+            listing["tasks"].as_array().unwrap().iter()
+                .map(|t| t["id"].as_str().unwrap().to_owned()).collect()
+        };
+        let list = |params| crate::dispatch::dispatch("session/listTasks", params, host.as_ref());
+        let unfiltered = list(None).await.unwrap();
+        assert_eq!(ids(&unfiltered).len(), 5, "no filter keeps the previous behaviour");
+        assert_eq!(list(Some(json!({}))).await.unwrap(), unfiltered);
+        assert_eq!(list(Some(json!({ "statusFilter": "all" }))).await.unwrap(), unfiltered);
+        let active = list(Some(json!({ "statusFilter": "active" }))).await.unwrap();
+        assert_eq!(ids(&active), [fg.id.clone(), agent.id.clone()]);
+        assert_eq!(active["sessionId"], unfiltered["sessionId"]);
+        let terminal = list(Some(json!({ "statusFilter": "terminal" }))).await.unwrap();
+        assert_eq!(ids(&terminal), [done.id.clone(), failed.id.clone(), stopped.id.clone()]);
+        assert_eq!(terminal["tasks"][0]["report"], "report");
+
+        for bad in [json!({ "statusFilter": "finished" }), json!({ "statusFilter": 1 })] {
+            let error = list(Some(bad)).await.unwrap_err();
+            assert_eq!(error.code, -32602, "{}", error.message);
+            assert!(error.message.contains("statusFilter must be one of: active, terminal, all"), "{}", error.message);
+        }
     }
 
     /// End-to-end: a notification published via the `notify_user` tool

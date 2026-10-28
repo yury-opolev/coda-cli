@@ -306,7 +306,7 @@ Inside the REPL:
 ```
 /login [claude|copilot|api-key]   sign in (Claude.ai browser / Copilot device code / API key)
 /status                   sign-in state for every provider
-/tasks                    open the live task browser (prints a textual snapshot in plain mode)
+/tasks [all]              open the live task browser: active work; `all` opens the history view
 /btw <question>           ask a side question about the session and its tasks (alias /ask)
 /provider [id]            show the connected account, or connect a different one
 /setup                    the first-run wizard: choose an account and sign in
@@ -344,20 +344,34 @@ Windows, `sh` elsewhere.
 In the full-screen TUI, `/tasks` opens a content-sized browser over the session's
 `TaskManager`, read through the engine's `session/listTasks` (so it works the same in local,
 API-only and serve-backed sessions, and shows tasks that have produced no output yet). Each row
-shows a status glyph, the task id, status, kind (subagent/shell) and description.
+shows a status glyph, the task id, status, kind (subagent/shell/tool/scheduled) and description.
+
+By default it shows **active work only** — every task still running, foreground or background,
+including subagents parked waiting for their own tasks — titled `Tasks — active (N)`, or
+`No active tasks` when there are none. Finished (completed, failed, stopped) tasks are not
+discarded: `h` switches to the **history** view (`Tasks — history (N)`), which lists every task
+the session still retains with its report and output tail, and `h` again switches back;
+`/tasks all` opens straight into history. The list follows the engine's task start and end
+events while it is open (no polling): a task that ends leaves the active view, the selection
+stays on the same task where it is still listed, and otherwise moves to a remaining one.
+
+Task ids are `task-00000001`, `task-00000002`, … — unique within the session, never reused,
+and simply wider past `task-99999999`.
 
 - **List:** `Up`/`Down` or `k`/`j` move · `Enter` opens the detail page (mode, parent, report,
   secret-redacted output tail) · `b` **backgrounds** the selected task (the agent stops waiting on
   it; it keeps running) · `x` **stops** it (and its process tree) · `m` starts a **message** to
-  a running subagent (closes the browser and fills in `/send <task-id> `) · `r` reloads · `/`
-  filters · `Esc` or `q` closes.
+  a running subagent (closes the browser and fills in `/send <task-id> `) · `h` toggles
+  active/history · `r` reloads · `/` filters · `Esc` or `q` closes. On a finished task `b`, `x`
+  and `m` are refused by the engine ("already finished").
 
 `/send <task-id> <message>` delivers a message to a running subagent's inbox: it is delivered
 at the subagent's next boundary (a wait on a running command ends within 30 s at most), or
 wakes it if it is parked. `/stop` interrupts the running turn and stops **every** running task. Everything here is
 **process-local** and **stops when Coda exits**.
 
-`coda serve` exposes the same controls to any client: `session/listTasks`,
+`coda serve` exposes the same controls to any client: `session/listTasks` (optional
+`statusFilter`: `active`, `terminal` or `all`, the default),
 `session/backgroundAll`, `task/background {taskId}`, `task/stop {taskId}`,
 `task/send {taskId, text}`, `session/stopAllTasks` and `session/askAside {question}`, plus the
 `event/taskStarted`, throttled `event/taskOutput` and `event/taskCompleted` (with the owning

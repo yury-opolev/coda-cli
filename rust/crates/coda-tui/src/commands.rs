@@ -185,8 +185,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "tasks",
         aliases: &[],
-        args: "",
-        summary: "Browse background tasks.",
+        args: "[all]",
+        summary: "Browse active tasks (all: include finished ones).",
         scope: Scope::Local,
     },
     CommandSpec {

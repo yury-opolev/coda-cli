@@ -67,7 +67,7 @@ impl App {
             "hooks" => self.open_browser(BrowserKind::Hooks).await,
             "settings" => self.open_settings_form(),
             "mcp" if invocation.args.is_empty() => self.open_browser(BrowserKind::Mcp).await,
-            "tasks" => self.open_browser(BrowserKind::Tasks).await,
+            "tasks" => self.open_tasks(invocation.first()).await,
             "version" => self.output(format!(
                 "coda-tui {} (Rust front-end)",
                 env!("CARGO_PKG_VERSION")

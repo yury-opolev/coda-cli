@@ -303,9 +303,9 @@
     },
     {
       "method": "session/listTasks",
-      "paramsSchema": null,
+      "paramsSchema": "schemas/ListTasksParams.json",
       "resultSchema": "schemas/TaskListResult.json",
-      "paramsContract": null,
+      "paramsContract": "sharedParser",
       "resultContract": "sharedServerDto",
       "requiresInitialize": false,
       "availability": "reusable"
