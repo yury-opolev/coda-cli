@@ -1057,20 +1057,24 @@ pub fn status_spans(
         ));
     }
 
-    if let Some(percent) = state.usage.percent_used() {
+    // The last request's whole input, cache included, against the window.
+    if let Some(label) = state.usage.context().and_then(|reading| reading.label()) {
         spans.push(Span::styled(
-            format!("{} context {percent}% ", glyphs::RULE_VERTICAL),
+            format!("{} context {label} ", glyphs::RULE_VERTICAL),
             theme.style(Role::Notification),
         ));
     }
 
-    // Tokens in and out. The direction matters: a long context re-sent every
-    // turn reads very differently from a long reply, and a single total hides
-    // which one is growing.
+    // Cumulative tokens in and out, cached input included. The direction
+    // matters: a long context re-sent every turn reads very differently from
+    // a long reply, and a single total hides which one is growing. A `+`
+    // marks totals that miss part of the session (resumed from a transcript
+    // saved before usage was recorded).
     if state.usage.input_tokens > 0 || state.usage.output_tokens > 0 {
+        let partial = if state.usage.totals_partial() { "+" } else { "" };
         spans.push(Span::styled(
             format!(
-                "{} {} {} in {} {} out ",
+                "{} {} {}{partial} in {} {}{partial} out ",
                 glyphs::RULE_VERTICAL,
                 glyphs::ARROW_DOWN,
                 compact_count(state.usage.input_tokens),
@@ -1079,11 +1083,11 @@ pub fn status_spans(
             ),
             theme.style(Role::Notification),
         ));
-        // Only when the catalogue prices this model. Showing "$0.00" for an
-        // unpriced one would read as free.
-        if let Some(cost) = state.usage.estimated_cost() {
+        // Only what the engine could price. Showing "$0.00" for an unpriced
+        // model would read as free.
+        if let Some(cost) = state.usage.cost_label() {
             spans.push(Span::styled(
-                format!("{} ${cost:.2} ", glyphs::RULE_VERTICAL),
+                format!("{} {cost} ", glyphs::RULE_VERTICAL),
                 theme.style(Role::Notification),
             ));
         }

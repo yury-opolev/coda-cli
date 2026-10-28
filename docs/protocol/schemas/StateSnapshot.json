@@ -996,7 +996,19 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "The most recent measured request."
+        },
+        "lastResponseModel": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The model that served `lastResponse`."
+        },
+        "lastResponseStale": {
+          "type": "boolean",
+          "description": "`true` when `lastResponse` no longer describes the current context: it\nwas restored from a saved session, or the conversation (rewind,\ncompaction, fork) or the model changed since it was measured. It is the\nlast known measurement, not the current one, until the next request."
         },
         "session": {
           "anyOf": [
@@ -1006,7 +1018,37 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Cumulative totals for the session, restored across resumes."
+        },
+        "sessionCoverage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UsageCoverage"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Absent from engines that predate it: coverage unknown."
+        },
+        "byModel": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ModelUsage"
+          },
+          "description": "Per-model share of `session`, so the cost stays attributable after a\nmodel switch."
+        },
+        "cost": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CostEstimate"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Absent when nothing has been priced: unknown, never a free session."
         },
         "contextLimit": {
           "type": [
@@ -1022,24 +1064,136 @@
           },
           "default": []
         }
-      }
+      },
+      "description": "The engine's usage accounting.\n\nThree different quantities, deliberately kept apart:\n\n- **Context occupancy** — `lastResponse.totalInputTokens` against\n  `contextLimit`. One request re-sends the whole conversation, cached or\n  not, so its total input is what is in the window.\n- **Cumulative traffic** — `session`: every request's tokens summed. It\n  passes the window size after a few turns and says nothing about how full\n  the window is.\n- **Estimated cost** — `cost`, priced per category."
     },
     "UsagePair": {
       "type": "object",
       "properties": {
         "inputTokens": {
           "type": "integer",
-          "format": "int64"
+          "format": "int64",
+          "description": "Uncached input tokens."
         },
         "outputTokens": {
           "type": "integer",
           "format": "int64"
+        },
+        "cacheReadTokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "Input tokens served from the prompt cache."
+        },
+        "cacheWriteTokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "Input tokens written to the prompt cache, every TTL together."
+        },
+        "cacheWrite5mTokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "The part of `cacheWriteTokens` written with the five-minute TTL (also\nwhere a provider that does not itemise by TTL is attributed)."
+        },
+        "cacheWrite1hTokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "The part of `cacheWriteTokens` written with the one-hour TTL."
+        },
+        "totalInputTokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "`inputTokens + cacheReadTokens + cacheWriteTokens`: everything the\nrequest(s) carried as input. For one request this is what occupied the\ncontext window."
         }
       },
       "required": [
         "inputTokens",
         "outputTokens"
-      ]
+      ],
+      "description": "Token counts for one response, or a running sum of them.\n\n`inputTokens` is **uncached** input only — the meaning it has always had.\nThe cache categories are additive fields: an engine that predates them\nomits them, and a reader must then treat the cache counts as *unknown*\n(so [`UsagePair::total_input`] is a lower bound), never as zero. Every\nengine that knows about them always sends them, zeros included, so their\npresence is itself the signal ([`UsagePair::reports_cache`]).\n\nProviders that report input *including* cached tokens (OpenAI-style\n`prompt_tokens` with a `cached_tokens` detail) are normalised at the\nprovider boundary, so `inputTokens` never double-counts the cache."
+    },
+    "UsageCoverage": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "complete",
+          "description": "Every request of this session was measured."
+        },
+        {
+          "type": "string",
+          "const": "partial",
+          "description": "Some of the conversation predates the measurement — typically a\nsession saved by an older version without usage accounting. The totals\ncover only the requests measured since, and the real figure is higher."
+        }
+      ],
+      "description": "Whether the session totals cover the whole conversation."
+    },
+    "ModelUsage": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "usage": {
+          "$ref": "#/$defs/UsagePair"
+        }
+      },
+      "required": [
+        "model",
+        "usage"
+      ],
+      "description": "One model's share of the session totals."
+    },
+    "CostEstimate": {
+      "type": "object",
+      "properties": {
+        "totalUsd": {
+          "type": "number",
+          "format": "double"
+        },
+        "inputUsd": {
+          "type": "number",
+          "format": "double"
+        },
+        "cacheReadUsd": {
+          "type": "number",
+          "format": "double"
+        },
+        "cacheWriteUsd": {
+          "type": "number",
+          "format": "double"
+        },
+        "outputUsd": {
+          "type": "number",
+          "format": "double"
+        },
+        "complete": {
+          "type": "boolean",
+          "description": "`false` when some measured tokens had no known price (or the history\nis [`UsageCoverage::Partial`]): the figure is then a lower bound, not\nthe cost."
+        }
+      },
+      "required": [
+        "totalUsd",
+        "inputUsd",
+        "cacheReadUsd",
+        "cacheWriteUsd",
+        "outputUsd",
+        "complete"
+      ],
+      "description": "An estimated price for the session totals, in US dollars.\n\nEach category is priced at its own rate — cache reads and cache writes\n(per TTL) are not charged at the uncached input price — using the price\nof the model that served each request at the time it was served."
     },
     "Limits": {
       "type": "object",

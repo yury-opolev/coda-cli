@@ -682,6 +682,12 @@
       "paramsSchema": "schemas/RequestResolvedEvent.json",
       "requiresStateEvents": true,
       "paramsContract": "sharedPublisherWithMetadata"
+    },
+    {
+      "method": "event/usageUpdated",
+      "paramsSchema": "schemas/UsageUpdatedEvent.json",
+      "requiresStateEvents": true,
+      "paramsContract": "sharedPublisherWithMetadata"
     }
   ],
   "supportSchemas": [

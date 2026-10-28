@@ -24,7 +24,7 @@ fn main() {
     let c = Correlation { root_turn_id: Some("t".into()), activity_id: Some("a".into()), call_id: Some("c1".into()), source_id: Some("root:t".into()), ..Default::default() };
     state.apply(UiEvent::Engine(Event::ToolCall { tool_name: "edit".into(), input_json: r#"{"path":"src/http.rs"}"#.into(), correlation: c.clone() }));
     state.apply(UiEvent::Engine(Event::ToolResult { tool_name: "edit".into(), content: "ok".into(), is_error: false, status: Some(ToolCallStatus::Succeeded), correlation: c }));
-    state.apply(UiEvent::Engine(Event::Usage { input_tokens: 24_000, output_tokens: 900 }));
+    state.apply(UiEvent::Engine(Event::Usage(coda_proto::state::UsagePair::from_counts(2_000, 22_000, 0, 0, 900))));
     state.apply(UiEvent::Engine(Event::TurnComplete { stop_reason: Some("end_turn".into()), interrupted: false, root_turn_id: None, activity_id: None }));
 
     let mut composer = Composer::new();

@@ -503,7 +503,8 @@ any turn runs; the session remains idle and accepts the next prompt normally.
 inputJson, rootTurnId?, activityId?, callId?, sourceId?}` · `event/toolProgress {toolName,
 elapsedMs, rootTurnId?, activityId?, callId?, sourceId?}` · `event/toolResult {toolName, content,
 isError, rootTurnId?, activityId?, callId?, sourceId?, status?}` · `event/error {message}` ·
-`event/stop {stopReason?}` · `event/usage {inputTokens, outputTokens}` ·
+`event/stop {stopReason?}` · `event/usage {inputTokens, outputTokens, cacheReadTokens?,
+cacheWriteTokens?, cacheWrite5mTokens?, cacheWrite1hTokens?, totalInputTokens?}` ·
 `event/turnComplete {stopReason?, interrupted, rootTurnId?, activityId?}`.
 
 Assistant-text deltas arrive in order.
@@ -600,13 +601,66 @@ initialization, failure and interruption semantics.
 With `clientCapabilities.stateEvents` negotiated, a client converges on lifecycle, activity
 phase, turn termination, effective config, the steering queue and session resets from the event
 stream alone: `event/lifecycle`, `event/activity`, `event/turnEnded`, `event/configChanged`,
-`event/steeringQueue`, `event/sessionChanged` (capability `state.turnEvents`). Tool detail and
-usage totals ride on the ungated `event/toolCall` / `event/toolResult` / `event/usage` frames.
+`event/steeringQueue`, `event/sessionChanged` (capability `state.turnEvents`), and the authoritative
+usage accounting on `event/usageUpdated` (see [Usage accounting](#usage-accounting-rust)). Tool detail
+and per-response usage ride on the ungated `event/toolCall` / `event/toolResult` / `event/usage` frames.
 This is **not** a claim that every `StateSnapshot` field is push-based — anything else still
 needs a snapshot, and `session/getEvents` + `cursor` remain the way to resynchronise.
 
 Capability negotiation is processed before anything gated is published, so a client that resumes
 a session in the same `initialize` call receives that session's own `event/sessionChanged`.
+
+### Usage accounting (Rust)
+
+Three different quantities, which a client must keep apart:
+
+| Quantity | Where | Meaning |
+|---|---|---|
+| **Context occupancy** | `usage.lastResponse.totalInputTokens` ÷ `usage.contextLimit` | Everything the most recent request sent — uncached input **plus** cache reads **plus** cache writes. Cached input still occupies the window. |
+| **Cumulative traffic** | `usage.session` | Every request's tokens summed, by category. Re-sent conversation is counted each time, so it passes the window size after a few turns and says nothing about how full the window is. |
+| **Estimated cost** | `usage.cost` | Each category priced at its own rate, at the price of the model that served each request. |
+
+Token counts (`UsagePair`, used by `event/usage`, `lastResponse` and `session`):
+
+- `inputTokens` — **uncached** input only (the meaning it always had).
+- `cacheReadTokens`, `cacheWriteTokens` (= `cacheWrite5mTokens` + `cacheWrite1hTokens`, split by
+  cache TTL where the provider itemises it; un-itemised writes count as five-minute), and
+  `totalInputTokens` = `inputTokens + cacheReadTokens + cacheWriteTokens`.
+- `outputTokens`.
+
+Provider differences are normalised before anything reaches the wire: an API whose reported input
+already includes cached tokens (OpenAI-style `prompt_tokens` / `input_tokens` with a
+`cached_tokens` detail) has the cached part moved into `cacheReadTokens`, so nothing is counted
+twice. The cache fields are **additive**: an engine that knows about them always sends them, zeros
+included; an older engine omits them. A client that sees them absent must treat the cache counts
+as **unknown** — `inputTokens` is then only a lower bound for the context, never a measured empty
+window. Older clients ignore the new fields and keep reading `inputTokens` as before (and so keep
+under-reporting the context of mostly-cached requests until they read `totalInputTokens`).
+
+`event/usage` is one response's counts. The cumulative totals belong to the engine: the gated
+`event/usageUpdated` carries the same `UsageState` the snapshot's `usage` section does, and a
+client **assigns** it rather than adding anything, so replayed, duplicated or reconnect-snapshot
+frames cannot inflate a total. `UsageState` also carries:
+
+- `lastResponseModel` — the model that produced `lastResponse`.
+- `lastResponseStale: true` — `lastResponse` is the last *known* measurement, not the current
+  context: it was restored from a saved session, or the history (rewind, compaction, fork) or the
+  active model changed since. The next request replaces it.
+- `sessionCoverage` — `complete`, or `partial` when the session was saved by a version that did
+  not record usage: the totals then cover only the requests measured since, and the real figure is
+  higher. Absent from engines that predate it (coverage unknown). An engine that sends it sends its
+  whole accounting in every projection, so a client may replace its copy outright.
+- `byModel` — the per-model share of `session`.
+- `cost` — `{totalUsd, inputUsd, cacheReadUsd, cacheWriteUsd, outputUsd, complete}`. `complete`
+  is `false` when some measured tokens had no known price or the history is partial; the dollar
+  figure is then a lower bound. Absent means nothing has been priced — unknown, never free. Cache
+  writes are priced by TTL; where the catalogue has only one write price it is the five-minute
+  rate, and one-hour writes are priced at twice the input rate.
+
+**Persistence.** The accounting is saved with the session transcript (an optional `usage` record
+older readers ignore) at every turn end, rewind and fork, and restored by assignment when
+`initialize` resumes the session — before anything reports the resumed totals — so restoring,
+reconnecting or replaying never double-counts. A fork starts from its parent's accounting.
 
 ### Failure reporting and retention (Rust)
 

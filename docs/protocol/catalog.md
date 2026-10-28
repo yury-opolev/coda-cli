@@ -126,7 +126,7 @@ the same structured projection regardless of that hint.
 | `event/thinking`, `event/thinkingComplete` | Provider-confirmed reasoning lifecycle / available summary. Silence is not evidence of reasoning; encrypted reasoning is not exposed. |
 | `event/toolCall`, `event/toolProgress`, `event/toolResult` | Tool lifecycle, input/results and timing. Match canonical turn + batch + call IDs; provider IDs alone may repeat. |
 | `event/turnComplete`, `event/stop` | Legacy turn termination notifications. Turn completion is distinct from the engine becoming ready for another prompt. |
-| `event/usage`, `event/streamProgress` | Reported response usage and streaming progress; do not silently interpret last-response usage as cumulative. |
+| `event/usage`, `event/streamProgress` | Reported response usage (uncached `inputTokens` plus additive cache categories and `totalInputTokens`) and streaming progress; do not silently interpret last-response usage as cumulative. |
 | `event/error`, `event/limitReached` | Execution errors and enforced limits. |
 | `event/steeringDelivered` | Inbox entries injected at a safe boundary, not proof of provider receipt or execution. |
 | `event/taskStarted`, `event/taskOutput`, `event/taskCompleted` | Task lifecycle: one start and one completion per task (kind, owning agent, mode) and throttled, bounded, secret-redacted output (≤ 4 frames/s per task, ≤ 2 000 chars, withheld while the client is not reading). `session/listTasks` stays authoritative. |
@@ -140,6 +140,7 @@ the same structured projection regardless of that hint.
 | `event/turnEnded`, `event/sessionChanged` | **Gated:** authoritative turn outcome and history/session reset fences. |
 | `event/configChanged`, `event/steeringQueue` | **Gated:** effective configuration and authoritative queue state/outcomes. |
 | `event/requestPending`, `event/requestResolved` | **Gated:** interaction registry changes and actual resolution outcomes. |
+| `event/usageUpdated` | **Gated:** the engine's authoritative usage accounting (same shape as the snapshot's `usage`): last-request context measurement and staleness, cumulative totals by category and model, coverage, cost estimate and context window. Assign, never accumulate. |
 | `event/eventsDropped` | **Gated:** explicit loss of retained event coverage; obtain an authoritative snapshot/history instead of guessing missing deltas. |
 | `event/agentMessage` | A background context (a scheduled run, a subagent, or trusted main) published a passive notification via `notify_user`. See [Background notifications](#background-notifications-notify_user). |
 | `event/agentMessageDelivered` | The trusted main conversation's own inbox (`ask_main`) delivered one or more accepted requests into the running turn's live history. Metadata only — see [Main inbox](#main-inbox-ask_main). |

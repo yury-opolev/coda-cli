@@ -1586,6 +1586,20 @@ impl ServeHost {
         }
     }
 
+    /// Resolves the active model's price from the catalogue, per category.
+    ///
+    /// Always reports, `None` included: a model the catalogue does not price
+    /// must not inherit the previous model's price, and the estimate then
+    /// says it is incomplete rather than quoting a wrong number.
+    fn note_catalog_pricing(&self) {
+        let captured = self.capture_runtime().config;
+        let prices = crate::catalog::ModelCatalog::load()
+            .find(captured.provider_id.as_deref(), &captured.model)
+            .and_then(|m| m.cost)
+            .map(|cost| crate::usage::UsagePrices::from_catalog(&cost));
+        self.engine_state.pricing_resolved(captured.model, prices);
+    }
+
     /// Commits a configuration mutation and publishes the resulting
     /// `config.next` **in the same critical section** (`CONFIG -> STATE ->
     /// BUS`), if the engine is still alive.
@@ -2315,6 +2329,9 @@ impl ServeHost {
         // ever say how big the context window is, which is exactly the
         // "usage is unknowable in serve mode" gap this closes.
         self.note_catalog_context_limit();
+        // And the price its responses will be charged at, so the cost
+        // estimate attributes each response to the model that served it.
+        self.note_catalog_pricing();
         *busy = true;
         if kind.accepts_steering() {
             // Only unseals; anything already queued is preserved.
@@ -2821,8 +2838,9 @@ impl ServeBackend for ServeHost {
                 return Err(RpcError::session_not_found());
             }
             let store = SessionTranscriptStore::new(&self.working_dir);
-            match store.load(req_id).await {
-                Some(messages) => {
+            match store.load_session(req_id).await {
+                Some(stored) => {
+                    let messages = stored.messages;
                     // Adopt the resumed id so future saves go to the right file.
                     *self.current_session_id.lock().expect("session_id poisoned") =
                         req_id.clone();
@@ -2837,6 +2855,10 @@ impl ServeBackend for ServeHost {
                         self.session.history.lock().expect("history poisoned");
                     *committed = messages;
                     let restored = committed.len() as i64;
+                    // The saved accounting, before anything can display the
+                    // resumed session's totals. A transcript saved before
+                    // accounting existed resumes with partial totals.
+                    self.engine_state.usage_restored(stored.usage, restored > 0);
                     self.engine_state.session_changed("resume", req_id.clone(), restored);
                 }
                 None => {
@@ -4499,6 +4521,11 @@ impl ServeHost {
         let source_id = self.active_session_id();
 
         let new_id = fork_session(&self.working_dir, Some(&source_id), &history, None).await;
+        // The fork shares the parent's history, so it starts from the
+        // parent's accounting; the two then diverge independently.
+        let _ = SessionTranscriptStore::new(&self.working_dir)
+            .save_usage(&new_id, &self.engine_state.stored_usage())
+            .await;
 
         // Adopt the new id so future turns write to the forked session.
         *self.current_session_id.lock().expect("session_id poisoned") = new_id.clone();
@@ -4531,7 +4558,9 @@ impl ServeHost {
         // so no snapshot can see a fence the transcript does not back.
         let session_id = self.active_session_id();
         let store = SessionTranscriptStore::new(&self.working_dir);
-        let _ = store.save(&session_id, &history, None).await;
+        let _ = store
+            .save_with_usage(&session_id, &history, None, Some(&self.engine_state.stored_usage()))
+            .await;
 
         // F2: rewind used to be silent. F3 (review): replacement and
         // announcement are one critical section — see `run_fork_inner`.
@@ -5241,7 +5270,10 @@ impl ServeHost {
         {
             let session_id = self.active_session_id();
             let store = SessionTranscriptStore::new(&self.working_dir);
-            let _ = store.save(&session_id, &history, None).await;
+            // The accounting travels with the conversation it measured, so a
+            // resumed session continues its totals instead of restarting.
+            let usage = self.engine_state.stored_usage();
+            let _ = store.save_with_usage(&session_id, &history, None, Some(&usage)).await;
         }
 
         // The terminal outcome, as one transaction: the committed length, the
@@ -9000,6 +9032,99 @@ mod tests {
             host.session_get_state(GetStateParams::default()).await.unwrap()["historyEpoch"],
             1
         );
+    }
+
+    /// Restart + resume: the totals continue instead of restarting at zero,
+    /// and the last context measurement survives as a stale one.
+    #[tokio::test]
+    async fn a_resumed_session_continues_its_saved_usage_totals() {
+        use coda_llm::anthropic::StreamEvent;
+        use coda_llm::Usage;
+
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path().to_string_lossy().into_owned();
+        let done = |uncached, read, write, output| StreamEvent::Done {
+            stop_reason: Some("end_turn".into()),
+            usage: Usage {
+                input_tokens: uncached,
+                cache_read_tokens: read,
+                cache_write_5m_tokens: write,
+                output_tokens: output,
+                ..Usage::ZERO
+            },
+        };
+        let client = ScriptedClient::new(vec![
+            vec![StreamEvent::TextDelta("one".into()), done(4, 170_000, 20_000, 449)],
+            vec![StreamEvent::TextDelta("two".into()), done(6, 195_000, 0, 100)],
+        ]);
+        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let host = ServeHost::new_with_client(
+            client,
+            Arc::new(ServeSink::new(tx.clone())),
+            Arc::new(PromptChannel::new(tx)),
+            workdir.clone(),
+        );
+        for text in ["first", "second"] {
+            host.session_prompt(PromptParams { text: Some(text.into()), images: None })
+                .await
+                .expect("prompt");
+        }
+        let session_id = host.active_session_id();
+        let before = host.session_get_state(GetStateParams::default()).await.unwrap()["usage"].clone();
+        assert_eq!(before["session"]["totalInputTokens"], 385_010);
+
+        let client = ScriptedClient::new(vec![vec![
+            StreamEvent::TextDelta("three".into()),
+            done(0, 200_000, 0, 75),
+        ]]);
+        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let resumed = ServeHost::new_with_client(
+            client,
+            Arc::new(ServeSink::new(tx.clone())),
+            Arc::new(PromptChannel::new(tx)),
+            workdir,
+        );
+        resumed
+            .initialize(InitParams { session_id: Some(session_id), ..Default::default() })
+            .await
+            .expect("resume");
+        let usage = resumed.session_get_state(GetStateParams::default()).await.unwrap()["usage"].clone();
+        assert_eq!(usage["session"], before["session"], "restored, not restarted");
+        assert_eq!(usage["sessionCoverage"], "complete");
+        assert_eq!(usage["lastResponse"]["totalInputTokens"], 195_006);
+        assert_eq!(usage["lastResponseStale"], true, "a past measurement, not the current context");
+
+        resumed
+            .session_prompt(PromptParams { text: Some("third".into()), images: None })
+            .await
+            .expect("prompt");
+        let usage = resumed.session_get_state(GetStateParams::default()).await.unwrap()["usage"].clone();
+        assert_eq!(usage["session"]["totalInputTokens"], 585_010);
+        assert_eq!(usage["session"]["outputTokens"], 624);
+        assert!(usage.get("lastResponseStale").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_transcript_saved_without_accounting_resumes_with_partial_totals() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionTranscriptStore::new(dir.path().to_str().unwrap());
+        let session_id = uuid::Uuid::new_v4().to_string();
+        store
+            .save(&session_id, &[Message::user("hi"), Message::assistant("hello")], None)
+            .await
+            .unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let host = ServeHost::new(
+            Arc::new(ServeSink::new(tx.clone())),
+            Arc::new(PromptChannel::new(tx)),
+            dir.path().to_string_lossy().into_owned(),
+        );
+        host.initialize(InitParams { session_id: Some(session_id), ..Default::default() })
+            .await
+            .expect("resume");
+        let usage = host.session_get_state(GetStateParams::default()).await.unwrap()["usage"].clone();
+        assert_eq!(usage["sessionCoverage"], "partial");
+        assert!(usage.get("session").is_none(), "unknown history, not a measured zero");
     }
 
     // ── S5: shutdown states are published, not decorative ─────────────────

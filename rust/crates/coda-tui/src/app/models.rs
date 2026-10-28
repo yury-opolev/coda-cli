@@ -33,11 +33,7 @@ impl App {
         if let Some(id) = result.model.as_deref() {
             let label = self.state.model_labels.resolve(result.provider_id.as_deref(), id).to_owned();
             let context_limit = result.active_context_limit();
-            let price = result.active_price();
             self.apply(UiEvent::ModelChanged { id: label, context_limit });
-            // Carried on the state so the renderer can show a running cost
-            // without reaching for a catalogue of its own.
-            self.state.usage.price_per_million = price;
         }
     }
 

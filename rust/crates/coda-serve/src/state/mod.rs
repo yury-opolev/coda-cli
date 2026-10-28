@@ -57,7 +57,7 @@ use coda_proto::state::{
     LastTurnOutcome, Limits, ModelRequestState, PendingRequestDto, PendingRequestKind,
     StateSnapshot, SteeringOutcomeDto, SteeringOutcomeKind, SteeringPendingDto, SteeringQueueState,
     ToolBatchRef, ToolCallState, ToolCallStateStatus, ToolsState, TurnErrorSummary, TurnState,
-    UsageState, config_differences,
+    CostEstimate, ModelUsage, UsageCoverage, UsagePair, UsageState, config_differences,
 };
 
 use crate::bus::EventBus;
@@ -240,8 +240,22 @@ pub(crate) struct StateInner {
 
 #[derive(Clone, Default)]
 struct UsageStateInner {
-    last_response: Option<(i64, i64)>,
-    session_total: Option<(i64, i64)>,
+    /// The last measured request — the context occupancy measurement.
+    last_response: Option<UsagePair>,
+    last_response_model: Option<String>,
+    /// The measurement predates a history change or came from a saved
+    /// session; see `UsageState::last_response_stale`.
+    last_response_stale: bool,
+    /// Cumulative totals. `None` until something is measured or restored.
+    session_total: Option<UsagePair>,
+    /// The totals do not cover the whole conversation (a session saved
+    /// before accounting was persisted).
+    partial_history: bool,
+    by_model: Vec<ModelUsage>,
+    /// Priced per response, at the serving model's price at that moment.
+    cost: Option<CostEstimate>,
+    /// The model the host last resolved a price for, and that price.
+    prices: Option<(String, Option<crate::usage::UsagePrices>)>,
     /// The active model's context window, when the host has resolved one.
     ///
     /// `None` is "this engine does not know", which is not the same as a
@@ -555,11 +569,104 @@ impl StateInner {
         Vec::new()
     }
 
-    pub(crate) fn usage_updated(&mut self, input_tokens: i64, output_tokens: i64) -> Vec<PendingEvent> {
-        self.usage.last_response = Some((input_tokens, output_tokens));
-        let (si, so) = self.usage.session_total.unwrap_or((0, 0));
-        self.usage.session_total = Some((si + input_tokens, so + output_tokens));
+    /// Accounts for one response.
+    ///
+    /// The response is attributed — and priced — to the model serving the
+    /// running turn (else the configured one), so a later model switch
+    /// cannot re-price history.
+    pub(crate) fn usage_updated(&mut self, usage: UsagePair) -> Vec<PendingEvent> {
+        let model = self.current_model().to_owned();
+        let u = &mut self.usage;
+        u.last_response = Some(usage);
+        u.last_response_model = Some(model.clone());
+        u.last_response_stale = false;
+        u.session_total = Some(u.session_total.map_or(usage, |total| total + usage));
+        match u.by_model.iter_mut().find(|m| m.model == model) {
+            Some(entry) => entry.usage = entry.usage + usage,
+            None => u.by_model.push(ModelUsage { model: model.clone(), usage }),
+        }
+        let prices = u
+            .prices
+            .as_ref()
+            .filter(|(priced, _)| *priced == model)
+            .and_then(|(_, prices)| prices.as_ref());
+        let cost = crate::usage::price(&usage, prices);
+        u.cost = Some(u.cost.map_or(cost, |total| crate::usage::add(total, cost)));
         self.usage_event()
+    }
+
+    /// The model a response arriving now is served by.
+    fn current_model(&self) -> &str {
+        self.turn
+            .as_ref()
+            .map_or(self.next_config.model.as_str(), |t| t.active_config.model.as_str())
+    }
+
+    /// Whether the last measurement no longer describes the current context.
+    fn last_response_stale(&self) -> bool {
+        self.usage.last_response.is_some()
+            && (self.usage.last_response_stale
+                || self
+                    .usage
+                    .last_response_model
+                    .as_deref()
+                    .is_some_and(|measured| measured != self.current_model()))
+    }
+
+    /// Records the price of `model`, used for every response it serves until
+    /// another model is priced. `None` is "this model has no known price".
+    pub(crate) fn pricing_resolved(
+        &mut self,
+        model: String,
+        prices: Option<crate::usage::UsagePrices>,
+    ) -> Vec<PendingEvent> {
+        self.usage.prices = Some((model, prices));
+        Vec::new()
+    }
+
+    /// Adopts a resumed session's saved accounting — by **assignment**, so a
+    /// repeated restore cannot inflate anything.
+    ///
+    /// `None` with a non-empty history is a transcript saved before accounting
+    /// was persisted: its past usage is unknown, so the totals that follow are
+    /// partial rather than a measured zero history.
+    pub(crate) fn usage_restored(
+        &mut self,
+        saved: Option<coda_agent::StoredUsage>,
+        has_history: bool,
+    ) -> Vec<PendingEvent> {
+        let prices = self.usage.prices.take();
+        let context_limit = self.usage.context_limit;
+        self.usage = UsageStateInner { prices, context_limit, ..UsageStateInner::default() };
+        match saved {
+            Some(saved) => {
+                let u = &mut self.usage;
+                u.session_total = Some(saved.session);
+                u.partial_history = !saved.complete;
+                u.last_response = saved.last_response;
+                u.last_response_model = saved.last_response_model;
+                // A measurement from a previous process describes the context
+                // as it was then; it is the last known value, not the current.
+                u.last_response_stale = true;
+                u.by_model = saved.by_model;
+                u.cost = saved.cost;
+            }
+            None => self.usage.partial_history = has_history,
+        }
+        self.usage_event()
+    }
+
+    /// The accounting to save with the session.
+    pub(crate) fn stored_usage(&self) -> coda_agent::StoredUsage {
+        let u = &self.usage;
+        coda_agent::StoredUsage {
+            session: u.session_total.unwrap_or_else(|| UsagePair::from_counts(0, 0, 0, 0, 0)),
+            complete: !u.partial_history,
+            last_response: u.last_response,
+            last_response_model: u.last_response_model.clone(),
+            by_model: u.by_model.clone(),
+            cost: u.cost,
+        }
     }
 
     /// Records the active model's context window.
@@ -585,16 +692,25 @@ impl StateInner {
     }
 
     fn usage_projection(&self) -> UsageState {
+        let u = &self.usage;
         UsageState {
-            last_response: self.usage.last_response.map(|(i, o)| coda_proto::state::UsagePair {
-                input_tokens: i,
-                output_tokens: o,
+            last_response: u.last_response,
+            last_response_model: u.last_response_model.clone(),
+            last_response_stale: self.last_response_stale(),
+            session: u.session_total,
+            session_coverage: Some(if u.partial_history {
+                UsageCoverage::Partial
+            } else {
+                UsageCoverage::Complete
             }),
-            session: self.usage.session_total.map(|(i, o)| coda_proto::state::UsagePair {
-                input_tokens: i,
-                output_tokens: o,
+            by_model: u.by_model.clone(),
+            // Unmeasured history cost something too: the estimate cannot be
+            // complete when the totals are not.
+            cost: u.cost.map(|cost| CostEstimate {
+                complete: cost.complete && !u.partial_history,
+                ..cost
             }),
-            context_limit: self.usage.context_limit,
+            context_limit: u.context_limit,
             unknown_fields: Vec::new(),
         }
     }
@@ -850,7 +966,15 @@ impl EngineState {
                 history_epoch: s.history_epoch,
                 history_length,
             });
-            vec![gated(coda_proto::events::event_method::SESSION_CHANGED, params)]
+            let mut events = vec![gated(coda_proto::events::event_method::SESSION_CHANGED, params)];
+            // The conversation the last request measured is not the one in
+            // the window any more. The cumulative totals are untouched: the
+            // traffic happened, whatever was rewound or compacted since.
+            if s.usage.last_response.is_some() && !s.usage.last_response_stale {
+                s.usage.last_response_stale = true;
+                events.extend(s.usage_event());
+            }
+            events
         });
     }
 
@@ -895,6 +1019,7 @@ impl EngineState {
             let started_instant = Instant::now();
             let mut live = LiveTurnAccumulator::new();
             live.push_user_text(&user_text);
+            let was_stale = s.last_response_stale();
             s.turn = Some(TurnTracking {
                 turn_id,
                 started_at: now.clone(),
@@ -910,7 +1035,11 @@ impl EngineState {
                 phase_before_awaiting: None,
                 tool_call_started_at: HashMap::new(),
             });
-            s.activity_event()
+            let mut events = s.activity_event();
+            if s.last_response_stale() != was_stale {
+                events.extend(s.usage_event());
+            }
+            events
         });
         admitted
     }
@@ -926,12 +1055,18 @@ impl EngineState {
             if t.turn_id != turn_id || t.active_config == active_config {
                 return Vec::new();
             }
+            let was_stale = s.last_response_stale();
+            let Some(t) = s.turn.as_mut() else { return Vec::new() };
             t.active_config = active_config;
             let params = serde_json::json!(wire::ConfigChangedEvent::Active(wire::ActiveConfigChanged {
                 turn_id,
                 active: t.active_config.clone(),
             }));
-            vec![gated(coda_proto::events::event_method::CONFIG_CHANGED, params)]
+            let mut events = vec![gated(coda_proto::events::event_method::CONFIG_CHANGED, params)];
+            if s.last_response_stale() != was_stale {
+                events.extend(s.usage_event());
+            }
+            events
         });
     }
 
@@ -983,6 +1118,7 @@ impl EngineState {
                 // client to re-render a config it already has.
                 return Vec::new();
             }
+            let was_stale = s.last_response_stale();
             s.next_config = next;
             let differing = s
                 .turn
@@ -995,7 +1131,13 @@ impl EngineState {
                 active: s.turn.as_ref().map(|t| t.active_config.clone()),
                 differing,
             }));
-            vec![gated(coda_proto::events::event_method::CONFIG_CHANGED, params)]
+            let mut events = vec![gated(coda_proto::events::event_method::CONFIG_CHANGED, params)];
+            // A model switch makes the last context measurement another
+            // model's; say so rather than leave it to the next poll.
+            if s.last_response_stale() != was_stale {
+                events.extend(s.usage_event());
+            }
+            events
         });
         admitted
     }
@@ -1084,6 +1226,7 @@ impl EngineState {
             if let Some(len) = end.history_length {
                 s.history_length = len;
             }
+            let was_stale = s.last_response_stale();
             s.turn = None;
 
             let mut events: Vec<PendingEvent> = Vec::new();
@@ -1110,6 +1253,11 @@ impl EngineState {
                     tools_truncated: s.tools_evicted,
                 }),
             ));
+            // A model switched mid-turn takes effect for the context only now
+            // that the turn's own model is no longer the current one.
+            if s.last_response_stale() != was_stale {
+                events.extend(s.usage_event());
+            }
             events
         });
         ended.load(std::sync::atomic::Ordering::SeqCst)
@@ -1158,8 +1306,25 @@ impl EngineState {
 
     // ── Usage ─────────────────────────────────────────────────────────────
 
-    pub fn usage_updated(&self, input_tokens: i64, output_tokens: i64) {
-        self.transact(move |s| s.usage_updated(input_tokens, output_tokens));
+    pub fn usage_updated(&self, usage: UsagePair) {
+        self.transact(move |s| s.usage_updated(usage));
+    }
+
+    /// Records the price the next responses of `model` are charged at.
+    pub fn pricing_resolved(&self, model: impl Into<String>, prices: Option<crate::usage::UsagePrices>) {
+        let model = model.into();
+        self.transact(move |s| s.pricing_resolved(model, prices));
+    }
+
+    /// Adopts a resumed session's saved accounting; see
+    /// [`StateInner::usage_restored`].
+    pub fn usage_restored(&self, saved: Option<coda_agent::StoredUsage>, has_history: bool) {
+        self.transact(move |s| s.usage_restored(saved, has_history));
+    }
+
+    /// The accounting to persist with the session transcript.
+    pub fn stored_usage(&self) -> coda_agent::StoredUsage {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).stored_usage()
     }
 
     /// Reports the active model's context window, so the usage projection can
@@ -2839,19 +3004,53 @@ pub(crate) mod tests {
     }
 
     // ── Usage is real, not permanently unknown ────────────────────────────
+    use coda_proto::state::{UsageCoverage, UsagePair};
+
+    fn pair(uncached: i64, read: i64, write: i64, output: i64) -> UsagePair {
+        UsagePair::from_counts(uncached, read, write, 0, output)
+    }
+
+    /// The reported reproduction: mostly- and wholly-cached prompts.
+    fn the_three_responses(state: &EngineState) {
+        state.usage_updated(pair(4, 170_000, 20_000, 449));
+        state.usage_updated(pair(6, 195_000, 0, 100));
+        state.usage_updated(pair(0, 200_000, 0, 75));
+    }
+
+    fn opus_prices() -> crate::usage::UsagePrices {
+        crate::usage::UsagePrices {
+            input: 5.0,
+            output: 25.0,
+            cache_read: Some(0.5),
+            cache_write_5m: Some(6.25),
+            cache_write_1h: Some(10.0),
+        }
+    }
+
     #[test]
     fn observed_usage_reaches_the_snapshot_and_accumulates_across_responses() {
         let state = test_state();
         let idle = state.project("v1", limits());
         assert!(idle.usage.last_response.is_none(), "unknown usage is None, never a false zero");
 
-        state.usage_updated(1500, 320);
-        state.usage_updated(200, 40);
+        state.context_limit_resolved(Some(1_000_000));
+        the_three_responses(&state);
         let snap = state.project("v1", limits());
         let last = snap.usage.last_response.unwrap();
-        assert_eq!((last.input_tokens, last.output_tokens), (200, 40));
+        assert_eq!(last.total_input(), 200_000, "the context is the whole request, cache included");
+        assert_eq!(last.input_tokens, 0);
+        assert_eq!(snap.usage.last_response_model.as_deref(), Some("claude-opus-4-5"));
+        assert!(!snap.usage.last_response_stale);
+
         let session = snap.usage.session.unwrap();
-        assert_eq!((session.input_tokens, session.output_tokens), (1700, 360));
+        assert_eq!(session.total_input(), 585_010);
+        assert_eq!(session.output_tokens, 624);
+        assert_eq!(session.input_tokens, 10);
+        assert_eq!(session.cache_read(), 565_000);
+        assert_eq!(session.cache_write(), 20_000);
+        assert_eq!(snap.usage.session_coverage, Some(UsageCoverage::Complete));
+        assert_eq!(snap.usage.by_model.len(), 1);
+        assert_eq!(snap.usage.by_model[0].usage, session);
     }
 
     #[test]
@@ -2862,8 +3061,7 @@ pub(crate) mod tests {
             Arc::new(EngineState::new(Arc::clone(&bus), "s1", "/work", HashMap::new(), active_config()));
         bus.enable_state_events();
 
-        state.usage_updated(1500, 320);
-        state.usage_updated(200, 40);
+        the_three_responses(&state);
 
         let frames = drain_methods(&mut rx);
         let last = frames
@@ -2875,9 +3073,163 @@ pub(crate) mod tests {
 
         // The running total, so a client that never polls still converges —
         // and assigning it twice cannot double it.
-        assert_eq!(last["session"]["inputTokens"], 1700);
-        assert_eq!(last["session"]["outputTokens"], 360);
-        assert_eq!(last["lastResponse"]["inputTokens"], 200);
+        assert_eq!(last["session"]["totalInputTokens"], 585_010);
+        assert_eq!(last["session"]["inputTokens"], 10);
+        assert_eq!(last["session"]["cacheReadTokens"], 565_000);
+        assert_eq!(last["session"]["outputTokens"], 624);
+        assert_eq!(last["lastResponse"]["totalInputTokens"], 200_000);
+        assert_eq!(last["lastResponse"]["inputTokens"], 0);
+    }
+
+    #[test]
+    fn cost_prices_every_category_at_its_own_rate() {
+        let state = test_state();
+        state.pricing_resolved("claude-opus-4-5", Some(opus_prices()));
+        state.usage_updated(UsagePair::from_counts(1_000_000, 1_000_000, 1_000_000, 1_000_000, 1_000_000));
+        let cost = state.project("v1", limits()).usage.cost.unwrap();
+        assert_eq!(cost.input_usd, 5.0);
+        assert_eq!(cost.cache_read_usd, 0.5);
+        assert_eq!(cost.cache_write_usd, 16.25, "5m and 1h writes at their own prices");
+        assert_eq!(cost.output_usd, 25.0);
+        assert_eq!(cost.total_usd, 46.75);
+        assert!(cost.complete);
+    }
+
+    #[test]
+    fn unpriced_usage_is_a_partial_estimate_never_a_free_session() {
+        let state = test_state();
+        state.usage_updated(pair(4, 170_000, 20_000, 449));
+        let cost = state.project("v1", limits()).usage.cost.unwrap();
+        assert!(!cost.complete, "no price is not zero cost");
+
+        // A price without a cache-read rate cannot price the cache reads.
+        let state = test_state();
+        state.pricing_resolved(
+            "claude-opus-4-5",
+            Some(crate::usage::UsagePrices { cache_read: None, ..opus_prices() }),
+        );
+        state.usage_updated(pair(1_000_000, 10, 0, 0));
+        let cost = state.project("v1", limits()).usage.cost.unwrap();
+        assert_eq!(cost.input_usd, 5.0, "what is priced is still counted");
+        assert!(!cost.complete);
+    }
+
+    #[test]
+    fn a_price_for_another_model_is_not_applied() {
+        let state = test_state();
+        state.pricing_resolved("some-other-model", Some(opus_prices()));
+        state.usage_updated(pair(1_000_000, 0, 0, 0));
+        let cost = state.project("v1", limits()).usage.cost.unwrap();
+        assert_eq!(cost.total_usd, 0.0);
+        assert!(!cost.complete);
+    }
+
+    #[test]
+    fn saved_accounting_restores_into_a_new_engine_exactly_once() {
+        let first = test_state();
+        first.pricing_resolved("claude-opus-4-5", Some(opus_prices()));
+        the_three_responses(&first);
+        let saved = first.stored_usage();
+        assert!(saved.complete);
+
+        let resumed = test_state();
+        resumed.usage_restored(Some(saved.clone()), true);
+        // Restoring is assignment: doing it again cannot double anything.
+        resumed.usage_restored(Some(saved.clone()), true);
+        let snap = resumed.project("v1", limits());
+        assert_eq!(snap.usage.session.unwrap().total_input(), 585_010);
+        assert_eq!(snap.usage.session.unwrap().output_tokens, 624);
+        assert_eq!(snap.usage.session_coverage, Some(UsageCoverage::Complete));
+        assert_eq!(snap.usage.cost, first.project("v1", limits()).usage.cost);
+        // The last measurement survives as such, marked as not current.
+        assert_eq!(snap.usage.last_response.unwrap().total_input(), 200_000);
+        assert!(snap.usage.last_response_stale);
+
+        resumed.usage_updated(pair(0, 201_000, 0, 10));
+        let snap = resumed.project("v1", limits());
+        assert_eq!(snap.usage.session.unwrap().total_input(), 786_010);
+        assert_eq!(snap.usage.session.unwrap().output_tokens, 634);
+        assert!(!snap.usage.last_response_stale, "a new request is a current measurement");
+    }
+
+    #[test]
+    fn a_legacy_transcript_resumes_with_partial_totals() {
+        let state = test_state();
+        state.usage_restored(None, true);
+        let snap = state.project("v1", limits());
+        assert_eq!(snap.usage.session_coverage, Some(UsageCoverage::Partial));
+        assert!(snap.usage.session.is_none(), "unknown history is not a measured zero");
+        assert!(snap.usage.last_response.is_none());
+
+        state.pricing_resolved("claude-opus-4-5", Some(opus_prices()));
+        state.usage_updated(pair(100, 0, 0, 10));
+        let snap = state.project("v1", limits());
+        assert_eq!(snap.usage.session.unwrap().total_input(), 100);
+        assert_eq!(snap.usage.session_coverage, Some(UsageCoverage::Partial));
+        assert!(!snap.usage.cost.unwrap().complete, "the unmeasured history cost something too");
+        assert!(!state.stored_usage().complete, "and stays partial once saved again");
+    }
+
+    #[test]
+    fn a_history_change_makes_the_last_measurement_stale() {
+        let state = test_state();
+        state.usage_updated(pair(0, 200_000, 0, 75));
+        state.session_changed("rewind", "s1", 2);
+        let snap = state.project("v1", limits());
+        assert!(snap.usage.last_response_stale);
+        assert_eq!(snap.usage.session.unwrap().total_input(), 200_000, "traffic is not undone");
+    }
+
+    #[test]
+    fn a_model_switch_makes_the_last_measurement_stale_and_says_so() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let bus = Arc::new(EventBus::new(tx, "engine-1"));
+        let state =
+            Arc::new(EngineState::new(Arc::clone(&bus), "s1", "/work", HashMap::new(), active_config()));
+        bus.enable_state_events();
+        state.usage_updated(pair(0, 200_000, 0, 75));
+        drain_methods(&mut rx);
+
+        let mut next = active_config();
+        next.model = "claude-sonnet-4-5".into();
+        assert!(state.commit_next_config("model", || next));
+        assert!(state.project("v1", limits()).usage.last_response_stale);
+        let frames = drain_methods(&mut rx);
+        let usage = frames
+            .iter()
+            .find(|(method, _)| method == coda_proto::events::event_method::USAGE_UPDATED)
+            .map(|(_, params)| params)
+            .expect("the staleness is pushed, not only polled");
+        assert_eq!(usage["lastResponseStale"], true);
+    }
+
+    #[test]
+    fn a_model_switched_mid_turn_is_reported_stale_when_the_turn_ends() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let bus = Arc::new(EventBus::new(tx, "engine-1"));
+        let state =
+            Arc::new(EngineState::new(Arc::clone(&bus), "s1", "/work", HashMap::new(), active_config()));
+        bus.enable_state_events();
+        state.begin_turn("t1", "go", active_config(), ActivityPhase::Preparing);
+        state.usage_updated(pair(0, 200_000, 0, 75));
+        let mut next = active_config();
+        next.model = "claude-sonnet-4-5".into();
+        assert!(state.commit_next_config("model", || next));
+        assert!(
+            !state.project("v1", limits()).usage.last_response_stale,
+            "the running turn still uses the model that measured it"
+        );
+        drain_methods(&mut rx);
+
+        state.end_turn(ended("t1"));
+        assert!(state.project("v1", limits()).usage.last_response_stale);
+        let frames = drain_methods(&mut rx);
+        let usage = frames
+            .iter()
+            .find(|(method, _)| method == coda_proto::events::event_method::USAGE_UPDATED)
+            .map(|(_, params)| params)
+            .expect("the change at turn end is pushed, so push and poll agree");
+        assert_eq!(usage["lastResponseStale"], true);
     }
 
     #[test]

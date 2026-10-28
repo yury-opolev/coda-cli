@@ -114,6 +114,7 @@ pub(super) fn document() -> Value {
     events.extend([
         e::ACTIVITY, e::TURN_ENDED, e::LIFECYCLE, e::CONFIG_CHANGED, e::STEERING_QUEUE,
         e::SESSION_CHANGED, e::EVENTS_DROPPED, e::REQUEST_PENDING, e::REQUEST_RESOLVED,
+        e::USAGE_UPDATED,
     ].into_iter().map(|method| event(method, true)));
     let server_requests: Vec<_> = [
         (s::PERMISSION, "PermissionRequest", "PermissionResponse", "deny"),

@@ -114,7 +114,14 @@ API-key-authenticated local pipe/socket transport requires `initialize` with `ap
 prompt-first returns `-32001` and starts no agent work.
 
 **Coda → Orchestrator (notifications, streamed during a turn):**
-`event/assistantText {delta}` · `event/assistantTextComplete {}` · `event/toolCall {toolName, inputJson, rootTurnId?, activityId?, callId?, sourceId?}` · `event/toolProgress {toolName, elapsedMs, rootTurnId?, activityId?, callId?, sourceId?}` · `event/toolResult {toolName, content, isError, rootTurnId?, activityId?, callId?, sourceId?, status?}` · `event/error {message}` · `event/stop {stopReason?}` · `event/usage {inputTokens, outputTokens}` · `event/turnComplete {stopReason?, interrupted, rootTurnId?, activityId?}`.
+`event/assistantText {delta}` · `event/assistantTextComplete {}` · `event/toolCall {toolName, inputJson, rootTurnId?, activityId?, callId?, sourceId?}` · `event/toolProgress {toolName, elapsedMs, rootTurnId?, activityId?, callId?, sourceId?}` · `event/toolResult {toolName, content, isError, rootTurnId?, activityId?, callId?, sourceId?, status?}` · `event/error {message}` · `event/stop {stopReason?}` · `event/usage {inputTokens, outputTokens, cacheReadTokens?, cacheWriteTokens?, cacheWrite5mTokens?, cacheWrite1hTokens?, totalInputTokens?}` · `event/turnComplete {stopReason?, interrupted, rootTurnId?, activityId?}`.
+
+`event/usage` reports one response. `inputTokens` is **uncached** input; the cache fields are additive and,
+when present, `totalInputTokens` (uncached + cache reads + cache writes) is what the request put in the
+context window. When they are absent (an older engine) the cache counts are unknown, not zero. The
+engine's cumulative totals, context window, staleness, coverage and per-category cost estimate are the
+`usage` section of `session/getState` and the gated `event/usageUpdated`; they are saved with the session
+and restored on resume. See [Usage accounting](serve-protocol.md#usage-accounting-rust).
 
 Tool identity fields are optional and additive: `rootTurnId` identifies the root turn,
 `activityId` its tool batch, `callId` a single invocation, and `sourceId` the origin

@@ -11,12 +11,55 @@
     "inputTokens": {
       "type": "integer",
       "format": "int64",
+      "description": "Uncached input tokens.",
       "default": 0
     },
     "outputTokens": {
       "type": "integer",
       "format": "int64",
       "default": 0
+    },
+    "cacheReadTokens": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64",
+      "description": "Absent from engines that predate cache reporting: the cache counts\nare then unknown, not zero.",
+      "default": null
+    },
+    "cacheWriteTokens": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64",
+      "default": null
+    },
+    "cacheWrite5mTokens": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64",
+      "default": null
+    },
+    "cacheWrite1hTokens": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64",
+      "default": null
+    },
+    "totalInputTokens": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64",
+      "description": "`inputTokens + cacheReadTokens + cacheWriteTokens`.",
+      "default": null
     }
   },
   "required": [

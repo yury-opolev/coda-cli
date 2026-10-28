@@ -95,7 +95,7 @@ pub use scheduling::{
 };
 pub use session::{
     AuditToolCall, AuditTurn, BundleTurn, ImportError, SessionAuditStore, SessionBundle,
-    SessionBundleService, SessionSummary, SessionTranscriptStore, StoredSession,
+    SessionBundleService, SessionSummary, SessionTranscriptStore, StoredSession, StoredUsage,
     fork as fork_session, new_session_id, rewind as rewind_session, session_id_is_valid,
 };
 pub use steering::{SteeringEntry, SteeringInbox};

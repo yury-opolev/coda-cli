@@ -178,10 +178,10 @@ pub enum Event {
         activity_id: Option<String>,
     },
     Stop { stop_reason: Option<String> },
-    Usage {
-        input_tokens: i64,
-        output_tokens: i64,
-    },
+    /// One response's token counts. `inputTokens` is **uncached** input;
+    /// the cache categories ride alongside it — see
+    /// [`crate::state::UsagePair`].
+    Usage(crate::state::UsagePair),
     Error { message: String },
     LimitReached { kind: String, message: String },
     StreamProgress {
@@ -423,10 +423,24 @@ struct StopPayload {
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 struct UsagePayload {
+    /// Uncached input tokens.
     #[serde(default)]
     input_tokens: i64,
     #[serde(default)]
     output_tokens: i64,
+    /// Absent from engines that predate cache reporting: the cache counts
+    /// are then unknown, not zero.
+    #[serde(default)]
+    cache_read_tokens: Option<i64>,
+    #[serde(default)]
+    cache_write_tokens: Option<i64>,
+    #[serde(default)]
+    cache_write_5m_tokens: Option<i64>,
+    #[serde(default)]
+    cache_write_1h_tokens: Option<i64>,
+    /// `inputTokens + cacheReadTokens + cacheWriteTokens`.
+    #[serde(default)]
+    total_input_tokens: Option<i64>,
 }
 
 #[derive(Default, Deserialize)]
@@ -793,10 +807,15 @@ impl Event {
             },
             m::USAGE => {
                 let p: UsagePayload = parse(params);
-                Event::Usage {
+                Event::Usage(crate::state::UsagePair {
                     input_tokens: p.input_tokens,
                     output_tokens: p.output_tokens,
-                }
+                    cache_read_tokens: p.cache_read_tokens,
+                    cache_write_tokens: p.cache_write_tokens,
+                    cache_write_5m_tokens: p.cache_write_5m_tokens,
+                    cache_write_1h_tokens: p.cache_write_1h_tokens,
+                    total_input_tokens: p.total_input_tokens,
+                })
             }
             m::ERROR => Event::Error {
                 message: parse::<MessagePayload>(params).message,
@@ -1051,9 +1070,9 @@ impl Event {
                 put_opt(&mut map, "stopReason", stop_reason);
                 (m::STOP, Value::Object(map))
             }
-            Event::Usage { input_tokens, output_tokens } => (
+            Event::Usage(usage) => (
                 m::USAGE,
-                serde_json::json!({ "inputTokens": input_tokens, "outputTokens": output_tokens }),
+                serde_json::to_value(usage).unwrap_or(Value::Null),
             ),
             Event::Error { message } => (m::ERROR, serde_json::json!({ "message": message })),
             Event::LimitReached { kind, message } => (
@@ -1314,7 +1333,11 @@ mod tests {
                 elapsed_ms: 12,
                 thinking_tokens: None,
             });
-            assert_round_trips(Event::Usage { input_tokens: 1, output_tokens: 2 });
+            assert_round_trips(Event::Usage(crate::state::UsagePair {
+                input_tokens: 1,
+                output_tokens: 2,
+                ..Default::default()
+            }));
             assert_round_trips(Event::Error { message: "boom".into() });
             assert_round_trips(Event::LimitReached {
                 kind: "context".into(),
@@ -1666,17 +1689,41 @@ mod tests {
 
     #[test]
     fn parses_usage_counters() {
+        // An engine that predates cache reporting: the cache counts are
+        // unknown, so the measured input is only a lower bound.
         let event = parse_event(
             event_method::USAGE,
             json!({ "inputTokens": 1500, "outputTokens": 320 }),
         );
-        assert!(matches!(
-            event,
-            Event::Usage {
-                input_tokens: 1500,
-                output_tokens: 320
-            }
-        ));
+        let Event::Usage(usage) = event else { panic!("not usage: {event:?}") };
+        assert_eq!((usage.input_tokens, usage.output_tokens), (1500, 320));
+        assert!(!usage.reports_cache());
+        assert_eq!(usage.total_input(), 1500);
+    }
+
+    #[test]
+    fn usage_carries_cache_categories_end_to_end() {
+        let usage = crate::state::UsagePair::from_counts(4, 170_000, 15_000, 5_000, 449);
+        let (method, params) = Event::Usage(usage).to_notification().unwrap();
+        assert_eq!(method, event_method::USAGE);
+        assert_eq!(
+            params,
+            json!({
+                "inputTokens": 4,
+                "outputTokens": 449,
+                "cacheReadTokens": 170_000,
+                "cacheWriteTokens": 20_000,
+                "cacheWrite5mTokens": 15_000,
+                "cacheWrite1hTokens": 5_000,
+                "totalInputTokens": 190_004,
+            })
+        );
+        let Event::Usage(parsed) = parse_event(event_method::USAGE, params) else {
+            panic!("not usage")
+        };
+        assert_eq!(parsed, usage);
+        assert!(parsed.reports_cache());
+        assert_eq!(parsed.total_input(), 190_004);
     }
 
     #[test]

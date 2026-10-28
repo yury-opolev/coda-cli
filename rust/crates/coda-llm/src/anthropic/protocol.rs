@@ -542,6 +542,49 @@ mod tests {
         assert_eq!(usage.cache_write_tokens(), 70);
     }
 
+    /// The reported reproduction: almost all of a large prompt is cached, so
+    /// the uncached count alone (4, then 0) says nothing about the window.
+    #[test]
+    fn mostly_and_wholly_cached_requests_keep_their_full_input() {
+        let (events, _) = run(&[
+            ("message_start", json!({ "type": "message_start", "message": { "usage": {
+                "input_tokens": 4,
+                "cache_read_input_tokens": 170_000,
+                "cache_creation_input_tokens": 20_000,
+                "cache_creation": { "ephemeral_5m_input_tokens": 20_000, "ephemeral_1h_input_tokens": 0 }
+            } } })),
+            ("message_delta", json!({ "type": "message_delta", "delta": {}, "usage": { "output_tokens": 449 } })),
+            ("message_stop", json!({ "type": "message_stop" })),
+        ]);
+        let Some(StreamEvent::Done { usage, .. }) = events.last() else { panic!() };
+        assert_eq!(usage.input_tokens, 4);
+        assert_eq!(usage.total_input_tokens(), 190_004);
+
+        let (events, _) = run(&[
+            ("message_start", json!({ "type": "message_start", "message": { "usage": {
+                "input_tokens": 0,
+                "cache_read_input_tokens": 200_000
+            } } })),
+            ("message_delta", json!({ "type": "message_delta", "delta": {}, "usage": { "output_tokens": 75 } })),
+            ("message_stop", json!({ "type": "message_stop" })),
+        ]);
+        let Some(StreamEvent::Done { usage, .. }) = events.last() else { panic!() };
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.total_input_tokens(), 200_000);
+        assert_eq!(usage.output_tokens, 75);
+    }
+
+    #[test]
+    fn an_uncached_request_reports_no_cache_activity() {
+        let (events, _) = run(&[
+            ("message_start", json!({ "type": "message_start", "message": { "usage": { "input_tokens": 1_000 } } })),
+            ("message_stop", json!({ "type": "message_stop" })),
+        ]);
+        let Some(StreamEvent::Done { usage, .. }) = events.last() else { panic!() };
+        assert!(!usage.has_cache_activity());
+        assert_eq!(usage.total_input_tokens(), 1_000);
+    }
+
     #[test]
     fn a_ping_produces_nothing() {
         let mut decoder = AnthropicDecoder::new();

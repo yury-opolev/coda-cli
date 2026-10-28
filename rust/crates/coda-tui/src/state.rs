@@ -5,6 +5,7 @@
 //! any async machinery: feed events in, assert on the state that comes out.
 
 use coda_proto::events::ToolCallStatus;
+use coda_proto::state::{CostEstimate, ModelUsage, UsageCoverage, UsagePair};
 use coda_proto::{Correlation, Event};
 use coda_render::tool::{CallStatus, ToolActivity, ToolCall, ToolDisplayMode};
 
@@ -86,48 +87,131 @@ impl Activity {
     }
 }
 
-/// Cumulative token usage for the session.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+/// The session's usage, as the engine accounts it.
+///
+/// Three quantities, kept apart because they answer different questions:
+///
+/// - **Context occupancy** — [`Usage::last_input_tokens`] against
+///   [`Usage::context_limit`]: everything the last request carried, cached or
+///   not, is what was in the window.
+/// - **Cumulative traffic** — [`Usage::input_tokens`] / [`Usage::output_tokens`]:
+///   every request's tokens summed, cached input included. It passes the
+///   window size after a few turns and says nothing about how full it is.
+/// - **Estimated cost** — [`Usage::cost`], priced per category by the engine.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Usage {
+    /// Cumulative total input — uncached, cache reads and cache writes.
     pub input_tokens: i64,
     pub output_tokens: i64,
-    /// Input tokens of the most recent response.
+    /// Total input of the most recent request, cache included: the context
+    /// window occupancy it measured.
     ///
     /// Kept apart from the running total because the two answer different
     /// questions and share no arithmetic. Every request re-sends the whole
-    /// conversation, so one response's input *is* roughly the context in use;
-    /// the sum of every response's input is how much has been paid for, which
-    /// passes the window size after a handful of turns and would peg a
-    /// context gauge at 100% forever.
+    /// conversation, so one request's input *is* the context in use; the sum
+    /// of every request's input is how much traffic there was, which passes
+    /// the window size after a handful of turns and would peg a context
+    /// gauge at 100% forever.
     pub last_input_tokens: i64,
     /// Nominal context window, used to show a percentage.
     pub context_limit: i64,
-    /// Dollars per million tokens in and out, when the model's price is known.
-    ///
-    /// Carried rather than looked up so the cost can be shown without the
-    /// renderer reaching for a catalogue, and so an unpriced model shows
-    /// nothing rather than a confident zero.
-    pub price_per_million: Option<(f64, f64)>,
+    /// Category breakdown of the cumulative totals.
+    pub session: Option<UsagePair>,
+    /// Category breakdown of the last request.
+    pub last: Option<UsagePair>,
+    /// The last measurement no longer describes the current context (it was
+    /// restored from a saved session, or the history or model changed).
+    pub context_stale: bool,
+    /// Whether the totals cover the whole session; `None` from an engine that
+    /// does not say.
+    pub coverage: Option<UsageCoverage>,
+    /// The engine's per-category estimate. `None` is unknown, never free.
+    pub cost: Option<CostEstimate>,
+    /// Per-model share of the totals.
+    pub by_model: Vec<ModelUsage>,
+}
+
+/// How the context occupancy may be described.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ContextReading {
+    /// Measured by the last request.
+    Current(f64),
+    /// The last known measurement, which no longer describes the window.
+    Stale(f64),
+    /// Measured by an engine that did not report cached input: the real
+    /// figure may be higher.
+    AtLeast(f64),
+}
+
+impl ContextReading {
+    pub fn fraction(self) -> f64 {
+        match self {
+            ContextReading::Current(f) | ContextReading::Stale(f) | ContextReading::AtLeast(f) => f,
+        }
+    }
+
+    /// `"19%"`, `"<1%"` for a genuine but small occupancy, `"~19%"` for a
+    /// stale one and `">=19%"` for a lower bound. `None` when the reading says
+    /// nothing worth showing (a lower bound under 1%).
+    pub fn label(self) -> Option<String> {
+        let percent = |f: f64| {
+            if f < 0.01 {
+                "<1%".to_owned()
+            } else {
+                format!("{}%", (f * 100.0).clamp(0.0, 100.0) as u8)
+            }
+        };
+        match self {
+            ContextReading::Current(f) => Some(percent(f)),
+            ContextReading::Stale(f) => Some(format!("~{}", percent(f))),
+            ContextReading::AtLeast(f) if f >= 0.01 => Some(format!(">={}", percent(f))),
+            ContextReading::AtLeast(_) => None,
+        }
+    }
 }
 
 impl Usage {
-    /// What this session has cost so far, in US dollars.
-    pub fn estimated_cost(&self) -> Option<f64> {
-        let (input, output) = self.price_per_million?;
-        let per_million = |tokens: i64, price: f64| tokens as f64 / 1_000_000.0 * price;
-        Some(per_million(self.input_tokens, input) + per_million(self.output_tokens, output))
-    }
-
-    /// Percentage of the context window consumed, if a limit is known.
+    /// How full the context window is, if anything has measured it.
     ///
-    /// Measured from the last response's input, not the session total: see
-    /// [`Usage::last_input_tokens`].
-    pub fn percent_used(&self) -> Option<u8> {
+    /// Measured from the last request's total input, not the session total:
+    /// see [`Usage::last_input_tokens`].
+    pub fn context(&self) -> Option<ContextReading> {
         if self.context_limit <= 0 || self.last_input_tokens <= 0 {
             return None;
         }
-        let ratio = self.last_input_tokens as f64 / self.context_limit as f64;
-        Some((ratio * 100.0).clamp(0.0, 100.0) as u8)
+        let fraction = (self.last_input_tokens as f64 / self.context_limit as f64).min(1.0);
+        Some(if self.last.is_some_and(|last| !last.reports_cache()) {
+            ContextReading::AtLeast(fraction)
+        } else if self.context_stale {
+            ContextReading::Stale(fraction)
+        } else {
+            ContextReading::Current(fraction)
+        })
+    }
+
+    /// Whole percent of the window in use, for the proportional bar: never 0
+    /// for a genuine non-zero occupancy.
+    pub fn percent_used(&self) -> Option<u8> {
+        let fraction = self.context()?.fraction();
+        Some(((fraction * 100.0).clamp(0.0, 100.0) as u8).max(1))
+    }
+
+    /// The totals cover only part of the session.
+    pub fn totals_partial(&self) -> bool {
+        self.coverage == Some(UsageCoverage::Partial)
+    }
+
+    /// `"$1.23"`, or `"$1.23+"` when the estimate is a lower bound. `None`
+    /// when nothing could be priced: unknown is not free.
+    pub fn cost_label(&self) -> Option<String> {
+        let cost = self.cost?;
+        if cost.complete {
+            Some(format!("${:.2}", cost.total_usd))
+        } else if cost.total_usd > 0.0 {
+            Some(format!("${:.2}+", cost.total_usd))
+        } else {
+            None
+        }
     }
 }
 
@@ -1566,18 +1650,20 @@ impl UiState {
                     self.notice("Interrupted.", NoticeLevel::Warning);
                 }
             }
-            Event::Usage {
-                input_tokens,
-                output_tokens,
-            } => {
+            Event::Usage(usage) => {
                 // One response, and only that. The running total is owned by
                 // the engine and arrives on `event/usageUpdated`
                 // (`UiEvent::UsageTotals`) — accumulating here instead would
                 // make every replayed or re-delivered frame inflate the total,
                 // and the pinned row wants this response either way.
-                self.usage.last_input_tokens = input_tokens;
+                //
+                // The context is the whole request, cached input included: a
+                // mostly-cached prompt is still a full window.
+                self.usage.last_input_tokens = usage.total_input();
+                self.usage.last = Some(usage);
+                self.usage.context_stale = false;
                 if let Some(progress) = self.turn_progress.as_mut() {
-                    progress.on_usage(input_tokens, output_tokens);
+                    progress.on_usage(usage.total_input(), usage.output_tokens);
                 }
             }
             Event::Error { message } => {
@@ -2034,7 +2120,7 @@ impl UiState {
                     (false, None) => TurnProgress::start(now),
                 };
                 if let Some(usage) = snapshot.usage.last_response {
-                    progress.on_usage(usage.input_tokens, usage.output_tokens);
+                    progress.on_usage(usage.total_input(), usage.output_tokens);
                 }
                 self.turn_progress = Some(progress);
                 self.turn_id = Some(turn.turn_id.clone());
@@ -2107,19 +2193,42 @@ impl UiState {
     ///
     /// Shared by `event/usageUpdated` and the snapshot's `usage` section
     /// because they are the same type carrying the same facts — one pushed,
-    /// one polled. Every field is optional and each is applied only when
-    /// present: "the engine did not say" must leave a known value alone
-    /// rather than reset it to a confident zero.
+    /// one polled. Always **assigned**, never added, so a replayed or
+    /// re-delivered frame changes nothing.
+    ///
+    /// An engine that reports `sessionCoverage` sends its whole accounting
+    /// every time, so the projection replaces this client's copy outright —
+    /// which is what makes a resumed or replaced engine's totals (including
+    /// "none measured yet") show instead of the previous engine's. From an
+    /// older engine every field is optional and applied only when present:
+    /// "the engine did not say" must leave a known value alone rather than
+    /// reset it to a confident zero. `contextLimit` is always the latter, as
+    /// the model list reports it too.
     fn apply_usage(&mut self, usage: &coda_proto::state::UsageState) {
         if let Some(limit) = usage.context_limit {
             self.usage.context_limit = limit;
         }
+        if usage.session_coverage.is_some() {
+            self.usage = Usage { context_limit: self.usage.context_limit, ..Usage::default() };
+        }
         if let Some(session) = usage.session {
-            self.usage.input_tokens = session.input_tokens;
+            self.usage.input_tokens = session.total_input();
             self.usage.output_tokens = session.output_tokens;
+            self.usage.session = Some(session);
         }
         if let Some(last) = usage.last_response {
-            self.usage.last_input_tokens = last.input_tokens;
+            self.usage.last_input_tokens = last.total_input();
+            self.usage.last = Some(last);
+            self.usage.context_stale = usage.last_response_stale;
+        }
+        if usage.session_coverage.is_some() {
+            self.usage.coverage = usage.session_coverage;
+        }
+        if usage.cost.is_some() {
+            self.usage.cost = usage.cost;
+        }
+        if !usage.by_model.is_empty() {
+            self.usage.by_model = usage.by_model.clone();
         }
     }
 
@@ -2424,7 +2533,7 @@ pub(crate) fn is_critical_event(event: &UiEvent) -> bool {
             Event::AssistantText { .. }
             | Event::Thinking { .. }
             | Event::ToolProgress { .. }
-            | Event::Usage { .. }
+            | Event::Usage(_)
             | Event::StreamProgress { .. } => false,
             _ => true,
         },
@@ -2925,11 +3034,8 @@ mod tests {
     #[test]
     fn a_usage_event_records_one_response_not_the_session_total() {
         let mut state = state();
-        state.apply(UiEvent::Engine(Event::Usage {
-            input_tokens: 1200,
-            output_tokens: 300,
-        }));
-        assert_eq!(state.usage.last_input_tokens, 1200);
+        state.apply(UiEvent::Engine(Event::Usage(UsagePair::from_counts(4, 170_000, 20_000, 0, 449))));
+        assert_eq!(state.usage.last_input_tokens, 190_004, "cached input occupies the window too");
         assert_eq!(
             (state.usage.input_tokens, state.usage.output_tokens),
             (0, 0),
@@ -2937,48 +3043,101 @@ mod tests {
         );
     }
 
+    fn engine_usage(session: UsagePair, last: UsagePair) -> UiEvent {
+        UiEvent::UsageTotals(coda_proto::state::UsageState {
+            last_response: Some(last),
+            session: Some(session),
+            session_coverage: Some(UsageCoverage::Complete),
+            context_limit: Some(1_000_000),
+            ..Default::default()
+        })
+    }
+
+    /// The reported reproduction, as the client sees it: mostly- and
+    /// wholly-cached requests read as a fifth of the window, not as 0% or as
+    /// nothing at all, and the cumulative counters include the cache.
+    #[test]
+    fn cached_requests_fill_the_gauge_and_the_counters() {
+        let mut state = state();
+        let responses = [
+            UsagePair::from_counts(4, 170_000, 20_000, 0, 449),
+            UsagePair::from_counts(6, 195_000, 0, 0, 100),
+            UsagePair::from_counts(0, 200_000, 0, 0, 75),
+        ];
+        let mut session = UsagePair::from_counts(0, 0, 0, 0, 0);
+        let mut labels = Vec::new();
+        for response in responses {
+            session = session + response;
+            state.apply(UiEvent::Engine(Event::Usage(response)));
+            state.apply(engine_usage(session, response));
+            labels.push(state.usage.context().and_then(|c| c.label()));
+        }
+        assert_eq!(
+            labels,
+            [Some("19%".to_owned()), Some("19%".to_owned()), Some("20%".to_owned())],
+            "190,004, 195,006 and 200,000 of 1,000,000",
+        );
+        assert_eq!((state.usage.input_tokens, state.usage.output_tokens), (585_010, 624));
+        assert_eq!(state.usage.last_input_tokens, 200_000);
+    }
+
     /// The bug this replaced: every response overwrote the running total with
     /// its own figures, so the status bar showed the last call rather than the
     /// session and appeared to jump about at random.
     #[test]
     fn session_totals_come_from_the_engine_and_are_assigned_not_accumulated() {
-        use coda_proto::state::{UsagePair, UsageState};
         let mut state = state();
+        let first = UsagePair::from_counts(1_200, 0, 0, 0, 300);
+        let second = UsagePair::from_counts(300, 1_200, 0, 0, 80);
 
-        let totals = |i, o, last_in| {
-            UiEvent::UsageTotals(UsageState {
-                last_response: Some(UsagePair { input_tokens: last_in, output_tokens: 0 }),
-                session: Some(UsagePair { input_tokens: i, output_tokens: o }),
-                context_limit: Some(200_000),
-                unknown_fields: Vec::new(),
-            })
-        };
-
-        state.apply(totals(1200, 300, 1200));
+        state.apply(engine_usage(first, first));
         assert_eq!((state.usage.input_tokens, state.usage.output_tokens), (1200, 300));
 
-        state.apply(totals(1500, 380, 300));
+        let total = first + second;
+        state.apply(engine_usage(total, second));
         assert_eq!(
             (state.usage.input_tokens, state.usage.output_tokens),
-            (1500, 380),
+            (2_700, 380),
             "the engine's total is taken as given, never added to the previous one"
         );
 
-        // Re-delivering a frame must change nothing at all.
-        state.apply(totals(1500, 380, 300));
-        assert_eq!((state.usage.input_tokens, state.usage.output_tokens), (1500, 380));
-        assert_eq!(state.usage.context_limit, 200_000);
+        // Re-delivering a frame — or a reconnect snapshot carrying the same
+        // projection — must change nothing at all.
+        state.apply(engine_usage(total, second));
+        state.apply(UiEvent::Engine(Event::Usage(second)));
+        assert_eq!((state.usage.input_tokens, state.usage.output_tokens), (2_700, 380));
+        assert_eq!(state.usage.context_limit, 1_000_000);
+    }
+
+    /// A resumed (or replaced) engine's accounting replaces the previous
+    /// engine's, "nothing measured" and partial history included.
+    #[test]
+    fn a_new_engines_projection_replaces_the_previous_accounting() {
+        let mut state = state();
+        let measured = UsagePair::from_counts(10, 1_000, 0, 0, 5);
+        state.apply(engine_usage(measured, measured));
+        state.apply(UiEvent::UsageTotals(coda_proto::state::UsageState {
+            session_coverage: Some(UsageCoverage::Partial),
+            ..Default::default()
+        }));
+        assert_eq!((state.usage.input_tokens, state.usage.output_tokens), (0, 0));
+        assert!(state.usage.context().is_none(), "no measurement of this session yet");
+        assert!(state.usage.totals_partial());
+        assert_eq!(state.usage.context_limit, 1_000_000, "the window is still known");
+    }
+
+    fn measured(last_input: i64, limit: i64) -> Usage {
+        Usage {
+            last_input_tokens: last_input,
+            context_limit: limit,
+            last: Some(UsagePair::from_counts(0, last_input, 0, 0, 0)),
+            ..Usage::default()
+        }
     }
 
     #[test]
     fn usage_percentage_needs_a_known_context_limit() {
-        let mut usage = Usage {
-            input_tokens: 50_000,
-            output_tokens: 0,
-            last_input_tokens: 50_000,
-            context_limit: 0,
-            price_per_million: None,
-        };
+        let mut usage = measured(50_000, 0);
         assert_eq!(usage.percent_used(), None);
 
         usage.context_limit = 200_000;
@@ -2990,38 +3149,60 @@ mod tests {
     /// it exceeds the window and would peg the gauge at 100% forever.
     #[test]
     fn usage_percentage_measures_the_last_request_not_the_session_total() {
-        let usage = Usage {
-            input_tokens: 900_000,
-            output_tokens: 20_000,
-            last_input_tokens: 40_000,
-            context_limit: 200_000,
-            price_per_million: None,
-        };
+        let usage = Usage { input_tokens: 900_000, output_tokens: 20_000, ..measured(40_000, 200_000) };
         assert_eq!(usage.percent_used(), Some(20), "the window holds one request, not the sum");
     }
 
     #[test]
     fn usage_percentage_is_unknown_before_any_response() {
-        let usage = Usage {
-            input_tokens: 0,
-            output_tokens: 0,
-            last_input_tokens: 0,
-            context_limit: 200_000,
-            price_per_million: None,
-        };
+        let usage = Usage { context_limit: 200_000, ..Usage::default() };
         assert_eq!(usage.percent_used(), None, "nothing measured is not zero percent");
+        assert!(usage.context().is_none());
     }
 
     #[test]
     fn usage_percentage_is_clamped_at_one_hundred() {
-        let usage = Usage {
-            input_tokens: 400_000,
-            output_tokens: 0,
-            last_input_tokens: 400_000,
-            context_limit: 200_000,
-            price_per_million: None,
+        assert_eq!(measured(400_000, 200_000).percent_used(), Some(100));
+    }
+
+    #[test]
+    fn a_small_genuine_occupancy_reads_below_one_percent_not_zero() {
+        let usage = measured(4_000, 1_000_000);
+        assert_eq!(usage.context().and_then(|c| c.label()).as_deref(), Some("<1%"));
+        assert_eq!(usage.percent_used(), Some(1), "the bar is never empty for a non-empty window");
+    }
+
+    #[test]
+    fn a_stale_or_lower_bound_reading_says_so() {
+        let stale = Usage { context_stale: true, ..measured(200_000, 1_000_000) };
+        assert_eq!(stale.context().and_then(|c| c.label()).as_deref(), Some("~20%"));
+
+        // An engine that did not report the cache: the real figure is higher.
+        let legacy = Usage {
+            last: Some(UsagePair { input_tokens: 200_000, ..Default::default() }),
+            ..measured(200_000, 1_000_000)
         };
-        assert_eq!(usage.percent_used(), Some(100));
+        assert_eq!(legacy.context().and_then(|c| c.label()).as_deref(), Some(">=20%"));
+        let tiny = Usage {
+            last: Some(UsagePair { input_tokens: 4, ..Default::default() }),
+            ..measured(4, 1_000_000)
+        };
+        assert_eq!(
+            tiny.context().and_then(|c| c.label()),
+            None,
+            "a lower bound under 1% says nothing; it must not read as an empty window",
+        );
+    }
+
+    #[test]
+    fn cost_is_shown_complete_partial_or_not_at_all() {
+        let estimate = |total_usd, complete| CostEstimate { total_usd, complete, ..Default::default() };
+        let usage = |cost| Usage { cost, ..Usage::default() };
+        assert_eq!(usage(None).cost_label(), None);
+        assert_eq!(usage(Some(estimate(1.234, true))).cost_label().as_deref(), Some("$1.23"));
+        assert_eq!(usage(Some(estimate(1.234, false))).cost_label().as_deref(), Some("$1.23+"));
+        assert_eq!(usage(Some(estimate(0.0, false))).cost_label(), None, "unknown is not free");
+        assert_eq!(usage(Some(estimate(0.0, true))).cost_label().as_deref(), Some("$0.00"));
     }
 
     #[test]
@@ -4341,7 +4522,7 @@ mod tests {
         assert_eq!(state.turn_progress.as_ref().unwrap().last_response_tokens(), None);
 
         state.apply_at(
-            UiEvent::Engine(Event::Usage { input_tokens: 100, output_tokens: 42 }),
+            UiEvent::Engine(Event::Usage(UsagePair { input_tokens: 100, output_tokens: 42, ..Default::default() })),
             start,
         );
         assert_eq!(
@@ -4998,10 +5179,10 @@ mod tests {
             let mut state = state();
             let mut snapshot = snapshot(EngineLifecycle::Busy);
             snapshot.usage = UsageState {
-                last_response: Some(UsagePair { input_tokens: 10, output_tokens: 3 }),
-                session: Some(UsagePair { input_tokens: 900, output_tokens: 120 }),
+                last_response: Some(UsagePair { input_tokens: 10, output_tokens: 3, ..Default::default() }),
+                session: Some(UsagePair { input_tokens: 900, output_tokens: 120, ..Default::default() }),
                 context_limit: Some(200_000),
-                unknown_fields: Vec::new(),
+                ..Default::default()
             };
             snapshot.turn = Some(turn(ActivityPhase::Responding, Some(1_000)));
             state.apply(UiEvent::Snapshot(Box::new(snapshot)));
@@ -5031,7 +5212,7 @@ mod tests {
                 start + Duration::from_secs(3),
             );
             state.apply_at(
-                UiEvent::Engine(Event::Usage { input_tokens: 11, output_tokens: 7 }),
+                UiEvent::Engine(Event::Usage(UsagePair { input_tokens: 11, output_tokens: 7, ..Default::default() })),
                 start + Duration::from_secs(3),
             );
 

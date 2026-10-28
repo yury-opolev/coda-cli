@@ -27,4 +27,4 @@ pub use audit::{AuditToolCall, AuditTurn, SessionAuditStore};
 pub use bundle::{BundleTurn, ImportError, SessionBundle, SessionBundleService};
 pub use forking::{fork, rewind};
 pub use ids::{is_valid as session_id_is_valid, new_id as new_session_id};
-pub use store::{SessionSummary, SessionTranscriptStore, StoredSession};
+pub use store::{SessionSummary, SessionTranscriptStore, StoredSession, StoredUsage};

@@ -793,6 +793,22 @@ mod tests {
     }
 
     #[test]
+    fn completed_splits_cached_input_out_of_the_total() {
+        let (events, _) = run(&[(
+            "response.completed",
+            json!({ "type": "response.completed", "response": { "usage": {
+                "input_tokens": 195_006,
+                "input_tokens_details": { "cached_tokens": 195_000 },
+                "output_tokens": 100
+            } } }),
+        )]);
+        let Some(StreamEvent::Done { usage, .. }) = events.last() else { panic!() };
+        assert_eq!(usage.input_tokens, 6);
+        assert_eq!(usage.cache_read_tokens, 195_000);
+        assert_eq!(usage.total_input_tokens(), 195_006, "the cache is not counted twice");
+    }
+
+    #[test]
     fn completed_without_tools_uses_end_turn_reason() {
         let (events, _) = run(&[(
             "response.completed",
