@@ -312,7 +312,8 @@ Inside the REPL:
 /setup                    the first-run wizard: choose an account and sign in
 /model [id]               show or set the chat model
 /effort [low|medium|high|xhigh|max|auto]  choose or set model-specific reasoning effort
-/context                  show context-window usage broken down by category
+/context                  show context-window occupancy and the session's token totals
+/cost                     show cumulative session token totals by category, and the cost estimate
 /goal [<text> | off]      set/clear the autonomous goal (--timeout, --max-turns)
 /log [<level> | stderr on|off]  show or set telemetry logging level
 /headers                  the outgoing request headers (secrets redacted)
@@ -441,15 +442,29 @@ configuration changes to its live MCP connections.
   explicitly. `/effort <level>` applies and saves directly; `auto` clears the
   explicit preference. In the model browser, `e` activates the highlighted model
   and opens its effort picker. `--effort <level>` is a session-only startup override.
-- **`/context`** shows how the model's 200k context window is being used, broken
-  down into **System prompt / System tools / MCP tools / Messages / Autocompact
-  buffer / Free space** with a grid visualization and per-category token counts.
-  Counts
-  come from the Anthropic **count-tokens API** when available
-  (`POST /v1/messages/count_tokens`), falling back to a local estimate otherwise
-  (e.g. Copilot or offline). The window size per model and the `/cost` price table
-  come from the **model catalog** (below), falling back to 200k / built-in prices.
+- **`/context`** shows how full the model's context window is: the **last request's
+  whole input** — uncached input plus cache reads plus cache writes, since cached
+  input still occupies the window — against the active model's window, with a bar,
+  the free remainder and the last request's cache breakdown. Nothing is reported
+  until a request has measured it; a small but real occupancy reads `<1%`, never
+  `0%`. After a resume, rewind, compaction, fork or model switch the last
+  measurement is shown as the last known one (`~20%`) until the next request.
+- **`/cost`** shows the **cumulative session totals** — every request's tokens
+  summed, cached input included, broken down into uncached / cache read / cache
+  write (5-minute and 1-hour) / output, and by model — with the engine's cost
+  estimate, which prices each category at its own rate. When some usage has no
+  known price the estimate says "at least"; when nothing could be priced it says
+  "unknown" rather than `$0.00`.
+- **Totals survive restarts.** Usage accounting is saved with the session and
+  restored when you resume it, so `--resume` / `/resume` continue the totals
+  instead of restarting from zero. A session saved by an older version has no
+  recorded history: its totals are marked partial (`+` in the status bar), covering
+  only the requests measured since.
 
+The status bar's `context N%` is the context occupancy above; `↓ in` / `↑ out` are
+the cumulative session totals (cached input included) and the dollar figure is the
+cost estimate. They measure different things and are never derived from each other.
+The window size per model and prices come from the **model catalog** (below).
 ### Model per provider (persisted)
 
 The provider is resolved automatically from the credential you're signed in to
