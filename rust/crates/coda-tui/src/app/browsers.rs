@@ -180,9 +180,10 @@ impl App {
                     return None;
                 }
                 match self.ask::<coda_proto::responses::TaskListResult>(
-                    method::LIST_TASKS, None,
+                    method::LIST_TASKS,
+                    Some(serde_json::json!({ "statusFilter": self.task_view.status_filter() })),
                 ).await {
-                    Ok(result) => rows::tasks(&result),
+                    Ok(result) => rows::tasks(&result, self.task_view),
                     Err(error) => {
                         self.notice(format!("Could not load tasks: {error}"), NoticeLevel::Error);
                         return None;
@@ -257,7 +258,8 @@ impl App {
             BrowserKind::Tasks => RowActions::new()
                 .on_key('b', |id| A::BackgroundTask(id.to_string()))
                 .on_key('x', |id| A::StopTask(id.to_string()))
-                .on_key('m', |id| A::MessageTask(id.to_string())),
+                .on_key('m', |id| A::MessageTask(id.to_string()))
+                .on_bare_key('h', || A::ToggleTaskHistory),
             // Hooks are read-only; Enter opens their detail view, which the
             // browser handles without troubling the host.
             BrowserKind::Hooks => RowActions::new(),
@@ -391,10 +393,22 @@ impl App {
     }
 
     pub(super) async fn reload_browser_with_status(&mut self, status: String) {
+        self.reload_browser_of(None, Some(status)).await;
+    }
+
+    /// Reloads the open browser, only when it is `only` (if given), setting
+    /// `status` or keeping the one it shows.
+    pub(super) async fn reload_browser_of(&mut self, only: Option<BrowserKind>, status: Option<String>) {
         let Some(kind) = self.browser_kind() else {
             return;
         };
+        if only.is_some_and(|only| only != kind) {
+            return;
+        }
         let previous = self.browser().cloned();
+        let status = status
+            .or_else(|| previous.as_ref().map(|b| b.status().to_owned()))
+            .unwrap_or_default();
 
         // Fetch before retiring. If the engine hiccups the old browser stays
         // exactly as it was, rather than vanishing and losing the user's place.

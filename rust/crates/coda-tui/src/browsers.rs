@@ -507,12 +507,50 @@ pub fn mcp_from_engine(result: &coda_proto::mcp::McpListResult) -> Browser {
     browser
 }
 
-/// The background task browser.
+/// Which tasks the `/tasks` browser shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TaskView {
+    /// Running work only — what still needs attention. The default.
+    #[default]
+    Active,
+    /// Every task the engine still retains, finished ones included.
+    History,
+}
+
+impl TaskView {
+    /// The `session/listTasks` `statusFilter` this view asks for.
+    pub fn status_filter(self) -> &'static str {
+        match self {
+            TaskView::Active => "active",
+            TaskView::History => "all",
+        }
+    }
+
+    pub fn toggled(self) -> Self {
+        match self {
+            TaskView::Active => TaskView::History,
+            TaskView::History => TaskView::Active,
+        }
+    }
+}
+
+/// The task browser.
 ///
 /// The engine registry is authoritative, including tasks with no output.
-pub fn tasks(result: &TaskListResult) -> Browser {
+/// The active view also drops finished rows itself, so it stays correct
+/// against an engine that predates `statusFilter` and lists everything.
+pub fn tasks(result: &TaskListResult, view: TaskView) -> Browser {
+    let shown: Vec<_> = result
+        .tasks
+        .iter()
+        .filter(|task| view == TaskView::History || task.status == "running")
+        .collect();
+    let (name, toggle, empty) = match view {
+        TaskView::Active => ("active", "h history", "No active tasks"),
+        TaskView::History => ("history", "h active", "No tasks in this session"),
+    };
     let mut browser = Browser::new(
-        format!("Tasks — {}", result.tasks.len()),
+        format!("Tasks — {name} ({})", shown.len()),
         vec![
             Column::new("", 1),
             Column::new("id", 16),
@@ -521,10 +559,13 @@ pub fn tasks(result: &TaskListResult) -> Browser {
             Column::new("description", 44),
         ],
     )
-    .with_footer("↑/↓ k/j move · Enter output · m message · b background · x stop · r reload · / filter · Esc q close");
+    .with_footer(format!(
+        "↑/↓ k/j move · Enter output · m message · b background · x stop · {toggle} · r reload · / filter · Esc q close"
+    ))
+    .with_empty_message(empty);
 
     browser.set_items(
-        result.tasks.iter()
+        shown.into_iter()
             .map(|task| {
                 let status = task.status.as_str();
                 let glyph = match status {
@@ -1103,10 +1144,10 @@ mod tests {
         result.tasks[0].report = Some("all good".into());
         result.tasks[0].output_tail = "build output".into();
         let mut failed = result.tasks[0].clone();
-        failed.id = "task-0002".into();
+        failed.id = "task-00000002".into();
         failed.status = "failed".into();
         result.tasks.push(failed);
-        let browser = tasks(&result);
+        let browser = tasks(&result, TaskView::History);
         let rows = browser.visible_items();
 
         assert_eq!(rows[0].cells[0], glyph::ACTIVE);
@@ -1124,27 +1165,81 @@ mod tests {
     fn task_rows_are_uniquely_keyed_across_sessions() {
         // Task ids restart per session; two rows must not share an id or the
         // browser's select-by-id restore would jump between them.
-        let browser = tasks(&task_listing("alpha", "running"));
-        let other = tasks(&task_listing("beta", "running"));
+        let browser = tasks(&task_listing("alpha", "running"), TaskView::Active);
+        let other = tasks(&task_listing("beta", "running"), TaskView::Active);
         let rows = browser.visible_items();
         assert_ne!(rows[0].id, other.visible_items()[0].id);
-        assert_eq!(rows[0].id, "alpha/task-0001");
+        assert_eq!(rows[0].id, "alpha/task-00000001");
         // The displayed id stays short.
-        assert_eq!(rows[0].cells[1], "task-0001");
+        assert_eq!(rows[0].cells[1], "task-00000001");
     }
 
     #[test]
     fn a_task_with_no_output_shows_its_authoritative_running_status() {
-        let browser = tasks(&task_listing("s", "running"));
+        let browser = tasks(&task_listing("s", "running"), TaskView::Active);
         assert_eq!(browser.visible_items()[0].cells[2], "running");
         assert!(browser.visible_items()[0].detail.join("\n").contains("no output yet"));
     }
 
+    fn mixed_listing() -> TaskListResult {
+        let row = |id: &str, kind: &str, status: &str, mode: &str| json!({
+            "id": id, "parentId": null, "kind": kind, "description": format!("{kind} {status}"),
+            "status": status, "mode": mode, "report": null, "outputTail": "",
+        });
+        serde_json::from_value(json!({
+            "sessionId": "s",
+            "tasks": [
+                row("task-00000001", "shell", "running", "foreground"),
+                row("task-00000002", "shell", "completed", "background"),
+                row("task-00000003", "tool", "running", "foreground"),
+                row("task-00000004", "subagent", "failed", "background"),
+                row("task-00000005", "subagent", "running", "background"),
+                row("task-00000006", "shell", "stopped", "background"),
+                row("task-00000007", "shell", "running", "background"),
+            ],
+        })).unwrap()
+    }
+
+    #[test]
+    fn the_active_view_shows_only_running_tasks_and_counts_them() {
+        let browser = tasks(&mixed_listing(), TaskView::Active);
+        let ids: Vec<_> = browser.visible_items().iter().map(|row| row.cells[1].clone()).collect();
+        assert_eq!(ids, ["task-00000001", "task-00000003", "task-00000005", "task-00000007"],
+            "foreground and background shells, tool calls and subagents stay; finished ones go");
+        assert_eq!(browser.title(), "Tasks — active (4)");
+        assert!(browser.footer().contains("h history"), "{}", browser.footer());
+    }
+
+    #[test]
+    fn the_history_view_keeps_every_task_and_its_report() {
+        let mut listing = mixed_listing();
+        listing.tasks[1].report = Some("all good".into());
+        let browser = tasks(&listing, TaskView::History);
+        assert_eq!(browser.visible_items().len(), 7);
+        assert_eq!(browser.title(), "Tasks — history (7)");
+        assert!(browser.footer().contains("h active"), "{}", browser.footer());
+        assert!(browser.visible_items()[1].detail.join("\n").contains("all good"));
+    }
+
+    #[test]
+    fn an_empty_active_view_says_so() {
+        let finished: TaskListResult = serde_json::from_value(json!({
+            "sessionId": "s",
+            "tasks": [{ "id": "task-00000001", "parentId": null, "kind": "shell",
+                "description": "done", "status": "completed", "mode": "background",
+                "report": null, "outputTail": "" }],
+        })).unwrap();
+        let browser = tasks(&finished, TaskView::Active);
+        assert!(browser.is_empty());
+        assert_eq!(browser.title(), "Tasks — active (0)");
+        assert_eq!(browser.empty_message(), Some("No active tasks"));
+        assert_eq!(tasks(&finished, TaskView::History).visible_items().len(), 1);
+    }
     fn task_listing(session: &str, status: &str) -> TaskListResult {
         serde_json::from_value(json!({
             "sessionId": session,
             "tasks": [{
-                "id": "task-0001", "parentId": null, "kind": "subagent",
+                "id": "task-00000001", "parentId": null, "kind": "subagent",
                 "description": "build", "status": status, "mode": "background",
                 "report": null, "outputTail": "",
             }],
@@ -1159,7 +1254,7 @@ mod tests {
         assert!(plugins(&[]).is_empty());
         assert!(hooks(&[]).is_empty());
         assert!(mcp(&[]).is_empty());
-        assert!(tasks(&TaskListResult { session_id: "s".into(), tasks: vec![] }).is_empty());
+        assert!(tasks(&TaskListResult { session_id: "s".into(), tasks: vec![] }, TaskView::Active).is_empty());
         assert!(sessions(&[]).is_empty());
     }
 

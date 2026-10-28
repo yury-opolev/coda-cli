@@ -163,6 +163,12 @@ pub struct App {
     /// This is staged exactly once per replacement and consumed by
     /// `settle_with_engine_at`.
     pub(crate) needs_model_refresh: bool,
+    /// Set by a task lifecycle event (or a resync) so an open `/tasks` browser
+    /// re-reads the engine's registry once, between loop iterations. Events,
+    /// not a timer, drive it: nothing polls.
+    pub(crate) needs_task_refresh: bool,
+    /// Which view `/tasks` shows: active work (the default) or history.
+    pub(crate) task_view: crate::browsers::TaskView,
     /// Set when engine-owned user notifications (`session/pendingMessages`)
     /// must be (re-)recovered: at bootstrap, after a dropped-event gap, and
     /// after an engine replacement. Consumed by `settle_with_engine_at`
@@ -1499,6 +1505,7 @@ impl App {
             SurfaceAction::DeleteSchedule(id) => self.delete_schedule(&id).await,
             action @ (SurfaceAction::BackgroundTask(_) | SurfaceAction::StopTask(_)
             | SurfaceAction::MessageTask(_)) => self.task_row_action(action).await,
+            SurfaceAction::ToggleTaskHistory => self.toggle_task_history().await,
             SurfaceAction::PromoteAside(question) => self.promote_aside(question).await,
             SurfaceAction::NewMcpServer => {
                 if self.allow_local_maintenance("MCP server configuration") {

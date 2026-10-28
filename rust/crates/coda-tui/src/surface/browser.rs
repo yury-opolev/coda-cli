@@ -351,8 +351,12 @@ impl Surface for BrowserSurface {
                 }
 
                 if items.is_empty() {
+                    let message = match self.browser.empty_message() {
+                        Some(message) if self.browser.items().is_empty() => message,
+                        _ => "Nothing to show.",
+                    };
                     lines.push(Line::from(Span::styled(
-                        "Nothing to show.".to_string(),
+                        message.to_string(),
                         theme.style(Role::Notification),
                     )));
                 }
@@ -432,6 +436,26 @@ mod tests {
         assert_eq!(s.desired_size(80, &Theme::default()), (80, 8));
         s.handle_key(key(KeyCode::Enter));
         assert!(s.desired_size(40, &Theme::default()).1 > 1);
+    }
+
+    #[test]
+    fn an_empty_list_shows_the_browsers_own_empty_message_unless_a_filter_hid_the_rows() {
+        let theme = Theme::default();
+        let text = |s: &BrowserSurface| -> String {
+            s.render(Rect::new(0, 0, 80, 10), &theme).iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n")
+        };
+        let browser = Browser::new("Tasks", vec![Column::new("id", 16)]).with_empty_message("No active tasks");
+        let mut s = BrowserSurface::new(BrowserKind::Tasks, browser);
+        assert!(text(&s).contains("No active tasks"));
+        s.browser.set_items(vec![Item::new("s/a", vec!["alpha".into()])]);
+        s.handle_key(key(KeyCode::Char('/')));
+        s.handle_key(key(KeyCode::Char('z')));
+        assert!(text(&s).contains("Nothing to show."), "a filter that matches nothing is not 'no tasks'");
+        assert!(text(&surface_with_no_rows()).contains("Nothing to show."));
+    }
+
+    fn surface_with_no_rows() -> BrowserSurface {
+        BrowserSurface::new(BrowserKind::Skills, Browser::new("Skills", vec![Column::new("Name", 24)]))
     }
 
     #[test]

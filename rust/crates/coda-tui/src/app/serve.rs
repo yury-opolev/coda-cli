@@ -392,6 +392,11 @@ impl App {
             }
         }
         // Task progress moves only the status row: no transcript relayout.
+        // A start or an end also changes what `/tasks` lists, so an open
+        // browser owes itself one re-read of the authoritative registry.
+        if matches!(event, Event::TaskStarted { .. } | Event::TaskCompleted { .. }) {
+            self.needs_task_refresh = true;
+        }
         if let Event::TaskStarted { task_id, .. } | Event::TaskOutput { task_id, .. } = &event {
             self.dirty |= self.state.running_tasks.insert(task_id.clone());
             return;
@@ -612,6 +617,9 @@ impl App {
         // Neither state nor history contains them, so every snapshot needs
         // an independent mailbox read, even when the frame buffer is empty.
         self.needs_pending_messages = true;
+        // Task starts and ends the client missed (a gap, a reconnect) are in
+        // no event it will see: an open `/tasks` re-reads the registry.
+        self.needs_task_refresh = true;
         if !outcome.opened.is_empty() || closed {
             self.open_current_prompt();
         }
@@ -847,6 +855,9 @@ impl App {
             // picker open) tries again regardless.
             self.needs_model_refresh = false;
             self.load_models().await;
+        }
+        if self.needs_task_refresh {
+            self.refresh_task_browser().await;
         }
     }
 
@@ -1498,6 +1509,8 @@ impl App {
             needs_resync: true,
             needs_rehydrate: true,
             needs_model_refresh: false,
+            needs_task_refresh: false,
+            task_view: crate::browsers::TaskView::default(),
             needs_pending_messages: true,
             pending_messages_cursor: 0,
             pending_messages_seen: std::collections::BTreeSet::new(),
