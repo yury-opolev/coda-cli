@@ -110,8 +110,12 @@ impl App {
     /// `/tasks` `h`: switch between the active and history views, keeping
     /// the selected task where it is still listed.
     pub(super) async fn toggle_task_history(&mut self) {
-        self.task_view = self.task_view.toggled();
-        self.reload_browser_with_status(String::new()).await;
+        let previous = self.task_view;
+        self.task_view = previous.toggled();
+        if !self.reload_browser_of(None, Some(String::new())).await {
+            // The old view is still on screen; keep asking for it.
+            self.task_view = previous;
+        }
     }
 
     /// `/tasks [all]`: opens the active view, or the history view with `all`.
@@ -132,10 +136,17 @@ impl App {
 
     /// Re-reads an open `/tasks` browser after a task started or ended (or a
     /// resync). One read per owed refresh, keeping the selection by task id
-    /// and whatever status the browser was showing.
+    /// and whatever status the browser was showing. A browser covered by a
+    /// prompt keeps the refresh owed until it is on top again; a failed read
+    /// is reported by the reload and not retried on its own (`r` retries).
     pub(super) async fn refresh_task_browser(&mut self) {
-        self.needs_task_refresh = false;
-        self.reload_browser_of(Some(crate::surface::browser::BrowserKind::Tasks), None).await;
+        use crate::surface::browser::BrowserKind;
+        if self.tasks_browser_on_top() {
+            self.needs_task_refresh = false;
+            self.reload_browser_of(Some(BrowserKind::Tasks), None).await;
+        } else {
+            self.needs_task_refresh = self.tasks_browser_on_stack();
+        }
     }
 
     /// `/send <task-id> <message>`: deliver a message to a running subagent.
@@ -413,6 +424,70 @@ mod tests {
         app.needs_resync = true;
         app.settle_with_engine().await;
         assert_eq!(app.browser().unwrap().title(), "Tasks — active (0)");
+    }
+
+    #[tokio::test]
+    async fn a_refresh_owed_while_the_browser_is_covered_runs_once_it_is_on_top_again() {
+        use crate::surface::browser::{BrowserKind, BrowserSurface};
+        use serde_json::json;
+        use std::sync::{Arc, Mutex};
+
+        let tasks = Arc::new(Mutex::new(vec![("task-00000001", "running")]));
+        let filters = Arc::new(Mutex::new(Vec::new()));
+        let cursor = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let mut harness = registry_engine(tasks.clone(), filters.clone(), cursor.clone());
+        let app = &mut harness.app;
+        app.needs_rehydrate = false;
+        app.needs_resync = false;
+        app.needs_pending_messages = false;
+        app.run_command(crate::commands::parse("/tasks").unwrap()).await;
+        let other = crate::overlay::Browser::new("Other", vec![crate::overlay::Column::new("x", 4)]);
+        app.surfaces.push(Box::new(BrowserSurface::new(BrowserKind::Skills, other)));
+
+        tasks.lock().unwrap()[0].1 = "completed";
+        deliver(app, &cursor, 1, "event/taskCompleted", json!({ "taskId": "task-00000001", "status": "completed", "description": "x" }));
+        app.settle_with_engine().await;
+        assert_eq!(filters.lock().unwrap().len(), 1, "a covered browser is not reloaded under what covers it");
+        assert_eq!(app.browser().unwrap().title(), "Other");
+
+        app.surfaces.pop();
+        app.settle_with_engine().await;
+        assert_eq!(app.browser().unwrap().title(), "Tasks — active (0)", "the owed refresh was kept");
+        app.settle_with_engine().await;
+        assert_eq!(filters.lock().unwrap().len(), 2, "and it ran exactly once");
+    }
+
+    #[tokio::test]
+    async fn a_failed_history_toggle_leaves_the_view_as_it_was() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counter = reads.clone();
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = asked.clone();
+        let mut harness = crate::app::serve::tests::app_answering(
+            crate::local::AccessMode::TrustedLocal,
+            move |method, params| {
+                if method != "session/listTasks" {
+                    return Ok(serde_json::json!({}));
+                }
+                recorder.lock().unwrap().push(params["statusFilter"].as_str().unwrap_or("").to_owned());
+                if counter.fetch_add(1, Ordering::SeqCst) == 1 {
+                    return Err((-32000, "the engine is busy".into()));
+                }
+                Ok(serde_json::json!({ "sessionId": "s1", "tasks": [] }))
+            },
+        );
+        let app = &mut harness.app;
+        app.run_command(crate::commands::parse("/tasks").unwrap()).await;
+        app.on_key(press('h')).await;
+        assert_eq!(app.task_view, crate::browsers::TaskView::Active);
+        assert_eq!(app.browser().unwrap().title(), "Tasks — active (0)");
+        app.on_key(press('r')).await;
+        assert_eq!(reads.load(Ordering::SeqCst), 3);
+        assert_eq!(asked.lock().unwrap().as_slice(), ["active", "all", "active"],
+            "a reload still asks for the view on screen");
     }
 
     #[test]

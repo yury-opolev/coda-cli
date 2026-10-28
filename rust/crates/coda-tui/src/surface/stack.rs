@@ -60,6 +60,11 @@ impl SurfaceStack {
         self.surfaces.last().map(|s| s.as_ref())
     }
 
+    /// Whether any surface on the stack, covered or not, matches.
+    pub fn any(&self, predicate: impl Fn(&dyn Surface) -> bool) -> bool {
+        self.surfaces.iter().any(|s| predicate(s.as_ref()))
+    }
+
 
     /// Opens a surface. Returns `false` when an exclusive surface refused it.
     ///
