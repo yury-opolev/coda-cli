@@ -1745,6 +1745,22 @@ pub(in crate::app) mod tests {
             .collect()
     }
 
+    pub(in crate::app) fn notices_at(app: &App, wanted: NoticeLevel) -> Vec<String> {
+        app.state
+            .transcript
+            .blocks()
+            .iter()
+            .filter_map(|block| match block {
+                Block::Notice { text, level } if *level == wanted => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub(in crate::app) fn warnings(app: &App) -> Vec<String> {
+        notices_at(app, NoticeLevel::Warning)
+    }
+
     /// Everything the client printed as ordinary command output.
     pub(in crate::app) fn outputs(app: &App) -> Vec<String> {
         app.state
@@ -6814,7 +6830,8 @@ pub(in crate::app) mod tests {
 
 #[cfg(test)]
 mod settings_gate_tests {
-    use super::tests::{app_with, notices, outputs, Harness};
+    use super::tests::{app_with, notices, notices_at, outputs, warnings, Harness};
+    use crate::transcript::NoticeLevel;
     use crate::commands::Invocation;
     use crate::config::Paths;
     use crate::local::AccessMode;
@@ -7495,10 +7512,11 @@ mod settings_gate_tests {
         assert_eq!(saved["theme"], "cool-dark");
         assert_eq!(saved["defaultProvider"], "github-copilot");
         assert!(
-            notices(&harness.app).iter().any(|n| n.contains("saved")),
+            !notices_at(&harness.app, NoticeLevel::Info).is_empty(),
             "{:?}",
             notices(&harness.app)
         );
+        assert!(warnings(&harness.app).is_empty(), "{:?}", warnings(&harness.app));
     }
 
     #[tokio::test]
@@ -7539,15 +7557,7 @@ mod settings_gate_tests {
         harness.app.run_command(invocation("/theme cool-dark")).await;
 
         assert_eq!(harness.app.theme.name, "cool-dark");
-        let warned = harness.app.state().transcript.blocks().iter().any(|b| {
-            matches!(
-                b,
-                crate::transcript::Block::Notice {
-                    text,
-                    level: crate::transcript::NoticeLevel::Warning,
-                } if text.contains("not saved")
-            )
-        });
+        let warned = warnings(&harness.app).iter().any(|n| n.contains("not saved"));
         assert!(warned, "{:?}", notices(&harness.app));
         assert_eq!(
             std::fs::read_to_string(dir.path().join("settings.json")).unwrap(),
@@ -7586,6 +7596,32 @@ mod settings_gate_tests {
 
         assert_eq!(harness.app.theme.name, "cool-dark");
         assert_eq!(harness.app.theme.depth(), ColorDepth::Ansi16);
+    }
+
+    #[tokio::test]
+    async fn a_failed_settings_form_save_leaves_the_running_theme_alone() {
+        let (mut harness, _dir) = sandboxed(AccessMode::TrustedLocal, ok);
+        assert_eq!(harness.app.theme.name, "warm-ember");
+        // A directory where the file belongs makes the save fail.
+        std::fs::create_dir(harness.app.paths.settings()).expect("block the settings path");
+        let mut settings = crate::config::Settings::empty_at(harness.app.paths.settings());
+        settings.set_theme("cool-dark");
+        harness
+            .app
+            .surfaces
+            .push(Box::new(crate::surface::settings::SettingsSurface::new(&settings)));
+
+        harness
+            .app
+            .apply_surface_action(crate::surface::SurfaceAction::SaveSettings)
+            .await;
+
+        assert_eq!(harness.app.theme.name, "warm-ember");
+        assert!(
+            !notices_at(&harness.app, NoticeLevel::Error).is_empty(),
+            "{:?}",
+            notices(&harness.app)
+        );
     }
 
     #[tokio::test]

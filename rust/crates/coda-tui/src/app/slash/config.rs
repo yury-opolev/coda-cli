@@ -45,17 +45,19 @@ impl App {
                 NoticeLevel::Info,
             ),
             Saved::Failed(error) => self.notice(
-                format!("Theme: {canonical} for this session only; not saved: {error}"),
+                format!("Theme: {canonical} for this session only;                 not saved: {error}."),
                 NoticeLevel::Warning,
             ),
-            // Client-local settings are never refused.
-            Saved::Refused => self.notice(
-                format!("Theme: {canonical} for this session only; not saved."),
-                NoticeLevel::Warning,
-            ),
-        }
-    }
-    /// `/output-style [<style>]` — show or set the response style persona.
+                            // Never refused today for client-local keys; if that changes, the
+                            // user is still told the truth.
+                            Saved::Refused => self.notice(
+                                format!("Theme: {canonical} for this session only; not saved."),
+                                NoticeLevel::Warning,
+                            ),
+                        }
+                    }
+
+                    /// `/output-style [<style>]` — show or set the response style persona.
     ///
     /// The list of styles comes from `config/describe`, which is the engine's
     /// own catalogue for the key. Before this, the TUI enumerated
