@@ -8,7 +8,7 @@
 use coda_boot::auth_cli::sanitize;
 use coda_render::theme::{ColorDepth, Theme};
 
-use crate::config::{Paths, Settings};
+use crate::config::{ConfigError, Paths, Settings};
 
 /// Longest settings-supplied text echoed into a warning.
 const MAX_ECHOED_CHARS: usize = 80;
@@ -30,12 +30,8 @@ pub fn startup_theme(paths: &Paths, depth: ColorDepth) -> StartupTheme {
     let settings = match Settings::load(paths) {
         Ok(settings) => settings,
         Err(error) => {
-            return fallback(Some(format!(
-                "Could not read {}: {}; using {}.",
-                paths.settings().display(),
-                sanitize(&error.to_string(), MAX_ECHOED_CHARS * 2),
-                Theme::default().name,
-            )));
+            let path = paths.settings().display().to_string();
+            return fallback(Some(unreadable_warning(&path, &error_cause(&error))));
         }
     };
     let Some(name) = settings.theme() else {
@@ -46,14 +42,43 @@ pub fn startup_theme(paths: &Paths, depth: ColorDepth) -> StartupTheme {
             theme: theme.with_depth(depth),
             warning: None,
         },
-        None => fallback(Some(format!(
-            "Unknown theme '{}' in {}; using {}. Available: {}.",
-            sanitize(name, MAX_ECHOED_CHARS),
-            paths.settings().display(),
-            Theme::default().name,
-            Theme::names().join(", "),
+        None => fallback(Some(unknown_theme_warning(
+            name,
+            &paths.settings().display().to_string(),
         ))),
     }
+}
+
+/// The underlying io/serde message. `ConfigError`'s own text repeats the path
+/// the warning already names, which would also eat into the length bound.
+fn error_cause(error: &ConfigError) -> String {
+    match error {
+        ConfigError::Read { source, .. } | ConfigError::Write { source, .. } => source.to_string(),
+        ConfigError::Parse { source, .. } => source.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// The path comes from `CODA_HOME`, so it is untrusted terminal text just
+/// like the settings contents: each piece is sanitized and bounded on its own
+/// so a long path cannot truncate the cause.
+fn unreadable_warning(path: &str, cause: &str) -> String {
+    format!(
+        "Could not read {}: {}; using {}.",
+        sanitize(path, MAX_ECHOED_CHARS * 2),
+        sanitize(cause, MAX_ECHOED_CHARS * 2),
+        Theme::default().name,
+    )
+}
+
+fn unknown_theme_warning(name: &str, path: &str) -> String {
+    format!(
+        "Unknown theme '{}' in {}; using {}. Available: {}.",
+        sanitize(name, MAX_ECHOED_CHARS),
+        sanitize(path, MAX_ECHOED_CHARS * 2),
+        Theme::default().name,
+        Theme::names().join(", "),
+    )
 }
 
 #[cfg(test)]
@@ -104,7 +129,26 @@ mod tests {
     fn invalid_json_falls_back_with_a_warning() {
         let resolved = resolve(Some("{ not json"), ColorDepth::TrueColor);
         assert_eq!(resolved.theme.name, Theme::default().name);
-        assert!(resolved.warning.unwrap().contains("settings.json"));
+        let warning = resolved.warning.unwrap();
+        assert!(warning.contains("settings.json"), "{warning}");
+        assert!(warning.contains("key must be a string"), "{warning}");
+        assert_eq!(warning.matches("settings.json").count(), 1, "{warning}");
+    }
+
+    #[test]
+    fn hostile_paths_are_sanitized_in_both_warnings() {
+        let path = "/tmp/\u{1b}[2J\nhome/.coda/settings.json";
+        let unreadable = unreadable_warning(path, "access \u{1b}denied\n");
+        assert!(!unreadable.chars().any(char::is_control), "{unreadable:?}");
+        let unknown = unknown_theme_warning("neon", path);
+        assert!(!unknown.chars().any(char::is_control), "{unknown:?}");
+    }
+
+    #[test]
+    fn long_paths_do_not_crowd_out_the_cause() {
+        let path = "p".repeat(500);
+        let warning = unreadable_warning(&path, "expected value at line 1 column 3");
+        assert!(warning.contains("expected value at line 1 column 3"), "{warning}");
     }
 
     #[test]
