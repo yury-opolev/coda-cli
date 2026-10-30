@@ -81,7 +81,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "theme",
         aliases: &[],
         args: "[name]",
-        summary: "Show or switch the colour theme.",
+        summary: "Show or switch the colour theme, saved to this profile.",
         scope: Scope::Local,
     },
     CommandSpec {

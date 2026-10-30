@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use coda_diagnostics::ProcessRole;
-use coda_render::theme::{ColorDepth, Theme};
+use coda_render::theme::ColorDepth;
 use coda_tui::cli::Cli;
 use coda_tui::terminal::{install_panic_hook, TerminalGuard};
 
@@ -32,7 +32,12 @@ fn main() -> Result<()> {
 }
 
 async fn run(cli: Cli, diagnostics: coda_diagnostics::DiagnosticContext, engine_log_dir: std::path::PathBuf) -> Result<()> {
-    let theme = Theme::default().with_depth(ColorDepth::detect());
+    let paths = coda_tui::config::Paths::new(cli.resolved_directory()?);
+    let startup_theme = coda_tui::appearance::startup_theme(&paths, ColorDepth::detect());
+    if let Some(warning) = &startup_theme.warning {
+        eprintln!("{warning}");
+    }
+    let theme = startup_theme.theme;
 
     // Before the engine, not after it. A launch whose selected provider has no
     // credential would otherwise exit on the engine's own startup error, with

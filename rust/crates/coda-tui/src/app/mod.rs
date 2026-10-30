@@ -883,30 +883,6 @@ impl App {
 
 
 
-    fn set_theme(&mut self, name: Option<&str>) {
-        match name {
-            None => self.output(format!(
-                "Theme: {}\nAvailable: {}",
-                self.theme.name,
-                Theme::names().join(", ")
-            )),
-            Some(name) => match Theme::by_name(name) {
-                Some(theme) => {
-                    let depth = self.theme.depth();
-                    self.theme = theme.with_depth(depth);
-                    self.notice(format!("Theme: {}", self.theme.name), NoticeLevel::Info);
-                }
-                None => self.notice(
-                    format!(
-                        "Unknown theme: {name}. Available: {}",
-                        Theme::names().join(", ")
-                    ),
-                    NoticeLevel::Warning,
-                ),
-            },
-        }
-    }
-
     fn status_text(&self) -> String {
         let mut out = String::from("Session\n");
         out.push_str(&format!(
@@ -1400,21 +1376,33 @@ impl App {
                 // by the engine at *its* startup, so an API-only session
                 // saves only its own half and says which half that was.
                 settings_surface.apply_client_local(&mut settings);
+                let selected_theme = settings_surface.selected_theme();
                 let engine_owned = self.owns_engine_settings();
                 if engine_owned {
                     settings_surface.apply_engine_owned(&mut settings);
                 }
                 match settings.save() {
-                    Ok(()) if engine_owned => self.notice(
-                        "Settings saved. Some changes apply on restart.",
-                        NoticeLevel::Info,
-                    ),
-                    Ok(()) => self.notice(
-                        "Appearance settings saved. The permission mode and telemetry \
-                         settings belong to the engine host, which this client did not \
-                         start, so they were left alone.",
-                        NoticeLevel::Info,
-                    ),
+                    Ok(()) => {
+                        // Only once it is on disk: the form promises that
+                        // what it shows is what is saved, so a failed save
+                        // must not leave the UI wearing an unsaved theme.
+                        if let Some(theme) = selected_theme.and_then(Theme::by_name) {
+                            self.theme = theme.with_depth(self.theme.depth());
+                        }
+                        if engine_owned {
+                            self.notice(
+                                "Settings saved. Some changes apply on restart.",
+                                NoticeLevel::Info,
+                            );
+                        } else {
+                            self.notice(
+                                "Appearance settings saved. The permission mode and telemetry \
+                                 settings belong to the engine host, which this client did not \
+                                 start, so they were left alone.",
+                                NoticeLevel::Info,
+                            );
+                        }
+                    }
                     Err(err) => self.notice(
                         format!("Could not save settings: {err}"),
                         NoticeLevel::Error,

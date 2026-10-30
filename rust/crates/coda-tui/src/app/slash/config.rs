@@ -4,12 +4,62 @@
 //! These change how the agent behaves rather than what the conversation is.
 
 
+use super::super::settings::Saved;
 use super::super::App;
+use coda_render::Theme;
 use crate::commands;
 use crate::config;
 use crate::transcript::NoticeLevel;
 
 impl App {
+    /// `/theme [<name>]` — show or switch the colour theme.
+    ///
+    /// The choice is this profile's own appearance, so it is saved in every
+    /// access mode; the next start reads it back. A failed save does not undo
+    /// the switch — the session keeps the theme the user asked for and is told
+    /// it will not outlast the session.
+    pub(super) async fn cmd_theme(&mut self, name: Option<&str>) {
+        let Some(name) = name else {
+            self.output(format!(
+                "Theme: {}\nAvailable: {}",
+                self.theme.name,
+                Theme::names().join(", ")
+            ));
+            return;
+        };
+        let Some(theme) = Theme::by_name(name) else {
+            self.notice(
+                format!("Unknown theme: {name}. Available: {}", Theme::names().join(", ")),
+                NoticeLevel::Warning,
+            );
+            return;
+        };
+        self.theme = theme.with_depth(self.theme.depth());
+        let canonical = self.theme.name;
+        let saved = self
+            .persist_client_local(move |settings| settings.set_theme(canonical))
+            .await;
+        match saved {
+            Saved::Ok => self.notice(
+                format!("Theme: {canonical} (saved for this profile)"),
+                NoticeLevel::Info,
+            ),
+            Saved::Failed(error) => self.notice(
+                format!(
+                    "Theme: {canonical} for this session only; not saved: {}.",
+                    error.to_string().trim_end_matches('.')
+                ),
+                NoticeLevel::Warning,
+            ),
+            // Never refused today for client-local keys; if that changes, the
+            // user is still told the truth.
+            Saved::Refused => self.notice(
+                format!("Theme: {canonical} for this session only; not saved."),
+                NoticeLevel::Warning,
+            ),
+        }
+    }
+
     /// `/output-style [<style>]` — show or set the response style persona.
     ///
     /// The list of styles comes from `config/describe`, which is the engine's

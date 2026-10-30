@@ -22,7 +22,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use coda_boot::{parse_diagnostic_verbosity, parse_effort_level, resolve_system_prompt, SessionIntent, ServeArgs};
 use coda_client::EngineCommand;
-use coda_render::theme::{ColorDepth, Theme};
+use coda_render::theme::ColorDepth;
 use coda_tui::app::App;
 use coda_tui::terminal::{install_panic_hook, TerminalGuard};
 
@@ -453,7 +453,12 @@ async fn run_interactive(
         command = command.env("CODA_SERVE_PROVIDER", provider.as_str());
     }
 
-    let theme = Theme::default().with_depth(ColorDepth::detect());
+    let paths = coda_tui::config::Paths::new(&working_dir);
+    let startup_theme = coda_tui::appearance::startup_theme(&paths, ColorDepth::detect());
+    if let Some(warning) = &startup_theme.warning {
+        eprintln!("{warning}");
+    }
+    let theme = startup_theme.theme;
 
     // Resolved by the engine, not by reading its files: the front-end spawns
     // the core, asks it read-only which sessions exist, and hands the answer
