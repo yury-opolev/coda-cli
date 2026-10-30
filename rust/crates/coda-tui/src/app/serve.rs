@@ -7473,6 +7473,121 @@ mod settings_gate_tests {
         assert!(written.contains("theme"), "{written}");
     }
 
+    fn saved_settings(dir: &tempfile::TempDir) -> Value {
+        let text = std::fs::read_to_string(dir.path().join("settings.json"))
+            .expect("settings.json was written");
+        serde_json::from_str(&text).expect("settings.json is JSON")
+    }
+
+    #[tokio::test]
+    async fn theme_switches_the_running_ui_and_saves_it_beside_other_keys() {
+        let (mut harness, dir) = sandboxed(AccessMode::TrustedLocal, ok);
+        std::fs::write(
+            harness.app.paths.settings(),
+            json!({ "defaultProvider": "github-copilot" }).to_string(),
+        )
+        .expect("seed settings");
+
+        harness.app.run_command(invocation("/theme cool-dark")).await;
+
+        assert_eq!(harness.app.theme.name, "cool-dark");
+        let saved = saved_settings(&dir);
+        assert_eq!(saved["theme"], "cool-dark");
+        assert_eq!(saved["defaultProvider"], "github-copilot");
+        assert!(
+            notices(&harness.app).iter().any(|n| n.contains("saved")),
+            "{:?}",
+            notices(&harness.app)
+        );
+    }
+
+    #[tokio::test]
+    async fn theme_saves_the_canonical_name_not_what_was_typed() {
+        let (mut harness, dir) = sandboxed(AccessMode::TrustedLocal, ok);
+
+        harness.app.run_command(invocation("/theme default")).await;
+
+        assert_eq!(saved_settings(&dir)["theme"], "warm-ember");
+    }
+
+    #[tokio::test]
+    async fn theme_is_saved_even_when_the_engine_belongs_to_someone_else() {
+        let (mut harness, dir) = sandboxed(AccessMode::ApiOnly, ok);
+
+        harness.app.run_command(invocation("/theme cool-dark")).await;
+
+        assert_eq!(saved_settings(&dir)["theme"], "cool-dark");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_theme_changes_and_writes_nothing() {
+        let (mut harness, dir) = sandboxed(AccessMode::TrustedLocal, ok);
+        let before = harness.app.theme.name;
+
+        harness.app.run_command(invocation("/theme nope")).await;
+
+        assert_eq!(harness.app.theme.name, before);
+        assert!(!dir.path().join("settings.json").exists());
+        assert!(notices(&harness.app).iter().any(|n| n.contains("Unknown theme")));
+    }
+
+    #[tokio::test]
+    async fn a_theme_that_cannot_be_saved_still_applies_to_this_session() {
+        let (mut harness, dir) = sandboxed(AccessMode::TrustedLocal, ok);
+        std::fs::write(harness.app.paths.settings(), "{ not json").expect("seed");
+
+        harness.app.run_command(invocation("/theme cool-dark")).await;
+
+        assert_eq!(harness.app.theme.name, "cool-dark");
+        let warned = harness.app.state().transcript.blocks().iter().any(|b| {
+            matches!(
+                b,
+                crate::transcript::Block::Notice {
+                    text,
+                    level: crate::transcript::NoticeLevel::Warning,
+                } if text.contains("not saved")
+            )
+        });
+        assert!(warned, "{:?}", notices(&harness.app));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("settings.json")).unwrap(),
+            "{ not json",
+            "a file that could not be read must not be overwritten"
+        );
+    }
+
+    #[tokio::test]
+    async fn switching_theme_keeps_the_terminals_colour_depth() {
+        use coda_render::ColorDepth;
+        let (mut harness, _dir) = sandboxed(AccessMode::TrustedLocal, ok);
+        harness.app.theme = harness.app.theme.clone().with_depth(ColorDepth::Ansi16);
+
+        harness.app.run_command(invocation("/theme cool-dark")).await;
+
+        assert_eq!(harness.app.theme.depth(), ColorDepth::Ansi16);
+    }
+
+    #[tokio::test]
+    async fn saving_the_settings_form_applies_its_theme_to_the_running_ui() {
+        use coda_render::ColorDepth;
+        let (mut harness, _dir) = sandboxed(AccessMode::TrustedLocal, ok);
+        harness.app.theme = harness.app.theme.clone().with_depth(ColorDepth::Ansi16);
+        let mut settings = crate::config::Settings::empty_at(harness.app.paths.settings());
+        settings.set_theme("cool-dark");
+        harness
+            .app
+            .surfaces
+            .push(Box::new(crate::surface::settings::SettingsSurface::new(&settings)));
+
+        harness
+            .app
+            .apply_surface_action(crate::surface::SurfaceAction::SaveSettings)
+            .await;
+
+        assert_eq!(harness.app.theme.name, "cool-dark");
+        assert_eq!(harness.app.theme.depth(), ColorDepth::Ansi16);
+    }
+
     #[tokio::test]
     async fn an_api_only_session_sets_effort_for_the_session_without_saving_it() {
         let (mut harness, dir) = sandboxed(AccessMode::ApiOnly, |method, _| match method {

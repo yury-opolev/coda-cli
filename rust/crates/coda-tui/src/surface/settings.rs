@@ -120,8 +120,9 @@ impl SettingsSurface {
         Self::new(&settings)
     }
 
-    pub fn theme_index(&self) -> usize {
-        selected(self.form(), index::THEME).unwrap_or(0)
+    /// The theme the form has selected, by canonical name.
+    pub fn selected_theme(&self) -> Option<&'static str> {
+        selected(self.form(), index::THEME).and_then(|i| Theme::names().get(i).copied())
     }
 
     pub fn form(&self) -> &Form {
@@ -240,11 +241,9 @@ mod tests {
         s.set_theme("COOL-DARK");
         s.set_permission_mode("plan");
         let surface = SettingsSurface::new(&s);
-        let cool_dark = Theme::names().iter().position(|n| *n == "cool-dark");
-        assert!(cool_dark.is_some(), "cool-dark is not in the catalogue");
         assert_eq!(
-            Some(surface.theme_index()),
-            cool_dark,
+            surface.selected_theme(),
+            Some("cool-dark"),
             "theme did not round-trip"
         );
         assert_eq!(
@@ -258,7 +257,10 @@ mod tests {
     fn an_unknown_configured_value_falls_back_rather_than_failing() {
         let mut s = settings();
         s.set_theme("a-theme-from-the-future");
-        assert_eq!(SettingsSurface::new(&s).theme_index(), 0);
+        assert_eq!(
+            SettingsSurface::new(&s).selected_theme(),
+            Theme::names().first().copied()
+        );
     }
 
     #[test]
