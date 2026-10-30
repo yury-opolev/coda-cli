@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod app;
+pub mod appearance;
 pub mod branding;
 pub mod browsers;
 pub mod cli;
