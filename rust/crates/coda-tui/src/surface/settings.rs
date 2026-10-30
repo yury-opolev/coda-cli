@@ -17,9 +17,10 @@ use ratatui::text::Line;
 ///
 /// Kept as slices rather than inline literals so the index-to-value mapping is
 /// stated once. Building and applying read the same list, which is what stops
-/// the two drifting apart and writing the wrong value.
+/// the two drifting apart and writing the wrong value. Themes are the
+/// exception: they come from `Theme::names()`, so the form can only offer
+/// what the renderer can resolve.
 pub const PERMISSION_MODES: &[&str] = &["ask", "auto", "plan"];
-pub const THEMES: &[&str] = &["warm-ember", "cool-slate", "high-contrast"];
 pub const TOOL_DISPLAY_MODES: &[&str] = &["compact", "expanded"];
 
 /// Index of each control within the form.
@@ -59,8 +60,8 @@ fn build(settings: &Settings) -> Form {
             )),
         ),
         Box::new(
-            Select::new("Theme", THEMES.iter().map(|s| s.to_string()).collect())
-                .with_selected(position_or_first(THEMES, settings.theme())),
+            Select::new("Theme", Theme::names().iter().map(|s| s.to_string()).collect())
+                .with_selected(position_or_first(Theme::names(), settings.theme())),
         ),
         Box::new(
             Select::new(
@@ -136,7 +137,7 @@ impl SettingsSurface {
     pub fn apply_client_local(&self, settings: &mut Settings) {
         let form = self.form();
         if let Some(i) = selected(form, index::THEME) {
-            settings.set_theme(THEMES[i]);
+            settings.set_theme(Theme::names()[i]);
         }
         if let Some(i) = selected(form, index::TOOL_DISPLAY) {
             settings.set_tool_display_mode(TOOL_DISPLAY_MODES[i]);
@@ -236,10 +237,16 @@ mod tests {
     #[test]
     fn the_surface_opens_on_configured_values_not_on_defaults() {
         let mut s = settings();
-        s.set_theme("high-contrast");
+        s.set_theme("COOL-DARK");
         s.set_permission_mode("plan");
         let surface = SettingsSurface::new(&s);
-        assert_eq!(surface.theme_index(), 2, "theme did not round-trip");
+        let cool_dark = Theme::names().iter().position(|n| *n == "cool-dark");
+        assert!(cool_dark.is_some(), "cool-dark is not in the catalogue");
+        assert_eq!(
+            Some(surface.theme_index()),
+            cool_dark,
+            "theme did not round-trip"
+        );
         assert_eq!(
             selected(surface.form(), index::PERMISSION),
             Some(2),
@@ -270,6 +277,19 @@ mod tests {
         // Save to a temp path; the point is the values, not the file.
         let _ = surface.apply(&mut s);
         assert_eq!(s.permission_mode(), Some("auto"));
+    }
+
+    #[test]
+    fn the_form_writes_a_theme_the_renderer_can_resolve() {
+        let mut surface = SettingsSurface::new(&settings());
+        surface.handle_key(key(KeyCode::Tab)); // permission -> theme
+        assert_eq!(surface.form().focused_index(), index::THEME);
+        surface.handle_key(key(KeyCode::Down)); // first option -> second
+        let mut s = settings();
+        surface.apply_client_local(&mut s);
+        let written = s.theme().expect("a theme was written");
+        assert!(Theme::by_name(written).is_some(), "{written} is not renderable");
+        assert_eq!(written, "cool-dark");
     }
 
     #[test]
