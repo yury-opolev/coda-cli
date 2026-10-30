@@ -1353,6 +1353,20 @@ Each root turn has one activity block. The full underlying engine, history, audi
 data is retained regardless of display mode. An invalid nonblank value is reported safely at startup and falls
 back to `"summary"`.
 
+**Shared (read-only) with the Claude CLI:** `CLAUDE.md` project instructions
+(including `~/.claude/CLAUDE.md`), `<project>/.mcp.json` MCP server config, and
+`~/.claude/skills/` (lowest precedence — your `~/.coda/skills` and project skills
+override by name). Override the skill source dirs with `CODA_CLAUDE_SKILLS_DIR` /
+`CODA_USER_SKILLS_DIR` (point at a missing path to opt out). Coda also reads foreign
+`.agents/skills/`, `~/.claude/agents/`, `~/.claude/commands/`, and `.claude-plugin/plugin.json`
+sources read-only. See [`docs/skills-and-plugins.md`](docs/skills-and-plugins.md) for the full
+authoring reference.
+
+> **Credential migration:** credentials previously lived under `%APPDATA%\LlmAuth`
+> (Windows) / `~/.config/LlmAuth` (other OS). On first run after upgrading, Coda
+> moves them to `~/.coda/credentials/` automatically and removes the old folder.
+> DPAPI is keyed to the user (not the file path), so migrated tokens still decrypt.
+
 ### Colour theme
 
 The terminal colour theme is the `theme` key in the user settings file (`~/.coda/settings.json`); it is
@@ -1375,20 +1389,6 @@ warning on stderr, and never blocks the launch.
 ```powershell
 $env:CODA_HOME = "$HOME\coda-work"; coda   # then /theme cool-dark once; later launches keep it
 ```
-
-**Shared (read-only) with the Claude CLI:** `CLAUDE.md` project instructions
-(including `~/.claude/CLAUDE.md`), `<project>/.mcp.json` MCP server config, and
-`~/.claude/skills/` (lowest precedence — your `~/.coda/skills` and project skills
-override by name). Override the skill source dirs with `CODA_CLAUDE_SKILLS_DIR` /
-`CODA_USER_SKILLS_DIR` (point at a missing path to opt out). Coda also reads foreign
-`.agents/skills/`, `~/.claude/agents/`, `~/.claude/commands/`, and `.claude-plugin/plugin.json`
-sources read-only. See [`docs/skills-and-plugins.md`](docs/skills-and-plugins.md) for the full
-authoring reference.
-
-> **Credential migration:** credentials previously lived under `%APPDATA%\LlmAuth`
-> (Windows) / `~/.config/LlmAuth` (other OS). On first run after upgrading, Coda
-> moves them to `~/.coda/credentials/` automatically and removes the old folder.
-> DPAPI is keyed to the user (not the file path), so migrated tokens still decrypt.
 
 ### Telemetry & logging
 
