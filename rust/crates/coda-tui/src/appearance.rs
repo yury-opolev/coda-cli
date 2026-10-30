@@ -78,7 +78,7 @@ fn unreadable_warning(path: &str, cause: &str) -> String {
 
 fn non_name_theme_warning(path: &str) -> String {
     format!(
-        "The theme in {} is not a name; using {}. Available: {}.",
+        "The theme in {} is not a name; using {}. Available: {}. Run /theme <name> to choose one.",
         sanitize(path, MAX_ECHOED_CHARS * 2),
         Theme::default().name,
         Theme::names().join(", "),
@@ -87,7 +87,7 @@ fn non_name_theme_warning(path: &str) -> String {
 
 fn unknown_theme_warning(name: &str, path: &str) -> String {
     format!(
-        "Unknown theme '{}' in {}; using {}. Available: {}.",
+        "Unknown theme '{}' in {}; using {}. Available: {}. Run /theme <name> to choose one.",
         sanitize(name, MAX_ECHOED_CHARS),
         sanitize(path, MAX_ECHOED_CHARS * 2),
         Theme::default().name,

@@ -1380,8 +1380,8 @@ read only by the terminal front-end, and project settings are not consulted. Val
 `/theme` shows the current and available themes; `/theme cool-dark` switches immediately and saves it to
 this profile, as does the Theme choice in `/settings`. If saving fails, the theme still applies for the
 session and a warning says it was not saved. At startup (including the first-run wizard) a missing value
-uses `warm-ember`; an unknown name, a value that is not a name, or an unreadable settings file also uses `warm-ember`, with a one-line
-warning on stderr, and never blocks the launch.
+uses `warm-ember`; an unknown name, a value that is not a name, or an unreadable settings file also uses
+`warm-ember`, with a one-line warning on stderr, and never blocks the launch.
 
 `CODA_HOME` names the profile root (the parent of `.coda`), so profiles can have their own colours. Each
 `CODA_HOME` is a fully separate profile with its own sign-in, settings and skills:

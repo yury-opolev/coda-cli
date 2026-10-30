@@ -62,7 +62,12 @@ fn build(settings: &Settings) -> Form {
         ),
         Box::new(
             Select::new("Theme", themes.iter().map(|s| s.to_string()).collect())
-                .with_selected(position_or_first(themes, settings.theme())),
+                .with_selected(position_or_first(
+                    themes,
+                    // Resolve as startup does (trim, alias) so saving the form
+                    // never rewrites a theme the profile started in.
+                    settings.theme().and_then(Theme::by_name).map(|t| t.name),
+                )),
         ),
         Box::new(
             Select::new(
@@ -252,6 +257,13 @@ mod tests {
             Some(2),
             "permission mode did not round-trip"
         );
+    }
+
+    #[test]
+    fn the_surface_preselects_what_startup_would_resolve() {
+        let mut s = settings();
+        s.set_theme(" Cool-Dark ");
+        assert_eq!(SettingsSurface::new(&s).selected_theme(), Some("cool-dark"));
     }
 
     #[test]

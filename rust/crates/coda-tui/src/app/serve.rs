@@ -7520,6 +7520,20 @@ mod settings_gate_tests {
     }
 
     #[tokio::test]
+    async fn a_saved_theme_comes_back_at_the_next_start() {
+        let (mut harness, _dir) = sandboxed(AccessMode::TrustedLocal, ok);
+
+        harness.app.run_command(invocation("/theme cool-dark")).await;
+
+        let start = crate::appearance::startup_theme(
+            &harness.app.paths,
+            coda_render::ColorDepth::TrueColor,
+        );
+        assert_eq!(start.theme.name, "cool-dark");
+        assert!(start.warning.is_none(), "{:?}", start.warning);
+    }
+
+    #[tokio::test]
     async fn theme_saves_the_canonical_name_not_what_was_typed() {
         let (mut harness, dir) = sandboxed(AccessMode::TrustedLocal, ok);
 

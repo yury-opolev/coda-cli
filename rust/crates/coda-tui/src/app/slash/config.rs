@@ -45,7 +45,10 @@ impl App {
                 NoticeLevel::Info,
             ),
             Saved::Failed(error) => self.notice(
-                format!("Theme: {canonical} for this session only; not saved: {error}."),
+                format!(
+                    "Theme: {canonical} for this session only; not saved: {}.",
+                    error.to_string().trim_end_matches('.')
+                ),
                 NoticeLevel::Warning,
             ),
             // Never refused today for client-local keys; if that changes, the
