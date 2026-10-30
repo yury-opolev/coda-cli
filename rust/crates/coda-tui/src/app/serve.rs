@@ -7557,7 +7557,9 @@ mod settings_gate_tests {
         harness.app.run_command(invocation("/theme cool-dark")).await;
 
         assert_eq!(harness.app.theme.name, "cool-dark");
-        let warned = warnings(&harness.app).iter().any(|n| n.contains("not saved"));
+        let warned = warnings(&harness.app)
+            .iter()
+            .any(|n| n.starts_with("Theme: cool-dark for this session only; not saved: "));
         assert!(warned, "{:?}", notices(&harness.app));
         assert_eq!(
             std::fs::read_to_string(dir.path().join("settings.json")).unwrap(),
