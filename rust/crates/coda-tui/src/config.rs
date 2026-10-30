@@ -282,6 +282,13 @@ impl Settings {
         self.root.get("theme")?.as_str()
     }
 
+    /// The raw `theme` value, so startup can tell a non-string value apart
+    /// from an absent one. `null` counts as absent: it is how a hand-edited
+    /// file says "no choice".
+    pub fn theme_value(&self) -> Option<&Value> {
+        self.root.get("theme").filter(|value| !value.is_null())
+    }
+
     pub fn set_theme(&mut self, theme: &str) {
         self.root
             .as_object_mut()

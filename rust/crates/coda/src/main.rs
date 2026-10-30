@@ -453,7 +453,8 @@ async fn run_interactive(
         command = command.env("CODA_SERVE_PROVIDER", provider.as_str());
     }
 
-    let startup_theme = coda_tui::appearance::startup_theme(&coda_tui::config::Paths::new(&working_dir), ColorDepth::detect());
+    let paths = coda_tui::config::Paths::new(&working_dir);
+    let startup_theme = coda_tui::appearance::startup_theme(&paths, ColorDepth::detect());
     if let Some(warning) = &startup_theme.warning {
         eprintln!("{warning}");
     }

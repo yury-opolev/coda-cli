@@ -34,8 +34,13 @@ pub fn startup_theme(paths: &Paths, depth: ColorDepth) -> StartupTheme {
             return fallback(Some(unreadable_warning(&path, &error_cause(&error))));
         }
     };
-    let Some(name) = settings.theme() else {
+    let Some(value) = settings.theme_value() else {
         return fallback(None);
+    };
+    let Some(name) = value.as_str() else {
+        return fallback(Some(non_name_theme_warning(
+            &paths.settings().display().to_string(),
+        )));
     };
     match Theme::by_name(name) {
         Some(theme) => StartupTheme {
@@ -64,10 +69,19 @@ fn error_cause(error: &ConfigError) -> String {
 /// so a long path cannot truncate the cause.
 fn unreadable_warning(path: &str, cause: &str) -> String {
     format!(
-        "Could not read {}: {}; using {}.",
+        "Could not use {}: {}; using {}.",
         sanitize(path, MAX_ECHOED_CHARS * 2),
         sanitize(cause, MAX_ECHOED_CHARS * 2),
         Theme::default().name,
+    )
+}
+
+fn non_name_theme_warning(path: &str) -> String {
+    format!(
+        "The theme in {} is not a name; using {}. Available: {}.",
+        sanitize(path, MAX_ECHOED_CHARS * 2),
+        Theme::default().name,
+        Theme::names().join(", "),
     )
 }
 
@@ -131,7 +145,8 @@ mod tests {
         assert_eq!(resolved.theme.name, Theme::default().name);
         let warning = resolved.warning.unwrap();
         assert!(warning.contains("settings.json"), "{warning}");
-        assert!(warning.contains("key must be a string"), "{warning}");
+        let (_, cause) = warning.split_once("settings.json: ").expect("cause follows the path");
+        assert!(cause.contains("line"), "{warning}");
         assert_eq!(warning.matches("settings.json").count(), 1, "{warning}");
     }
 
@@ -153,8 +168,38 @@ mod tests {
 
     #[test]
     fn colour_depth_is_applied_to_the_resolved_theme() {
-        let expected = Theme::by_name("cool-dark").unwrap().with_depth(ColorDepth::Ansi16);
         let resolved = resolve(Some(r#"{"theme": "cool-dark"}"#), ColorDepth::Ansi16);
-        assert_eq!(resolved.theme.depth(), expected.depth());
+        assert_eq!(resolved.theme.name, "cool-dark");
+        assert_eq!(resolved.theme.depth(), ColorDepth::Ansi16);
+    }
+
+    #[test]
+    fn a_theme_that_is_not_a_name_falls_back_with_a_warning() {
+        for value in ["5", "true", "{}", "[]"] {
+            let resolved = resolve(Some(&format!(r#"{{"theme": {value}}}"#)), ColorDepth::TrueColor);
+            assert_eq!(resolved.theme.name, Theme::default().name, "{value}");
+            let warning = resolved.warning.unwrap_or_else(|| panic!("no warning for {value}"));
+            assert!(warning.contains("not a name"), "{warning}");
+            assert!(warning.contains("settings.json"), "{warning}");
+            assert!(warning.contains("warm-ember, cool-dark"), "{warning}");
+        }
+    }
+
+    #[test]
+    fn a_null_theme_is_treated_as_unset() {
+        let resolved = resolve(Some(r#"{"theme": null}"#), ColorDepth::TrueColor);
+        assert_eq!(resolved.theme.name, Theme::default().name);
+        assert!(resolved.warning.is_none());
+    }
+
+    #[test]
+    fn an_unreadable_settings_file_falls_back_with_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("settings.json")).unwrap();
+        let paths = Paths::new(dir.path()).with_user_root(dir.path());
+        let resolved = startup_theme(&paths, ColorDepth::TrueColor);
+        assert_eq!(resolved.theme.name, Theme::default().name);
+        let warning = resolved.warning.expect("a warning");
+        assert!(warning.contains("settings.json"), "{warning}");
     }
 }

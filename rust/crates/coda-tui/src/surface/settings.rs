@@ -17,9 +17,7 @@ use ratatui::text::Line;
 ///
 /// Kept as slices rather than inline literals so the index-to-value mapping is
 /// stated once. Building and applying read the same list, which is what stops
-/// the two drifting apart and writing the wrong value. Themes are the
-/// exception: they come from `Theme::names()`, so the form can only offer
-/// what the renderer can resolve.
+/// the two drifting apart and writing the wrong value.
 pub const PERMISSION_MODES: &[&str] = &["ask", "auto", "plan"];
 pub const TOOL_DISPLAY_MODES: &[&str] = &["compact", "expanded"];
 
@@ -44,6 +42,9 @@ fn position_or_first(options: &[&str], value: Option<&str>) -> usize {
 
 /// Builds the settings form from the current configuration.
 fn build(settings: &Settings) -> Form {
+    // Unlike the lists above, themes come from the renderer, so the form can
+    // only offer what it can resolve.
+    let themes = Theme::names();
     Form::new(vec![
         Box::new(
             StaticText::new("Changes apply on save and are written to settings.json.")
@@ -60,8 +61,8 @@ fn build(settings: &Settings) -> Form {
             )),
         ),
         Box::new(
-            Select::new("Theme", Theme::names().iter().map(|s| s.to_string()).collect())
-                .with_selected(position_or_first(Theme::names(), settings.theme())),
+            Select::new("Theme", themes.iter().map(|s| s.to_string()).collect())
+                .with_selected(position_or_first(themes, settings.theme())),
         ),
         Box::new(
             Select::new(
@@ -291,7 +292,7 @@ mod tests {
         surface.apply_client_local(&mut s);
         let written = s.theme().expect("a theme was written");
         assert!(Theme::by_name(written).is_some(), "{written} is not renderable");
-        assert_eq!(written, "cool-dark");
+        assert_eq!(written, Theme::names()[1]);
     }
 
     #[test]
