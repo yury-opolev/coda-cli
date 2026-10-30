@@ -312,6 +312,7 @@ Inside the REPL:
 /setup                    the first-run wizard: choose an account and sign in
 /model [id]               show or set the chat model
 /effort [low|medium|high|xhigh|max|auto]  choose or set model-specific reasoning effort
+/theme [name]             show or switch the colour theme (saved to this profile)
 /context                  show context-window occupancy and the session's token totals
 /cost                     show cumulative session token totals by category, and the cost estimate
 /goal [<text> | off]      set/clear the autonomous goal (--timeout, --max-turns)
@@ -1351,6 +1352,29 @@ interactive session; Coda does not rewrite or migrate this setting. The default 
 Each root turn has one activity block. The full underlying engine, history, audit, serve, task, and telemetry
 data is retained regardless of display mode. An invalid nonblank value is reported safely at startup and falls
 back to `"summary"`.
+
+### Colour theme
+
+The terminal colour theme is the `theme` key in the user settings file (`~/.coda/settings.json`); it is
+read only by the terminal front-end, and project settings are not consulted. Values are `"warm-ember"`
+(default; `"default"` is an alias) and `"cool-dark"`:
+
+```json
+{ "theme": "cool-dark" }
+```
+
+`/theme` shows the current and available themes; `/theme cool-dark` switches immediately and saves it to
+this profile, as does the Theme choice in `/settings`. If saving fails, the theme still applies for the
+session and a warning says it was not saved. At startup (including the first-run wizard) a missing value
+uses `warm-ember`; an unknown name or an unreadable settings file also uses `warm-ember`, with a one-line
+warning on stderr, and never blocks the launch.
+
+`CODA_HOME` names the profile root (the parent of `.coda`), so profiles can have their own colours. Each
+`CODA_HOME` is a fully separate profile with its own sign-in, settings and skills:
+
+```powershell
+$env:CODA_HOME = "$HOME\coda-work"; coda   # then /theme cool-dark once; later launches keep it
+```
 
 **Shared (read-only) with the Claude CLI:** `CLAUDE.md` project instructions
 (including `~/.claude/CLAUDE.md`), `<project>/.mcp.json` MCP server config, and
