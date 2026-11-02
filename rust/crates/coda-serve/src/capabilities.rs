@@ -106,6 +106,15 @@ pub fn capability_catalog() -> HashMap<String, CapabilityEntry> {
     // here survives an engine restart.
     m.insert("messaging.askMain".into(), CapabilityEntry::supported());
 
+    // ── Planned restart ──────────────────────────────────────────────────
+    // `task/suspend`, `task/resume`, `session/suspendAllTasks` and
+    // `session/resumeAllTasks` pause and continue subagents at a safe point
+    // (`event/taskSuspended` / `event/taskResumed`, status `suspended`).
+    m.insert("tasks.suspend".into(), CapabilityEntry::supported());
+    // `session/prepareRestart` drains the engine into a restart file that
+    // `initialize { restore }` (or `coda serve --restore`) applies.
+    m.insert("session.plannedRestart".into(), CapabilityEntry::supported());
+
     // ── Accepted-but-unimplemented surfaces, declared rather than silently
     // ignored. `session/getState` rejects `sections` outright instead of
     // answering a different question than the client asked. ──────────────
@@ -287,6 +296,8 @@ mod tests {
             "mcp.list",
             "state.awaitingUserInput",
             "schedules.bounds",
+            "tasks.suspend",
+            "session.plannedRestart",
         ] {
             assert!(catalog[name].supported, "{name} is implemented and must be advertised");
             assert!(catalog[name].reason.is_none(), "{name} is supported; no excuse needed");
@@ -339,6 +350,8 @@ mod tests {
             ("config.describe", coda_proto::messages::method::CONFIG_DESCRIBE),
             ("config.session", coda_proto::messages::method::CONFIG_SET),
             ("mcp.list", coda_proto::messages::method::MCP_LIST),
+            ("tasks.suspend", coda_proto::messages::method::TASK_SUSPEND),
+            ("session.plannedRestart", coda_proto::messages::method::PREPARE_RESTART),
         ];
         let catalog = capability_catalog();
         for (capability, method) in routed {

@@ -12,6 +12,7 @@ pub use coda_proto::requests::{
     CancelRequestParams, ConfigSetParams, GetEventsParams, GetHistoryParams,
     GetStateParams, ListSessionsParams, ListTasksParams, PendingMessagesParams, ResolveRequestParams, SetModelParams,
     HooksInfoParams, HooksTrustParams, ForkParams, RewindParams, TaskIdParams, TaskSendParams, AskAsideParams,
+    PrepareRestartParams,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -473,6 +474,21 @@ pub trait ServeBackend: Send + Sync {
     /// history and independent of the running turn. Requires initialization.
     async fn session_ask_aside(&self, p: AskAsideParams) -> Result<Value, RpcError>;
 
+    // ── Planned restart and task suspension ─────────────────────────────
+    /// Ask one running subagent to pause at its next safe point. Requires
+    /// initialization.
+    async fn task_suspend(&self, p: TaskIdParams) -> Result<Value, RpcError>;
+    /// Clear one subagent's suspension; refused while draining. Requires
+    /// initialization.
+    async fn task_resume(&self, p: TaskIdParams) -> Result<Value, RpcError>;
+    /// Ask every running subagent to pause. Requires initialization.
+    async fn session_suspend_all_tasks(&self) -> Result<Value, RpcError>;
+    /// Clear every suspension; refused while draining. Requires
+    /// initialization.
+    async fn session_resume_all_tasks(&self) -> Result<Value, RpcError>;
+    /// Drain the engine and write a restart file. Requires initialization.
+    async fn session_prepare_restart(&self, p: PrepareRestartParams) -> Result<Value, RpcError>;
+
     /// Whether `initialize` has completed on this connection.
     ///
     /// The gate is enforced in [`dispatch`] rather than in each handler so
@@ -618,6 +634,13 @@ pub async fn dispatch(
         "task/stop" => backend.task_stop(required(params)?).await,
         "task/send" => backend.task_send(required(params)?).await,
         "session/askAside" => backend.session_ask_aside(required(params)?).await,
+        "task/suspend" => backend.task_suspend(required(params)?).await,
+        "task/resume" => backend.task_resume(required(params)?).await,
+        "session/suspendAllTasks" => backend.session_suspend_all_tasks().await,
+        "session/resumeAllTasks" => backend.session_resume_all_tasks().await,
+        "session/prepareRestart" => {
+            backend.session_prepare_restart(optional_strict(params)?).await
+        }
         _ => Err(RpcError::method_not_found(method)),
     }
 }
@@ -814,6 +837,21 @@ mod tests {
         async fn session_ask_aside(&self, p: AskAsideParams) -> Result<Value, RpcError> {
             Ok(json!({ "ok": true, "answer": p.question }))
         }
+        async fn task_suspend(&self, p: TaskIdParams) -> Result<Value, RpcError> {
+            Ok(json!({ "ok": true, "taskId": p.task_id, "op": "suspend" }))
+        }
+        async fn task_resume(&self, p: TaskIdParams) -> Result<Value, RpcError> {
+            Ok(json!({ "ok": true, "taskId": p.task_id, "op": "resume" }))
+        }
+        async fn session_suspend_all_tasks(&self) -> Result<Value, RpcError> {
+            Ok(json!({ "ok": true, "count": 2 }))
+        }
+        async fn session_resume_all_tasks(&self) -> Result<Value, RpcError> {
+            Ok(json!({ "ok": true, "count": 3 }))
+        }
+        async fn session_prepare_restart(&self, p: PrepareRestartParams) -> Result<Value, RpcError> {
+            Ok(json!({ "ok": true, "drainTimeoutMs": p.drain_timeout_ms, "reason": p.reason }))
+        }
         fn is_initialized(&self) -> bool {
             true
         }
@@ -973,6 +1011,21 @@ mod tests {
         }
         async fn session_ask_aside(&self, p: AskAsideParams) -> Result<Value, RpcError> {
             self.0.session_ask_aside(p).await
+        }
+        async fn task_suspend(&self, p: TaskIdParams) -> Result<Value, RpcError> {
+            self.0.task_suspend(p).await
+        }
+        async fn task_resume(&self, p: TaskIdParams) -> Result<Value, RpcError> {
+            self.0.task_resume(p).await
+        }
+        async fn session_suspend_all_tasks(&self) -> Result<Value, RpcError> {
+            self.0.session_suspend_all_tasks().await
+        }
+        async fn session_resume_all_tasks(&self) -> Result<Value, RpcError> {
+            self.0.session_resume_all_tasks().await
+        }
+        async fn session_prepare_restart(&self, p: PrepareRestartParams) -> Result<Value, RpcError> {
+            self.0.session_prepare_restart(p).await
         }
         fn is_initialized(&self) -> bool {
             false
@@ -1177,6 +1230,41 @@ mod tests {
                     .await;
             assert!(result.is_ok(), "{method} must be routed once initialized: {result:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn dispatches_task_suspension_methods() {
+        let id = Some(json!({ "taskId": "task-0007" }));
+        let r = dispatch("task/suspend", id.clone(), &FakeBackend).await.unwrap();
+        assert_eq!((r["taskId"].as_str(), r["op"].as_str()), (Some("task-0007"), Some("suspend")));
+        let r = dispatch("task/resume", id, &FakeBackend).await.unwrap();
+        assert_eq!((r["taskId"].as_str(), r["op"].as_str()), (Some("task-0007"), Some("resume")));
+        for method in ["task/suspend", "task/resume"] {
+            let err = dispatch(method, None, &FakeBackend).await.unwrap_err();
+            assert_eq!(err.code, -32602, "{method} requires a taskId");
+        }
+        let r = dispatch("session/suspendAllTasks", None, &FakeBackend).await.unwrap();
+        assert_eq!(r["count"], 2);
+        let r = dispatch("session/resumeAllTasks", None, &FakeBackend).await.unwrap();
+        assert_eq!(r["count"], 3);
+    }
+
+    #[tokio::test]
+    async fn dispatches_prepare_restart_with_strict_optional_params() {
+        let r = dispatch("session/prepareRestart", None, &FakeBackend).await.unwrap();
+        assert!(r["drainTimeoutMs"].is_null());
+        let r = dispatch(
+            "session/prepareRestart",
+            Some(json!({ "drainTimeoutMs": 5000, "reason": "upgrade" })),
+            &FakeBackend,
+        )
+        .await
+        .unwrap();
+        assert_eq!((r["drainTimeoutMs"].as_u64(), r["reason"].as_str()), (Some(5000), Some("upgrade")));
+        let err = dispatch("session/prepareRestart", Some(json!({ "drainTimeoutMs": "soon" })), &FakeBackend)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, -32602, "a malformed drain timeout is refused, not defaulted");
     }
 
     // ── Method routing tests ─────────────────────────────────────────────────
@@ -1688,6 +1776,21 @@ mod tests {
             Err(RpcError { code: self.0, message: self.1.into() })
         }
         async fn session_ask_aside(&self, _p: AskAsideParams) -> Result<Value, RpcError> {
+            Err(RpcError { code: self.0, message: self.1.into() })
+        }
+        async fn task_suspend(&self, _p: TaskIdParams) -> Result<Value, RpcError> {
+            Err(RpcError { code: self.0, message: self.1.into() })
+        }
+        async fn task_resume(&self, _p: TaskIdParams) -> Result<Value, RpcError> {
+            Err(RpcError { code: self.0, message: self.1.into() })
+        }
+        async fn session_suspend_all_tasks(&self) -> Result<Value, RpcError> {
+            Err(RpcError { code: self.0, message: self.1.into() })
+        }
+        async fn session_resume_all_tasks(&self) -> Result<Value, RpcError> {
+            Err(RpcError { code: self.0, message: self.1.into() })
+        }
+        async fn session_prepare_restart(&self, _p: PrepareRestartParams) -> Result<Value, RpcError> {
             Err(RpcError { code: self.0, message: self.1.into() })
         }
         fn is_initialized(&self) -> bool {

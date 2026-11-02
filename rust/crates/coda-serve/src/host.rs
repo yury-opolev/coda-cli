@@ -2562,8 +2562,7 @@ fn safe_engine_error(code: i64) -> coda_proto::state::TurnErrorSummary {
     }
 }
 
-/// The `task/background` / `task/stop` reply: `ok` exactly when no refusal
-/// reason applies.
+/// The `task/*` control reply: `ok` exactly when no refusal reason applies.
 fn task_control_result(task_id: String, reason: Option<&str>) -> Result<Value, RpcError> {
     serde_json::to_value(coda_proto::responses::TaskControlResult {
         ok: reason.is_none(),
@@ -4203,6 +4202,59 @@ impl ServeBackend for ServeHost {
         task_control_result(p.task_id, reason)
     }
 
+    /// Asks one running subagent to pause at its next safe point.
+    async fn task_suspend(&self, p: crate::dispatch::TaskIdParams) -> Result<Value, RpcError> {
+        use coda_agent::tasks::TaskActionResult;
+        let reason = match self.task_manager.request_suspend(&p.task_id) {
+            TaskActionResult::Ok => None,
+            TaskActionResult::NotFound => Some("notFound"),
+            TaskActionResult::Rejected => Some("notSuspendable"),
+            _ => Some("notRunning"),
+        };
+        task_control_result(p.task_id, reason)
+    }
+
+    /// Clears one subagent's suspension. Refused while a planned restart
+    /// drains: the work would only have to be suspended again.
+    async fn task_resume(&self, p: crate::dispatch::TaskIdParams) -> Result<Value, RpcError> {
+        use coda_agent::tasks::TaskActionResult;
+        if self.engine_state.is_draining() {
+            return Err(RpcError::restart_pending());
+        }
+        let reason = match self.task_manager.request_resume(&p.task_id) {
+            TaskActionResult::Ok => None,
+            TaskActionResult::NotFound => Some("notFound"),
+            TaskActionResult::Rejected => Some("notSuspendable"),
+            _ => match self.task_manager.get(&p.task_id) {
+                Some(task) if !task.status.is_terminal() => Some("notSuspended"),
+                _ => Some("notRunning"),
+            },
+        };
+        task_control_result(p.task_id, reason)
+    }
+
+    async fn session_suspend_all_tasks(&self) -> Result<Value, RpcError> {
+        let count = self.task_manager.suspend_all();
+        serde_json::to_value(coda_proto::responses::TaskBulkControlResult { ok: true, count })
+            .map_err(|e| RpcError::internal(e.to_string()))
+    }
+
+    async fn session_resume_all_tasks(&self) -> Result<Value, RpcError> {
+        if self.engine_state.is_draining() {
+            return Err(RpcError::restart_pending());
+        }
+        let count = self.task_manager.resume_all();
+        serde_json::to_value(coda_proto::responses::TaskBulkControlResult { ok: true, count })
+            .map_err(|e| RpcError::internal(e.to_string()))
+    }
+
+    async fn session_prepare_restart(
+        &self,
+        _p: coda_proto::requests::PrepareRestartParams,
+    ) -> Result<Value, RpcError> {
+        Err(RpcError::internal("not implemented"))
+    }
+
     /// Phase 3 (`/btw`): one tool-less model request that sees the
     /// conversation so far (including the turn in flight) and the live task
     /// table. It takes no turn slot, so it works while a turn runs, and it
@@ -4276,7 +4328,9 @@ impl ServeBackend for ServeHost {
                     mode: task.mode.as_str().into(),
                     output_tail,
                     report,
-                    suspend_requested: None,
+                    suspend_requested: (task.suspend_requested
+                        && task.status == coda_agent::tasks::TaskRunStatus::Running)
+                        .then_some(true),
                 }
             }).collect();
         serde_json::to_value(TaskListResult {
@@ -16247,6 +16301,263 @@ mod tests {
                     "the canary must run against a log that actually recorded this turn"
                 );
             }
+        }
+    }
+
+    // ── Planned restart: task suspension over the wire ───────────────────
+
+    mod task_suspension {
+        use super::*;
+        use crate::dispatch::dispatch;
+        use coda_agent::tasks::{TaskExecutionMode, TaskKind, TaskRunStatus};
+        use coda_llm::anthropic::StreamEvent;
+        use coda_llm::{Content, Correlation, Usage};
+        use serde_json::json;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        const PROBE: &str = "SUBAGENT-PROBE: list the tasks, then report";
+
+        /// Main agent: starts one `task` subagent, then answers in text.
+        /// Subagent: its first model request is held at `gate` (so a test can
+        /// ask for suspension while it is mid-request), then calls
+        /// `task_list`; every later request reports.
+        struct ProbeClient {
+            main_requests: AtomicUsize,
+            subagent_requests: AtomicUsize,
+            gate: Arc<tokio::sync::Notify>,
+        }
+
+        fn tool_use(name: &str, input: Value) -> Vec<StreamEvent> {
+            vec![
+                StreamEvent::ToolUse(Content::ToolUse {
+                    id: format!("call-{name}"),
+                    name: name.into(),
+                    input_json: input.to_string(),
+                    correlation: Correlation::default(),
+                }),
+                StreamEvent::Done { stop_reason: Some("tool_use".into()), usage: Usage::ZERO },
+            ]
+        }
+
+        fn answer(text: &str) -> Vec<StreamEvent> {
+            vec![
+                StreamEvent::TextDelta(text.into()),
+                StreamEvent::Done { stop_reason: Some("end_turn".into()), usage: Usage::ZERO },
+            ]
+        }
+
+        #[async_trait]
+        impl LlmClient for ProbeClient {
+            fn provider_id(&self) -> &str {
+                "probe-mock"
+            }
+            async fn stream(
+                &self,
+                request: coda_llm::ChatRequest,
+            ) -> Result<coda_llm::ResponseStream, coda_llm::LlmError> {
+                let subagent = request.messages.first().is_some_and(|m| m.text().contains(PROBE));
+                let events = if subagent {
+                    if self.subagent_requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                        self.gate.notified().await;
+                        tool_use("task_list", json!({}))
+                    } else {
+                        answer("probe done")
+                    }
+                } else if self.main_requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                    tool_use("task", json!({ "prompt": PROBE }))
+                } else {
+                    answer("noted")
+                };
+                let (tx, rx) = tokio::sync::mpsc::channel(64);
+                tokio::spawn(async move {
+                    for event in events {
+                        let _ = tx.send(Ok(event)).await;
+                    }
+                });
+                Ok(coda_llm::ResponseStream::new(rx))
+            }
+        }
+
+        fn probe_host(
+            client: Arc<dyn LlmClient>,
+            dir: &std::path::Path,
+        ) -> (Arc<ServeHost>, mpsc::UnboundedReceiver<Vec<u8>>) {
+            let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            let sink = Arc::new(ServeSink::new(tx.clone()));
+            let ch = Arc::new(PromptChannel::new(tx));
+            let host = ServeHost::new_with_optional_client_and_mcp(
+                Some(client),
+                sink,
+                ch,
+                dir.display().to_string(),
+                crate::mcp::McpBundle::disabled(),
+                StartupOptions::default(),
+                None,
+                None,
+            );
+            (host, rx)
+        }
+
+        async fn wait_for(label: &str, mut cond: impl FnMut() -> bool) {
+            for _ in 0..1000 {
+                if cond() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("timed out waiting for: {label}");
+        }
+
+        async fn listed(host: &ServeHost, task_id: &str) -> Value {
+            let listing = dispatch("session/listTasks", None, host).await.unwrap();
+            listing["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["id"] == task_id)
+                .cloned()
+                .unwrap_or_else(|| panic!("{task_id} is listed: {listing}"))
+        }
+
+        async fn call(host: &ServeHost, method: &str, task_id: &str) -> Result<Value, RpcError> {
+            dispatch(method, Some(json!({ "taskId": task_id })), host).await
+        }
+
+        #[tokio::test]
+        async fn task_suspend_and_resume_without_restart() {
+            let dir = tempfile::tempdir().unwrap();
+            let client = Arc::new(ProbeClient {
+                main_requests: AtomicUsize::new(0),
+                subagent_requests: AtomicUsize::new(0),
+                gate: Arc::new(tokio::sync::Notify::new()),
+            });
+            let (host, mut rx) = probe_host(Arc::clone(&client) as Arc<dyn LlmClient>, dir.path());
+            host.initialize(InitParams::default()).await.unwrap();
+            host.permission_mode.set(PermissionMode::BypassPermissions);
+
+            dispatch("session/prompt", Some(json!({ "text": "start the probe" })), host.as_ref())
+                .await
+                .unwrap();
+            let task_id = host
+                .task_manager
+                .list_with_output_matching(0, Default::default())
+                .into_iter()
+                .find(|(t, _)| t.kind == TaskKind::Subagent)
+                .map(|(t, _)| t.id)
+                .expect("the main agent started a subagent");
+            wait_for("the subagent's first model request", || {
+                client.subagent_requests.load(Ordering::SeqCst) == 1
+            })
+            .await;
+
+            let r = call(&host, "task/suspend", &task_id).await.unwrap();
+            assert_eq!(r, json!({ "ok": true, "taskId": task_id }));
+            let pending = listed(&host, &task_id).await;
+            assert_eq!(pending["status"], "running", "it pauses only at a safe point");
+            assert_eq!(pending["suspendRequested"], true);
+
+            client.gate.notify_one();
+            let status = |host: &ServeHost| host.task_manager.get(&task_id).unwrap().status;
+            wait_for("the subagent to reach its safe point", || {
+                status(&host) == TaskRunStatus::Suspended
+            })
+            .await;
+            let paused = listed(&host, &task_id).await;
+            assert_eq!(paused["status"], "suspended");
+            assert!(paused.get("suspendRequested").is_none(), "{paused}");
+            let events = drain_events(&mut rx);
+            let suspended = events
+                .iter()
+                .find(|(m, p)| m == "event/taskSuspended" && p["taskId"] == task_id.as_str())
+                .unwrap_or_else(|| panic!("event/taskSuspended was published: {events:?}"));
+            assert_eq!(suspended.1["reason"], "requested");
+            assert_eq!(suspended.1["kind"], "subagent");
+            assert_eq!(client.subagent_requests.load(Ordering::SeqCst), 1, "no model call while paused");
+
+            let r = call(&host, "task/resume", &task_id).await.unwrap();
+            assert_eq!(r["ok"], true);
+            wait_for("the resumed subagent to finish", || status(&host).is_terminal()).await;
+            assert_eq!(status(&host), TaskRunStatus::Completed);
+            assert_eq!(client.subagent_requests.load(Ordering::SeqCst), 2);
+            let events = drain_events(&mut rx);
+            let position = |method: &str| {
+                events
+                    .iter()
+                    .position(|(m, p)| m == method && p["taskId"] == task_id.as_str())
+                    .unwrap_or_else(|| panic!("{method} was published: {events:?}"))
+            };
+            assert!(position("event/taskResumed") < position("event/taskCompleted"));
+        }
+
+        #[tokio::test]
+        async fn task_suspend_rejects_shell_tasks() {
+            let dir = tempfile::tempdir().unwrap();
+            let (host, _rx) = host_with_events(dir.path());
+            let m = &host.task_manager;
+            let shell = m.register(TaskKind::Shell, "build", None, TaskExecutionMode::Background).unwrap();
+            let agent = m.register(TaskKind::Subagent, "agent", None, TaskExecutionMode::Background).unwrap();
+            let done = m.register(TaskKind::Subagent, "done", None, TaskExecutionMode::Background).unwrap();
+            m.complete(&done.id, Some("report".into()));
+
+            let reason = |r: Result<Value, RpcError>| r.unwrap()["reason"].as_str().map(str::to_owned);
+            for method in ["task/suspend", "task/resume"] {
+                assert_eq!(reason(call(&host, method, &shell.id).await).as_deref(), Some("notSuspendable"));
+                assert_eq!(reason(call(&host, method, "task-99999999").await).as_deref(), Some("notFound"));
+                assert_eq!(reason(call(&host, method, &done.id).await).as_deref(), Some("notRunning"));
+            }
+            assert_eq!(reason(call(&host, "task/resume", &agent.id).await).as_deref(), Some("notSuspended"));
+            assert!(!shell.cancel.is_cancelled(), "a refused suspension leaves the shell running");
+
+            let r = call(&host, "task/suspend", &agent.id).await.unwrap();
+            assert_eq!(r, json!({ "ok": true, "taskId": agent.id }));
+            assert_eq!(call(&host, "task/suspend", &agent.id).await.unwrap()["ok"], true, "idempotent");
+            assert_eq!(call(&host, "task/resume", &agent.id).await.unwrap()["ok"], true);
+            assert!(!m.is_suspension_requested(&agent.id));
+        }
+
+        #[tokio::test]
+        async fn suspend_all_and_resume_all_counts() {
+            let dir = tempfile::tempdir().unwrap();
+            let (host, _rx) = host_with_events(dir.path());
+            let m = &host.task_manager;
+            let a = m.register(TaskKind::Subagent, "a", None, TaskExecutionMode::Background).unwrap();
+            let b = m.register(TaskKind::Subagent, "b", None, TaskExecutionMode::Background).unwrap();
+            let shell = m.register(TaskKind::Shell, "build", None, TaskExecutionMode::Background).unwrap();
+
+            let r = dispatch("session/suspendAllTasks", None, host.as_ref()).await.unwrap();
+            assert_eq!(r, json!({ "ok": true, "count": 2 }), "shell tasks are not suspendable");
+            let r = dispatch("session/suspendAllTasks", None, host.as_ref()).await.unwrap();
+            assert_eq!(r["count"], 0, "nothing newly requested");
+            for id in [&a.id, &b.id] {
+                assert_eq!(listed(&host, id).await["suspendRequested"], true);
+            }
+            assert!(listed(&host, &shell.id).await.get("suspendRequested").is_none());
+
+            let r = dispatch("session/resumeAllTasks", None, host.as_ref()).await.unwrap();
+            assert_eq!(r, json!({ "ok": true, "count": 2 }));
+            assert!(listed(&host, &a.id).await.get("suspendRequested").is_none());
+        }
+
+        #[tokio::test]
+        async fn resume_refused_while_draining() {
+            let dir = tempfile::tempdir().unwrap();
+            let (host, _rx) = host_with_events(dir.path());
+            let agent = host
+                .task_manager
+                .register(TaskKind::Subagent, "agent", None, TaskExecutionMode::Background)
+                .unwrap();
+            host.begin_draining(None, chrono::Utc::now() + chrono::Duration::minutes(10))
+                .await
+                .unwrap();
+
+            assert_eq!(call(&host, "task/suspend", &agent.id).await.unwrap()["ok"], true);
+            let err = call(&host, "task/resume", &agent.id).await.unwrap_err();
+            assert_eq!(err, RpcError::restart_pending());
+            assert_eq!(err.code, coda_proto::messages::error_code::RESTART_PENDING);
+            let err = dispatch("session/resumeAllTasks", None, host.as_ref()).await.unwrap_err();
+            assert_eq!(err.code, coda_proto::messages::error_code::RESTART_PENDING);
+            assert!(host.task_manager.is_suspension_requested(&agent.id), "nothing was resumed");
         }
     }
 }
