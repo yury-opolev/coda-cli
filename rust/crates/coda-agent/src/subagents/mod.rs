@@ -18,10 +18,15 @@
 //! free.  Background subagents are registered with `TaskManager` so they
 //! survive a context switch and can be monitored/stopped.
 
+pub mod checkpoint;
 pub mod host;
 pub mod plugin_loader;
 pub mod registry;
 
+pub use checkpoint::{
+    CheckpointInboxItem, SubagentCheckpoint, SubagentSpec, CHECKPOINT_SIZE_CAP,
+    SUBAGENT_CHECKPOINT_VERSION,
+};
 pub use host::SubagentHost;
 pub use plugin_loader::PluginAgentLoader;
 pub use registry::SubagentRegistry;
