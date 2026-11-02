@@ -518,11 +518,12 @@ impl ManagedTask {
         s.version
     }
 
-    /// Atomically promotes a foreground Running task to the background. Returns
-    /// `Some(version)` on success, `None` when already terminal or already background.
+    /// Atomically promotes a foreground live (running or suspended) task to the
+    /// background. Returns `Some(version)` on success, `None` when already
+    /// terminal or already background.
     pub fn try_promote_to_background(&self) -> Option<u64> {
         let mut s = self.state.lock().unwrap();
-        if s.status != TaskRunStatus::Running || s.mode != TaskExecutionMode::Foreground {
+        if s.status.is_terminal() || s.mode != TaskExecutionMode::Foreground {
             return None;
         }
         s.mode = TaskExecutionMode::Background;

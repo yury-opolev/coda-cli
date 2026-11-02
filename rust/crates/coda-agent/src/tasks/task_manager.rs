@@ -96,6 +96,9 @@ struct ManagerState {
     /// The number of the most recently issued task id. Ids are never reused
     /// within a session; see [`TaskManager::register`].
     next_id: u64,
+    /// Set once [`TaskManager::register`] has issued an id: from then on a
+    /// restored id must lie above `next_id`.
+    allocated: bool,
     shutting_down: bool,
     disposed: bool,
 }
@@ -170,6 +173,7 @@ impl TaskManager {
                 subscriptions: Vec::new(),
                 outbox: HashMap::new(),
                 next_id: 0,
+                allocated: false,
                 shutting_down: false,
                 disposed: false,
             }),
@@ -318,8 +322,8 @@ impl TaskManager {
         }
     }
 
-    /// Stops awaiting every running foreground shell task. Returns how many
-    /// were asked to move to the background.
+    /// Stops awaiting every live (running or suspended) foreground shell or
+    /// tool task. Returns how many were asked to move to the background.
     pub fn background_all(&self) -> usize {
         let running = self.state.lock().unwrap().running_tasks();
         running
@@ -616,6 +620,7 @@ impl TaskManager {
                 .into());
         };
         s.next_id = number;
+        s.allocated = true;
         // Eight digits minimum; larger numbers simply grow wider.
         let id = format!("task-{number:08}");
         let log_path = self.log_root.join(&self.session_id).join(format!("{id}.log"));
@@ -639,9 +644,10 @@ impl TaskManager {
     }
 
     /// Re-creates a task from a planned-restart file under its old `id`
-    /// (`task-` + digits) and start time. Fails for a malformed or taken id,
-    /// an unknown parent, or while shutting down. Later [`Self::register`]
-    /// calls never reuse a number at or below a restored one.
+    /// (the canonical `task-{:08}` form) and start time. Fails for a
+    /// malformed or taken id, a number at or below one [`Self::register`]
+    /// already issued, an unknown parent, or while shutting down. Later
+    /// [`Self::register`] calls never reuse a number at or below a restored one.
     #[allow(clippy::too_many_arguments)]
     pub fn register_restored(
         &self,
@@ -657,6 +663,7 @@ impl TaskManager {
             .strip_prefix("task-")
             .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
             .and_then(|digits| digits.parse::<u64>().ok())
+            .filter(|number| format!("task-{number:08}") == id)
             .ok_or_else(|| format!("Invalid task id '{id}'."))?;
 
         let mut s = self.state.lock().unwrap();
@@ -665,6 +672,9 @@ impl TaskManager {
         }
         if s.find(id).is_some() {
             return Err(format!("Task '{id}' already exists."));
+        }
+        if s.allocated && number <= s.next_id {
+            return Err(format!("Task id '{id}' was already issued in this session."));
         }
         let depth = match parent_task_id {
             Some(pid) => match s.find(pid) {
@@ -2099,13 +2109,57 @@ mod tests {
         assert!(restore("task-abc").is_err());
         assert!(restore("job-00000009").is_err());
         assert!(restore("task-").is_err());
-        let low = restore("task-00000002").unwrap();
-        assert!(!m.is_suspension_requested(&low.id));
-        assert_eq!(subagent(&m, None).id, "task-00000009", "the counter never goes back");
+        assert!(restore("task-00000002").is_err(), "an allocated number is never reused");
+        let high = restore("task-00000010").unwrap();
+        assert!(!m.is_suspension_requested(&high.id));
+        assert_eq!(subagent(&m, None).id, "task-00000011", "the counter never goes back");
         assert_eq!(
             observer.0.lock().unwrap().first().cloned(),
             Some("started task-00000007".to_owned())
         );
+    }
+
+    #[test]
+    fn register_restored_requires_canonical_ids_and_never_reuses_allocated_numbers() {
+        let m = mgr();
+        let restore = |id: &str| {
+            m.register_restored(
+                id,
+                TaskKind::Subagent,
+                "x",
+                None,
+                TaskExecutionMode::Background,
+                std::time::SystemTime::now(),
+                false,
+            )
+        };
+        assert!(restore("task-7").is_err(), "not zero-padded");
+        assert!(restore("task-000000007").is_err(), "over-padded");
+        assert!(restore("task-+0000007").is_err());
+        assert!(restore("task-00000005").is_ok());
+        assert!(restore("task-00000003").is_ok(), "restores may arrive in any order");
+
+        let fresh = subagent(&m, None);
+        assert_eq!(fresh.id, "task-00000006");
+        assert!(restore("task-00000004").is_err(), "below an allocated number");
+        assert!(restore("task-00000006").is_err(), "the allocated number itself");
+        assert!(restore("task-00000009").is_ok(), "above the counter");
+        assert!(restore("task-123456789").is_ok(), "wider numbers are canonical");
+    }
+
+    #[test]
+    fn background_moves_a_suspended_foreground_task_to_the_background() {
+        let m = mgr();
+        let one = m.register(TaskKind::Tool, "a", None, TaskExecutionMode::Foreground).unwrap();
+        let two = m.register(TaskKind::Tool, "b", None, TaskExecutionMode::Foreground).unwrap();
+        assert!(m.mark_suspended(&one.id, checkpoint(1)));
+        assert!(m.mark_suspended(&two.id, checkpoint(1)));
+        assert_eq!(m.background(&one.id), TaskActionResult::Ok);
+        assert!(one.try_promote_to_background().is_some(), "a suspended task is promotable");
+        assert_eq!(one.mode(), TaskExecutionMode::Background);
+        assert_eq!(one.status(), TaskRunStatus::Suspended);
+        assert_eq!(m.background_all(), 1, "the other suspended foreground task");
+        assert!(two.try_promote_to_background().is_some());
     }
 
     #[test]

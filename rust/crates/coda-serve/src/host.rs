@@ -4114,9 +4114,7 @@ impl ServeBackend for ServeHost {
             coda_agent::tasks::TaskActionResult::NotFound => Some("notFound"),
             coda_agent::tasks::TaskActionResult::Rejected => Some("notBackgroundable"),
             _ => match self.task_manager.get(&p.task_id) {
-                Some(task) if task.status == coda_agent::tasks::TaskRunStatus::Running => {
-                    Some("notForeground")
-                }
+                Some(task) if !task.status.is_terminal() => Some("notForeground"),
                 _ => Some("notRunning"),
             },
         };

@@ -661,11 +661,11 @@ async fn await_running_task(
             TaskWaitOutcome::Interrupted
         }
         // Decided under the task's own lock: promoted means it is still
-        // running and now in the background; not promoted and not running
-        // means it finished first and its result is reported inline.
+        // live (running or suspended) and now in the background; not
+        // promoted and terminal means it finished first and its result is
+        // reported inline.
         Some(Some(reason))
-            if task.try_promote_to_background().is_some()
-                || task.status() == crate::tasks::TaskRunStatus::Running =>
+            if task.try_promote_to_background().is_some() || !task.status().is_terminal() =>
         {
             TaskWaitOutcome::Yielded(yield_handle(&task, reason, receives_completions(ctx)))
         }
@@ -896,5 +896,71 @@ mod tests {
         assert_eq!(status_str(ToolCallStatus::Failed), "Failed");
         assert_eq!(status_str(ToolCallStatus::Cancelled), "Cancelled");
         assert_eq!(status_str(ToolCallStatus::Skipped), "Skipped");
+    }
+
+    struct AllowAll;
+    #[async_trait::async_trait]
+    impl PermissionPrompt for AllowAll {
+        async fn request(&self, _: &dyn crate::tool::Tool, _: &str, _: CancellationToken) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn a_suspended_foreground_child_yields_a_handle_and_reports_to_its_owner_later() {
+        use crate::tasks::{TaskActionResult, TaskCheckpoint, TaskExecutionMode, TaskKind};
+        let dir = tempfile::tempdir().unwrap();
+        let manager = TaskManager::new("s", Some(dir.path().to_path_buf()), 4096, 10);
+        let owner =
+            manager.register(TaskKind::Subagent, "owner", None, TaskExecutionMode::Background).unwrap();
+        let inbox = Arc::new(SteeringInbox::new());
+        owner.attach_steering(Arc::clone(&inbox));
+        let child = manager
+            .register(TaskKind::Tool, "call", Some(&owner.id), TaskExecutionMode::Foreground)
+            .unwrap();
+        assert!(manager.mark_suspended(&child.id, TaskCheckpoint {
+            history: Vec::new(),
+            steps_used: 0,
+            parked: false,
+            suspended_at: std::time::SystemTime::now(),
+        }));
+        assert_eq!(manager.background(&child.id), TaskActionResult::Ok);
+
+        let registry = ToolRegistry::new(Vec::<Arc<dyn crate::tool::Tool>>::new());
+        let ctx = BatchContext {
+            tools: &registry,
+            permission_prompt: &AllowAll,
+            permission_mode: PermissionMode::Default,
+            permission_mode_state: None,
+            steering: None,
+            working_directory: ".",
+            granted_directories: None,
+            tool_max_duration: None,
+            tool_progress_interval: Duration::from_secs(30),
+            todos: None,
+            tool_user_question: None,
+            plan_approver: None,
+            lsp_manager: None,
+            task_manager: Some(Arc::clone(&manager)),
+            schedule_store: None,
+            caller_task_id: Some(owner.id.clone()),
+            schedule_origin: None,
+            subagent_factory: None,
+            message_bus: None,
+            is_main_context: false,
+        };
+        let outcome =
+            await_running_task(&ctx, &child.id, Some(Duration::from_secs(60)), &CancellationToken::new())
+                .await;
+        let TaskWaitOutcome::Yielded(handle) = outcome else {
+            panic!("a suspended child is still live: the owner gets a handle, not a result");
+        };
+        assert!(!handle.is_error, "{}", handle.content);
+        assert_eq!(child.mode(), TaskExecutionMode::Background);
+
+        assert!(manager.mark_resumed(&child.id));
+        assert!(manager.complete(&child.id, Some("child report".into())));
+        let items = inbox.take_all_for_delivery();
+        assert!(items.iter().any(|i| i.text.contains("child report")), "{items:?}");
     }
 }
