@@ -141,6 +141,10 @@ pub struct InitParams {
     /// event method is ever emitted for this connection.
     #[serde(default)]
     pub client_capabilities: Option<coda_proto::messages::ClientCapabilities>,
+    /// Planned-restart restore (`true` | `false` | `"suspended"`); absent
+    /// defaults to `coda serve --restore`.
+    #[serde(default)]
+    pub restore: Option<coda_proto::messages::RestoreMode>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -560,7 +564,18 @@ pub async fn dispatch(
         return Err(RpcError::not_initialized(method));
     }
     match method {
-        "initialize" => backend.initialize(optional(params)).await,
+        "initialize" => {
+            // Everything else in `initialize` is read leniently (legacy
+            // clients), but a `restore` that is not `true`/`false`/`"suspended"`
+            // is refused rather than silently dropped.
+            if let Some(restore) = params.as_ref().and_then(|p| p.get("restore")) {
+                if !restore.is_null() {
+                    serde_json::from_value::<coda_proto::messages::RestoreMode>(restore.clone())
+                        .map_err(|e| RpcError::invalid_params(format!("restore: {e}")))?;
+                }
+            }
+            backend.initialize(optional(params)).await
+        }
         "shutdown" => backend.shutdown().await,
         "session/prompt" => backend.session_prompt(optional(params)).await,
         "session/interrupt" => backend.session_interrupt().await,
@@ -1274,6 +1289,20 @@ mod tests {
         let r = dispatch("initialize", Some(json!({"protocolVersion":"1"})), &FakeBackend).await;
         assert!(r.is_ok(), "{r:?}");
         assert_eq!(r.unwrap()["protocolVersion"], "1");
+    }
+
+    #[tokio::test]
+    async fn initialize_refuses_a_restore_that_is_not_bool_or_suspended() {
+        for ok in [json!(true), json!(false), json!("suspended"), Value::Null] {
+            let r = dispatch("initialize", Some(json!({ "restore": ok })), &FakeBackend).await;
+            assert!(r.is_ok(), "{ok} is accepted: {r:?}");
+        }
+        for bad in [json!("yes"), json!(1)] {
+            let err = dispatch("initialize", Some(json!({ "restore": bad })), &FakeBackend)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, -32602, "{bad} is refused");
+        }
     }
 
     #[tokio::test]

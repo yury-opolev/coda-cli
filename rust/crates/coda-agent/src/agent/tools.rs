@@ -471,7 +471,7 @@ fn cancel_remaining(
 }
 
 /// Restore only missing results, without replaying tools or guessing their outcomes.
-pub(super) fn recover_interrupted_history(history: &mut Vec<coda_llm::Message>) -> usize {
+pub fn recover_interrupted_history(history: &mut Vec<coda_llm::Message>) -> usize {
     use coda_llm::{Message, Role};
 
     let mut recovered = 0;

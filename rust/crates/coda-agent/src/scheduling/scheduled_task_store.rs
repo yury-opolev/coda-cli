@@ -127,6 +127,22 @@ impl ScheduledTaskStore {
         self.add_core(task)
     }
 
+    /// Re-insert a saved definition under its own id (a planned restart).
+    /// Returns `false`, changing nothing, when a definition with that id
+    /// already exists.
+    pub fn restore(&self, task: ScheduledTask) -> bool {
+        {
+            let mut s = self.state.lock().unwrap();
+            if s.items.iter().any(|t| t.id == task.id) {
+                return false;
+            }
+            s.items.push(task);
+            self.commit_locked(&mut s);
+        }
+        self.signal.notify_waiters();
+        true
+    }
+
     /// Remove the task with the given id. Returns `true` if found and removed.
     pub fn remove(&self, id: &str) -> bool {
         let changed = {
@@ -386,6 +402,20 @@ mod tests {
         let items = store.items();
         assert_eq!(items[0].id, a.id);
         assert_eq!(items[1].id, b.id);
+    }
+
+    #[test]
+    fn restore_keeps_the_id_and_counters_and_refuses_a_duplicate() {
+        let store = ScheduledTaskStore::new();
+        let mut saved = ScheduledTaskStore::new().add(draft(ScheduleKind::Interval), now());
+        saved.runs_started = 4;
+        let before = store.get_snapshot().version;
+
+        assert!(store.restore(saved.clone()));
+        assert_eq!(store.items(), vec![saved.clone()]);
+        assert!(store.get_snapshot().version > before);
+        assert!(!store.restore(saved), "a definition with that id already exists");
+        assert_eq!(store.items().len(), 1);
     }
 
     // ── remove ────────────────────────────────────────────────────────────────

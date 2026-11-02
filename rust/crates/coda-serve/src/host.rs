@@ -334,6 +334,14 @@ impl RestartCapture {
     }
 }
 
+/// Saved subagents waiting for a client before they can be re-created.
+struct PendingSubagentRestore {
+    checkpoints: Vec<coda_agent::subagents::SubagentCheckpoint>,
+    keep_suspended: bool,
+    /// Removed once the subagents are re-created.
+    tasks_dir: PathBuf,
+}
+
 /// A task the drain had to stop, as recorded in the restart file.
 fn interrupted_task(
     task: &coda_agent::tasks::TaskSnapshot,
@@ -608,6 +616,12 @@ pub struct StartupOptions {
     /// Copilot or Claude.ai session resolves its own endpoints and starts
     /// normally whatever this holds.
     pub anthropic_endpoint: ApiKeyEndpoint,
+    /// `coda serve --restore[=suspended]`: the `restore` an `initialize`
+    /// that leaves it out gets.
+    pub restore: Option<coda_proto::messages::RestoreMode>,
+    /// `coda serve --session <id>`: the `sessionId` an `initialize` that
+    /// leaves it out resumes.
+    pub session_id: Option<String>,
 }
 
 impl std::fmt::Debug for StartupOptions {
@@ -624,6 +638,8 @@ impl std::fmt::Debug for StartupOptions {
             // Never surface the key itself, in Debug or anywhere else.
             .field("api_key", &self.api_key.as_ref().map(|_| "***"))
             .field("endpoint", &self.endpoint)
+            .field("restore", &self.restore)
+            .field("session_id", &self.session_id)
             // The resolved decision is deliberately absent: it either repeats
             // `endpoint` or came from the environment, and a resolved base URL
             // can carry a path — which can carry a tenant id.
@@ -693,6 +709,15 @@ impl StartupOptions {
         let provider = non_empty("CODA_SERVE_PROVIDER").map(|p| canonical_provider(&p));
         let api_key = non_empty("CODA_SERVE_API_KEY");
         let endpoint = non_empty("CODA_SERVE_ENDPOINT");
+        let restore = match non_empty("CODA_SERVE_RESTORE") {
+            None => None,
+            Some(raw) => Some(parse_startup_restore(&raw).ok_or_else(|| {
+                StartupError(format!(
+                    "invalid CODA_SERVE_RESTORE '{raw}' (expected true, false, or suspended)"
+                ))
+            })?),
+        };
+        let session_id = non_empty("CODA_SERVE_SESSION");
 
         let opts = Self {
             model,
@@ -706,6 +731,8 @@ impl StartupOptions {
             api_key,
             endpoint,
             anthropic_endpoint: ApiKeyEndpoint::Unresolved,
+            restore,
+            session_id,
         };
         opts.validate()?;
         // Resolved after `validate`, so `--endpoint requires --api-key` is
@@ -809,6 +836,17 @@ impl StartupOptions {
             max_duration: self.goal_max_duration.clone(),
             max_continuations: self.goal_max_continuations,
         }
+    }
+}
+
+/// Maps a `CODA_SERVE_RESTORE` value (`coda serve --restore[=suspended]`).
+fn parse_startup_restore(raw: &str) -> Option<coda_proto::messages::RestoreMode> {
+    use coda_proto::messages::RestoreMode;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" => Some(RestoreMode::Resume),
+        "false" | "0" => Some(RestoreMode::Off),
+        "suspended" => Some(RestoreMode::Suspended),
+        _ => None,
     }
 }
 
@@ -1182,6 +1220,16 @@ pub struct ServeHost {
     /// (stopped tasks, declined requests, recalled steering), reused by the
     /// retry because that state cannot be observed a second time.
     restart_capture: Mutex<Option<RestartCapture>>,
+    /// `coda serve --restore` / `--session`: what `initialize` assumes when
+    /// the client leaves `restore` / `sessionId` out.
+    startup_restore: Option<coda_proto::messages::RestoreMode>,
+    startup_session_id: Option<String>,
+    /// Subagents a restore could not re-create yet because no client was
+    /// wired; restored the first time the session services are built.
+    pending_restore: Mutex<Option<PendingSubagentRestore>>,
+    /// Restored messages, re-published once the `initialize` response has
+    /// been written (see [`ServeHost::after_initialize_response`]).
+    restored_messages: Mutex<Vec<crate::restart::SavedMessage>>,
     /// Test seam: replaces [`RESTART_SETTLE`] so a test does not wait 30 s
     /// for a subagent that will never reach a safe point.
     #[cfg(test)]
@@ -1569,6 +1617,10 @@ impl ServeHost {
             steering_observer,
             restart_prep: Mutex::new(RestartPrep::Idle),
             restart_capture: Mutex::new(None),
+            startup_restore: startup_opts.restore,
+            startup_session_id: startup_opts.session_id.clone(),
+            pending_restore: Mutex::new(None),
+            restored_messages: Mutex::new(Vec::new()),
             #[cfg(test)]
             restart_settle_override: Mutex::new(None),
             #[cfg(test)]
@@ -2218,7 +2270,42 @@ impl ServeHost {
             svc.schedule_runtime.pause_launches(true);
         }
         *guard = Some(Arc::clone(&svc));
+        // Restored under the services lock, so nothing can register a task
+        // (whose new id would refuse the saved ones) before they are back.
+        let pending = self.pending_restore.lock().expect("pending restore poisoned").take();
+        if let Some(pending) = pending {
+            self.restore_subagents(&svc, pending).await;
+        }
         svc
+    }
+
+    /// Re-creates saved subagents under their old ids (all registered before
+    /// any runs), then removes their files. Returns the ids re-created.
+    async fn restore_subagents(
+        &self,
+        svc: &SessionServices,
+        pending: PendingSubagentRestore,
+    ) -> Vec<String> {
+        let PendingSubagentRestore { checkpoints, keep_suspended, tasks_dir } = pending;
+        let results = svc
+            .subagent_host
+            .restore_all(checkpoints, keep_suspended, Arc::new(coda_agent::NullSink))
+            .await;
+        let mut restored = Vec::with_capacity(results.len());
+        for (task_id, outcome) in results {
+            match outcome {
+                Ok(id) => restored.push(id),
+                Err(error) => {
+                    tracing::warn!(%task_id, %error, "a saved subagent could not be restored")
+                }
+            }
+        }
+        if let Err(error) = tokio::fs::remove_dir_all(&tasks_dir).await {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(%error, "cannot remove the restored subagent files");
+            }
+        }
+        restored
     }
 
     /// Enters the planned-restart `draining` lifecycle: every new turn
@@ -2493,6 +2580,231 @@ impl ServeHost {
             suspended_tasks: suspended,
         })
         .map_err(|e| RpcError::internal(e.to_string()))
+    }
+
+    /// Applies a validated (and already consumed) restart file: schedules,
+    /// settings and subagents now; its messages are re-published once the
+    /// `initialize` response is out. The `[restart]` history entry is added
+    /// by `initialize` itself, together with the transcript.
+    async fn apply_restart_file(
+        &self,
+        file: crate::restart::RestartFile,
+        mode: coda_proto::messages::RestoreMode,
+    ) -> coda_proto::messages::RestoredSummary {
+        use coda_agent::scheduling::{ScheduleKind, ScheduleRecurrence, ScheduledTask};
+        use coda_agent::subagents::SubagentCheckpoint;
+        use coda_proto::messages::{RestoreMode, RestoredSummary};
+
+        let now = Utc::now();
+        let mut summary = RestoredSummary {
+            applied: true,
+            prepared_at: Some(file.prepared_at.to_rfc3339()),
+            reason: file.reason.clone(),
+            from_version: Some(file.coda_version.clone()),
+            to_version: Some(coda_boot::version().to_owned()),
+            interrupted_tasks: file.interrupted.tasks.len(),
+            interrupted_requests: file.interrupted.requests.len(),
+            steering: file.steering.len(),
+            tasks_suspended: mode == RestoreMode::Suspended,
+            ..RestoredSummary::default()
+        };
+
+        for value in &file.schedules {
+            let mut task = match serde_json::from_value::<ScheduledTask>(value.clone()) {
+                Ok(task) => task,
+                Err(error) => {
+                    tracing::warn!(%error, "a saved schedule could not be read");
+                    continue;
+                }
+            };
+            // A recurring slot missed while the engine was down moves to the
+            // first one after now: no burst, no catch-up run. A one-shot
+            // `at` stays due and fires once.
+            if task.kind != ScheduleKind::At && !task.is_retired() && task.next_run_utc <= now {
+                match ScheduleRecurrence::advance_recurring_past(&task, now) {
+                    Ok(next) => task.next_run_utc = next,
+                    Err(error) => tracing::warn!(%error, "a saved schedule could not be advanced"),
+                }
+            }
+            if self.schedule_store.restore(task) {
+                summary.schedules += 1;
+            }
+        }
+
+        self.apply_restart_settings(&file.settings, &mut summary).await;
+
+        let messages: Vec<crate::restart::SavedMessage> = file
+            .messages
+            .into_iter()
+            .filter(|m| matches!(m.channel.as_str(), "user" | "main") && m.message_source().is_some())
+            .collect();
+        summary.messages = messages.len();
+        *self.restored_messages.lock().expect("restored messages poisoned") = messages;
+
+        let store = SessionTranscriptStore::new(&self.working_dir);
+        let tasks_dir = store.tasks_dir(&file.session_id);
+        let mut checkpoints = Vec::new();
+        for id in &file.tasks {
+            let canonical = id
+                .strip_prefix("task-")
+                .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()));
+            let checkpoint = if canonical {
+                SubagentCheckpoint::read(&tasks_dir.join(format!("{id}.json")))
+                    .and_then(|cp| if cp.task_id == *id { Ok(cp) } else { Err("id mismatch".into()) })
+            } else {
+                Err("not a task id".into())
+            };
+            match checkpoint {
+                Ok(cp) => checkpoints.push(cp),
+                Err(error) => {
+                    tracing::warn!(task_id = %id, %error, "a saved subagent is unreadable");
+                    summary.interrupted_tasks += 1;
+                }
+            }
+        }
+        summary.tasks = checkpoints.iter().map(|cp| cp.task_id.clone()).collect();
+        let pending = PendingSubagentRestore {
+            checkpoints,
+            keep_suspended: mode == RestoreMode::Suspended,
+            tasks_dir,
+        };
+
+        // Services (subagent host, schedule runtime) are built now when a
+        // client is wired, so the restored schedules run and the subagents
+        // continue without waiting for a prompt; otherwise the subagents wait
+        // for the first time the services are built.
+        if self.wire_client_from_env_if_missing().await.is_err() {
+            tracing::warn!("no provider could be wired for the restore");
+        }
+        let client = self.client.lock().await.clone();
+        *self.pending_restore.lock().expect("pending restore poisoned") = Some(pending);
+        if let Some(client) = client {
+            let svc = self.get_or_init_services(client).await;
+            // The services already existed: restore directly.
+            let left = self.pending_restore.lock().expect("pending restore poisoned").take();
+            if let Some(left) = left {
+                summary.tasks = self.restore_subagents(&svc, left).await;
+            }
+        }
+        summary
+    }
+
+    /// Re-applies the saved settings through the same paths as their
+    /// setters; what is refused or deliberately skipped is reported.
+    async fn apply_restart_settings(
+        &self,
+        settings: &crate::restart::SavedSettings,
+        summary: &mut coda_proto::messages::RestoredSummary,
+    ) {
+        use coda_proto::messages::SettingNotRestored;
+        let mut skip = |name: &str, value: Option<&str>, reason: String| {
+            summary.settings_not_restored.push(SettingNotRestored {
+                name: name.to_owned(),
+                value: value.map(str::to_owned),
+                reason,
+            });
+        };
+        let note = |r: &Value| r["note"].as_str().unwrap_or("refused").to_owned();
+        let mut applied = Vec::new();
+
+        let wired = self.runtime.lock().expect("runtime config poisoned").provider_id.clone();
+        let other_provider = match (&settings.provider, &wired) {
+            (Some(saved), Some(wired)) if !saved.eq_ignore_ascii_case(wired) => Some(wired.clone()),
+            _ => None,
+        };
+        if let Some(wired) = &other_provider {
+            skip(
+                "provider",
+                settings.provider.as_deref(),
+                format!("this engine runs provider {wired}; the provider is not switched on restore"),
+            );
+        }
+
+        if let Some(model) = &settings.model {
+            if other_provider.is_some() {
+                skip("model", Some(model), "it was chosen for another provider".into());
+            } else {
+                match self.session_set_model(SetModelParams { model: model.clone() }).await {
+                    Ok(r) if r["ok"] == true => applied.push("model"),
+                    Ok(r) => skip("model", Some(model), note(&r)),
+                    Err(e) => skip("model", Some(model), e.message),
+                }
+            }
+        }
+        if let Some(effort) = &settings.effort {
+            if other_provider.is_some() {
+                skip("effort", Some(effort), "it was chosen for another provider".into());
+            } else {
+                let params = SetEffortParams { effort: Some(effort.clone()), ..Default::default() };
+                match self.session_set_effort(params).await {
+                    Ok(r) if r["ok"] == true => applied.push("effort"),
+                    Ok(r) => skip("effort", Some(effort), note(&r)),
+                    Err(e) => skip("effort", Some(effort), e.message),
+                }
+            }
+        }
+        if let Some(goal) = &settings.goal {
+            let params = SetGoalParams {
+                goal: Some(goal.goal.clone()),
+                max_duration: goal.max_duration.clone(),
+                max_continuations: goal.max_continuations,
+            };
+            match self.session_set_goal(params).await {
+                Ok(_) => applied.push("goal"),
+                Err(e) => skip("goal", Some(&goal.goal), e.message),
+            }
+        }
+        if let Some(text) = &settings.system_prompt {
+            let params = SetSystemPromptParams { text: Some(text.clone()) };
+            match self.session_set_system_prompt(params).await {
+                Ok(_) => applied.push("systemPrompt"),
+                Err(e) => skip("systemPrompt", None, e.message),
+            }
+        }
+        if let Some(mode) = &settings.permission_mode {
+            if parse_permission_mode(mode) == Some(PermissionMode::BypassPermissions) {
+                skip(
+                    "permissionMode",
+                    Some("bypassPermissions"),
+                    "bypassPermissions is never restored automatically; the mode is back to default"
+                        .into(),
+                );
+            } else {
+                let params = SetPermissionModeParams { mode: mode.clone() };
+                match self.session_set_permission_mode(params).await {
+                    Ok(r) if r["ok"] == true => applied.push("permissionMode"),
+                    Ok(_) => skip("permissionMode", Some(mode), "not a known permission mode".into()),
+                    Err(e) => skip("permissionMode", Some(mode), e.message),
+                }
+            }
+        }
+        summary.settings = applied.into_iter().map(str::to_owned).collect();
+    }
+
+    /// Re-publishes the messages a restore saved, after the `initialize`
+    /// response that reported them: notifications as new `event/agentMessage`
+    /// entries, main-inbox items re-queued (which wakes the idle pump). The
+    /// transport calls this once the response is written.
+    pub(crate) fn after_initialize_response(&self) {
+        let messages =
+            std::mem::take(&mut *self.restored_messages.lock().expect("restored messages poisoned"));
+        for m in messages {
+            let Some(source) = m.message_source() else { continue };
+            let outcome = if m.channel == "main" {
+                self.message_bus
+                    .publish_main(&source, m.text, m.context, m.idempotency_key)
+                    .map(|_| ())
+                    .map_err(|e| format!("{e:?}"))
+            } else {
+                self.message_bus
+                    .publish_user(&source, m.text, m.context, m.idempotency_key)
+                    .map(|_| ())
+                    .map_err(|e| format!("{e:?}"))
+            };
+            if let Err(error) = outcome {
+                tracing::warn!(%error, "a restored message could not be re-published");
+            }
+        }
     }
 
     /// Construct all session-scoped services that require a live client.
@@ -3219,6 +3531,47 @@ impl Drop for TurnGuard<'_> {
 #[async_trait]
 impl ServeBackend for ServeHost {
     async fn initialize(&self, p: InitParams) -> Result<Value, RpcError> {
+        use crate::restart::RestartFileCheck;
+        use coda_proto::messages::{RestoreMode, RestoredSummary};
+
+        let session_id = p.session_id.clone().or_else(|| self.startup_session_id.clone());
+        let restore_mode = p.restore.or(self.startup_restore).unwrap_or(RestoreMode::Off);
+        // The restart file is read and validated before the slot is claimed:
+        // a file this engine cannot understand refuses the handshake with no
+        // side effects, so the client can retry without `restore`.
+        let mut restart = None;
+        if restore_mode != RestoreMode::Off {
+            let Some(id) = session_id.as_deref() else {
+                return Err(RpcError::invalid_params("restore requires a sessionId"));
+            };
+            if !session_id_is_valid(id) {
+                return Err(RpcError::session_not_found());
+            }
+            let path = SessionTranscriptStore::new(&self.working_dir).restart_file_path(id);
+            let check = match tokio::fs::read(&path).await {
+                Ok(bytes) => crate::restart::check(Some(&bytes), id, &self.working_dir, Utc::now()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    RestartFileCheck::Ignored("missing")
+                }
+                Err(_) => RestartFileCheck::Ignored("unreadable"),
+            };
+            if let RestartFileCheck::Unsupported(version) = check {
+                return Err(RpcError {
+                    code: coda_proto::messages::error_code::RESTART_FILE_UNSUPPORTED,
+                    message: format!(
+                        "restart file format {version} is newer than this Coda supports ({})",
+                        crate::restart::RESTART_FILE_VERSION
+                    ),
+                });
+            }
+            restart = Some((path, check));
+        }
+        let ignored = |reason: &str| RestoredSummary {
+            applied: false,
+            ignored_reason: Some(reason.to_owned()),
+            ..RestoredSummary::default()
+        };
+
         let initialization = self.try_claim_initialization()?;
         // Negotiate before resume publishes its sessionChanged event, but only
         // after claiming the slot: a refused handshake must have no side effects.
@@ -3227,41 +3580,79 @@ impl ServeBackend for ServeHost {
         }
 
         let mut resumed = false;
+        let mut restored_summary: Option<RestoredSummary> = None;
+        let mut restart_to_apply = None;
         // If the client supplied a session_id, attempt to resume it.
         // Security: session_id comes from an untrusted wire message — validate it
         // before using it as a file-system key.
-        if let Some(ref req_id) = p.session_id {
+        if let Some(ref req_id) = session_id {
             if !session_id_is_valid(req_id) {
                 // Invalid id format — treat as not found.
                 return Err(RpcError::session_not_found());
             }
             let store = SessionTranscriptStore::new(&self.working_dir);
-            match store.load_session(req_id).await {
-                Some(stored) => {
-                    let messages = stored.messages;
-                    // Adopt the resumed id so future saves go to the right file.
-                    *self.current_session_id.lock().expect("session_id poisoned") =
-                        req_id.clone();
-                    resumed = true;
-                    // F2: resume changes the whole conversation view; announce it.
-                    // F3 (review): seeding the committed history and announcing
-                    // the new epoch/fence are one critical section under
-                    // HISTORY (order HISTORY -> STATE -> BUS, no `.await`
-                    // inside), so no concurrent read can be handed the resumed
-                    // conversation under the pre-resume `historyEpoch`.
-                    let mut committed =
-                        self.session.history.lock().expect("history poisoned");
-                    *committed = messages;
-                    let restored = committed.len() as i64;
-                    // The saved accounting, before anything can display the
-                    // resumed session's totals. A transcript saved before
-                    // accounting existed resumes with partial totals.
-                    self.engine_state.usage_restored(stored.usage, restored > 0);
-                    self.engine_state.session_changed("resume", req_id.clone(), restored);
+            let stored = store.load_session(req_id).await;
+            let valid_restart = matches!(restart, Some((_, RestartFileCheck::Valid(_))));
+            // A valid restart file stands in for a missing transcript: the
+            // session restarts empty under its id.
+            let (mut messages, usage) = match stored {
+                Some(stored) => (stored.messages, stored.usage),
+                None if valid_restart => (Vec::new(), None),
+                // Session not found in the working directory.
+                None => return Err(RpcError::session_not_found()),
+            };
+            match restart.take() {
+                Some((path, RestartFileCheck::Valid(file))) => {
+                    // Consumed before anything is applied, so a restore can
+                    // never happen twice.
+                    match tokio::fs::remove_file(&path).await {
+                        Ok(()) => {
+                            coda_agent::agent::tools::recover_interrupted_history(&mut messages);
+                            messages.push(Message::user(crate::restart::restart_note(
+                                &file,
+                                coda_boot::version(),
+                            )));
+                            restart_to_apply = Some(file);
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "cannot consume the restart file");
+                            restored_summary = Some(ignored("consumeFailed"));
+                        }
+                    }
                 }
-                None => {
-                    // Session not found in the working directory.
-                    return Err(RpcError::session_not_found());
+                Some((_, RestartFileCheck::Ignored(reason))) => {
+                    restored_summary = Some(ignored(reason));
+                }
+                _ => {}
+            }
+            // Adopt the resumed id so future saves go to the right file.
+            *self.current_session_id.lock().expect("session_id poisoned") = req_id.clone();
+            resumed = true;
+            // F2: resume changes the whole conversation view; announce it.
+            // F3 (review): seeding the committed history and announcing
+            // the new epoch/fence are one critical section under
+            // HISTORY (order HISTORY -> STATE -> BUS, no `.await`
+            // inside), so no concurrent read can be handed the resumed
+            // conversation under the pre-resume `historyEpoch`.
+            let persisted = {
+                let mut committed = self.session.history.lock().expect("history poisoned");
+                *committed = messages;
+                let restored = committed.len() as i64;
+                // The saved accounting, before anything can display the
+                // resumed session's totals. A transcript saved before
+                // accounting existed resumes with partial totals.
+                self.engine_state.usage_restored(usage, restored > 0);
+                self.engine_state.session_changed("resume", req_id.clone(), restored);
+                restart_to_apply.is_some().then(|| committed.clone())
+            };
+            // The `[restart]` entry is persisted at once, so it survives
+            // even if the engine stops before the next turn.
+            if let Some(history) = persisted {
+                let usage = self.engine_state.stored_usage();
+                if let Err(error) =
+                    store.save_with_usage(req_id, &history, None, Some(&usage)).await
+                {
+                    tracing::warn!(%error, "cannot persist the restored conversation");
                 }
             }
         }
@@ -3322,6 +3713,9 @@ impl ServeBackend for ServeHost {
             }
         }
         self.apply_pending_startup_effort().await?;
+        if let Some(file) = restart_to_apply {
+            restored_summary = Some(self.apply_restart_file(file, restore_mode).await);
+        }
         // Capability negotiation already happened at the top of this method
         // (§2.1, S4): absent `clientCapabilities` means legacy behaviour — no
         // gated `event/*` method is ever written to the connection.
@@ -3352,7 +3746,7 @@ impl ServeBackend for ServeHost {
             engine_instance_id: self.engine_state.bus_ref().engine_instance_id().to_string(),
             event_cursor: self.engine_state.bus_ref().cursor(),
             capabilities: capability_catalog(),
-            restored: None,
+            restored: restored_summary,
         };
 
         // Surface any MCP connection/config failures now that a client is
@@ -17353,6 +17747,680 @@ mod tests {
             );
             let late = host.task_manager.find_task(&late_id).unwrap();
             assert_eq!(late.stop_note().as_deref(), Some("planned restart"));
+        }
+    }
+
+    mod planned_restore {
+        use super::*;
+        use crate::dispatch::dispatch;
+        use crate::restart::RestartFile;
+        use coda_agent::tasks::{TaskKind, TaskRunStatus};
+        use coda_llm::anthropic::StreamEvent;
+        use coda_llm::{Content, Correlation, Usage};
+        use serde_json::json;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        #[cfg(windows)]
+        const LONG: &str = "ping -n 30 127.0.0.1";
+        #[cfg(not(windows))]
+        const LONG: &str = "sleep 30";
+        const OUTER: &str = "OUTER-AGENT: start the inner agent and wait for it";
+        const INNER: &str = "INNER-AGENT: run the command";
+
+        /// What a model request looked like, as the scripts see it.
+        struct Request {
+            /// `main`, `outer` or `inner`, from the conversation's first message.
+            role: &'static str,
+            last_text: String,
+            tool_results: Vec<String>,
+            /// Everything sent, for substring checks.
+            dump: String,
+        }
+
+        impl Request {
+            fn of(request: &coda_llm::ChatRequest) -> Self {
+                let first = request.messages.first().map(|m| m.text()).unwrap_or_default();
+                let role = if first.contains(OUTER) {
+                    "outer"
+                } else if first.contains(INNER) {
+                    "inner"
+                } else {
+                    "main"
+                };
+                let tool_results = request
+                    .messages
+                    .iter()
+                    .flat_map(|m| m.content.iter())
+                    .filter_map(|c| match c {
+                        Content::ToolResult { content, .. } => Some(content.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                Self {
+                    role,
+                    last_text: request.messages.last().map(|m| m.text()).unwrap_or_default(),
+                    tool_results,
+                    dump: format!("{:?} {:?}", request.system, request.messages),
+                }
+            }
+        }
+
+        enum Reply {
+            Now(Vec<StreamEvent>),
+            /// Held until the client's gate is notified.
+            Gated(Vec<StreamEvent>),
+        }
+
+        /// Answers by looking at each request (so concurrent subagents get
+        /// the right reply whatever the order) and records every request.
+        struct RecordingClient {
+            respond: Box<dyn Fn(&Request) -> Reply + Send + Sync>,
+            requests: Mutex<Vec<Request>>,
+            gate: tokio::sync::Notify,
+        }
+
+        impl RecordingClient {
+            fn new(respond: impl Fn(&Request) -> Reply + Send + Sync + 'static) -> Arc<Self> {
+                Arc::new(Self {
+                    respond: Box::new(respond),
+                    requests: Mutex::new(Vec::new()),
+                    gate: tokio::sync::Notify::new(),
+                })
+            }
+
+            fn dumps(&self, role: &str) -> Vec<String> {
+                let requests = self.requests.lock().unwrap();
+                requests.iter().filter(|r| r.role == role).map(|r| r.dump.clone()).collect()
+            }
+        }
+
+        #[async_trait]
+        impl LlmClient for RecordingClient {
+            fn provider_id(&self) -> &str {
+                "recording"
+            }
+            async fn stream(
+                &self,
+                request: coda_llm::ChatRequest,
+            ) -> Result<coda_llm::ResponseStream, coda_llm::LlmError> {
+                let seen = Request::of(&request);
+                let reply = (self.respond)(&seen);
+                self.requests.lock().unwrap().push(seen);
+                let events = match reply {
+                    Reply::Now(events) => events,
+                    Reply::Gated(events) => {
+                        self.gate.notified().await;
+                        events
+                    }
+                };
+                let (tx, rx) = tokio::sync::mpsc::channel(64);
+                tokio::spawn(async move {
+                    for event in events {
+                        let _ = tx.send(Ok(event)).await;
+                    }
+                });
+                Ok(coda_llm::ResponseStream::new(rx))
+            }
+        }
+
+        fn tool_use(name: &str, input: Value) -> Vec<StreamEvent> {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let n = NEXT.fetch_add(1, Ordering::SeqCst);
+            vec![
+                StreamEvent::ToolUse(Content::ToolUse {
+                    id: format!("call-{name}-{n}"),
+                    name: name.into(),
+                    input_json: input.to_string(),
+                    correlation: Correlation::default(),
+                }),
+                StreamEvent::Done { stop_reason: Some("tool_use".into()), usage: Usage::ZERO },
+            ]
+        }
+
+        fn answer(text: &str) -> Vec<StreamEvent> {
+            vec![
+                StreamEvent::TextDelta(text.into()),
+                StreamEvent::Done { stop_reason: Some("end_turn".into()), usage: Usage::ZERO },
+            ]
+        }
+
+        /// Main starts the outer agent; the outer agent starts the inner one
+        /// and waits for it (ending its turn, i.e. parking, while the inner
+        /// one is suspended); the inner one runs `inner_command` once.
+        fn team(inner_command: &'static str, gate_inner: bool) -> impl Fn(&Request) -> Reply {
+            move |r: &Request| {
+                let last_result = r.tool_results.last().map(String::as_str).unwrap_or("");
+                match r.role {
+                    "outer" if r.dump.contains("inner done") => Reply::Now(answer("outer done")),
+                    "outer" if last_result.contains("Started subagent task") => {
+                        let at = last_result.find("task-").expect("a task id");
+                        let id = &last_result[at..at + 13];
+                        Reply::Now(tool_use("task_wait", json!({ "taskId": id, "timeoutSeconds": 120 })))
+                    }
+                    "outer" if r.tool_results.is_empty() => {
+                        Reply::Now(tool_use("task", json!({ "prompt": INNER })))
+                    }
+                    "outer" => Reply::Now(answer("waiting for the inner agent")),
+                    "inner" if r.tool_results.is_empty() => {
+                        let call = tool_use("run_command", json!({ "command": inner_command }));
+                        if gate_inner { Reply::Gated(call) } else { Reply::Now(call) }
+                    }
+                    "inner" => Reply::Now(answer("inner done")),
+                    _ if r.tool_results.is_empty() && r.last_text.contains("start the team") => {
+                        Reply::Now(tool_use("task", json!({ "prompt": OUTER })))
+                    }
+                    _ => Reply::Now(answer("DONE")),
+                }
+            }
+        }
+
+        fn new_host(
+            client: Arc<dyn LlmClient>,
+            dir: &std::path::Path,
+            startup: StartupOptions,
+        ) -> (Arc<ServeHost>, mpsc::UnboundedReceiver<Vec<u8>>) {
+            let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            let sink = Arc::new(ServeSink::new(tx.clone()));
+            let ch = Arc::new(PromptChannel::new(tx));
+            let host = ServeHost::new_with_optional_client_and_mcp(
+                Some(client),
+                sink,
+                ch,
+                dir.display().to_string(),
+                crate::mcp::McpBundle::disabled(),
+                startup,
+                None,
+                None,
+            );
+            (host, rx)
+        }
+
+        /// `initialize` as the transport runs it: the response, then the
+        /// restored messages.
+        async fn initialize(host: &ServeHost, params: Value) -> Result<Value, RpcError> {
+            let result = dispatch("initialize", Some(params), host).await;
+            host.after_initialize_response();
+            result
+        }
+
+        async fn wait_for(label: &str, mut cond: impl FnMut() -> bool) {
+            for _ in 0..2000 {
+                if cond() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("timed out waiting for: {label}");
+        }
+
+        fn restart_path(dir: &std::path::Path, session_id: &str) -> PathBuf {
+            SessionTranscriptStore::new(dir).restart_file_path(session_id)
+        }
+
+        fn minimal_file(
+            dir: &std::path::Path,
+            session_id: &str,
+            prepared_at: chrono::DateTime<Utc>,
+        ) -> RestartFile {
+            RestartFile {
+                version: crate::restart::RESTART_FILE_VERSION,
+                coda_version: "0.0.1".into(),
+                session_id: session_id.into(),
+                working_dir: dir.display().to_string(),
+                prepared_at,
+                reason: None,
+                schedules: Vec::new(),
+                messages: Vec::new(),
+                settings: Default::default(),
+                steering: Vec::new(),
+                interrupted: Default::default(),
+                tasks: Vec::new(),
+            }
+        }
+
+        /// A session with a transcript and the given restart file on disk.
+        async fn session_with_file(dir: &std::path::Path, bytes: &[u8]) -> String {
+            let session_id = Uuid::new_v4().to_string();
+            SessionTranscriptStore::new(dir)
+                .save(&session_id, &[Message::user("hello")], None)
+                .await
+                .unwrap();
+            std::fs::write(restart_path(dir, &session_id), bytes).unwrap();
+            session_id
+        }
+
+        fn idle_client() -> Arc<dyn LlmClient> {
+            RecordingClient::new(|_| Reply::Now(answer("DONE")))
+        }
+
+        #[tokio::test]
+        async fn restart_round_trip_restores_schedules_messages_settings_and_reports_interruption() {
+            let dir = tempfile::tempdir().unwrap();
+
+            // ── Engine A: build up state, then prepare the restart ──────────
+            let client_a = RecordingClient::new(|r| {
+                if r.tool_results.is_empty() && r.last_text.contains("run it") {
+                    Reply::Now(tool_use("run_command", json!({ "command": LONG })))
+                } else {
+                    Reply::Now(answer("DONE"))
+                }
+            });
+            let (a, _rx_a) = new_host(client_a, dir.path(), StartupOptions::default());
+            a.initialize(InitParams::default()).await.unwrap();
+            for schedule in [
+                json!({ "prompt": "check the build", "every": "1h" }),
+                json!({ "prompt": "tidy up", "cron": "*/30 * * * *" }),
+            ] {
+                dispatch("session/scheduleCreate", Some(schedule), a.as_ref()).await.unwrap();
+            }
+            let call = |method: &'static str, params: Value| {
+                let a = Arc::clone(&a);
+                async move { dispatch(method, Some(params), a.as_ref()).await.unwrap() }
+            };
+            call("session/setGoal", json!({ "goal": "ship it", "maxContinuations": 3 })).await;
+            let r = call("session/setModel", json!({ "model": "claude-restart-test" })).await;
+            assert_eq!(r["ok"], true, "{r}");
+            call("session/setPermissionMode", json!({ "mode": "bypassPermissions" })).await;
+            let source = coda_agent::MessageSource::Subagent {
+                task_id: "task-00000042".into(),
+                label: "reviewer".into(),
+            };
+            a.message_bus
+                .publish_user(&source, "review finished", Some("diff".into()), Some("k-1".into()))
+                .unwrap();
+
+            let prompt = {
+                let a = Arc::clone(&a);
+                tokio::spawn(async move {
+                    dispatch("session/prompt", Some(json!({ "text": "run it" })), a.as_ref()).await
+                })
+            };
+            wait_for("the command to start", || {
+                a.task_manager.list().iter().any(|t| t.kind == TaskKind::Shell)
+            })
+            .await;
+            let steer = a.session_steer(SteerParams { text: "also check X".into() }).await.unwrap();
+            assert_eq!(steer["ok"], true, "{steer}");
+            let r = dispatch("session/prepareRestart", Some(json!({ "drainTimeoutMs": 300 })), a.as_ref())
+                .await
+                .unwrap();
+            assert_eq!((r["drained"].as_bool(), r["interruptedTasks"].as_u64()), (Some(false), Some(1)));
+            let _ = tokio::time::timeout(Duration::from_secs(10), prompt).await;
+            dispatch("shutdown", None, a.as_ref()).await.unwrap();
+            let session_id = a.active_session_id();
+            drop(a);
+
+            // A long restart window: both schedules' slots passed meanwhile.
+            let path = restart_path(dir.path(), &session_id);
+            let mut file: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let past = (Utc::now() - chrono::Duration::hours(3)).to_rfc3339();
+            let mut saved = Vec::new();
+            for schedule in file["schedules"].as_array_mut().unwrap() {
+                schedule["nextRunUtc"] = json!(past);
+                saved.push((schedule["id"].clone(), schedule["runsStarted"].clone()));
+            }
+            assert_eq!(saved.len(), 2);
+            std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+
+            // ── Engine B: restore ─────────────────────────────────────────────
+            let client_b = RecordingClient::new(|_| Reply::Now(answer("DONE")));
+            let (b, mut rx_b) =
+                new_host(Arc::clone(&client_b) as Arc<dyn LlmClient>, dir.path(), StartupOptions::default());
+            let result = dispatch(
+                "initialize",
+                Some(json!({ "sessionId": session_id, "restore": true })),
+                b.as_ref(),
+            )
+            .await
+            .unwrap();
+            let restored = &result["restored"];
+            assert_eq!(restored["applied"], true, "{restored}");
+            assert_eq!(restored["schedules"], 2, "{restored}");
+            assert_eq!(restored["messages"], 1, "{restored}");
+            assert_eq!(restored["interruptedTasks"], 1, "{restored}");
+            assert_eq!(restored["steering"], 1, "{restored}");
+            assert_eq!(restored["toVersion"], coda_boot::version());
+            let settings: Vec<&str> =
+                restored["settings"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+            assert!(settings.contains(&"model") && settings.contains(&"goal"), "{restored}");
+            let not_restored = &restored["settingsNotRestored"];
+            assert_eq!(not_restored[0]["name"], "permissionMode", "{restored}");
+            assert_eq!(not_restored[0]["value"], "bypassPermissions");
+            assert!(!path.exists(), "the restart file is consumed");
+
+            let events = drain_events(&mut rx_b);
+            assert!(
+                !events.iter().any(|(m, _)| m == "event/agentMessage"),
+                "messages follow the initialize response"
+            );
+            b.after_initialize_response();
+            let events = drain_events(&mut rx_b);
+            let message = events
+                .iter()
+                .find(|(m, _)| m == "event/agentMessage")
+                .unwrap_or_else(|| panic!("the notification is re-delivered: {events:?}"));
+            assert_eq!(message.1["text"], "review finished");
+            assert_eq!(message.1["context"], "diff");
+            let pending = dispatch("session/pendingMessages", None, b.as_ref()).await.unwrap();
+            assert_eq!(pending["messages"][0]["cursor"], message.1["cursor"], "a cursor of this engine");
+
+            let now = Utc::now();
+            let list = dispatch("session/scheduleList", None, b.as_ref()).await.unwrap();
+            let schedules = list["schedules"].as_array().unwrap();
+            assert_eq!(schedules.len(), 2, "{list}");
+            for (id, runs_started) in &saved {
+                let s = schedules.iter().find(|s| &s["id"] == id).unwrap_or_else(|| panic!("{id} kept"));
+                assert_eq!(&s["runsStarted"], runs_started);
+                let next: chrono::DateTime<Utc> = s["nextRunUtc"].as_str().unwrap().parse().unwrap();
+                assert!(next > now, "the missed slot moved past now: {s}");
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert!(
+                !b.task_manager.list().iter().any(|t| t.kind == TaskKind::Scheduled),
+                "no catch-up run"
+            );
+
+            let state = dispatch("session/getState", None, b.as_ref()).await.unwrap();
+            assert_eq!(state["config"]["next"]["model"], "claude-restart-test");
+            assert_eq!(state["config"]["next"]["permissionMode"], "default");
+            let goal = b.goal_params.lock().unwrap().clone();
+            assert_eq!((goal.goal.as_deref(), goal.max_continuations), (Some("ship it"), Some(3)));
+
+            dispatch("session/prompt", Some(json!({ "text": "continue" })), b.as_ref()).await.unwrap();
+            let first = client_b
+                .dumps("main")
+                .into_iter()
+                .find(|d| d.contains("continue"))
+                .expect("the prompt reached the model");
+            assert!(first.contains("[restart]"), "{first}");
+            assert!(first.contains(LONG), "{first}");
+            assert!(first.contains("also check X"), "{first}");
+
+            // ── Engine C: a restore happens once ─────────────────────────────
+            let (c, _rx_c) = new_host(idle_client(), dir.path(), StartupOptions::default());
+            let result =
+                initialize(&c, json!({ "sessionId": session_id, "restore": true })).await.unwrap();
+            assert_eq!(result["restored"], json!({
+                "applied": false,
+                "ignoredReason": "missing",
+                "schedules": 0,
+                "messages": 0,
+                "settings": [],
+                "settingsNotRestored": [],
+                "interruptedTasks": 0,
+                "interruptedRequests": 0,
+                "steering": 0,
+                "tasks": [],
+                "tasksSuspended": false,
+            }));
+        }
+
+        #[tokio::test]
+        async fn restore_ignores_file_older_than_24h() {
+            let dir = tempfile::tempdir().unwrap();
+            let file = minimal_file(dir.path(), "placeholder", Utc::now() - chrono::Duration::hours(25));
+            let session_id = session_with_file(dir.path(), b"").await;
+            let file = RestartFile { session_id: session_id.clone(), ..file };
+            std::fs::write(restart_path(dir.path(), &session_id), serde_json::to_vec(&file).unwrap())
+                .unwrap();
+
+            let (host, _rx) = new_host(idle_client(), dir.path(), StartupOptions::default());
+            let r = initialize(&host, json!({ "sessionId": session_id, "restore": true })).await.unwrap();
+            assert_eq!(r["restored"]["applied"], false);
+            assert_eq!(r["restored"]["ignoredReason"], "expired");
+            assert!(restart_path(dir.path(), &session_id).exists(), "an ignored file is left on disk");
+        }
+
+        #[tokio::test]
+        async fn restore_ignores_file_for_another_session() {
+            let dir = tempfile::tempdir().unwrap();
+            let file = minimal_file(dir.path(), "someone-else", Utc::now());
+            let session_id = session_with_file(dir.path(), &serde_json::to_vec(&file).unwrap()).await;
+
+            let (host, _rx) = new_host(idle_client(), dir.path(), StartupOptions::default());
+            let r = initialize(&host, json!({ "sessionId": session_id, "restore": true })).await.unwrap();
+            assert_eq!(r["restored"]["applied"], false);
+            assert_eq!(r["restored"]["ignoredReason"], "sessionMismatch");
+            assert_eq!(r["sessionId"], session_id.as_str(), "the transcript still resumes");
+            assert!(restart_path(dir.path(), &session_id).exists(), "an ignored file is left on disk");
+            let history = host.session.history.lock().unwrap().clone();
+            assert_eq!(history.len(), 1, "no [restart] entry for an ignored file");
+        }
+
+        #[tokio::test]
+        async fn restore_refuses_newer_format_and_allows_retry() {
+            let dir = tempfile::tempdir().unwrap();
+            let session_id = session_with_file(dir.path(), br#"{"version":2}"#).await;
+            let (host, _rx) = new_host(idle_client(), dir.path(), StartupOptions::default());
+
+            let err = initialize(&host, json!({ "restore": true })).await.unwrap_err();
+            assert_eq!(err.code, -32602, "restore needs a sessionId");
+            let err = initialize(&host, json!({ "sessionId": session_id, "restore": true }))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, coda_proto::messages::error_code::RESTART_FILE_UNSUPPORTED);
+            assert_eq!(err.message, "restart file format 2 is newer than this Coda supports (1)");
+            assert!(!host.engine_state.is_initialized(), "initialization was not claimed");
+
+            let r = initialize(&host, json!({ "sessionId": session_id })).await.unwrap();
+            assert_eq!(r["sessionId"], session_id.as_str());
+            assert!(r.get("restored").is_none(), "{r}");
+            assert!(restart_path(dir.path(), &session_id).exists());
+        }
+
+        #[tokio::test]
+        async fn restore_without_transcript_starts_the_session_empty() {
+            let dir = tempfile::tempdir().unwrap();
+            let session_id = Uuid::new_v4().to_string();
+            let path = restart_path(dir.path(), &session_id);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let file = minimal_file(dir.path(), &session_id, Utc::now());
+            std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+
+            // Defaults from `coda serve --restore --session <id>`.
+            let startup = StartupOptions {
+                restore: Some(coda_proto::messages::RestoreMode::Resume),
+                session_id: Some(session_id.clone()),
+                ..StartupOptions::default()
+            };
+            let (host, _rx) = new_host(idle_client(), dir.path(), startup);
+            let r = initialize(&host, json!({})).await.unwrap();
+            assert_eq!(r["sessionId"], session_id.as_str());
+            assert_eq!(r["restored"]["applied"], true, "{r}");
+            let history = host.session.history.lock().unwrap().clone();
+            assert_eq!(history.len(), 1);
+            assert!(history[0].text().starts_with("[restart]"), "{:?}", history[0]);
+            let stored = SessionTranscriptStore::new(dir.path()).load(&session_id).await.unwrap();
+            assert_eq!(stored.len(), 1, "the [restart] entry is persisted");
+        }
+
+        /// Engine A runs the team until the inner agent is in a long command,
+        /// then prepares a restart. Returns `(session id, outer id, inner id)`.
+        async fn prepare_team(dir: &std::path::Path) -> (String, String, String) {
+            let client = RecordingClient::new(team(LONG, false));
+            let (a, _rx) = new_host(Arc::clone(&client) as Arc<dyn LlmClient>, dir, StartupOptions::default());
+            a.initialize(InitParams::default()).await.unwrap();
+            a.permission_mode.set(PermissionMode::BypassPermissions);
+            *a.restart_settle_override.lock().unwrap() = Some(Duration::from_secs(10));
+
+            dispatch("session/prompt", Some(json!({ "text": "start the team" })), a.as_ref())
+                .await
+                .unwrap();
+            wait_for("the inner command to start", || {
+                a.task_manager.list().iter().any(|t| t.kind == TaskKind::Shell)
+            })
+            .await;
+            wait_for("the outer agent to wait", || {
+                client.dumps("outer").len() >= 2
+            })
+            .await;
+            let subagents = |a: &ServeHost| {
+                let mut ids: Vec<(u32, String)> = a
+                    .task_manager
+                    .list()
+                    .into_iter()
+                    .filter(|t| t.kind == TaskKind::Subagent)
+                    .map(|t| (a.task_manager.find_task(&t.id).unwrap().depth, t.id))
+                    .collect();
+                ids.sort();
+                ids
+            };
+            let ids = subagents(&a);
+            assert_eq!(ids.len(), 2, "{ids:?}");
+            let (outer, inner) = (ids[0].1.clone(), ids[1].1.clone());
+
+            let r = dispatch("session/prepareRestart", Some(json!({ "drainTimeoutMs": 300 })), a.as_ref())
+                .await
+                .unwrap();
+            let mut suspended: Vec<String> =
+                serde_json::from_value(r["suspendedTasks"].clone()).unwrap();
+            suspended.sort();
+            assert_eq!(suspended, vec![outer.clone(), inner.clone()], "{r}");
+            for id in [&outer, &inner] {
+                assert_eq!(a.task_manager.get(id).unwrap().status, TaskRunStatus::Suspended);
+            }
+            let session_id = a.active_session_id();
+            let tasks_dir = SessionTranscriptStore::new(dir).tasks_dir(&session_id);
+            let inner_cp = coda_agent::subagents::SubagentCheckpoint::read(
+                &tasks_dir.join(format!("{inner}.json")),
+            )
+            .unwrap();
+            let interrupted = inner_cp
+                .messages()
+                .iter()
+                .flat_map(|m| m.content.clone())
+                .any(|c| matches!(c, Content::ToolResult { content, .. }
+                    if content.contains("Interrupted by a planned restart")));
+            assert!(interrupted, "the inner command's result says it was interrupted");
+            assert!(tasks_dir.join(format!("{outer}.json")).exists());
+            dispatch("shutdown", None, a.as_ref()).await.unwrap();
+            (session_id, outer, inner)
+        }
+
+        #[tokio::test]
+        async fn subagents_suspend_on_prepare_and_continue_after_restore() {
+            let dir = tempfile::tempdir().unwrap();
+            let (session_id, outer, inner) = prepare_team(dir.path()).await;
+
+            let client = RecordingClient::new(team(LONG, false));
+            let (b, mut rx) =
+                new_host(Arc::clone(&client) as Arc<dyn LlmClient>, dir.path(), StartupOptions::default());
+            let r = initialize(&b, json!({ "sessionId": session_id, "restore": true })).await.unwrap();
+            let mut tasks: Vec<String> =
+                serde_json::from_value(r["restored"]["tasks"].clone()).unwrap();
+            tasks.sort();
+            assert_eq!(tasks, vec![outer.clone(), inner.clone()], "{r}");
+            assert_eq!(r["restored"]["tasksSuspended"], false);
+
+            let status = |id: &str| b.task_manager.get(id).map(|t| t.status);
+            wait_for("both subagents to finish", || {
+                status(&outer) == Some(TaskRunStatus::Completed)
+                    && status(&inner) == Some(TaskRunStatus::Completed)
+            })
+            .await;
+            let events = drain_events(&mut rx);
+            for id in [&outer, &inner] {
+                assert!(
+                    events.iter().any(|(m, p)| m == "event/taskStarted"
+                        && p["taskId"] == id.as_str()
+                        && p["resumed"] == true),
+                    "{id} started as resumed: {events:?}"
+                );
+            }
+            let inner_next = client.dumps("inner").into_iter().next().expect("the inner agent continued");
+            assert!(inner_next.contains(INNER) && inner_next.contains(LONG), "{inner_next}");
+            assert!(inner_next.contains("Interrupted by a planned restart"), "{inner_next}");
+            let outer_next = client.dumps("outer").into_iter().next().expect("the outer agent continued");
+            assert!(outer_next.contains(OUTER) && outer_next.contains("is suspended"), "{outer_next}");
+            assert!(
+                !SessionTranscriptStore::new(dir.path()).tasks_dir(&session_id).exists(),
+                "the subagent files are removed once restored"
+            );
+        }
+
+        #[tokio::test]
+        async fn restore_suspended_mode_keeps_subagents_paused_until_task_resume() {
+            let dir = tempfile::tempdir().unwrap();
+            let (session_id, outer, inner) = prepare_team(dir.path()).await;
+
+            let client = RecordingClient::new(team(LONG, false));
+            let (b, _rx) =
+                new_host(Arc::clone(&client) as Arc<dyn LlmClient>, dir.path(), StartupOptions::default());
+            let r = initialize(&b, json!({ "sessionId": session_id, "restore": "suspended" }))
+                .await
+                .unwrap();
+            assert_eq!(r["restored"]["tasksSuspended"], true);
+
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let listing = dispatch(
+                "session/listTasks",
+                Some(json!({ "statusFilter": "suspended" })),
+                b.as_ref(),
+            )
+            .await
+            .unwrap();
+            let mut listed: Vec<String> = listing["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["id"].as_str().unwrap().to_owned())
+                .collect();
+            listed.sort();
+            assert_eq!(listed, vec![outer.clone(), inner.clone()], "{listing}");
+            assert!(client.dumps("outer").is_empty() && client.dumps("inner").is_empty());
+
+            for id in [&outer, &inner] {
+                let r = dispatch("task/resume", Some(json!({ "taskId": id })), b.as_ref()).await.unwrap();
+                assert_eq!(r["ok"], true, "{r}");
+            }
+            let status = |id: &str| b.task_manager.get(id).map(|t| t.status);
+            wait_for("both subagents to finish", || {
+                status(&outer) == Some(TaskRunStatus::Completed)
+                    && status(&inner) == Some(TaskRunStatus::Completed)
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn parent_task_wait_sees_suspended_child_then_gets_report() {
+            const QUICK: &str = "echo hi";
+            let dir = tempfile::tempdir().unwrap();
+            let client = RecordingClient::new(team(QUICK, true));
+            let (host, _rx) =
+                new_host(Arc::clone(&client) as Arc<dyn LlmClient>, dir.path(), StartupOptions::default());
+            host.initialize(InitParams::default()).await.unwrap();
+            host.permission_mode.set(PermissionMode::BypassPermissions);
+
+            dispatch("session/prompt", Some(json!({ "text": "start the team" })), host.as_ref())
+                .await
+                .unwrap();
+            wait_for("the inner agent's first request", || client.dumps("inner").len() == 1).await;
+            let inner = host
+                .task_manager
+                .list()
+                .into_iter()
+                .filter(|t| t.kind == TaskKind::Subagent)
+                .find(|t| host.task_manager.find_task(&t.id).unwrap().depth == 2)
+                .expect("the inner agent runs")
+                .id;
+            let r = dispatch("task/suspend", Some(json!({ "taskId": inner })), host.as_ref()).await.unwrap();
+            assert_eq!(r["ok"], true, "{r}");
+            client.gate.notify_one();
+            let status = |id: &str| host.task_manager.get(id).map(|t| t.status);
+            wait_for("the inner agent to pause", || status(&inner) == Some(TaskRunStatus::Suspended)).await;
+            wait_for("the outer agent to see it", || {
+                client.dumps("outer").iter().any(|d| d.contains("is suspended"))
+            })
+            .await;
+
+            let r = dispatch("task/resume", Some(json!({ "taskId": inner })), host.as_ref()).await.unwrap();
+            assert_eq!(r["ok"], true, "{r}");
+            wait_for("the outer agent to get the report", || {
+                client.dumps("outer").iter().any(|d| d.contains("inner done"))
+            })
+            .await;
+            assert_eq!(status(&inner), Some(TaskRunStatus::Completed));
         }
     }
 }
