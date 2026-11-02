@@ -649,6 +649,8 @@ impl SubagentHost {
                     permit = semaphore.acquire_owned() => permit.ok(),
                     _ = run_cancel.cancelled() => {
                         mgr.stop(&task_id);
+                        // run_inner never ran, so its descendant cleanup must happen here.
+                        mgr.stop_descendants(&task_id);
                         return;
                     }
                 },
@@ -665,7 +667,9 @@ impl SubagentHost {
 
     /// Re-creates a subagent from a planned-restart checkpoint under its old
     /// task id and continues its run in the background, where it left off.
-    /// Its owner (if any) must already be restored. With `keep_suspended`
+    /// Its owner (if any) must already be restored, and a parked owner's children
+    /// must be registered before it runs: restore several related tasks with
+    /// [`Self::restore_all`]. With `keep_suspended`
     /// (or when the checkpoint was explicitly suspended) it stays suspended
     /// until resumed. Returns the task id.
     pub async fn restore(
@@ -3333,8 +3337,9 @@ mod tests {
             let host = restored_host(&client, &mgr);
             let sink = Arc::new(CollectingSink::new());
 
-            let parent = host.restore(parent_cp.clone(), false, sink.clone()).await.unwrap();
-            let child = host.restore(child_cp.clone(), false, sink).await.unwrap();
+            let restored = host.restore_all(vec![child_cp.clone(), parent_cp.clone()], false, sink).await;
+            let parent = restored[0].1.clone().unwrap();
+            let child = restored[1].1.clone().unwrap();
             assert_eq!(parent, parent_cp.task_id);
             assert_eq!(child, child_cp.task_id);
             assert_eq!(mgr.get(&child).unwrap().parent_id.as_deref(), Some(parent.as_str()));
@@ -3400,8 +3405,9 @@ mod tests {
             let client = after_restart_client();
             let host = restored_host(&client, &mgr);
             let sink = Arc::new(CollectingSink::new());
-            let parent = host.restore(parent_cp, false, sink.clone()).await.unwrap();
-            let child = host.restore(child_cp, false, sink).await.unwrap();
+            let restored = host.restore_all(vec![child_cp, parent_cp], false, sink).await;
+            let parent = restored[0].1.clone().unwrap();
+            let child = restored[1].1.clone().unwrap();
 
             wait_until("the child to suspend", || status(&mgr, &child) == TaskRunStatus::Suspended)
                 .await;
