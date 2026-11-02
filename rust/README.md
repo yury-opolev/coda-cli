@@ -205,8 +205,22 @@ another message.
 
 **Rendering is separated from layout.** `coda-render` produces `RenderLine`
 values — text plus colour roles in *cell* coordinates — and `draw` maps those
-onto ratatui spans. Width is measured per grapheme cluster and clamped to
-`[1, 2]`, because summing per-character widths mismeasures ZWJ emoji.
+onto ratatui spans. Width is measured per grapheme cluster with exactly the
+widths ratatui draws with (summing per-character widths mismeasures ZWJ emoji,
+and counting a zero-width grapheme such as a soft hyphen as a cell shifts
+everything after it).
+
+Terminals disagree with ratatui about some emoji, and ratatui never repaints a
+cell it believes unchanged, so a disagreement leaves glyphs on screen that
+survive scrolling. Two defences cover it: `draw` sends ZWJ, skin-tone and tag
+emoji sequences as their first emoji padded to the same cells
+(`text::terminal_stable`), so code-point-measuring terminals cannot overrun
+into the next cells or the scrollbar; and the terminal backend is wrapped in
+`render::backend::StableBackend`, which blanks a wide glyph's hidden cell
+*before* printing it, so a terminal that draws the glyph one cell wide shows a
+blank there instead of whatever an earlier frame left. `text::sanitize` also
+removes complete OSC/DCS/APC strings (e.g. OSC 8 hyperlinks), charset escapes
+and C1 controls from tool and model output, not just their introducers.
 
 Markdown tables use a connected single-line grid with centered headers by
 default and left-aligned body cells. Explicit Markdown column alignment takes

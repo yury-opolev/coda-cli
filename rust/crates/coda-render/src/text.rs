@@ -12,15 +12,20 @@ pub const TAB_WIDTH: usize = 4;
 
 /// Display width of a string in terminal cells.
 ///
-/// Measured per grapheme cluster and clamped to `[1, 2]`, matching how the
-/// terminal driver advances the cursor. Summing per-character widths would be
-/// wrong: a ZWJ emoji sequence such as `👨‍👩‍👧` is several wide characters but
-/// occupies only two cells.
+/// Measured per grapheme cluster, exactly as ratatui measures what it draws.
+/// Summing per-character widths would be wrong: a ZWJ emoji sequence such as
+/// `👨‍👩‍👧` is several wide characters but occupies only two cells.
 pub fn width(text: &str) -> usize {
     text.graphemes(true).map(grapheme_width).sum()
 }
 
-/// Display width of a single grapheme cluster, clamped to `[1, 2]`.
+/// Display width of a single grapheme cluster.
+///
+/// This must agree with ratatui, which places every cell from these same
+/// widths: a zero-width grapheme (soft hyphen, zero-width space, BOM, a lone
+/// combining mark) is appended to the previous cell, so counting it as a cell
+/// would leave everything after it drawn one column left of where the layout
+/// put it.
 pub fn grapheme_width(grapheme: &str) -> usize {
     // Fast path: printable ASCII is always one cell.
     let mut chars = grapheme.chars();
@@ -29,11 +34,48 @@ pub fn grapheme_width(grapheme: &str) -> usize {
             return 1;
         }
     }
-    if grapheme.width() > 1 {
-        2
-    } else {
-        1
+    grapheme.width()
+}
+
+/// Whether `c` makes an emoji sequence's width depend on the terminal.
+fn joins_emoji(c: char) -> bool {
+    c == '\u{200D}' || ('\u{1F3FB}'..='\u{1F3FF}').contains(&c) || ('\u{E0020}'..='\u{E007F}').contains(&c)
+}
+
+/// A form of `grapheme` every terminal draws in [`grapheme_width`] cells.
+///
+/// ZWJ sequences (`👨‍👩‍👧`), skin-tone modifiers (`👍🏽`) and tag sequences
+/// (subdivision flags) are two cells to ratatui, but terminals that measure by
+/// code point — legacy conhost, Windows Terminal outside grapheme mode — print
+/// every component, overrunning the cells after them. ratatui never repaints
+/// what it believes is unchanged, so the overrun stays on screen while the
+/// content scrolls, and can spill into the scrollbar column. Such a cluster is
+/// drawn as its first emoji instead, padded to the cells the layout gave it.
+/// Anything else is returned unchanged.
+pub fn terminal_stable(grapheme: &str) -> std::borrow::Cow<'_, str> {
+    // Only emoji clusters: a ZWJ also joins Indic conjuncts (`क्‍ष`), which
+    // are letters and must be drawn whole.
+    let emoji_base = grapheme
+        .chars()
+        .next()
+        .is_some_and(|c| c >= '\u{A9}' && !c.is_alphanumeric());
+    if !emoji_base || !grapheme.chars().any(joins_emoji) {
+        return std::borrow::Cow::Borrowed(grapheme);
     }
+    let cells = grapheme_width(grapheme);
+    let mut stable: String = grapheme
+        .split('\u{200D}')
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .filter(|&c| !joins_emoji(c))
+        .collect();
+    if width(&stable) > cells {
+        stable.clear();
+    }
+    let padding = cells - width(&stable);
+    stable.extend(std::iter::repeat_n(' ', padding));
+    std::borrow::Cow::Owned(stable)
 }
 
 /// Expands tabs to spaces so that widths are stable and wrapping is predictable.
@@ -210,18 +252,19 @@ pub fn sanitize(text: &str) -> String {
 
     while let Some(c) = chars.next() {
         match c {
-            '\u{1b}' => {
-                // Drop an ANSI escape sequence up to its final byte.
-                if chars.peek() == Some(&'[') {
-                    chars.next();
-                    for next in chars.by_ref() {
-                        if ('\u{40}'..='\u{7E}').contains(&next) {
-                            break;
-                        }
-                    }
-                } else {
+            '\u{1b}' => match chars.next() {
+                Some('[') => skip_control_sequence(&mut chars),
+                Some(']' | 'P' | 'X' | '^' | '_') => skip_control_string(&mut chars, &mut out),
+                // nF escapes such as `ESC ( B`: intermediates, then one final.
+                Some('\u{20}'..='\u{2F}') => {
+                    while chars.next_if(|c| ('\u{20}'..='\u{2F}').contains(c)).is_some() {}
                     chars.next();
                 }
+                _ => {}
+            },
+            '\u{9b}' => skip_control_sequence(&mut chars),
+            '\u{90}' | '\u{98}' | '\u{9d}' | '\u{9e}' | '\u{9f}' => {
+                skip_control_string(&mut chars, &mut out)
             }
             '\t' => out.push_str(&" ".repeat(TAB_WIDTH)),
             '\r' => {}
@@ -232,6 +275,38 @@ pub fn sanitize(text: &str) -> String {
     }
 
     out
+}
+
+/// Skips a CSI sequence's parameters and intermediates up to its final byte.
+fn skip_control_sequence(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    for next in chars.by_ref() {
+        if ('\u{40}'..='\u{7E}').contains(&next) {
+            break;
+        }
+    }
+}
+
+/// Skips an OSC/DCS/SOS/PM/APC payload up to its terminator.
+///
+/// Dropping only the introducer would print the payload — an OSC 8 hyperlink
+/// would leave `8;;https://…` in the transcript. An unterminated string stops
+/// at the end of the line so one malformed sequence cannot swallow the rest of
+/// the output.
+fn skip_control_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, out: &mut String) {
+    while let Some(next) = chars.next() {
+        match next {
+            '\u{7}' | '\u{9c}' => return,
+            '\u{1b}' => {
+                chars.next_if_eq(&'\\');
+                return;
+            }
+            '\n' => {
+                out.push('\n');
+                return;
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Wraps text and prefixes continuation lines with a hanging indent.
@@ -283,6 +358,45 @@ mod tests {
     fn measures_combining_marks_as_a_single_cell() {
         // "e" followed by a combining acute accent.
         assert_eq!(width("e\u{0301}"), 1);
+    }
+
+    #[test]
+    fn zero_width_graphemes_measure_what_ratatui_draws() {
+        // ratatui appends a zero-width grapheme to the previous cell, so
+        // counting it as a cell shifts everything after it — a table's right
+        // border lands one column short of its neighbours.
+        for text in ["\u{200B}", "\u{AD}", "\u{FEFF}", "\u{200E}", "\u{0301}", "a\u{AD}b"] {
+            assert_eq!(
+                width(text),
+                ratatui::text::Line::raw(text).width(),
+                "{}",
+                text.escape_unicode()
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_stable_leaves_zwj_in_indic_conjuncts_alone() {
+        for conjunct in ["\u{915}\u{94D}\u{200D}\u{937}", "\u{930}\u{94D}\u{200D}\u{92F}"] {
+            for grapheme in conjunct.graphemes(true) {
+                assert_eq!(terminal_stable(grapheme), grapheme);
+            }
+        }
+    }
+
+    #[test]
+    fn sanitize_strips_osc_hyperlinks_without_leaving_their_payload() {
+        assert_eq!(
+            sanitize("\u{1b}]8;;https://example.com\u{7}link\u{1b}]8;;\u{1b}\\ done"),
+            "link done"
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_charset_and_c1_sequences() {
+        assert_eq!(sanitize("\u{1b}(Bplain"), "plain");
+        assert_eq!(sanitize("\u{9b}31mred\u{9b}0m"), "red");
+        assert_eq!(sanitize("\u{1b}Ptmux;payload\u{1b}\\after"), "after");
     }
 
     #[test]

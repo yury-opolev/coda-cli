@@ -153,11 +153,18 @@ pub fn slice_by_cells(text: &str, start: usize, end: usize) -> String {
     let mut out = String::new();
     let mut cell = 0usize;
     for grapheme in text.graphemes(true) {
-        let w = text::grapheme_width(grapheme).max(1);
-        if cell >= end {
+        let w = text::grapheme_width(grapheme);
+        if w > 0 && cell >= end {
             break;
         }
-        if cell + w > start {
+        // ratatui draws a zero-width grapheme into the cell before it.
+        let inside = if w == 0 {
+            let owner = cell.saturating_sub(1);
+            owner >= start && owner < end
+        } else {
+            cell + w > start
+        };
+        if inside {
             out.push_str(grapheme);
         }
         cell += w;
@@ -193,7 +200,7 @@ fn skip_gutter_prefix(s: &str, gutter_cells: usize) -> &str {
         if cell >= gutter_cells {
             return &s[byte_idx..];
         }
-        cell += text::grapheme_width(grapheme).max(1);
+        cell += text::grapheme_width(grapheme);
     }
     ""
 }
@@ -289,6 +296,14 @@ mod tests {
         let rows = vec![row0, row1];
         let text = copy_visible_text(&rows, 0..2);
         assert_eq!(text, "hello\nworld");
+    }
+
+    #[test]
+    fn slice_by_cells_keeps_zero_width_graphemes_with_the_cell_before_them() {
+        // ratatui draws `b` in cell 1: the zero-width space joins cell 0.
+        assert_eq!(slice_by_cells("a\u{200B}bc", 1, 2), "b");
+        assert_eq!(slice_by_cells("a\u{200B}bc", 0, 1), "a\u{200B}");
+        assert_eq!(slice_by_cells("a\u{200B}bc", 2, 3), "c");
     }
 
     #[test]

@@ -213,7 +213,7 @@ pub fn to_line(row: &RenderLine, theme: &Theme, width: usize) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
 
     if row.spans.is_empty() && row.prefix_role.is_none() {
-        spans.push(Span::styled(row.text.clone(), base));
+        spans.push(Span::styled(stable_text(&row.text), base));
     } else {
         spans.extend(styled_runs(row, theme, base));
     }
@@ -262,25 +262,33 @@ fn styled_runs(row: &RenderLine, theme: &Theme, base: Style) -> Vec<Span<'static
         let role = row.role_at(cell);
         let style = style_for(role, row, theme, base);
 
+        let grapheme = text::terminal_stable(grapheme);
         match current_style {
-            Some(previous) if previous == style => current.push_str(grapheme),
+            Some(previous) if previous == style => current.push_str(&grapheme),
             Some(previous) => {
                 spans.push(Span::styled(std::mem::take(&mut current), previous));
-                current.push_str(grapheme);
+                current.push_str(&grapheme);
                 current_style = Some(style);
             }
             None => {
-                current.push_str(grapheme);
+                current.push_str(&grapheme);
                 current_style = Some(style);
             }
         }
-        cell += text::grapheme_width(grapheme);
+        cell += text::width(&grapheme);
     }
 
     if let Some(style) = current_style {
         spans.push(Span::styled(current, style));
     }
     spans
+}
+
+/// `text` with every grapheme in its [`text::terminal_stable`] form.
+fn stable_text(text: &str) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+
+    text.graphemes(true).map(text::terminal_stable).collect()
 }
 
 fn style_for(role: Role, row: &RenderLine, theme: &Theme, base: Style) -> Style {
@@ -719,7 +727,7 @@ fn draw_transcript_with_pin(
     // Draw the pin row.
     if let (Some(pin_area), Some(text)) = (pin_area, pin_text) {
         let style = theme.style(Role::User);
-        let line = Line::from(Span::styled(text.to_string(), style));
+        let line = Line::from(Span::styled(stable_text(text), style));
         frame.render_widget(Paragraph::new(vec![line]), pin_area);
     }
 
@@ -1195,6 +1203,32 @@ mod tests {
             .into_iter()
             .map(|span| span.content.into_owned())
             .collect()
+    }
+
+    #[test]
+    fn emoji_sequences_terminals_measure_differently_are_drawn_in_a_stable_form() {
+        // Joined, skin-toned and tag-sequence emoji are two cells to ratatui
+        // but wider in terminals that measure them by code point, so they
+        // spilled over their neighbours and into the scrollbar, where the diff
+        // never repainted them. Each must reach the terminal as a plain emoji
+        // padded to the cells the layout gave it.
+        let text = "a\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}b\u{1F44D}\u{1F3FD}c\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}d";
+        let plain = RenderLine::new(text, Role::Assistant);
+        let styled = RenderLine::new(text, Role::Assistant)
+            .with_spans(vec![RenderSpan::new(1, 3, Role::Heading)]);
+        for row in [plain, styled] {
+            let line = to_line(&row, &Theme::default(), 80);
+            let drawn: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(
+                !drawn.chars().any(|c| c == '\u{200D}'
+                    || ('\u{1F3FB}'..='\u{1F3FF}').contains(&c)
+                    || ('\u{E0020}'..='\u{E007F}').contains(&c)),
+                "unstable sequence reached the terminal: {}",
+                drawn.escape_unicode()
+            );
+            assert_eq!(line.width(), coda_render::text::width(text), "{drawn}");
+            assert_eq!(drawn.find('b'), Some("a\u{1F468}".len()), "{drawn}");
+        }
     }
 
     #[test]

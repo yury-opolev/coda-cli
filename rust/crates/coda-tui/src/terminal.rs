@@ -19,11 +19,13 @@ use crossterm::{cursor, execute};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
+use crate::render::backend::StableBackend;
+
 /// Tracks whether the terminal is currently in raw/alternate mode, so the panic
 /// hook restores it exactly once and never on a terminal we never touched.
 static TERMINAL_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-pub type Tui = Terminal<CrosstermBackend<Stdout>>;
+pub type Tui = Terminal<StableBackend<CrosstermBackend<Stdout>>>;
 
 /// Poll on the owning async task, without EventStream's detached reader thread.
 /// Cancellation therefore leaves no reader competing with the returned shell.
@@ -70,7 +72,7 @@ impl TerminalGuard {
                 execute!(stdout, EnableMouseCapture)?;
             }
 
-            let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+            let mut terminal = Terminal::new(StableBackend::new(CrosstermBackend::new(io::stdout())))?;
             terminal.clear()?;
 
             Ok(Self {
