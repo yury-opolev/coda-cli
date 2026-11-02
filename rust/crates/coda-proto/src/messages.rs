@@ -395,7 +395,9 @@ pub struct RestoredSummary {
     /// Steering messages that were queued but undelivered at the restart.
     #[serde(default)]
     pub steering: usize,
-    /// Ids of the subagents re-created under their original ids.
+    /// Ids of the subagents re-created under their original ids. Saved
+    /// subagents that wait for a provider (none is wired yet) are re-created
+    /// when the session services are first built, and are not listed here.
     #[serde(default)]
     pub tasks: Vec<String>,
     /// Whether restored subagents were kept suspended (`restore: "suspended"`).

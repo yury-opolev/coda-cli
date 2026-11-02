@@ -2258,9 +2258,18 @@ impl ServeHost {
         &self,
         client: Arc<dyn LlmClient>,
     ) -> Arc<SessionServices> {
+        self.services_restoring(client).await.0
+    }
+
+    /// [`Self::get_or_init_services`], also returning the ids of the saved
+    /// subagents re-created if this call built the services.
+    async fn services_restoring(
+        &self,
+        client: Arc<dyn LlmClient>,
+    ) -> (Arc<SessionServices>, Option<Vec<String>>) {
         let mut guard = self.session_services.lock().await;
         if let Some(ref svc) = *guard {
-            return Arc::clone(svc);
+            return (Arc::clone(svc), None);
         }
         let svc = Arc::new(self.build_session_services(client));
         // Built while draining (lazily, by work admitted before the drain):
@@ -2273,14 +2282,16 @@ impl ServeHost {
         // Restored under the services lock, so nothing can register a task
         // (whose new id would refuse the saved ones) before they are back.
         let pending = self.pending_restore.lock().expect("pending restore poisoned").take();
-        if let Some(pending) = pending {
-            self.restore_subagents(&svc, pending).await;
-        }
-        svc
+        let restored = match pending {
+            Some(pending) => Some(self.restore_subagents(&svc, pending).await),
+            None => None,
+        };
+        (svc, restored)
     }
 
     /// Re-creates saved subagents under their old ids (all registered before
-    /// any runs), then removes their files. Returns the ids re-created.
+    /// any runs), then removes the files of those re-created. Returns their
+    /// ids.
     async fn restore_subagents(
         &self,
         svc: &SessionServices,
@@ -2300,11 +2311,16 @@ impl ServeHost {
                 }
             }
         }
-        if let Err(error) = tokio::fs::remove_dir_all(&tasks_dir).await {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(%error, "cannot remove the restored subagent files");
+        // File by file: one that was not re-created stays on disk.
+        for id in &restored {
+            if let Err(error) = tokio::fs::remove_file(tasks_dir.join(format!("{id}.json"))).await {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(task_id = %id, %error, "cannot remove a restored subagent's file");
+                }
             }
         }
+        // Only succeeds once the directory is empty.
+        let _ = tokio::fs::remove_dir(&tasks_dir).await;
         restored
     }
 
@@ -2524,6 +2540,10 @@ impl ServeHost {
         let session_id = self.active_session_id();
         let store = SessionTranscriptStore::new(self.working_dir.clone());
         let tasks_dir = store.tasks_dir(&session_id);
+        // Held until the restart file is written: a first build of the
+        // services re-creates any subagents a restore left pending under this
+        // lock, so each is seen either as a task below or as still pending.
+        let services = self.session_services.lock().await;
         let mut suspended = Vec::new();
         for task in tasks.list() {
             if task.kind != TaskKind::Subagent || task.status != TaskRunStatus::Suspended {
@@ -2538,6 +2558,24 @@ impl ServeHost {
                 RpcError::internal(format!("cannot save subagent {}: {e}", task.id))
             })?;
             suspended.push(task.id);
+        }
+        // Restored subagents still waiting for the services (no provider was
+        // wired) are carried over to the next restore as they were saved.
+        let deferred: Vec<SubagentCheckpoint> = self
+            .pending_restore
+            .lock()
+            .expect("pending restore poisoned")
+            .as_ref()
+            .map(|pending| pending.checkpoints.clone())
+            .unwrap_or_default();
+        for checkpoint in deferred {
+            if suspended.contains(&checkpoint.task_id) {
+                continue;
+            }
+            checkpoint.write(&tasks_dir).await.map_err(|e| {
+                RpcError::internal(format!("cannot save subagent {}: {e}", checkpoint.task_id))
+            })?;
+            suspended.push(checkpoint.task_id);
         }
 
         let file = RestartFile {
@@ -2568,6 +2606,10 @@ impl ServeHost {
         coda_agent::session::private_file::write_private_atomic(&path, &bytes)
             .await
             .map_err(|e| RpcError::internal(format!("cannot write the restart file: {e}")))?;
+        // They belong to the restart file now: a later build of this
+        // engine's services must not re-create them (and remove their files).
+        *self.pending_restore.lock().expect("pending restore poisoned") = None;
+        drop(services);
         let path = std::path::absolute(&path).unwrap_or(path);
         self.engine_state.drain_completed();
 
@@ -2662,7 +2704,6 @@ impl ServeHost {
                 }
             }
         }
-        summary.tasks = checkpoints.iter().map(|cp| cp.task_id.clone()).collect();
         let pending = PendingSubagentRestore {
             checkpoints,
             keep_suspended: mode == RestoreMode::Suspended,
@@ -2672,19 +2713,30 @@ impl ServeHost {
         // Services (subagent host, schedule runtime) are built now when a
         // client is wired, so the restored schedules run and the subagents
         // continue without waiting for a prompt; otherwise the subagents wait
-        // for the first time the services are built.
+        // for the first time the services are built. `tasks` lists only the
+        // subagents actually re-created; deferred ones keep their files (and
+        // a `session/prepareRestart` before then carries them over).
         if self.wire_client_from_env_if_missing().await.is_err() {
             tracing::warn!("no provider could be wired for the restore");
         }
         let client = self.client.lock().await.clone();
+        let deferred = pending.checkpoints.len();
         *self.pending_restore.lock().expect("pending restore poisoned") = Some(pending);
         if let Some(client) = client {
-            let svc = self.get_or_init_services(client).await;
-            // The services already existed: restore directly.
-            let left = self.pending_restore.lock().expect("pending restore poisoned").take();
-            if let Some(left) = left {
-                summary.tasks = self.restore_subagents(&svc, left).await;
-            }
+            let (svc, restored) = self.services_restoring(client).await;
+            summary.tasks = match restored {
+                Some(restored) => restored,
+                // The services already existed: restore directly.
+                None => {
+                    let left = self.pending_restore.lock().expect("pending restore poisoned").take();
+                    match left {
+                        Some(left) => self.restore_subagents(&svc, left).await,
+                        None => Vec::new(),
+                    }
+                }
+            };
+        } else if deferred > 0 {
+            tracing::info!(deferred, "saved subagents wait until a provider is wired");
         }
         summary
     }
@@ -3582,6 +3634,11 @@ impl ServeBackend for ServeHost {
         let mut resumed = false;
         let mut restored_summary: Option<RestoredSummary> = None;
         let mut restart_to_apply = None;
+        // The session is loaded (read only) before anything fallible runs,
+        // and adopted after: a handshake refused below leaves the engine,
+        // the transcript and the restart file as they were, so a retry can
+        // still restore.
+        let mut loaded = None;
         // If the client supplied a session_id, attempt to resume it.
         // Security: session_id comes from an untrusted wire message — validate it
         // before using it as a file-system key.
@@ -3595,7 +3652,7 @@ impl ServeBackend for ServeHost {
             let valid_restart = matches!(restart, Some((_, RestartFileCheck::Valid(_))));
             // A valid restart file stands in for a missing transcript: the
             // session restarts empty under its id.
-            let (mut messages, usage) = match stored {
+            let (messages, usage) = match stored {
                 Some(stored) => (stored.messages, stored.usage),
                 None if valid_restart => (Vec::new(), None),
                 // Session not found in the working directory.
@@ -3603,67 +3660,14 @@ impl ServeBackend for ServeHost {
             };
             match restart.take() {
                 Some((path, RestartFileCheck::Valid(file))) => {
-                    // Consumed before anything is applied, so a restore can
-                    // never happen twice.
-                    match tokio::fs::remove_file(&path).await {
-                        Ok(()) => {
-                            coda_agent::agent::tools::recover_interrupted_history(&mut messages);
-                            messages.push(Message::user(crate::restart::restart_note(
-                                &file,
-                                coda_boot::version(),
-                            )));
-                            restart_to_apply = Some(file);
-                        }
-                        Err(error) => {
-                            tracing::warn!(%error, "cannot consume the restart file");
-                            restored_summary = Some(ignored("consumeFailed"));
-                        }
-                    }
+                    restart_to_apply = Some((path, file));
                 }
                 Some((_, RestartFileCheck::Ignored(reason))) => {
                     restored_summary = Some(ignored(reason));
                 }
                 _ => {}
             }
-            // Adopt the resumed id so future saves go to the right file.
-            *self.current_session_id.lock().expect("session_id poisoned") = req_id.clone();
-            resumed = true;
-            // F2: resume changes the whole conversation view; announce it.
-            // F3 (review): seeding the committed history and announcing
-            // the new epoch/fence are one critical section under
-            // HISTORY (order HISTORY -> STATE -> BUS, no `.await`
-            // inside), so no concurrent read can be handed the resumed
-            // conversation under the pre-resume `historyEpoch`.
-            let persisted = {
-                let mut committed = self.session.history.lock().expect("history poisoned");
-                *committed = messages;
-                let restored = committed.len() as i64;
-                // The saved accounting, before anything can display the
-                // resumed session's totals. A transcript saved before
-                // accounting existed resumes with partial totals.
-                self.engine_state.usage_restored(usage, restored > 0);
-                self.engine_state.session_changed("resume", req_id.clone(), restored);
-                restart_to_apply.is_some().then(|| committed.clone())
-            };
-            // The `[restart]` entry is persisted at once, so it survives
-            // even if the engine stops before the next turn.
-            if let Some(history) = persisted {
-                let usage = self.engine_state.stored_usage();
-                if let Err(error) =
-                    store.save_with_usage(req_id, &history, None, Some(&usage)).await
-                {
-                    tracing::warn!(%error, "cannot persist the restored conversation");
-                }
-            }
-        }
-
-        if let Some(ctx) = &self.diagnostics {
-            let session_ctx = ctx.with_session(self.active_session_id());
-            session_ctx.record(if resumed {
-                coda_diagnostics::Event::SessionResumed
-            } else {
-                coda_diagnostics::Event::SessionInitialized
-            });
+            loaded = Some((req_id.clone(), store, messages, usage));
         }
 
         // Wire an explicitly provided API key; otherwise leave client as-is
@@ -3713,7 +3717,71 @@ impl ServeBackend for ServeHost {
             }
         }
         self.apply_pending_startup_effort().await?;
-        if let Some(file) = restart_to_apply {
+
+        // Nothing below refuses the handshake (short of a racing shutdown),
+        // so the restore commits here.
+        let mut restart_file = None;
+        if let Some((req_id, store, mut messages, usage)) = loaded {
+            if let Some((path, file)) = restart_to_apply {
+                // Consumed before anything is applied, so a restore can
+                // never happen twice.
+                match tokio::fs::remove_file(&path).await {
+                    Ok(()) => {
+                        coda_agent::agent::tools::recover_interrupted_history(&mut messages);
+                        messages.push(Message::user(crate::restart::restart_note(
+                            &file,
+                            coda_boot::version(),
+                        )));
+                        restart_file = Some(file);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "cannot consume the restart file");
+                        restored_summary = Some(ignored("consumeFailed"));
+                    }
+                }
+            }
+            // Adopt the resumed id so future saves go to the right file.
+            *self.current_session_id.lock().expect("session_id poisoned") = req_id.clone();
+            resumed = true;
+            // F2: resume changes the whole conversation view; announce it.
+            // F3 (review): seeding the committed history and announcing
+            // the new epoch/fence are one critical section under
+            // HISTORY (order HISTORY -> STATE -> BUS, no `.await`
+            // inside), so no concurrent read can be handed the resumed
+            // conversation under the pre-resume `historyEpoch`.
+            let persisted = {
+                let mut committed = self.session.history.lock().expect("history poisoned");
+                *committed = messages;
+                let restored = committed.len() as i64;
+                // The saved accounting, before anything can display the
+                // resumed session's totals. A transcript saved before
+                // accounting existed resumes with partial totals.
+                self.engine_state.usage_restored(usage, restored > 0);
+                self.engine_state.session_changed("resume", req_id.clone(), restored);
+                restart_file.is_some().then(|| committed.clone())
+            };
+            // The `[restart]` entry is persisted at once, so it survives
+            // even if the engine stops before the next turn.
+            if let Some(history) = persisted {
+                let usage = self.engine_state.stored_usage();
+                if let Err(error) =
+                    store.save_with_usage(&req_id, &history, None, Some(&usage)).await
+                {
+                    tracing::warn!(%error, "cannot persist the restored conversation");
+                }
+            }
+        }
+
+        if let Some(ctx) = &self.diagnostics {
+            let session_ctx = ctx.with_session(self.active_session_id());
+            session_ctx.record(if resumed {
+                coda_diagnostics::Event::SessionResumed
+            } else {
+                coda_diagnostics::Event::SessionInitialized
+            });
+        }
+
+        if let Some(file) = restart_file {
             restored_summary = Some(self.apply_restart_file(file, restore_mode).await);
         }
         // Capability negotiation already happened at the top of this method
@@ -17920,11 +17988,19 @@ mod tests {
             dir: &std::path::Path,
             startup: StartupOptions,
         ) -> (Arc<ServeHost>, mpsc::UnboundedReceiver<Vec<u8>>) {
+            new_host_with(Some(client), dir, startup)
+        }
+
+        fn new_host_with(
+            client: Option<Arc<dyn LlmClient>>,
+            dir: &std::path::Path,
+            startup: StartupOptions,
+        ) -> (Arc<ServeHost>, mpsc::UnboundedReceiver<Vec<u8>>) {
             let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
             let sink = Arc::new(ServeSink::new(tx.clone()));
             let ch = Arc::new(PromptChannel::new(tx));
             let host = ServeHost::new_with_optional_client_and_mcp(
-                Some(client),
+                client,
                 sink,
                 ch,
                 dir.display().to_string(),
@@ -18235,6 +18311,44 @@ mod tests {
             assert_eq!(stored.len(), 1, "the [restart] entry is persisted");
         }
 
+        #[tokio::test]
+        async fn restore_failing_initialize_keeps_the_file_for_a_retry() {
+            let dir = tempfile::tempdir().unwrap();
+            let session_id = session_with_file(dir.path(), b"").await;
+            let file = minimal_file(dir.path(), &session_id, Utc::now());
+            std::fs::write(restart_path(dir.path(), &session_id), serde_json::to_vec(&file).unwrap())
+                .unwrap();
+            // An effort the model cannot take fails initialize late, after
+            // the transcript and the restart file were read.
+            let startup = StartupOptions {
+                model: Some("claude-haiku-4.5".into()),
+                effort: StartupEffort::Level(Effort::High),
+                ..StartupOptions::default()
+            };
+            let (host, _rx) = new_host(idle_client(), dir.path(), startup);
+            let restarts = |history: &[Message]| {
+                history.iter().filter(|m| m.text().starts_with("[restart]")).count()
+            };
+
+            initialize(&host, json!({ "sessionId": session_id, "restore": true }))
+                .await
+                .expect_err("the startup effort is refused");
+            assert!(restart_path(dir.path(), &session_id).exists(), "the restore is not lost");
+            assert_eq!(restarts(&host.session.history.lock().unwrap()), 0);
+            let stored = SessionTranscriptStore::new(dir.path()).load(&session_id).await.unwrap();
+            assert_eq!(restarts(&stored), 0, "no [restart] entry is persisted");
+
+            *host.pending_startup_effort.lock().unwrap() = None;
+            let r = initialize(&host, json!({ "sessionId": session_id, "restore": true }))
+                .await
+                .unwrap();
+            assert_eq!(r["restored"]["applied"], true, "{r}");
+            assert!(!restart_path(dir.path(), &session_id).exists(), "consumed by the retry");
+            assert_eq!(restarts(&host.session.history.lock().unwrap()), 1);
+            let stored = SessionTranscriptStore::new(dir.path()).load(&session_id).await.unwrap();
+            assert_eq!(restarts(&stored), 1);
+        }
+
         /// Engine A runs the team until the inner agent is in a long command,
         /// then prepares a restart. Returns `(session id, outer id, inner id)`.
         async fn prepare_team(dir: &std::path::Path) -> (String, String, String) {
@@ -18337,6 +18451,52 @@ mod tests {
                 !SessionTranscriptStore::new(dir.path()).tasks_dir(&session_id).exists(),
                 "the subagent files are removed once restored"
             );
+        }
+
+        #[tokio::test]
+        async fn restore_deferred_subagents_survive_another_restart() {
+            let dir = tempfile::tempdir().unwrap();
+            let (session_id, outer, inner) = prepare_team(dir.path()).await;
+            let tasks_dir = SessionTranscriptStore::new(dir.path()).tasks_dir(&session_id);
+            let sorted = |value: &Value| {
+                let mut ids: Vec<String> = serde_json::from_value(value.clone()).unwrap();
+                ids.sort();
+                ids
+            };
+
+            // Engine B has no provider: the subagents wait for its services,
+            // which are never built before it restarts again.
+            let (b, _rx) = new_host_with(None, dir.path(), StartupOptions::default());
+            let r = initialize(&b, json!({ "sessionId": session_id, "restore": true })).await.unwrap();
+            assert_eq!(r["restored"]["applied"], true, "{r}");
+            assert_eq!(r["restored"]["tasks"], json!([]), "nothing re-created yet: {r}");
+            let r = dispatch("session/prepareRestart", Some(json!({ "drainTimeoutMs": 300 })), b.as_ref())
+                .await
+                .unwrap();
+            assert_eq!(sorted(&r["suspendedTasks"]), vec![outer.clone(), inner.clone()], "{r}");
+            let path = r["restartFile"].as_str().expect("a path");
+            let file: RestartFile = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            let mut carried = file.tasks.clone();
+            carried.sort();
+            assert_eq!(carried, vec![outer.clone(), inner.clone()]);
+            for id in [&outer, &inner] {
+                assert!(tasks_dir.join(format!("{id}.json")).exists(), "{id} is still saved");
+            }
+            dispatch("shutdown", None, b.as_ref()).await.unwrap();
+            drop(b);
+
+            // Engine C has one: they are re-created and continue.
+            let client = RecordingClient::new(team(LONG, false));
+            let (c, _rx) =
+                new_host(Arc::clone(&client) as Arc<dyn LlmClient>, dir.path(), StartupOptions::default());
+            let r = initialize(&c, json!({ "sessionId": session_id, "restore": true })).await.unwrap();
+            assert_eq!(sorted(&r["restored"]["tasks"]), vec![outer.clone(), inner.clone()], "{r}");
+            let status = |id: &str| c.task_manager.get(id).map(|t| t.status);
+            wait_for("both subagents to finish", || {
+                status(&outer) == Some(TaskRunStatus::Completed)
+                    && status(&inner) == Some(TaskRunStatus::Completed)
+            })
+            .await;
         }
 
         #[tokio::test]
