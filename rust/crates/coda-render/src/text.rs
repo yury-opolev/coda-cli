@@ -53,7 +53,13 @@ fn joins_emoji(c: char) -> bool {
 /// drawn as its first emoji instead, padded to the cells the layout gave it.
 /// Anything else is returned unchanged.
 pub fn terminal_stable(grapheme: &str) -> std::borrow::Cow<'_, str> {
-    if !grapheme.chars().any(joins_emoji) {
+    // Only emoji clusters: a ZWJ also joins Indic conjuncts (`क्‍ष`), which
+    // are letters and must be drawn whole.
+    let emoji_base = grapheme
+        .chars()
+        .next()
+        .is_some_and(|c| c >= '\u{A9}' && !c.is_alphanumeric());
+    if !emoji_base || !grapheme.chars().any(joins_emoji) {
         return std::borrow::Cow::Borrowed(grapheme);
     }
     let cells = grapheme_width(grapheme);
@@ -366,6 +372,15 @@ mod tests {
                 "{}",
                 text.escape_unicode()
             );
+        }
+    }
+
+    #[test]
+    fn terminal_stable_leaves_zwj_in_indic_conjuncts_alone() {
+        for conjunct in ["\u{915}\u{94D}\u{200D}\u{937}", "\u{930}\u{94D}\u{200D}\u{92F}"] {
+            for grapheme in conjunct.graphemes(true) {
+                assert_eq!(terminal_stable(grapheme), grapheme);
+            }
         }
     }
 
