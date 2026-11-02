@@ -769,9 +769,11 @@ fn finished_result(task: &crate::tasks::ManagedTask) -> ToolResult {
             }
             ToolResult::error(text)
         }
-        TaskRunStatus::Failed | TaskRunStatus::Running => ToolResult::error(
-            output.or(snapshot.error).unwrap_or_else(|| format!("Task {} failed.", task.id)),
-        ),
+        TaskRunStatus::Failed | TaskRunStatus::Running | TaskRunStatus::Suspended => {
+            ToolResult::error(
+                output.or(snapshot.error).unwrap_or_else(|| format!("Task {} failed.", task.id)),
+            )
+        }
     }
 }
 

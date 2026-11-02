@@ -96,12 +96,7 @@ impl Tool for TaskWaitTool {
 }
 
 pub(crate) fn format_terminal_result(snap: &crate::tasks::TaskSnapshot) -> ToolOutcome {
-    let status = match snap.status {
-        TaskRunStatus::Completed => "completed",
-        TaskRunStatus::Failed => "failed",
-        TaskRunStatus::Stopped => "stopped",
-        TaskRunStatus::Running => "running",
-    };
+    let status = snap.status.as_str();
     let mut parts = vec![format!("Task '{}' {status}.", snap.id)];
     if let Some(r) = &snap.result {
         if !r.is_empty() {

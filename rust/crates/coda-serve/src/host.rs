@@ -4134,7 +4134,7 @@ impl ServeBackend for ServeHost {
 
     /// Phase 2: a user message for one running subagent's inbox.
     async fn task_send(&self, p: crate::dispatch::TaskSendParams) -> Result<Value, RpcError> {
-        use coda_agent::tasks::{TaskActionResult, TaskRunStatus};
+        use coda_agent::tasks::TaskActionResult;
         if p.text.trim().is_empty() {
             return task_control_result(p.task_id, Some("emptyText"));
         }
@@ -4143,7 +4143,7 @@ impl ServeBackend for ServeHost {
             TaskActionResult::NotFound => Some("notFound"),
             TaskActionResult::Rejected => Some("notAgent"),
             _ => match self.task_manager.get(&p.task_id) {
-                Some(task) if task.status == TaskRunStatus::Running => Some("notAccepting"),
+                Some(task) if !task.status.is_terminal() => Some("notAccepting"),
                 _ => Some("notRunning"),
             },
         };

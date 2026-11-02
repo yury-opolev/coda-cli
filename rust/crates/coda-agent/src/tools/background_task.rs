@@ -121,12 +121,7 @@ impl Tool for BackgroundTaskOutputTool {
             output_section
         };
 
-        let status_label = match status {
-            TaskRunStatus::Running => "running",
-            TaskRunStatus::Completed => "completed",
-            TaskRunStatus::Failed => "failed",
-            TaskRunStatus::Stopped => "stopped",
-        };
+        let status_label = status.as_str();
 
         ToolResult::ok(format!("{output_section}\n[status: {status_label}]"))
     }

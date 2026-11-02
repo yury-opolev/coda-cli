@@ -209,6 +209,8 @@ mod tests {
             result: None,
             error: None,
             resolved_model: None,
+            resumed: false,
+            suspend_requested: false,
         }
     }
 

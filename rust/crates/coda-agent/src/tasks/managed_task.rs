@@ -20,6 +20,9 @@ use crate::steering::SteeringInbox;
 #[serde(rename_all = "camelCase")]
 pub enum TaskRunStatus {
     Running,
+    /// Paused at a safe point (planned restart); not terminal. Only
+    /// subagents are ever suspended.
+    Suspended,
     Completed,
     Failed,
     Stopped,
@@ -27,13 +30,14 @@ pub enum TaskRunStatus {
 
 impl TaskRunStatus {
     pub fn is_terminal(self) -> bool {
-        !matches!(self, TaskRunStatus::Running)
+        !matches!(self, TaskRunStatus::Running | TaskRunStatus::Suspended)
     }
 
     /// The wire spelling (`session/listTasks`, task events).
     pub fn as_str(self) -> &'static str {
         match self {
             TaskRunStatus::Running => "running",
+            TaskRunStatus::Suspended => "suspended",
             TaskRunStatus::Completed => "completed",
             TaskRunStatus::Failed => "failed",
             TaskRunStatus::Stopped => "stopped",
@@ -120,6 +124,23 @@ pub struct TaskSnapshot {
     pub result: Option<String>,
     pub error: Option<String>,
     pub resolved_model: Option<String>,
+    /// Re-created from a planned-restart file rather than started fresh.
+    pub resumed: bool,
+    /// Suspension is requested for this task, explicitly or inherited from
+    /// an ancestor. Only [`TaskManager`](super::TaskManager) snapshots carry
+    /// the inherited part; [`ManagedTask::to_snapshot`] sees only its own flag.
+    pub suspend_requested: bool,
+}
+
+/// The conversation state a subagent left at the safe point where it
+/// suspended; what a planned restart serializes for it.
+#[derive(Clone, Debug)]
+pub struct TaskCheckpoint {
+    pub history: Vec<coda_llm::Message>,
+    pub steps_used: usize,
+    /// Suspended while parked (waiting for its children), not mid-loop.
+    pub parked: bool,
+    pub suspended_at: SystemTime,
 }
 
 // ── ManagedTask ───────────────────────────────────────────────────────────────
@@ -183,6 +204,19 @@ pub struct ManagedTask {
     /// agent waits on this task with `task_wait`, a completion is handed to
     /// that wait instead of being pushed, so it is delivered exactly once.
     owner_attach: Mutex<(u32, bool)>,
+    /// Suspension explicitly requested for this task itself (its
+    /// descendants inherit it; see `TaskManager::is_suspension_requested`).
+    suspend_explicit: std::sync::atomic::AtomicBool,
+    /// Why the operator stopped this task, when a reason was given
+    /// (`TaskManager::stop_with_note`).
+    stop_note: Mutex<Option<String>>,
+    /// Re-created from a planned-restart file.
+    resumed: std::sync::atomic::AtomicBool,
+    /// Set while suspended at a safe point; cleared on resume.
+    checkpoint: Mutex<Option<TaskCheckpoint>>,
+    /// Opaque description of how to re-create this subagent (its spawn
+    /// spec), recorded once at spawn.
+    spec: std::sync::OnceLock<serde_json::Value>,
 }
 
 /// Stable consumer id for the main agent's cursor. The leading NUL cannot collide
@@ -200,6 +234,33 @@ impl ManagedTask {
         output_ring_bytes: u64,
         mode: TaskExecutionMode,
     ) -> Arc<Self> {
+        Self::new_started_at(
+            id,
+            parent_id,
+            depth,
+            kind,
+            description,
+            log_path,
+            output_ring_bytes,
+            mode,
+            SystemTime::now(),
+        )
+    }
+
+    /// [`ManagedTask::new`] with a given start time (a restored task keeps
+    /// the one it had before the restart).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_started_at(
+        id: String,
+        parent_id: Option<String>,
+        depth: u32,
+        kind: TaskKind,
+        description: String,
+        log_path: PathBuf,
+        output_ring_bytes: u64,
+        mode: TaskExecutionMode,
+        started_at: SystemTime,
+    ) -> Arc<Self> {
         Arc::new(Self {
             id,
             parent_id,
@@ -207,7 +268,7 @@ impl ManagedTask {
             kind,
             description,
             log_path,
-            started_at: SystemTime::now(),
+            started_at,
             cancel: CancellationToken::new(),
             resolved_model: None,
             steering: std::sync::OnceLock::new(),
@@ -232,7 +293,81 @@ impl ManagedTask {
             settled: std::sync::atomic::AtomicBool::new(false),
             completion_pushed: std::sync::atomic::AtomicBool::new(false),
             owner_attach: Mutex::new((0, false)),
+            suspend_explicit: std::sync::atomic::AtomicBool::new(false),
+            stop_note: Mutex::new(None),
+            resumed: std::sync::atomic::AtomicBool::new(false),
+            checkpoint: Mutex::new(None),
+            spec: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Whether suspension was explicitly requested for this task itself.
+    pub fn suspend_explicit(&self) -> bool {
+        self.suspend_explicit.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Sets or clears the explicit suspension request. Returns the previous value.
+    pub(crate) fn set_suspend_explicit(&self, on: bool) -> bool {
+        self.suspend_explicit.swap(on, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// Why the operator stopped this task, if a reason was recorded.
+    pub fn stop_note(&self) -> Option<String> {
+        self.stop_note.lock().unwrap().clone()
+    }
+
+    pub(crate) fn set_stop_note(&self, note: &str) {
+        *self.stop_note.lock().unwrap() = Some(note.to_owned());
+    }
+
+    /// Whether this task was re-created from a planned-restart file.
+    pub fn was_resumed(&self) -> bool {
+        self.resumed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_resumed_from_restart(&self) {
+        self.resumed.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The checkpoint taken when this task suspended, while it is suspended.
+    pub fn checkpoint(&self) -> Option<TaskCheckpoint> {
+        self.checkpoint.lock().unwrap().clone()
+    }
+
+    /// Records the opaque spawn spec. First call wins.
+    pub fn set_spec(&self, spec: serde_json::Value) -> bool {
+        self.spec.set(spec).is_ok()
+    }
+
+    /// The opaque spawn spec, if one was recorded.
+    pub fn spec(&self) -> Option<&serde_json::Value> {
+        self.spec.get()
+    }
+
+    /// Running → Suspended, keeping `checkpoint`. Returns the new version, or
+    /// `None` when the task is not running.
+    pub(crate) fn try_suspend(&self, checkpoint: TaskCheckpoint) -> Option<u64> {
+        let mut s = self.state.lock().unwrap();
+        if s.status != TaskRunStatus::Running {
+            return None;
+        }
+        s.status = TaskRunStatus::Suspended;
+        s.version += 1;
+        *self.checkpoint.lock().unwrap() = Some(checkpoint);
+        Some(s.version)
+    }
+
+    /// Suspended → Running, dropping the checkpoint. Returns the new version,
+    /// or `None` when the task is not suspended.
+    pub(crate) fn try_resume(&self) -> Option<u64> {
+        let mut s = self.state.lock().unwrap();
+        if s.status != TaskRunStatus::Suspended {
+            return None;
+        }
+        s.status = TaskRunStatus::Running;
+        s.version += 1;
+        *self.checkpoint.lock().unwrap() = None;
+        Some(s.version)
     }
 
     /// The owning agent starts waiting on this task inline (`task_wait`).
@@ -415,7 +550,7 @@ impl ManagedTask {
     ) -> Option<u64> {
         let version = {
             let mut s = self.state.lock().unwrap();
-            if s.status != TaskRunStatus::Running {
+            if s.status.is_terminal() {
                 return None;
             }
             s.status = next;
@@ -457,7 +592,7 @@ impl ManagedTask {
             return None;
         }
         let mut s = self.state.lock().unwrap();
-        if s.status != TaskRunStatus::Running {
+        if s.status.is_terminal() {
             return None;
         }
         self.output.append(text);
@@ -516,6 +651,8 @@ impl ManagedTask {
             result: s.result.clone(),
             error: s.error.clone(),
             resolved_model: self.resolved_model.clone(),
+            resumed: self.was_resumed(),
+            suspend_requested: self.suspend_explicit(),
         }
     }
 }

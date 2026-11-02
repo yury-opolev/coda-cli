@@ -23,27 +23,32 @@ pub const INITIALIZATION_GATED_METHODS: &[&str] = &[
 
 /// Which tasks `session/listTasks` (and the model's `task_list`) return.
 ///
-/// `active` is every task still `running` — foreground or background, with
-/// or without output, including parked subagents. `terminal` is `completed`,
-/// `failed` and `stopped`. `all` is both, the behaviour when no filter is
-/// given. Filtering is presentation only: no record, output or completion is
-/// affected.
+/// `active` is every task not yet finished — `running` (foreground or
+/// background, with or without output, including parked subagents) or
+/// `suspended` (paused at a safe point). `suspended` is only the suspended
+/// ones. `terminal` is `completed`, `failed` and `stopped`. `all` is
+/// everything, the behaviour when no filter is given. Filtering is
+/// presentation only: no record, output or completion is affected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum TaskStatusFilter {
     Active,
+    Suspended,
     Terminal,
     #[default]
     All,
 }
 
 impl TaskStatusFilter {
-    /// Whether a task in a terminal (`true`) or running (`false`) state passes.
-    pub fn admits(self, terminal: bool) -> bool {
+    /// Whether a task whose status has the wire spelling `status`
+    /// (`running`, `suspended`, `completed`, `failed`, `stopped`) passes.
+    pub fn admits_status(self, status: &str) -> bool {
+        let live = matches!(status, "running" | "suspended");
         match self {
-            TaskStatusFilter::Active => !terminal,
-            TaskStatusFilter::Terminal => terminal,
+            TaskStatusFilter::Active => live,
+            TaskStatusFilter::Suspended => status == "suspended",
+            TaskStatusFilter::Terminal => !live,
             TaskStatusFilter::All => true,
         }
     }
@@ -52,6 +57,7 @@ impl TaskStatusFilter {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "active" => Some(TaskStatusFilter::Active),
+            "suspended" => Some(TaskStatusFilter::Suspended),
             "terminal" => Some(TaskStatusFilter::Terminal),
             "all" => Some(TaskStatusFilter::All),
             _ => None,
@@ -284,11 +290,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn list_tasks_params_accept_the_three_filters_and_refuse_others() {
+    fn list_tasks_params_accept_the_four_filters_and_refuse_others() {
         let parse = |v: Value| serde_json::from_value::<ListTasksParams>(v);
         assert_eq!(parse(serde_json::json!({})).unwrap().status_filter, None);
         for (wire, filter) in [
             ("active", TaskStatusFilter::Active),
+            ("suspended", TaskStatusFilter::Suspended),
             ("terminal", TaskStatusFilter::Terminal),
             ("all", TaskStatusFilter::All),
         ] {
@@ -302,9 +309,16 @@ mod tests {
     }
 
     #[test]
-    fn active_admits_only_running_and_terminal_only_finished_tasks() {
-        assert!(TaskStatusFilter::Active.admits(false) && !TaskStatusFilter::Active.admits(true));
-        assert!(TaskStatusFilter::Terminal.admits(true) && !TaskStatusFilter::Terminal.admits(false));
-        assert!(TaskStatusFilter::All.admits(true) && TaskStatusFilter::All.admits(false));
+    fn each_filter_admits_exactly_its_statuses() {
+        let admitted = |filter: TaskStatusFilter| -> Vec<&str> {
+            ["running", "suspended", "completed", "failed", "stopped"]
+                .into_iter()
+                .filter(|status| filter.admits_status(status))
+                .collect()
+        };
+        assert_eq!(admitted(TaskStatusFilter::Active), ["running", "suspended"]);
+        assert_eq!(admitted(TaskStatusFilter::Suspended), ["suspended"]);
+        assert_eq!(admitted(TaskStatusFilter::Terminal), ["completed", "failed", "stopped"]);
+        assert_eq!(admitted(TaskStatusFilter::All).len(), 5);
     }
 }

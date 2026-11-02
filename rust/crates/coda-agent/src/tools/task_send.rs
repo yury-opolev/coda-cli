@@ -4,7 +4,6 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::tasks::TaskRunStatus;
 use crate::tool::{Tool, ToolContext, ToolOutcome, ToolResult};
 use crate::tool::ToolContextServiceExt as _;
 
@@ -66,7 +65,7 @@ impl Tool for TaskSendTool {
             None => return ToolResult::error(format!("Task '{task_id}' not found.")),
         };
 
-        if task.status() != TaskRunStatus::Running {
+        if task.status().is_terminal() {
             return ToolResult::error(format!(
                 "Task '{task_id}' is not running; cannot send a message."
             ));

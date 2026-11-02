@@ -543,7 +543,9 @@ pub fn tasks(result: &TaskListResult, view: TaskView) -> Browser {
     let shown: Vec<_> = result
         .tasks
         .iter()
-        .filter(|task| view == TaskView::History || task.status == "running")
+        .filter(|task| {
+            view == TaskView::History || matches!(task.status.as_str(), "running" | "suspended")
+        })
         .collect();
     let (name, toggle, empty) = match view {
         TaskView::Active => ("active", "h history", "No active tasks"),
@@ -1179,6 +1181,15 @@ mod tests {
         let browser = tasks(&task_listing("s", "running"), TaskView::Active);
         assert_eq!(browser.visible_items()[0].cells[2], "running");
         assert!(browser.visible_items()[0].detail.join("\n").contains("no output yet"));
+    }
+
+    #[test]
+    fn a_suspended_task_stays_in_the_active_view_marked_paused() {
+        let browser = tasks(&task_listing("s", "suspended"), TaskView::Active);
+        let rows = browser.visible_items();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cells[0], glyph::INACTIVE);
+        assert_eq!(rows[0].cells[2], "suspended");
     }
 
     fn mixed_listing() -> TaskListResult {

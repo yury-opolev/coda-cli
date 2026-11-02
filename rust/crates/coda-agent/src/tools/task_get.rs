@@ -4,7 +4,6 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::tasks::TaskRunStatus;
 use crate::tool::{Tool, ToolContext, ToolOutcome, ToolResult};
 use crate::tool::ToolContextServiceExt as _;
 
@@ -60,12 +59,7 @@ impl Tool for TaskGetTool {
             }
         }
 
-        let status = match snap.status {
-            TaskRunStatus::Running => "running",
-            TaskRunStatus::Completed => "completed",
-            TaskRunStatus::Failed => "failed",
-            TaskRunStatus::Stopped => "stopped",
-        };
+        let status = snap.status.as_str();
 
         let mut lines = vec![
             format!("id: {}", snap.id),

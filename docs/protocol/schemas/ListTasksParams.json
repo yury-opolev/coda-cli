@@ -21,10 +21,11 @@
       "type": "string",
       "enum": [
         "active",
+        "suspended",
         "terminal",
         "all"
       ],
-      "description": "Which tasks `session/listTasks` (and the model's `task_list`) return.\n\n`active` is every task still `running` — foreground or background, with\nor without output, including parked subagents. `terminal` is `completed`,\n`failed` and `stopped`. `all` is both, the behaviour when no filter is\ngiven. Filtering is presentation only: no record, output or completion is\naffected."
+      "description": "Which tasks `session/listTasks` (and the model's `task_list`) return.\n\n`active` is every task not yet finished — `running` (foreground or\nbackground, with or without output, including parked subagents) or\n`suspended` (paused at a safe point). `suspended` is only the suspended\nones. `terminal` is `completed`, `failed` and `stopped`. `all` is\neverything, the behaviour when no filter is given. Filtering is\npresentation only: no record, output or completion is affected."
     }
   }
 }

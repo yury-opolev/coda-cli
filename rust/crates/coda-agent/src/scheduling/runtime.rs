@@ -1084,7 +1084,9 @@ fn map_terminal_status(
         TaskRunStatus::Completed => ("completed", ScheduleTerminalOutcome::Succeeded),
         TaskRunStatus::Failed => ("failed", ScheduleTerminalOutcome::Failed),
         TaskRunStatus::Stopped => ("stopped", ScheduleTerminalOutcome::Stopped),
-        TaskRunStatus::Running => ("completed", ScheduleTerminalOutcome::Succeeded),
+        TaskRunStatus::Running | TaskRunStatus::Suspended => {
+            ("completed", ScheduleTerminalOutcome::Succeeded)
+        }
     }
 }
 
@@ -1178,6 +1180,8 @@ pub(crate) mod tests {
             result: Some("ok".into()),
             error: None,
             resolved_model: None,
+            resumed: false,
+            suspend_requested: false,
         }
     }
 

@@ -116,12 +116,7 @@ pub fn completion_body(task: &ManagedTask, status: TaskRunStatus) -> String {
 /// subagent its final report (or error). Never longer than `max_chars`.
 pub fn completion_body_bounded(task: &ManagedTask, status: TaskRunStatus, max_chars: usize) -> String {
     let snapshot = task.to_snapshot();
-    let status_word = match status {
-        TaskRunStatus::Completed => "completed",
-        TaskRunStatus::Failed => "failed",
-        TaskRunStatus::Stopped => "stopped",
-        TaskRunStatus::Running => "running",
-    };
+    let status_word = status.as_str();
     let mut header = format!("status: {status_word}\n");
     if status == TaskRunStatus::Stopped && task.stopped_by_operator() {
         header.push_str("note: stopped by the user\n");

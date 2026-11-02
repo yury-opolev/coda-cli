@@ -21,8 +21,8 @@ pub mod task_subscription;
 
 pub use log_writer::TaskOutputChannel;
 pub use managed_task::{
-    ManagedTask, TaskActionResult, TaskExecutionMode, TaskKind, TaskRunStatus, TaskSnapshot,
-    MAIN_CONSUMER_ID,
+    ManagedTask, TaskActionResult, TaskCheckpoint, TaskExecutionMode, TaskKind, TaskRunStatus,
+    TaskSnapshot, MAIN_CONSUMER_ID,
 };
 pub use completion_push::MainInboxCompletionPush;
 pub use task_manager::{
