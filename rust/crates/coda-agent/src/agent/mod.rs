@@ -39,6 +39,7 @@ pub mod output_budget;
 pub mod park;
 pub mod stop;
 pub mod stream;
+mod suspend;
 pub mod tools;
 
 use stop::{StopAction, UserQuestionPrompt, decide_stop};
@@ -171,6 +172,12 @@ pub struct AgentLoop {
     /// When set, a natural stop with live tasks of this agent's own parks the
     /// loop instead of ending the run (non-blocking runtime, Phase 2).
     park_policy: Option<park::ParkPolicy>,
+    /// Steps a restored run already used before this one (counted toward
+    /// `max_iterations` and recorded in its checkpoints).
+    steps_offset: usize,
+    /// Start parked: wait for an inbox item before the first model call (a
+    /// subagent restored while it was parked).
+    start_parked: bool,
 
     // Configuration.
     model: String,
@@ -213,6 +220,27 @@ impl AgentLoop {
             steering: self.steering.as_deref(),
             main_inbox: if self.is_main_context { self.message_bus.as_deref() } else { None },
         })
+    }
+
+    /// The cooperative safe point ([`suspend`]): pauses this run when it is a
+    /// subagent whose suspension was requested. Inert for the main agent and
+    /// for tasks of any other kind.
+    async fn safe_point(
+        &self,
+        history: &[Message],
+        steps_used: usize,
+        cancel: &CancellationToken,
+    ) -> Result<(), AgentError> {
+        let (Some(tasks), Some(id)) = (self.task_manager.as_deref(), self.caller_task_id.as_deref())
+        else {
+            return Ok(());
+        };
+        if tasks.find_task(id).is_none_or(|t| t.kind != crate::tasks::TaskKind::Subagent) {
+            return Ok(());
+        }
+        suspend::safe_point(tasks, id, history, steps_used, false, self.steering.as_deref(), cancel)
+            .await
+            .map(|_| ())
     }
 
     /// The `max_tokens` for the next request: the configured budget, shrunk
@@ -332,10 +360,26 @@ impl AgentLoop {
                 parker.check_deadlines(&mut park_state, history)?;
             }
 
-            // 1. Cooperative pause gate (no-op seam; later phase adds the gate).
+            // 1. Cooperative safe point: a subagent asked to suspend pauses
+            //    here, between iterations — never mid-stream or mid-batch.
+            self.safe_point(history, self.steps_offset + iteration, &cancel).await?;
+
+            // A run restored while parked waits for its inbox before its
+            // first model call, exactly as it did before the restart.
+            if iteration == 0 && self.start_parked {
+                if let Some(parker) = self.parker() {
+                    let outcome = parker
+                        .at_natural_stop(&mut park_state, history, self.steps_offset, &cancel)
+                        .await?;
+                    if outcome == park::ParkOutcome::Finish {
+                        sink.emit(AgentEvent::Stop { stop_reason: Some("end_turn".into()) });
+                        return Ok(goal_status(&goal));
+                    }
+                }
+            }
 
             // 2. Iteration bound check (non-goal only, §1.2).
-            if goal.is_none() && iteration >= self.max_iterations {
+            if goal.is_none() && self.steps_offset + iteration >= self.max_iterations {
                 break;
             }
 
@@ -714,7 +758,11 @@ impl AgentLoop {
                         // end here: it waits (no model calls) for the next
                         // inbox item and runs another turn.
                         if let Some(parker) = self.parker() {
-                            match parker.at_natural_stop(&mut park_state, history, &cancel).await? {
+                            let steps_used = self.steps_offset + iteration + 1;
+                            match parker
+                                .at_natural_stop(&mut park_state, history, steps_used, &cancel)
+                                .await?
+                            {
                                 park::ParkOutcome::Resume => continue,
                                 park::ParkOutcome::Finish => {}
                             }
@@ -1015,6 +1063,8 @@ pub struct AgentLoopBuilder {
     message_bus: Option<Arc<crate::message::MessageBus>>,
     is_main_context: bool,
     park_policy: Option<park::ParkPolicy>,
+    steps_offset: usize,
+    start_parked: bool,
     model: String,
     system_prompt: Option<String>,
     max_tokens: u32,
@@ -1061,6 +1111,8 @@ impl AgentLoopBuilder {
             message_bus: None,
             is_main_context: false,
             park_policy: None,
+            steps_offset: 0,
+            start_parked: false,
             model: "claude-opus-4-5".into(),
             system_prompt: None,
             max_tokens: DEFAULT_MAX_TOKENS,
@@ -1266,6 +1318,20 @@ impl AgentLoopBuilder {
         self
     }
 
+    /// Steps already used by the run this one continues (a restored
+    /// subagent): they count toward `max_iterations`.
+    pub fn with_steps_offset(mut self, steps: usize) -> Self {
+        self.steps_offset = steps;
+        self
+    }
+
+    /// Begin parked: before the first model call, wait as at a natural stop
+    /// (a subagent restored while parked). Needs a park policy.
+    pub fn with_start_parked(mut self, on: bool) -> Self {
+        self.start_parked = on;
+        self
+    }
+
     pub fn build(self) -> AgentLoop {
         AgentLoop {
             client: self.client,
@@ -1291,6 +1357,8 @@ impl AgentLoopBuilder {
             message_bus: self.message_bus,
             is_main_context: self.is_main_context,
             park_policy: self.park_policy,
+            steps_offset: self.steps_offset,
+            start_parked: self.start_parked,
             model: self.model,
             system_prompt: self.system_prompt,
             max_tokens: self.max_tokens,
@@ -4602,6 +4670,286 @@ mod tests {
         let (content, _) = tool_result_text(&client.requests.lock().unwrap()[1], "r1");
         assert_eq!(content, "remote result", "it ran inline to the end");
         assert!(manager.list().is_empty());
+    }
+
+    // ── Planned restart: the cooperative safe point ─────────────────────────
+
+    /// Asks for its own caller's suspension, as a drain would mid-batch.
+    struct SuspendSelfTool;
+
+    #[async_trait]
+    impl crate::tool::Tool for SuspendSelfTool {
+        fn name(&self) -> &str { "probe" }
+        fn description(&self) -> &str { "probe" }
+        fn input_schema_json(&self) -> &str { "{}" }
+        fn is_read_only(&self) -> bool { true }
+        async fn execute(&self, _: &serde_json::Value, ctx: &ToolContext, _: CancellationToken) -> ToolOutcome {
+            use crate::tool::ToolContextServiceExt;
+            let manager = ctx.get_task_manager().expect("task manager wired");
+            let id = ctx.caller_task_id.as_deref().expect("runs as a task");
+            assert_eq!(manager.request_suspend(id), crate::tasks::TaskActionResult::Ok);
+            ToolResult::ok("probe result")
+        }
+    }
+
+    fn register_subagent(manager: &TaskManager, parent: Option<&str>) -> Arc<crate::tasks::ManagedTask> {
+        manager
+            .register(
+                crate::tasks::TaskKind::Subagent,
+                "worker",
+                parent,
+                crate::tasks::TaskExecutionMode::Background,
+            )
+            .unwrap()
+    }
+
+    fn register_job(manager: &TaskManager, owner: &str) -> Arc<crate::tasks::ManagedTask> {
+        manager
+            .register(
+                crate::tasks::TaskKind::Shell,
+                "job",
+                Some(owner),
+                crate::tasks::TaskExecutionMode::Background,
+            )
+            .unwrap()
+    }
+
+    async fn wait_for_status(task: &crate::tasks::ManagedTask, status: crate::tasks::TaskRunStatus) {
+        for _ in 0..1_000 {
+            if task.status() == status {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("task {} never reached {status:?} (is {:?})", task.id, task.status());
+    }
+
+    type RunHandle = tokio::task::JoinHandle<(Result<GoalStatus, AgentError>, Vec<Message>)>;
+
+    fn spawn_run(agent: AgentLoop, history: Vec<Message>, cancel: CancellationToken) -> RunHandle {
+        tokio::spawn(async move {
+            let mut history = history;
+            let result = agent.run(&mut history, &NullSink, None, cancel).await;
+            (result, history)
+        })
+    }
+
+    fn suspending_subagent(
+        manager: &Arc<TaskManager>,
+    ) -> (AgentLoop, Arc<MockLlmClient>, Arc<crate::tasks::ManagedTask>) {
+        let owner = register_subagent(manager, None);
+        let client = MockLlmClient::new(two_turn_script(&[("p1", "probe")]));
+        let tools = Arc::new(ToolRegistry::new([dyn_tool(Arc::new(SuspendSelfTool))]));
+        let agent = AgentLoopBuilder::new(client.clone(), Arc::new(AllowAll), tools)
+            .with_task_manager(Arc::clone(manager))
+            .with_caller_task_id(owner.id.clone())
+            .build();
+        (agent, client, owner)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn suspended_subagent_pauses_before_next_model_request_and_resumes() {
+        use crate::tasks::{TaskActionResult, TaskRunStatus};
+        let manager = task_manager_for_test();
+        let (agent, client, owner) = suspending_subagent(&manager);
+        let run = spawn_run(agent, vec![Message::user("go")], CancellationToken::new());
+
+        wait_for_status(&owner, TaskRunStatus::Suspended).await;
+        assert_eq!(client.requests.lock().unwrap().len(), 1, "paused before the next request");
+        let checkpoint = manager.checkpoint(&owner.id).expect("a suspended task has a checkpoint");
+        assert!(!checkpoint.parked);
+        assert_eq!(checkpoint.steps_used, 1);
+        let last = checkpoint.history.last().unwrap();
+        assert!(
+            last.content.iter().any(|b| matches!(
+                b,
+                Content::ToolResult { tool_use_id, .. } if tool_use_id == "p1"
+            )),
+            "the checkpoint ends with the finished batch's results: {last:?}"
+        );
+
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        assert_eq!(client.requests.lock().unwrap().len(), 1, "stays paused until resumed");
+        assert!(!run.is_finished());
+
+        assert_eq!(manager.request_resume(&owner.id), TaskActionResult::Ok);
+        let (result, _) = run.await.unwrap();
+        result.unwrap();
+        let requests = client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(tool_result_text(&requests[1], "p1"), ("probe result".to_owned(), false));
+        assert_eq!(owner.status(), TaskRunStatus::Running);
+        assert!(manager.checkpoint(&owner.id).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_while_suspended_returns_cancelled() {
+        let manager = task_manager_for_test();
+        let (agent, client, owner) = suspending_subagent(&manager);
+        let cancel = CancellationToken::new();
+        let run = spawn_run(agent, vec![Message::user("go")], cancel.clone());
+
+        wait_for_status(&owner, crate::tasks::TaskRunStatus::Suspended).await;
+        cancel.cancel();
+        let (result, _) = run.await.unwrap();
+        assert!(matches!(result, Err(AgentError::Cancelled)), "{result:?}");
+        assert_eq!(client.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gate_is_inactive_for_main_context_and_non_subagent_tasks() {
+        let manager = task_manager_for_test();
+        let parent = register_subagent(&manager, None);
+        assert_eq!(manager.request_suspend(&parent.id), crate::tasks::TaskActionResult::Ok);
+        let tool_task = manager
+            .register(
+                crate::tasks::TaskKind::Tool,
+                "call",
+                Some(&parent.id),
+                crate::tasks::TaskExecutionMode::Foreground,
+            )
+            .unwrap();
+        manager.suspend_all();
+
+        for caller in [Some(tool_task.id.clone()), None] {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let client = MockLlmClient::new(two_turn_script(&[("t1", "tool_a")]));
+            let tools = Arc::new(ToolRegistry::new([dyn_tool(MockTool::new("tool_a", true, log))]));
+            let mut builder = AgentLoopBuilder::new(client.clone(), Arc::new(AllowAll), tools)
+                .with_task_manager(Arc::clone(&manager));
+            builder = match &caller {
+                Some(id) => builder.with_caller_task_id(id.clone()),
+                None => builder.with_main_context(),
+            };
+            let agent = builder.build();
+            let mut history = vec![Message::user("go")];
+            tokio::time::timeout(
+                Duration::from_secs(60),
+                agent.run(&mut history, &NullSink, None, CancellationToken::new()),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("caller {caller:?} must not pause"))
+            .unwrap();
+            assert_eq!(client.requests.lock().unwrap().len(), 2, "caller {caller:?}");
+        }
+        assert_eq!(tool_task.status(), crate::tasks::TaskRunStatus::Running);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn parked_subagent_suspends_without_a_model_call() {
+        use crate::tasks::{TaskActionResult, TaskRunStatus};
+        let manager = task_manager_for_test();
+        let owner = register_subagent(&manager, None);
+        let job = register_job(&manager, &owner.id);
+        let client = MockLlmClient::new(vec![vec![
+            Ok(StreamEvent::TextDelta("waiting for the job".into())),
+            Ok(done()),
+        ]]);
+        let tools = Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
+        let agent = AgentLoopBuilder::new(client.clone(), Arc::new(AllowAll), tools)
+            .with_task_manager(Arc::clone(&manager))
+            .with_caller_task_id(owner.id.clone())
+            .with_steering(Arc::new(SteeringInbox::new()))
+            .with_park_policy(park::ParkPolicy::subagent(owner.id.clone()))
+            .build();
+        let run = spawn_run(agent, vec![Message::user("go")], CancellationToken::new());
+
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(client.requests.lock().unwrap().len(), 1);
+        assert_eq!(owner.status(), TaskRunStatus::Running, "parked, not suspended");
+
+        assert_eq!(manager.request_suspend(&owner.id), TaskActionResult::Ok);
+        wait_for_status(&owner, TaskRunStatus::Suspended).await;
+        let checkpoint = manager.checkpoint(&owner.id).unwrap();
+        assert!(checkpoint.parked);
+        assert_eq!(checkpoint.steps_used, 1);
+        assert_eq!(checkpoint.history.last().unwrap().text(), "waiting for the job");
+
+        assert_eq!(manager.request_resume(&owner.id), TaskActionResult::Ok);
+        wait_for_status(&owner, TaskRunStatus::Running).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(!run.is_finished(), "resumed into the parked state");
+        assert_eq!(client.requests.lock().unwrap().len(), 1, "no model call while parked");
+
+        manager.complete(&job.id, Some("exit code: 0".into()));
+        let (result, _) = run.await.unwrap();
+        result.unwrap();
+        assert_eq!(client.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn steps_offset_counts_toward_iteration_cap() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let client = MockLlmClient::new(vec![
+            vec![Ok(tool_use_event("t1", "tool_a")), Ok(done())],
+            vec![Ok(tool_use_event("t2", "tool_a")), Ok(done())],
+        ]);
+        let tools = Arc::new(ToolRegistry::new([dyn_tool(MockTool::new("tool_a", true, log))]));
+        let agent = AgentLoopBuilder::new(client.clone(), Arc::new(AllowAll), tools)
+            .with_max_iterations(3)
+            .with_steps_offset(2)
+            .with_tool_max_duration(None)
+            .build();
+        let mut history = vec![Message::user("go")];
+        agent.run(&mut history, &NullSink, None, CancellationToken::new()).await.unwrap();
+
+        assert_eq!(client.requests.lock().unwrap().len(), 1, "2 of 3 steps were already used");
+        assert_eq!(history.last().unwrap().text(), "(stopped: reached the maximum tool iterations)");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn start_parked_skips_the_first_model_call_until_inbox_has_work() {
+        let manager = task_manager_for_test();
+        let build = |owner: &str, client: &Arc<MockLlmClient>, steering: &Arc<SteeringInbox>| {
+            AgentLoopBuilder::new(
+                client.clone(),
+                Arc::new(AllowAll),
+                Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0])),
+            )
+            .with_task_manager(Arc::clone(&manager))
+            .with_caller_task_id(owner.to_owned())
+            .with_steering(Arc::clone(steering))
+            .with_park_policy(park::ParkPolicy::subagent(owner.to_owned()))
+            .with_start_parked(true)
+            .build()
+        };
+        let restored = || vec![Message::user("go"), Message::assistant("parked earlier")];
+
+        // Nothing left to wait for: it finishes as a natural stop would.
+        let idle = register_subagent(&manager, None);
+        let client = MockLlmClient::new(vec![]);
+        let agent = build(&idle.id, &client, &Arc::new(SteeringInbox::new()));
+        let mut history = restored();
+        agent.run(&mut history, &NullSink, None, CancellationToken::new()).await.unwrap();
+        assert!(client.requests.lock().unwrap().is_empty());
+        assert_eq!(history.last().unwrap().text(), "parked earlier");
+
+        // A live job: it parks until its inbox has work.
+        let owner = register_subagent(&manager, None);
+        let job = register_job(&manager, &owner.id);
+        let steering = Arc::new(SteeringInbox::new());
+        let client = MockLlmClient::new(vec![vec![
+            Ok(StreamEvent::TextDelta("handled".into())),
+            Ok(done()),
+        ]]);
+        let run = spawn_run(build(&owner.id, &client, &steering), restored(), CancellationToken::new());
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(client.requests.lock().unwrap().is_empty(), "no model call while parked");
+
+        steering.enqueue("new instruction").expect("a parked agent accepts messages");
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        {
+            let requests = client.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(
+                requests[0].messages.iter().any(|m| m.text().contains("new instruction")),
+                "the woken turn delivers the message"
+            );
+        }
+        manager.complete(&job.id, Some("exit code: 0".into()));
+        let (result, _) = run.await.unwrap();
+        result.unwrap();
+        assert_eq!(client.requests.lock().unwrap().len(), 1);
     }
 }
 

@@ -541,6 +541,11 @@ enum YieldReason {
 /// Longest output tail included in a yield handle.
 const YIELD_TAIL_CHARS: usize = 4_000;
 
+/// The stop note of a task interrupted by a planned restart's drain.
+pub(crate) const PLANNED_RESTART_NOTE: &str = "planned restart";
+/// Longest output tail in the result of a call a planned restart interrupted.
+const PLANNED_RESTART_TAIL_CHARS: usize = 2_000;
+
 /// Generic fallback of the non-blocking runtime (§6.1): a call of a
 /// [`detachable`](crate::tool::Tool::detachable) tool (a remote MCP call)
 /// runs as a [`TaskKind::Tool`](crate::tasks::TaskKind::Tool) task, so the
@@ -716,10 +721,26 @@ async fn await_attached_task(
     let finished = |task: &crate::tasks::ManagedTask| {
         Some(crate::tools::task_wait::format_terminal_result(&task.to_snapshot()))
     };
+    // A suspension wakes the wait too: a suspended task will not finish
+    // until it is resumed, so the caller is told so instead of waiting on.
+    let suspended = async {
+        loop {
+            let changed = manager.suspend_signal().notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if task.status() == crate::tasks::TaskRunStatus::Suspended {
+                return;
+            }
+            changed.await;
+        }
+    };
     let ended = tokio::select! {
         biased;
         _ = cancel.cancelled() => None,
         _ = task.wait_for_completion() => Some(None),
+        _ = suspended => Some(Some(ToolResult::ok(
+            crate::tools::task_wait::suspended_text(task_id),
+        ))),
         _ = tokio::time::sleep(wait) => Some(Some(ToolResult::ok(pending.to_owned()))),
     };
     if !owner {
@@ -762,6 +783,13 @@ fn finished_result(task: &crate::tasks::ManagedTask) -> ToolResult {
             ToolResult::ok(output.or(snapshot.result).unwrap_or_default())
         }
         TaskRunStatus::Stopped => {
+            if task.stop_note().as_deref() == Some(PLANNED_RESTART_NOTE) {
+                let tail = task.redacted_peek(PLANNED_RESTART_TAIL_CHARS);
+                let tail = if tail.trim().is_empty() { "(no output)" } else { tail.trim_end() };
+                return ToolResult::error(format!(
+                    "Interrupted by a planned restart; last output:\n{tail}"
+                ));
+            }
             let tail = task.redacted_peek(YIELD_TAIL_CHARS);
             let mut text = format!("Stopped: task {} was stopped before it finished.", task.id);
             if !tail.trim().is_empty() {
@@ -962,5 +990,139 @@ mod tests {
         assert!(manager.complete(&child.id, Some("child report".into())));
         let items = inbox.take_all_for_delivery();
         assert!(items.iter().any(|i| i.text.contains("child report")), "{items:?}");
+    }
+
+    fn test_ctx<'a>(
+        registry: &'a ToolRegistry,
+        manager: &Arc<TaskManager>,
+        caller: Option<&str>,
+    ) -> BatchContext<'a> {
+        BatchContext {
+            tools: registry,
+            permission_prompt: &AllowAll,
+            permission_mode: PermissionMode::Default,
+            permission_mode_state: None,
+            steering: None,
+            working_directory: ".",
+            granted_directories: None,
+            tool_max_duration: None,
+            tool_progress_interval: Duration::from_secs(30),
+            todos: None,
+            tool_user_question: None,
+            plan_approver: None,
+            lsp_manager: None,
+            task_manager: Some(Arc::clone(manager)),
+            schedule_store: None,
+            caller_task_id: caller.map(str::to_owned),
+            schedule_origin: None,
+            subagent_factory: None,
+            message_bus: None,
+            is_main_context: false,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn attached_wait_wakes_when_child_suspends() {
+        use crate::tasks::{TaskCheckpoint, TaskExecutionMode, TaskKind};
+        let dir = tempfile::tempdir().unwrap();
+        let manager = TaskManager::new("s", Some(dir.path().to_path_buf()), 4096, 10);
+        let owner =
+            manager.register(TaskKind::Subagent, "owner", None, TaskExecutionMode::Background).unwrap();
+        let inbox = Arc::new(SteeringInbox::new());
+        owner.attach_steering(Arc::clone(&inbox));
+        let child = manager
+            .register(TaskKind::Subagent, "child", Some(&owner.id), TaskExecutionMode::Background)
+            .unwrap();
+
+        let registry = ToolRegistry::new(Vec::<Arc<dyn crate::tool::Tool>>::new());
+        let ctx = test_ctx(&registry, &manager, Some(&owner.id));
+        let suspender = {
+            let (manager, id) = (Arc::clone(&manager), child.id.clone());
+            async move {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                assert!(manager.mark_suspended(&id, TaskCheckpoint {
+                    history: Vec::new(),
+                    steps_used: 0,
+                    parked: false,
+                    suspended_at: std::time::SystemTime::now(),
+                }));
+            }
+        };
+        let begun = tokio::time::Instant::now();
+        let cancel = CancellationToken::new();
+        let (result, ()) = tokio::join!(
+            await_attached_task(
+                &ctx,
+                &child.id,
+                Duration::from_secs(30),
+                "still running",
+                &cancel,
+            ),
+            suspender,
+        );
+        let result = result.expect("not cancelled");
+        assert_eq!(begun.elapsed(), Duration::from_secs(3), "the suspension ends the wait");
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(result.content, crate::tools::task_wait::suspended_text(&child.id));
+
+        // The wait released its claim: the later completion is pushed, once.
+        assert!(manager.mark_resumed(&child.id));
+        assert!(manager.complete(&child.id, Some("child report".into())));
+        let items = inbox.take_all_for_delivery();
+        assert_eq!(
+            items.iter().filter(|i| i.text.contains("child report")).count(),
+            1,
+            "{items:?}"
+        );
+        assert!(!child.delivered_inline_to_owner());
+    }
+
+    #[tokio::test]
+    async fn stop_with_planned_restart_note_yields_interrupted_tool_result() {
+        use crate::tasks::{TaskExecutionMode, TaskKind};
+        let dir = tempfile::tempdir().unwrap();
+        let manager = TaskManager::new("s", Some(dir.path().to_path_buf()), 4096, 10);
+        let registry = ToolRegistry::new(Vec::<Arc<dyn crate::tool::Tool>>::new());
+        let ctx = test_ctx(&registry, &manager, None);
+        let cancel = CancellationToken::new();
+
+        for (output, expected_tail) in [("npm test\n3 passing\n", "npm test\n3 passing"), ("", "(no output)")] {
+            let task = manager
+                .register(TaskKind::Shell, "npm test", None, TaskExecutionMode::Foreground)
+                .unwrap();
+            if !output.is_empty() {
+                manager.append_output(&task.id, output);
+            }
+            let runner = {
+                let (manager, task) = (Arc::clone(&manager), Arc::clone(&task));
+                tokio::spawn(async move {
+                    task.cancel.cancelled().await;
+                    manager.stop(&task.id);
+                })
+            };
+            let stopper = {
+                let (manager, id) = (Arc::clone(&manager), task.id.clone());
+                async move {
+                    tokio::task::yield_now().await;
+                    assert_eq!(
+                        manager.stop_with_note(&id, PLANNED_RESTART_NOTE),
+                        crate::tasks::TaskActionResult::Ok
+                    );
+                }
+            };
+            let (outcome, ()) = tokio::join!(
+                await_running_task(&ctx, &task.id, None, &cancel),
+                stopper,
+            );
+            runner.await.unwrap();
+            let TaskWaitOutcome::Finished(result) = outcome else {
+                panic!("a stopped task is a finished call, not an interrupted turn");
+            };
+            assert!(result.is_error);
+            assert_eq!(
+                result.content,
+                format!("Interrupted by a planned restart; last output:\n{expected_tail}")
+            );
+        }
     }
 }

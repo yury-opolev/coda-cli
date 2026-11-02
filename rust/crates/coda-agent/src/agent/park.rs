@@ -208,20 +208,26 @@ impl Parker<'_> {
 
     /// Decides what happens after a turn ended naturally: finish, or park
     /// until an inbox item (or a deadline) wakes the agent for another turn.
+    /// A parked agent asked to suspend does so here (`steps_used` goes into
+    /// its checkpoint) and, once resumed, keeps parking.
     pub(crate) async fn at_natural_stop(
         &self,
         state: &mut ParkState,
         history: &mut Vec<Message>,
+        steps_used: usize,
         cancel: &CancellationToken,
     ) -> Result<ParkOutcome, AgentError> {
         if state.finishing_since.is_some() {
             return Ok(ParkOutcome::Finish);
         }
-        let parked_at = Instant::now();
+        let mut parked_at = Instant::now();
         loop {
             let settled = self.tasks.settle_signal().notified();
             tokio::pin!(settled);
             settled.as_mut().enable();
+            let suspend = self.tasks.suspend_signal().notified();
+            tokio::pin!(suspend);
+            suspend.as_mut().enable();
 
             if self.inbox_has_any() {
                 self.reopen();
@@ -239,6 +245,23 @@ impl Parker<'_> {
 
             // Parked: accept messages, make no model calls.
             self.reopen();
+            if let Some(owner) = self.policy.owner_task_id.as_deref() {
+                let suspended = super::suspend::safe_point(
+                    self.tasks,
+                    owner,
+                    history,
+                    steps_used,
+                    true,
+                    self.steering,
+                    cancel,
+                )
+                .await?;
+                if suspended {
+                    // The time spent suspended does not count as waiting.
+                    parked_at = Instant::now();
+                    continue;
+                }
+            }
             let (limit_name, limit, remaining) = self.park_budget(state, parked_at);
             let expired = async {
                 match remaining {
@@ -257,6 +280,7 @@ impl Parker<'_> {
                     return Ok(ParkOutcome::Resume);
                 }
                 _ = &mut settled => continue,
+                _ = &mut suspend => continue,
                 _ = expired => {
                     self.deliver_deadline(state, history, limit_name, limit);
                     return Ok(ParkOutcome::Resume);
