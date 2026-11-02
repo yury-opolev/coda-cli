@@ -23,6 +23,7 @@ Message framing is `Content-Length`-delimited JSON-RPC 2.0 (the same framing as 
 coda serve [--provider id] [--model id] [--cwd path] [--permission-mode m] [--yolo]
            [--system-prompt text | --system-prompt-file path]
            [--api-key key] [--endpoint name|path]
+           [--restore[=suspended]] [--session id]
 ```
 
 | Flag | Meaning |
@@ -36,6 +37,8 @@ coda serve [--provider id] [--model id] [--cwd path] [--permission-mode m] [--yo
 | `--system-prompt-file` | read the exact replacement root system prompt from a file |
 | `--api-key` | **selects the API-key-authenticated local pipe/socket transport** (see below). May also be supplied via the `CODA_SERVE_API_KEY` environment variable. |
 | `--endpoint` | optional socket name/path; auto-generated if omitted |
+| `--restore` | make `initialize` restore the planned-restart file by default; `--restore=suspended` keeps restored subagents suspended (see [Planned restart](serve-protocol.md#planned-restart-rust)) |
+| `--session` | session id `initialize` resumes when the client does not name one |
 
 `--system-prompt` and `--system-prompt-file` are mutually exclusive and may occur only once.
 They require a separate following value: missing values, duplicates, and `--flag=value` forms fail
@@ -86,7 +89,7 @@ The transport is chosen by whether an API key is present:
 
 | Method | Params | Result |
 |---|---|---|
-| `initialize` | `{ protocolVersion: string, clientInfo?: string, apiKey?: string, sessionId?: string }` | `{ protocolVersion: string, sessionId: string, serverInfo: string, telemetryLogPath?: string }` |
+| `initialize` | `{ protocolVersion: string, clientInfo?: string, apiKey?: string, sessionId?: string, restore?: true\|false\|"suspended" }` | `{ protocolVersion: string, sessionId: string, serverInfo: string, telemetryLogPath?: string, restored? }` |
 | `session/prompt` | `{ text?, images?: [{ mediaType, base64 }] }` | `{ ok, stopReason?, interrupted, goalStatus? }` |
 | `session/interrupt` | `{}` | `{ ok }` |
 | `session/history` | `{}` | `{ messages: [{ role, content }] }` |
@@ -94,7 +97,7 @@ The transport is chosen by whether an API key is present:
 | `session/setGoal` | `{ goal?: string\|null, maxDuration?: string, maxContinuations?: int }` | `{ ok, goal?, maxDuration?, maxContinuations? }` |
 | `shutdown` | `{}` | `{ ok }` |
 
-`initialize` normally occurs first and accepts an optional `sessionId` for resume. When the local
+`initialize` normally occurs first and accepts an optional `sessionId` for resume, plus `restore` to apply the state a previous engine saved with `session/prepareRestart` ([Planned restart](serve-protocol.md#planned-restart-rust)). When the local
 pipe/socket transport is used, it MUST carry `apiKey`. Only one turn runs at a time — a `session/prompt` while
 busy returns a JSON-RPC error. Images are input-only, base64, ≤ 5 MB each, of type
 `image/png|jpeg|gif|webp`.
@@ -216,8 +219,8 @@ The model can call these built-in tools (subject to the permission mode). MCP se
 | `schedule_cancel_self` | no | a scheduled run retires **its own** schedule once its job is done. Takes no schedule id or task id. Only the scheduled root run may call it; `stopRunning: true` also ends the current run, otherwise the run finishes normally. |
 | `task_output`, `task_stop`, `sleep` | mixed | read a task's new output; stop any task (and what it started) |
 | `task_start`, `task_recall` | mixed | **deprecated** aliases kept for one release: `task_start` = `task`; `task_recall` only returns completions that could not be pushed |
-| `task_list`, `task_get`, `task_peek`, `task_send` | yes | list tasks (optional `statusFilter`: `active`, `terminal` or `all`, the default), read one task, peek recent output, steer a running agent task (subagent or scheduled) |
-| `task_wait`, `task_remove` | yes | wait briefly for a task (`timeoutSeconds`, default and max 30; not cut short by messages; never stops it — ending the turn is the preferred way to wait), remove a finished task (log preserved) |
+| `task_list`, `task_get`, `task_peek`, `task_send` | yes | list tasks (optional `statusFilter`: `active` — running or suspended —, `suspended`, `terminal` or `all`, the default), read one task, peek recent output, steer a running agent task (subagent or scheduled) |
+| `task_wait`, `task_remove` | yes | wait briefly for a task (`timeoutSeconds`, default and max 30; not cut short by messages; never stops it — ending the turn is the preferred way to wait; a suspended subagent is reported as suspended at once), remove a finished task (log preserved) |
 | `notebook_edit` | no (gated) | edit Jupyter notebook cells |
 | `git_worktree` | no (gated) | list/add/remove git worktrees |
 | `task` | — | start a subagent in the background; returns its task id at once and its final report is pushed back when it finishes (the subagent parks — no model calls — while its own tasks run) |

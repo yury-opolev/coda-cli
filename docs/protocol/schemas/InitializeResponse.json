@@ -162,7 +162,7 @@
           "items": {
             "type": "string"
           },
-          "description": "Ids of the subagents re-created under their original ids.",
+          "description": "Ids of the subagents re-created under their original ids. Saved\nsubagents that wait for a provider (none is wired yet) are re-created\nwhen the session services are first built, and are not listed here.",
           "default": []
         },
         "tasksSuspended": {

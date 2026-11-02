@@ -32,13 +32,13 @@ might infer from its name. Unsupported operations are listed separately.
 
 | Method | Class | Contract / limitation |
 |---|---|---|
-| `initialize` | Reusable | Negotiate the connection, optionally resume a validated saved session; returns session/engine identity, capabilities and baseline event cursor. Clients initialize before running work. |
+| `initialize` | Reusable | Negotiate the connection, optionally resume a validated saved session; returns session/engine identity, capabilities and baseline event cursor. With `restore` (`true` / `"suspended"`, or the `coda serve --restore` default) it also applies the restart file a previous engine wrote with `session/prepareRestart` and reports it in `restored`; a newer file format is `-32017` with no side effects. Clients initialize before running work. |
 | `shutdown` | Reusable | Stop this engine; not a user/browser detach operation. |
 | `session/prompt` | Reusable | Run one foreground turn; response arrives when execution ends. A concurrent prompt is refused, not queued. |
 | `session/interrupt` | Reusable | Request cancellation of the active turn. Observe terminal state; a request acknowledgement alone is not completion. |
 | `session/steer` | Reusable | Add text to the active turn's inbox; returns a message ID or a rejection reason. No future-job backlog. |
 | `session/recallSteering` | Reusable | Atomically withdraw pending inbox text. Destructive; never use for queue inspection. |
-| `session/getState` | Reusable | Authoritative snapshot with identity, cursor, lifecycle, phase, queue, tools, requests, configuration, usage and limits. `sections` filtering is unsupported and rejected. |
+| `session/getState` | Reusable | Authoritative snapshot with identity, cursor, lifecycle (`initializing`, `ready`, `busy`, `draining`, `stopping`, `stopped`), phase, queue, tools, requests, configuration, usage and limits, plus `drain` progress while a planned restart drains. `sections` filtering is unsupported and rejected. |
 | `session/getEvents` | Reusable | Bounded replay for a matching engine instance. Ring eviction and process replacement are explicit, not silent success. |
 | `session/getHistory` | Reusable | Rich committed history plus optional live projection, with instance/epoch/length fences and bounded pages. |
 | `session/listSessions` | Reusable | Bounded saved-session discovery within the engine's workspace. Available before initialize. |
@@ -75,7 +75,10 @@ might infer from its name. Unsupported operations are listed separately.
 | `session/backgroundAll`, `task/background` | Reusable | Stop *waiting* on foreground tasks (all, or one); the work keeps running and reports later. Requires initialize. |
 | `session/stopAllTasks`, `task/stop` | Reusable | Stop running tasks and their process trees. Requires initialize. |
 | `task/send` | Reusable | Deliver a message to a running subagent's inbox. Requires initialize. |
+| `task/suspend`, `session/suspendAllTasks` | Reusable | Pause one subagent (with its descendants), or every subagent, at the next safe point; status becomes `suspended` and `event/taskSuspended` is published. Other task kinds are `notSuspendable`. Requires initialize. See [Task suspension](../serve-protocol.md#task-suspension-rust). |
+| `task/resume`, `session/resumeAllTasks` | Reusable | Clear one subagent's, or every, explicit suspension; `event/taskResumed` follows. Refused with `-32016` while draining. Requires initialize. |
 | `session/askAside` | Reusable | A side question answered by one tool-less model request over the conversation and the live task table; never added to history, works during a turn. Requires initialize. |
+| `session/prepareRestart` | Reusable | Planned restart: enter the `draining` lifecycle (new work refused with `-32016` "restart pending"), wait up to `drainTimeoutMs` for work to finish or subagents to suspend, interrupt the rest, and write the owner-only restart file the next engine's `initialize { restore }` applies once. The engine stays draining. Requires initialize. See [Planned restart](../serve-protocol.md#planned-restart-rust). |
 
 The new `session/getHistory`, `session/getPendingRequests`,
 `session/resolveRequest`, `session/cancelRequest` and `config/set` methods
@@ -83,6 +86,14 @@ require completed initialization. Read-only discovery does not. Legacy
 routes retain their compatibility parsing; new query routes reject malformed
 recognized fields instead of silently dropping fences. Unknown additive
 fields are tolerated.
+
+Engine-specific JSON-RPC error codes: `-32002` (session not found),
+`-32010` (engine instance changed),
+`-32011` (not initialized), `-32012` (stale history epoch), `-32013` (history
+length moved), `-32014` (unknown or already resolved request), `-32015`
+(outcome does not match the request kind), `-32016` (`restart pending`: the
+engine is draining for a planned restart) and `-32017` (the restart file's
+format is newer than this engine supports; `initialize` changed nothing).
 
 Initialization shares the foreground exclusion slot with prompts and history
 mutations. A concurrent initialize or an initialize during an active operation
@@ -129,7 +140,8 @@ the same structured projection regardless of that hint.
 | `event/usage`, `event/streamProgress` | Reported response usage (uncached `inputTokens` plus additive cache categories and `totalInputTokens`) and streaming progress; do not silently interpret last-response usage as cumulative. |
 | `event/error`, `event/limitReached` | Execution errors and enforced limits. |
 | `event/steeringDelivered` | Inbox entries injected at a safe boundary, not proof of provider receipt or execution. |
-| `event/taskStarted`, `event/taskOutput`, `event/taskCompleted` | Task lifecycle: one start and one completion per task (kind, owning agent, mode) and throttled, bounded, secret-redacted output (≤ 4 frames/s per task, ≤ 2 000 chars, withheld while the client is not reading). `session/listTasks` stays authoritative. |
+| `event/taskStarted`, `event/taskOutput`, `event/taskCompleted` | Task lifecycle: one start and one completion per task (kind, owning agent, mode) and throttled, bounded, secret-redacted output (≤ 4 frames/s per task, ≤ 2 000 chars, withheld while the client is not reading). A subagent re-created by a planned-restart restore starts again with `resumed: true`. `session/listTasks` stays authoritative. |
+| `event/taskSuspended`, `event/taskResumed` | A subagent paused at a safe point (`reason`: `requested`, `parent` or `restart`; status `suspended`, not finished) and continued. |
 | `event/scheduleLifecycle` | Existing background lifecycle vocabulary. Do not infer complete fleet or background counters from availability of this name. |
 | `event/promptRewritten`, `event/responseRewritten` | Hook rewrite notifications. |
 | `event/toolInputModified`, `event/toolResultModified` | Hook changes to tool content. |
@@ -221,9 +233,14 @@ literally:
   separate field (`lastOutcome`).
 - Absent bound fields mean *unlimited*, never zero.
 
-Schedules are engine-scoped and **in memory only** in the Rust engine: nothing
-survives an engine restart, and no schedule state is written to disk. Do not
-build resumption on top of `session/scheduleList`.
+Schedules are engine-scoped and **in memory only** in the Rust engine: no
+schedule state is written to disk on its own, and an engine that simply exits
+or crashes loses them. Do not build resumption on top of
+`session/scheduleList`. A **planned** restart does carry them over:
+`session/prepareRestart` saves every definition (id, bounds, `runsStarted`,
+next run) in the restart file and `initialize { restore }` re-creates them,
+moving a recurring slot missed during the restart to the next one (no catch-up
+burst) — see [Planned restart](../serve-protocol.md#planned-restart-rust).
 
 ## Background notifications (`notify_user`)
 
@@ -239,12 +256,17 @@ from the conversation the model sees:
   `ask_main` channel (see [Main inbox](#main-inbox-ask_main) below) is the
   one that can cause the main conversation to act, and it is a different
   queue with a different tool.
-- It is **entirely in-memory (RAM) and engine-process-scoped**. There is no
-  disk persistence and no continuation across an engine restart: a fresh
-  engine process starts a fresh, empty notification bus at cursor `0`.
+- It is **entirely in-memory (RAM) and engine-process-scoped**. The bus
+  never persists anything on its own: an engine that exits or crashes takes
+  its notifications with it, and a fresh engine process starts a fresh, empty
+  notification bus at cursor `0`. The exception is a **planned restart**:
+  `session/prepareRestart` saves the notifications after its
+  `deliveredCursor` into the restart file, and the next engine's
+  `initialize { restore }` re-publishes them (new cursors, fresh
+  `event/agentMessage` notifications) after its response — see
+  [Planned restart](../serve-protocol.md#planned-restart-rust).
   Normal chat/session persistence (`.coda/sessions`, rich history) is
-  completely unaffected — this bus never writes anything to disk and never
-  reads anything back from it.
+  unaffected by the bus.
 - Publishing (via the `notify_user` tool) returns a **receipt**, not a
   delivery confirmation: `accepted` only ever means "the bus took custody of
   this notification". It is never presented as, and must never be read as,
@@ -319,7 +341,9 @@ nowhere else:
 - **RAM-only, bounded main queue**, independent of the passive bus's ring:
   pending requests are never silently evicted to make room for a new one —
   a full queue refuses new publications outright rather than losing one a
-  caller never knew was dropped. Nothing here survives an engine restart.
+  caller never knew was dropped. The queue does not persist on its own; only
+  a planned restart (`session/prepareRestart` + `initialize { restore }`)
+  carries pending requests over to the next engine.
 - **Delivery persists an ordinary, source-prefixed transcript entry** — once
   the single trusted consumer actually drains the queue, the exact text
   injected is projected into the running turn's own live history (and, once
@@ -361,9 +385,14 @@ nowhere else:
     never merely because the failed attempt's own slot release woke it.
   There is no attempt cap and no discard: a queued request is never dropped
   for having been retried too often.
-- **Nothing new on disk, nothing across a restart.** This adds no persisted
-  queue state and no restart continuation. Ordinary transcript persistence
-  is unchanged.
+- **Nothing new on disk of its own.** The main queue adds no persisted state
+  and is lost when an engine simply exits. A planned restart is the exception:
+  `session/prepareRestart` saves the pending requests in the restart file, and
+  the next engine's `initialize { restore }` queues them again after its
+  response, which wakes the idle main conversation — see
+  [Planned restart](../serve-protocol.md#planned-restart-rust). While the
+  engine is draining the idle path does not start a turn; queued requests stay
+  queued. Ordinary transcript persistence is unchanged.
 - **Shutdown.** `shutdown` publishes `stopping` first, so no further turn is
   admitted, cancels any running turn, then stops and **joins** the idle path
   within a bounded grace period (aborting it if a provider ignores

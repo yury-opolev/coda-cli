@@ -76,6 +76,9 @@ orchestrator ──spawn/connect──► coda serve
    receive server-initiated `request/*` you must answer. The `session/prompt` response resolves
    when the turn completes (or is interrupted).
 4. Repeat. `session/interrupt` cancels the in-flight turn. `shutdown` (or closing stdin) stops the server.
+5. To replace the engine without losing its in-memory state (an upgrade), call
+   `session/prepareRestart`, then `shutdown`, then start the new engine and send
+   `initialize { sessionId, restore: true }` — see [Planned restart](#planned-restart-rust).
 
 Startup ordering is deterministic: Coda starts the selected transport first and emits the local
 pipe/socket readiness line after bind. It then connects configured MCP servers sequentially and
@@ -142,7 +145,7 @@ the historical goal/startup details are not a promise of identical defaults.
 
 | Method | Params | Result |
 |---|---|---|
-| `initialize` | `{ protocolVersion: string, clientInfo?: string, apiKey?: string, sessionId?: string }` | `{ protocolVersion: string, sessionId: string, serverInfo: string, telemetryLogPath?: string }` |
+| `initialize` | `{ protocolVersion: string, clientInfo?: string, apiKey?: string, sessionId?: string, restore?: true\|false\|"suspended" }` | `{ protocolVersion: string, sessionId: string, serverInfo: string, telemetryLogPath?: string, restored?: RestoredSummary }` |
 | `session/prompt` | `{ text?, images?: [{ mediaType, base64 }] }` | `{ ok, stopReason?, interrupted, goalStatus? }` |
 | `session/interrupt` | `{}` | `{ ok }` |
 | `session/history` | `{}` | `{ messages: [{ role, content }] }` |
@@ -161,7 +164,7 @@ re-fetches the catalog from models.dev first.
 |---|---|---|
 | `session/getHistory` | `{ sessionId?, historyEpoch?, expectedHistoryLength?, engineInstanceId?, sinceIndex?, limit?, includeLive? }` | `{ sessionId, engineInstanceId, isLiveSession, historyEpoch?, cursor?, historyLength, entries[], nextIndex, totalKnown, truncated, liveEntries?, liveTruncated?, liveOmittedBytes? }` |
 | `session/listSessions` | `{ limit? }` | `{ sessions: [{ sessionId, createdUtc, messageCount, preview, previewTruncated, isCurrent }], totalKnown, truncated }` |
-| `session/listTasks` | `{ statusFilter? }` | `{ sessionId, tasks: [{ id, parentId, kind, description, status, mode, outputTail, report }] }` |
+| `session/listTasks` | `{ statusFilter? }` | `{ sessionId, tasks: [{ id, parentId, kind, description, status, mode, outputTail, report, suspendRequested? }] }` |
 | `session/getPendingRequests` | `{}` | `{ requests: PendingRequest[], engineInstanceId }` |
 | `session/resolveRequest` | `{ requestId, outcome }` | `{ ok, state, requestId, outcome }` |
 | `session/cancelRequest` | `{ requestId, reason? }` | `{ ok, requestId, appliedDefault, outcome }` |
@@ -174,12 +177,18 @@ re-fetches the catalog from models.dev first.
 | `task/background` | `{ taskId }` | `{ ok, taskId, reason? }` |
 | `task/stop` | `{ taskId }` | `{ ok, taskId, reason? }` |
 | `task/send` | `{ taskId, text }` | `{ ok, taskId, reason? }` |
+| `task/suspend` | `{ taskId }` | `{ ok, taskId, reason? }` |
+| `task/resume` | `{ taskId }` | `{ ok, taskId, reason? }` |
+| `session/suspendAllTasks` | `{}` | `{ ok, count }` |
+| `session/resumeAllTasks` | `{}` | `{ ok, count }` |
 | `session/askAside` | `{ question }` | `{ ok, answer?, reason?, error? }` |
+| `session/prepareRestart` | `{ drainTimeoutMs?, reason?, deliveredCursor? }` | `{ ok, restartFile, drained, interruptedTasks, interruptedRequests, suspendedTasks }` |
 
 **Initialization gate.** `session/getHistory`, `session/getPendingRequests`,
-`session/resolveRequest`, `session/cancelRequest`, `config/set`, the five task controls
-(`session/backgroundAll`, `session/stopAllTasks`, `task/background`, `task/stop`, `task/send`)
-and `session/askAside` require a completed
+`session/resolveRequest`, `session/cancelRequest`, `config/set`, the nine task controls
+(`session/backgroundAll`, `session/stopAllTasks`, `task/background`, `task/stop`, `task/send`,
+`task/suspend`, `task/resume`, `session/suspendAllTasks`, `session/resumeAllTasks`),
+`session/askAside` and `session/prepareRestart` require a completed
 `initialize` and otherwise return `-32011`. Read-only discovery — `session/listSessions`,
 `session/listTasks`, `config/describe`, `mcp/list`, `session/getState`, `session/getEvents` — is valid **before**
 `initialize`, so a client can choose a session before resuming one. Every route that shipped
@@ -190,12 +199,16 @@ registry in registration order, including silent running tasks and retained term
 tasks. It is shared by local and API-only `/tasks` browsers, including `serve` mode;
 clients must not infer task existence or status from local log files or completion
 notifications. `kind` is `subagent`, `shell`, `scheduled` or `tool` (a long MCP tool call
-the agent runs as a task); `status` is `running`,
+the agent runs as a task); `status` is `running`, `suspended` (a subagent paused at a safe
+point — not finished; see [Task suspension](#task-suspension-rust)),
 `completed`, `failed`, or `stopped`; `mode` is `foreground` or `background`.
-`statusFilter` (optional) narrows the listing without affecting any task: `active` returns only
-`running` tasks (foreground or background, with or without output, including parked
-subagents), `terminal` only `completed`, `failed` and `stopped` ones, and `all` — the
-behaviour when it is omitted — both. Any other value is refused with `-32602` (invalid params).
+`suspendRequested: true` marks a task that was asked to suspend but has not reached a safe
+point yet (its `status` is still `running`); it is omitted otherwise.
+`statusFilter` (optional) narrows the listing without affecting any task: `active` returns every
+unfinished task — `running` (foreground or background, with or without output, including parked
+subagents) or `suspended` —, `suspended` only the suspended ones, `terminal` only `completed`,
+`failed` and `stopped` ones, and `all` — the behaviour when it is omitted — everything. Any other
+value is refused with `-32602` (invalid params).
 The full-screen TUI's `/tasks` asks for `active`; its history view (`h`, or `/tasks all`) asks
 for `all`.
 The session id namespaces the registry's task ids. Ids are opaque strings, unique within a
@@ -220,7 +233,9 @@ subagent's next boundary (a running wait is not cut short), or wakes it when it 
 started). A refused `task/*` call answers `ok: false` with `reason` `notFound`,
 `notRunning`, for `task/background` only `notForeground` (already in the background — every
 subagent is) / `notBackgroundable`, and for `task/send` only `notAgent` (a shell task has no
-inbox), `notAccepting` (the subagent is finishing) / `emptyText`. When a background shell or
+inbox), `notAccepting` (the subagent is finishing) / `emptyText`; `task/suspend` and
+`task/resume` add `notSuspendable`, `notSuspended` and `suspendedByParent` (see
+[Task suspension](#task-suspension-rust)). When a background shell or
 subagent task owned by the main agent ends — completed, failed, or stopped by the agent —
 exactly one `[task-completed]` item (for a subagent, carrying its final report) is delivered
 to the main conversation through the main inbox (announced like any delivered agent message,
@@ -488,7 +503,9 @@ that id (subsequent turns persist back to the same file). If no transcript exist
 `sessionId` to start a new session (the returned `sessionId` is then newly generated). Transcripts
 are written automatically after every turn. Resumed metadata is applied before session
 initialization. Although clients should send `initialize` first, the first `session/prompt` can
-initialize the session if that request was omitted.
+initialize the session if that request was omitted. Adding `restore` to that `initialize` also
+applies the state a previous engine saved with `session/prepareRestart` — see
+[Planned restart](#planned-restart-rust).
 
 Only one turn runs at a time — a `session/prompt` while busy returns a JSON-RPC error.
 
@@ -589,7 +606,11 @@ refuse a prompt.
 `session/fork`, `session/rewind` and `session/compact` take the same slot as a prompt for their
 whole duration and publish a turn in the `maintenance` / `compacting` phase while they hold it —
 a prompt is refused, and a fork is refused while a prompt is running. `shutdown` publishes
-`stopping` and then `stopped`.
+`stopping` and then `stopped`. `session/prepareRestart` publishes `draining`: from then on the
+engine refuses new work with `-32016` and never returns to `ready` or `busy` (see
+[Planned restart](#planned-restart-rust)); `shutdown` still moves it to `stopping` and `stopped`.
+The lifecycle values are therefore `initializing`, `ready`, `busy`, `draining`, `stopping` and
+`stopped`.
 
 Initialization shares the exclusion slot without creating an agent turn.
 It reports `initializing`, refuses concurrent initialization/work, and cannot
@@ -778,6 +799,26 @@ memory grow with task output. The last output of a task is sent before its `task
 (unless the connection is congested). Use `session/listTasks` for the authoritative list and
 the retained tail; the task log has everything.
 
+A subagent that pauses at a safe point and continues later additionally produces
+`event/taskSuspended` and `event/taskResumed` (see [Task suspension](#task-suspension-rust)).
+A subagent re-created by a [planned restart](#planned-restart-rust) restore is announced by the
+new engine with an `event/taskStarted` carrying `"resumed": true` under its original `taskId`;
+`resumed` is omitted for every other start.
+
+```jsonc
+event/taskSuspended {
+  "taskId":      "task-00000002",
+  "ownerTaskId": "task-00000001", // absent for the main agent
+  "kind":        "subagent",
+  "reason":      "restart"        // "requested" | "parent" | "restart"
+}
+event/taskResumed {
+  "taskId":      "task-00000002",
+  "ownerTaskId": "task-00000001",
+  "kind":        "subagent"
+}
+```
+
 ### `session/askAside` — side questions (`/btw`)
 
 `{ question }` → `{ ok, answer?, reason?, error? }`. One separate, **tool-less** model
@@ -787,6 +828,348 @@ status, age, last output lines). It runs concurrently with the main agent — it
 slot, so it works while a turn is running — and is **never** added to the history. Refusals:
 `emptyQuestion`, `noProvider` (no model connected), `modelError` (`error` names the failure
 class, never provider text; the request is abandoned after 120 s). Requires `initialize`.
+
+## Task suspension (Rust)
+
+A **subagent** task can be paused at a *safe point* and continued later; shell, tool and
+scheduled tasks cannot (they are `notSuspendable`). A safe point is the top of an agent-loop
+iteration, before the next model request, or the subagent's park (waiting, without model calls,
+for tasks it started). It is never in the middle of a model response; a tool batch in progress
+completes first. A suspended subagent makes no model calls, keeps its conversation, and has
+`status: "suspended"` — a non-terminal status: it has **not** finished and has not reported.
+
+| Method | Effect |
+|---|---|
+| `task/suspend {taskId}` | Requests suspension of one running subagent. Its descendants pause with it (inherited suspension). Idempotent: `ok: true` again for an already suspended task. |
+| `task/resume {taskId}` | Clears that subagent's own suspension. Its descendants continue too, unless they were suspended explicitly themselves. |
+| `session/suspendAllTasks` | Requests suspension of every live subagent; `count` is how many were newly requested. |
+| `session/resumeAllTasks` | Clears every explicit suspension; `count` is how many were cleared. |
+
+Refusals answer `ok: false` with `reason`: `notFound`; `notSuspendable` (not a subagent);
+`notRunning` (already finished); for `task/resume` also `notSuspended` (neither suspended nor
+asked to suspend) and `suspendedByParent` (paused only because an ancestor is suspended — resume
+that ancestor). `task/resume` and `session/resumeAllTasks` are refused with `-32016` while the
+engine is [draining](#planned-restart-rust).
+
+Between the request and the safe point the task is still `running` and `session/listTasks`
+reports `suspendRequested: true`. When it pauses the engine publishes `event/taskSuspended`
+with `reason` `requested` (suspended itself), `parent` (inherited from an ancestor) or
+`restart` (suspended by a planned-restart drain); when it continues, `event/taskResumed`.
+`statusFilter: "suspended"` lists only suspended tasks, and `active` includes them.
+
+While suspended a subagent still accepts `task/send` (delivered after it resumes), still
+collects the completion reports of its own child tasks, and can be stopped with `task/stop` or
+`session/stopAllTasks`; `shutdown` stops it like any task. An agent that waits on a suspended
+child — `task_wait`, or a foreground wait on the task — returns at once (an in-flight wait
+wakes) with a normal, non-error result:
+
+```text
+Task 'task-00000002' is suspended (paused at a safe point); it has not finished. Its report will be delivered to you automatically after it is resumed and finishes. You may end your turn or wait again.
+```
+
+The capability `tasks.suspend` advertises these methods.
+
+## Planned restart (Rust)
+
+Schedules, `notify_user` notifications, the `ask_main` inbox, protocol-set settings, queued
+steering and running subagents live only in the engine's memory. A **planned restart** — for
+example replacing the engine with a newer Coda — carries them over: the old engine drains and
+writes a *restart file*, the new engine applies it once during `initialize`. The capability
+`session.plannedRestart` advertises it.
+
+```text
+old engine:  session/prepareRestart → (draining…) → result { restartFile, … } → shutdown
+new engine:  initialize { sessionId, restore: true } → { …, restored: { applied: true, … } }
+```
+
+### `session/prepareRestart`
+
+| Param | Meaning |
+|---|---|
+| `drainTimeoutMs` | How long to wait for running work before interrupting it. Default `600000` (10 min), maximum `3600000` (1 h; larger is `-32602`). `0` interrupts immediately. |
+| `reason` | Free text, saved in the restart file and quoted in the `[restart]` note. |
+| `deliveredCursor` | The last `notify_user` cursor the client has already shown. Retained notifications after it are saved and re-delivered after the restart. Absent means `0`: every notification the bus still retains is re-delivered. |
+
+The result arrives once the restart file is written:
+
+| Field | Meaning |
+|---|---|
+| `ok` | `true`. |
+| `restartFile` | Absolute path of the restart file. |
+| `drained` | `true` when everything finished or suspended before the timeout, so nothing was interrupted. |
+| `interruptedTasks` | Tasks the drain stopped (listed in the file's `interrupted.tasks`). |
+| `interruptedRequests` | Open permission/question/plan requests the drain declined. |
+| `suspendedTasks` | Ids of the subagents saved suspended for the next engine. |
+
+A second call while the first is still draining is refused with `-32016`; a call after it
+finished returns the same result again without draining twice. The engine **stays draining**
+afterwards: send `shutdown` and start the new engine.
+
+### Draining
+
+`session/prepareRestart` moves the lifecycle to `draining` (published as `event/lifecycle
+{ lifecycle: "draining" }` to clients that negotiated state events). From then on:
+
+- **New work is refused** with JSON-RPC error `-32016`, message `"restart pending"`:
+  `session/prompt`, `session/compact`, `session/fork`, `session/rewind`, and turns the engine
+  would start itself (the idle `ask_main` delivery — queued items stay queued and are saved).
+  `task/resume` and `session/resumeAllTasks` are refused the same way.
+- **Running work continues.** Steering into the running turn (`session/steer`) is still
+  accepted, and open requests can still be answered (`session/resolveRequest`, the raw
+  `request/*` reply, `session/cancelRequest`). Reads, `task/stop` and `shutdown` work as usual.
+- **Schedules stop launching.** Definitions are kept unchanged; a due run is simply not
+  started.
+- **Subagents suspend.** Every live subagent is asked to suspend and pauses at its next safe
+  point (`event/taskSuspended`, `reason: "restart"`); a subagent started during the drain
+  starts suspended.
+- The engine never returns to `ready`/`busy`; `shutdown` still goes `stopping` → `stopped`.
+
+`session/getState` reports `lifecycle: "draining"` and a `drain` section (omitted otherwise):
+
+```jsonc
+"drain": {
+  "startedAt":   "2026-11-02T12:00:00Z", // RFC 3339 UTC
+  "deadlineAt":  "2026-11-02T12:10:00Z", // running work is interrupted at this instant
+  "remainingMs": 412000,                 // until deadlineAt, never negative
+  "reason":      "upgrade",              // omitted when none was given
+  "completed":   false                   // true once the restart file is written
+}
+```
+
+The drain is complete when no turn holds the execution slot, every shell, tool and scheduled
+task has finished, and every subagent has finished or is suspended. If that does not happen
+before `drainTimeoutMs`:
+
+1. Everything still running is recorded — each shell/tool/scheduled task with its command,
+   start time and the last 2,000 characters of its secret-redacted output, each open request
+   (its kind and tool name or question text) — and queued steering is withdrawn and saved.
+2. The running turn is cancelled, the recorded tasks are stopped (shell process trees are
+   killed), and the open requests are declined (fail-closed: deny / no answer / reject). An
+   agent that was waiting on a stopped task receives the tool result
+   `Interrupted by a planned restart; last output:` followed by that output tail (`(no output)`
+   when empty).
+3. The engine waits up to 10 s for the turn to end and then up to **30 s** (the settle window)
+   for subagents to reach a safe point and suspend. A subagent still not suspended after that —
+   typically one waiting on a slow model response — is stopped and recorded as an interrupted
+   task of kind `subagent`, together with anything else still running.
+
+The model is told about all of this after the restart (see the `[restart]` entry below).
+
+### The restart file
+
+The file is `<cwd>/.coda/sessions/<sessionId>.restart.json`. It is written atomically (a
+temporary file renamed into place) and readable only by its owner (mode `0600` on Unix; on
+Windows a protected DACL with a single full-control entry for the current user). It is written
+**last**, after every subagent file. `session/listSessions` ignores `*.restart.json` files.
+Format version `1`:
+
+```json
+{
+  "version": 1,
+  "codaVersion": "0.1.176",
+  "sessionId": "8c1f0b2e-5d7a-4c11-9e3b-2f6a1d0c9b77",
+  "workingDir": "C:\\work\\repo",
+  "preparedAt": "2026-11-02T12:10:02.481Z",
+  "reason": "upgrade",
+  "schedules": [
+    {
+      "schemaVersion": 3,
+      "id": "a1b2c3",
+      "name": "nightly backup",
+      "kind": "cron",
+      "prompt": "Back up the database and report the size.",
+      "cron": "0 2 * * *",
+      "timeZoneId": "Europe/Berlin",
+      "nextRunUtc": "2026-11-03T01:00:00Z",
+      "createdAtUtc": "2026-10-30T09:00:00Z",
+      "updatedAtUtc": "2026-11-02T01:00:05Z",
+      "maxRuns": 30,
+      "runsStarted": 4
+    }
+  ],
+  "messages": [
+    {
+      "channel": "user",
+      "cursor": 17,
+      "id": "3f9c2a7e5b0d4e1a8c6f1b2d3e4a5c6d",
+      "source": "scheduledTask",
+      "label": "nightly backup",
+      "text": "Backup finished: 1.2 GB.",
+      "taskId": "task-00000004",
+      "scheduleDefinitionId": "a1b2c3",
+      "scheduleName": "nightly backup"
+    },
+    {
+      "channel": "main",
+      "cursor": 3,
+      "id": "9a8b7c6d5e4f40312a1b0c9d8e7f6a5b",
+      "source": "subagent",
+      "label": "reviewer",
+      "text": "Should I also review the migrations?",
+      "taskId": "task-00000002"
+    }
+  ],
+  "settings": {
+    "model": "claude-sonnet-4-5",
+    "provider": "anthropic",
+    "effort": "high",
+    "goal": { "goal": "Make the test suite green", "maxDuration": "2h", "maxContinuations": 40 },
+    "permissionMode": "acceptEdits",
+    "systemPrompt": "You are the release assistant."
+  },
+  "steering": ["also check the Windows build"],
+  "interrupted": {
+    "tasks": [
+      {
+        "taskId": "task-00000003",
+        "kind": "shell",
+        "description": "npm test",
+        "command": "npm test",
+        "startedAt": "2026-11-02T12:01:30Z",
+        "outputTail": "  412 passing\n  3 pending\n"
+      }
+    ],
+    "requests": [
+      { "kind": "permission", "toolName": "run_command" },
+      { "kind": "question", "question": "Delete the old fixtures?" }
+    ]
+  },
+  "tasks": ["task-00000002"]
+}
+```
+
+- `schedules` holds each definition exactly as `session/scheduleList` knows it (id, bounds,
+  `runsStarted`, `nextRunUtc`, retirement).
+- `messages` holds `notify_user` notifications (`channel: "user"`, `cursor` is the bus cursor)
+  and pending `ask_main` items (`channel: "main"`, `cursor` is the main-queue sequence).
+  `source` is `scheduledTask`, `subagent`, `main` or `taskCompletion`; `context`,
+  `idempotencyKey` and the provenance fields are omitted when absent.
+- `settings` omits what is not set; `goal` carries the remaining per-goal budgets.
+- `steering` is operator steering that was queued but not yet delivered.
+- `interrupted.tasks[].kind` is `shell`, `tool`, `scheduled` or `subagent`; `command` is present
+  for shell tasks. `interrupted.requests[].kind` is `permission`, `question` or `planApproval`.
+- `tasks` lists the subagents saved suspended; each has its own file (below).
+
+### Subagent files
+
+Each suspended subagent is saved to `<cwd>/.coda/sessions/<sessionId>.tasks/<taskId>.json`
+with the same atomic, owner-only writer (format version `1`):
+
+```jsonc
+{
+  "version": 1,
+  "taskId": "task-00000002",
+  "ownerTaskId": null,              // the agent that started it; null for the main agent
+  "reportsTo": "main",              // "main" or the owner's task id
+  "kind": "subagent",
+  "description": "review the diff",
+  "mode": "background",
+  "spec": {                         // how it was spawned
+    "agentType": "general-purpose", "prompt": "Review the diff …", "systemPrompt": "…",
+    "model": "claude-sonnet-4-5", "provider": "anthropic", "effort": null, "depth": 1,
+    "maxSteps": 200, "maxTokens": 16000, "foreground": false, "scheduleOrigin": null
+  },
+  "conversation": [ /* the subagent's messages, in the session transcript format */ ],
+  "stepsUsed": 7,
+  "parked": false,                  // true when it was parked waiting for its own tasks
+  "steering": [{ "kind": "message", "text": "focus on the API" }], // undelivered inbox items
+  "explicitlySuspended": false,     // suspended by the operator before the drain
+  "startedAt": "2026-11-02T11:58:10Z",
+  "suspendedAt": "2026-11-02T12:00:01Z",
+  "truncated": false
+}
+```
+
+A file is capped at **8 MiB**. When the conversation is larger, the oldest tool results are
+replaced, one by one, by `[truncated for a planned restart: N characters omitted]` until it fits,
+and `truncated` is `true`.
+
+### Restore on `initialize`
+
+`initialize` accepts `restore`: `true` (restore; suspended subagents continue), `"suspended"`
+(restore, but keep the restored subagents suspended until `task/resume`) or `false` (restore
+nothing — the default). Any other value is `-32602`. `restore` requires a `sessionId`
+(`-32602` otherwise). The file is read and validated **before** the initialization is claimed:
+
+- A file whose `version` is newer than this engine supports fails `initialize` with **`-32017`**
+  (`restart file format 2 is newer than this Coda supports (1)`) and no side effects: the client
+  may retry without `restore`.
+- Otherwise a file that cannot be used is **ignored** and left on disk; the session resumes as
+  a plain resume and `restored` says why: `missing` (no file), `unreadable` (not valid JSON or
+  not a restart file), `sessionMismatch`, `workingDirMismatch` (compared case-insensitively on
+  Windows), `expired` (`preparedAt` older than 24 h, or more than 5 min in the future), or
+  `consumeFailed` (a valid file that could not be deleted — it is never applied without being
+  consumed).
+- A valid file stands in for a missing transcript: the session starts empty under that id.
+  Without a transcript and without a valid file, `initialize` fails with `-32002` as usual.
+
+A valid file is **deleted before anything is applied**, so a restore happens at most once; a
+second `initialize { restore: true }` reports `ignoredReason: "missing"`. Each subagent file is
+deleted once its subagent is re-created.
+
+`coda serve --restore` makes `restore: true` the default for an `initialize` that leaves it out,
+`--restore=suspended` makes it `"suspended"`, and `--session <id>` supplies the default
+`sessionId` (environment equivalents: `CODA_SERVE_RESTORE` = `true` | `false` | `suspended`,
+`CODA_SERVE_SESSION`). Values the client sends win.
+
+The response carries `restored` exactly when a restore was asked for:
+
+| Field | Meaning |
+|---|---|
+| `applied` | `true` when the file was applied; `false` with `ignoredReason` otherwise. |
+| `ignoredReason` | One of the reasons above; omitted when applied. |
+| `preparedAt`, `reason`, `fromVersion`, `toVersion` | When and why the old engine prepared the restart, and the two Coda versions. |
+| `schedules`, `messages` | How many schedules and messages were restored. |
+| `settings` | Names of the settings applied (`model`, `effort`, `goal`, `systemPrompt`, `permissionMode`). |
+| `settingsNotRestored` | `[{ name, value?, reason }]` for each saved setting deliberately not applied. |
+| `interruptedTasks`, `interruptedRequests`, `steering` | What the drain interrupted, declined and carried over. |
+| `tasks` | Ids of the subagents re-created under their original ids. |
+| `tasksSuspended` | `true` for `restore: "suspended"`. |
+
+What a restore applies:
+
+- **Schedules** keep their ids, bounds and `runsStarted`. A recurring (interval/cron) schedule
+  whose `nextRunUtc` passed while the engine was down moves to its first slot after now — no
+  burst and no catch-up run. A one-shot `at` schedule whose time passed stays due and fires
+  **once** after the restore (at-least-once). Retired definitions come back retired.
+- **Messages** are re-published **after** the `initialize` response is written, with **new**
+  cursors on the new engine's bus: notifications arrive as fresh `event/agentMessage`
+  notifications, and `ask_main` items are queued again and wake the idle main conversation.
+  Recover them with `session/pendingMessages` from cursor `0` like any other notification.
+- **Settings** are applied through the same paths as their setters, and anything refused is
+  listed in `settingsNotRestored`. `bypassPermissions` is **never** restored: the mode stays
+  `default` and is reported. The provider is never switched: when the new engine runs a
+  different provider, `provider`, `model` and `effort` are reported instead of applied.
+- **Subagents** are re-created under their original task ids with their conversation, step
+  count, inbox and spawn settings, announced by `event/taskStarted { resumed: true }`, and
+  continue from their safe point (or stay suspended for `restore: "suspended"`, and always when
+  the operator had suspended them before the drain). Their reports reach their owners as usual.
+  When no provider can be wired during `initialize`, they are re-created the first time the
+  session services are built and are not listed in `tasks`.
+- **One `[restart]` entry** is appended to the restored conversation as a user-role message (after
+  any interrupted tool calls in the transcript are closed) and saved at once, so the model learns
+  what happened on its next turn. Lines appear only when they apply:
+
+```text
+[restart] Coda was restarted for an upgrade (0.1.176 → 0.1.177).
+Steering sent before the restart that was not delivered: "also check the Windows build".
+Interrupted: run_command npm test (started 12:01 UTC, last output: 412 passing 3 pending).
+Declined requests: permission for run_command; question "Delete the old fixtures?".
+Suspended subagents restored: task-00000002.
+Re-run anything still needed.
+```
+
+The first line reads `… for an upgrade (0.1.176 → 0.1.177): <reason>.` when a reason was
+given, and `[restart] Coda was restarted.` / `[restart] Coda was restarted (<reason>).` when
+both engines have the same version. `Re-run anything still needed.` is added only when
+something was interrupted or declined.
+
+### Error codes
+
+| Code | Message | When |
+|---|---|---|
+| `-32016` | `restart pending` | The engine is draining for a planned restart and refuses new work; also a second `session/prepareRestart` while one is in progress. |
+| `-32017` | `restart file format N is newer than this Coda supports (1)` | `initialize { restore }` found a newer restart file; nothing was changed, retry without `restore`. |
 
 ## Coda → Orchestrator (server-initiated requests — you MUST answer; the agent blocks)
 | Method | Params | Reply |
