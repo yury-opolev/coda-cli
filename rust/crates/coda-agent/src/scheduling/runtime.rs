@@ -26,6 +26,7 @@
 //!   next boundary.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -281,6 +282,11 @@ pub struct ScheduleRuntime {
     /// Thread-safe, published after every state change.
     view: Arc<RwLock<HashMap<String, ScheduleRuntimeState>>>,
     cancel: CancellationToken,
+    /// Launch pause (planned-restart drain): while set, due definitions are
+    /// not launched; definitions and in-flight runs are untouched.
+    launches_paused: Arc<AtomicBool>,
+    /// Wakes the loop when launches are unpaused.
+    launches_resumed: Arc<tokio::sync::Notify>,
     /// Handle to the background loop task (set after `start()`).
     loop_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -310,6 +316,8 @@ impl ScheduleRuntime {
         let (tx, rx) = mpsc::unbounded_channel();
         let cancel = CancellationToken::new();
         let view = Arc::new(RwLock::new(HashMap::new()));
+        let launches_paused = Arc::new(AtomicBool::new(false));
+        let launches_resumed = Arc::new(tokio::sync::Notify::new());
 
         let this = Arc::new(Self {
             _store: store.clone(),
@@ -318,6 +326,8 @@ impl ScheduleRuntime {
             commands_tx: tx,
             view: view.clone(),
             cancel: cancel.clone(),
+            launches_paused: Arc::clone(&launches_paused),
+            launches_resumed: Arc::clone(&launches_resumed),
             loop_handle: tokio::sync::Mutex::new(None),
         });
 
@@ -338,6 +348,8 @@ impl ScheduleRuntime {
             loop_view,
             loop_cancel,
             clock,
+            launches_paused,
+            launches_resumed,
         ));
 
         // Store handle — but we can't block here (async context), so we use
@@ -348,6 +360,25 @@ impl ScheduleRuntime {
         });
 
         this
+    }
+
+    /// Pauses (or resumes) launching due definitions.
+    ///
+    /// While paused nothing new is launched — not a due tick, not a coalesced
+    /// replacement — and the loop does not wake for due-ness, so it never
+    /// spins on a definition it is not allowed to launch. Definitions stay
+    /// exactly as they are and runs already in flight are not touched.
+    /// Unpausing wakes the loop so anything due launches promptly.
+    pub fn pause_launches(&self, paused: bool) {
+        let was = self.launches_paused.swap(paused, AtomicOrdering::SeqCst);
+        if was && !paused {
+            self.launches_resumed.notify_one();
+        }
+    }
+
+    /// Whether launches are currently paused.
+    pub fn launches_paused(&self) -> bool {
+        self.launches_paused.load(AtomicOrdering::SeqCst)
     }
 
     /// Stop the runtime and wait for the loop task to exit.
@@ -392,6 +423,8 @@ async fn run_loop(
     view: Arc<RwLock<HashMap<String, ScheduleRuntimeState>>>,
     cancel: CancellationToken,
     clock: Arc<dyn ScheduleClock>,
+    paused: Arc<AtomicBool>,
+    resumed: Arc<tokio::sync::Notify>,
 ) {
     let mut entries: HashMap<String, Entry> = HashMap::new();
 
@@ -407,13 +440,15 @@ async fn run_loop(
         // 2. Process queued terminal callbacks.
         while let Ok(cmd) = commands_rx.try_recv() {
             if cancel.is_cancelled() { break; }
-            process_terminal(&mut entries, cmd, &store, &runner, &sink, &commands_tx, &view, &clock).await;
+            let launches_paused = paused.load(AtomicOrdering::SeqCst);
+            process_terminal(&mut entries, cmd, &store, &runner, &sink, &commands_tx, &view, &clock, launches_paused).await;
         }
 
         if cancel.is_cancelled() { break; }
 
         // 3. Evaluate due definitions.
-        evaluate_due(&mut entries, &store, &runner, &sink, &commands_tx, &view, &cancel, &clock).await;
+        let launches_paused = paused.load(AtomicOrdering::SeqCst);
+        evaluate_due(&mut entries, &store, &runner, &sink, &commands_tx, &view, &cancel, &clock, launches_paused).await;
 
         if cancel.is_cancelled() { break; }
 
@@ -423,12 +458,13 @@ async fn run_loop(
 
         // 5. Wait for next event.
         let now = clock.now();
-        let delay = compute_delay(&entries, now);
+        let delay = compute_delay(&entries, now, paused.load(AtomicOrdering::SeqCst));
         let observed_version = wait_snapshot.version;
 
         tokio::select! {
             _ = tokio::time::sleep(delay) => {}
             _ = store.wait_for_change(observed_version) => {}
+            _ = resumed.notified() => {}
             Some(cmd) = commands_rx.recv() => {
                 // Re-queue and fall through so next iteration processes it.
                 let _ = commands_tx.send(cmd);
@@ -505,6 +541,7 @@ async fn evaluate_due(
     view: &Arc<RwLock<HashMap<String, ScheduleRuntimeState>>>,
     cancel: &CancellationToken,
     clock: &Arc<dyn ScheduleClock>,
+    launches_paused: bool,
 ) {
     let ids: Vec<String> = entries.keys().cloned().collect();
 
@@ -552,7 +589,7 @@ async fn evaluate_due(
 
         let due = next_run <= now;
         match status {
-            RuntimeStatus::Idle if due => {
+            RuntimeStatus::Idle if due && !launches_paused => {
                 claim_and_launch(entries, &id, now, store, runner, sink, commands_tx, view).await;
             }
             RuntimeStatus::Running | RuntimeStatus::Pending if due => {
@@ -871,6 +908,7 @@ async fn process_terminal(
     commands_tx: &UnboundedSender<TerminalCommand>,
     view: &Arc<RwLock<HashMap<String, ScheduleRuntimeState>>>,
     clock: &Arc<dyn ScheduleClock>,
+    launches_paused: bool,
 ) {
     let entry = match entries.get(&command.definition_id) {
         Some(e) => e,
@@ -945,8 +983,10 @@ async fn process_terminal(
         return;
     }
 
-    if was_pending {
+    if was_pending && !launches_paused {
         // Launch one coalesced replacement; next_run_utc is already future.
+        // While launches are paused the replacement is dropped: the entry is
+        // idle and fires again at its (already advanced) next boundary.
         let def = entries.get(&command.definition_id).unwrap().definition.clone();
         launch(
             entries,
@@ -972,11 +1012,18 @@ fn is_recurring(definition: &ScheduledTask) -> bool {
     matches!(definition.kind, ScheduleKind::Interval | ScheduleKind::Cron)
 }
 
-fn compute_delay(entries: &HashMap<String, Entry>, now: DateTime<Utc>) -> Duration {
+fn compute_delay(
+    entries: &HashMap<String, Entry>,
+    now: DateTime<Utc>,
+    launches_paused: bool,
+) -> Duration {
     let mut earliest = now + chrono::Duration::from_std(MAX_REEVALUATION).unwrap();
     for entry in entries.values() {
         if entry.deleted || entry.faulted { continue; }
-        if entry.status == RuntimeStatus::Idle
+        // A paused runtime cannot launch, so due-ness is no reason to wake:
+        // an overdue idle entry would otherwise make this a busy loop.
+        if !launches_paused
+            && entry.status == RuntimeStatus::Idle
             && entry.definition.next_run_utc < earliest
             && !entry.definition.is_retired()
         {
@@ -1584,6 +1631,60 @@ pub(crate) mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // Launch pause (planned-restart drain)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn paused_runtime_does_not_launch_due_definitions() {
+        struct CountingClock {
+            inner: Arc<TestClock>,
+            reads: AtomicUsize,
+        }
+        impl ScheduleClock for CountingClock {
+            fn now(&self) -> DateTime<Utc> {
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                self.inner.now()
+            }
+        }
+        let start = fake_start();
+        let clock = Arc::new(CountingClock { inner: TestClock::new(start), reads: AtomicUsize::new(0) });
+        let store = ScheduledTaskStore::new();
+        let runner = MockRunner::never_completes();
+        let runtime = ScheduleRuntime::new_with_clock(
+            store.clone(),
+            runner.clone(),
+            RecordingSink::new(),
+            clock.clone(),
+        );
+        runtime.pause_launches(true);
+        assert!(runtime.launches_paused());
+
+        let mut draft = draft_interval(3600);
+        draft.next_run_utc = start - chrono::Duration::seconds(1);
+        let definition = store.add(draft, start);
+        settle().await;
+
+        assert_eq!(runner.launch_count.load(Ordering::SeqCst), 0, "a paused runtime must not launch");
+        let untouched = current(&store, &definition.id);
+        assert_eq!(untouched.next_run_utc, definition.next_run_utc, "the definition must be untouched");
+        assert_eq!(untouched.runs_started, definition.runs_started);
+
+        // An overdue definition is no reason to wake while paused: the loop
+        // must park, not spin re-evaluating something it cannot launch.
+        let reads_before = clock.reads.load(Ordering::SeqCst);
+        settle().await;
+        let reads_while_parked = clock.reads.load(Ordering::SeqCst) - reads_before;
+        assert!(reads_while_parked < 5, "the paused loop spun: {reads_while_parked} clock reads");
+
+        runtime.pause_launches(false);
+        wait_until("unpausing launches the due definition", || {
+            runner.launch_count.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        runtime.shutdown().await;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // STAGE 1 — bounded schedules
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -1733,7 +1834,7 @@ pub(crate) mod tests {
         reconcile(&mut entries, &store.get_snapshot(), &view, &store);
         evaluate_due(
             &mut entries, &store, &runner_port, &sink, &tx, &view,
-            &CancellationToken::new(), &clock,
+            &CancellationToken::new(), &clock, false,
         ).await;
         assert_eq!(runner.launches(), 1, "the later admission occurred after expiry");
     }
@@ -2055,7 +2156,7 @@ pub(crate) mod tests {
         }).unwrap();
         runner.finish_all(crate::tasks::TaskRunStatus::Completed);
         let terminal = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.unwrap().unwrap();
-        process_terminal(&mut entries, terminal, &store, &runner_port, &sink, &tx, &view, &clock).await;
+        process_terminal(&mut entries, terminal, &store, &runner_port, &sink, &tx, &view, &clock, false).await;
         let definition = current(&store, &id);
         assert_eq!(definition.retirement.unwrap().reason, ScheduleRetirementReason::Cancelled);
         assert!(definition.last_terminal_outcome.is_some());

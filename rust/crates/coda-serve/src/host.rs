@@ -74,7 +74,7 @@ use crate::dispatch::AdjustEffortParams;
 use crate::prompts::{PromptChannel, WirePermissionPrompt, WirePlanApprover, WireUserQuestion};
 use crate::mcp::McpBundle;
 use crate::session::Session;
-use crate::state::{EngineState, SteeringStateObserver, TurnEnd};
+use crate::state::{AlreadyDraining, EngineState, SteeringStateObserver, TurnEnd, TurnRefusal};
 use coda_proto::state::ActivityPhase;
 use crate::state_sink::StateSink;
 use crate::capabilities::capability_catalog;
@@ -2112,8 +2112,40 @@ impl ServeHost {
             return Arc::clone(svc);
         }
         let svc = Arc::new(self.build_session_services(client));
+        // Built while draining (lazily, by work admitted before the drain):
+        // start with launches paused. Checked under the services lock, which
+        // `begin_draining` also takes, so one of the two always pauses it.
+        if self.engine_state.is_draining() {
+            svc.schedule_runtime.pause_launches(true);
+        }
         *guard = Some(Arc::clone(&svc));
         svc
+    }
+
+    /// Enters the planned-restart `draining` lifecycle: every new turn
+    /// (prompt, main-inbox pump, compaction, fork, rewind) is refused with
+    /// `restart pending`, and the schedule runtime stops launching. Work
+    /// already running — including an open turn and its pending requests —
+    /// continues.
+    // Called by `session/prepareRestart`; until that lands only tests do.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn begin_draining(
+        &self,
+        reason: Option<String>,
+        deadline: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), AlreadyDraining> {
+        self.engine_state.begin_draining(reason, deadline)?;
+        self.pause_schedule_launches(true).await;
+        Ok(())
+    }
+
+    /// Pauses or resumes launching due schedules. A no-op until the session
+    /// services exist; services built later while draining start paused.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn pause_schedule_launches(&self, paused: bool) {
+        if let Some(svc) = self.session_services.lock().await.as_ref() {
+            svc.schedule_runtime.pause_launches(paused);
+        }
     }
 
     /// Construct all session-scoped services that require a live client.
@@ -2303,6 +2335,11 @@ impl ServeHost {
         precondition: Option<&dyn Fn() -> bool>,
     ) -> Result<TurnGuard<'_>, ClaimRefused> {
         let mut busy = self.turn_active.lock().expect("turn_active poisoned");
+        // Checked before `busy`: a draining engine's answer is "restart
+        // pending" whether or not the slot happens to be held right now.
+        if self.engine_state.is_draining() {
+            return Err(ClaimRefused::Draining);
+        }
         if *busy {
             return Err(ClaimRefused::Busy);
         }
@@ -2318,10 +2355,12 @@ impl ServeHost {
         let admitted = {
             let runtime = self.runtime.lock().expect("runtime config poisoned");
             let active_config = runtime.active_config(self.permission_mode.get());
-            self.engine_state.begin_turn(turn_id, user_text, active_config, kind.phase())
+            self.engine_state.try_begin_turn(turn_id, user_text, active_config, kind.phase())
         };
-        if !admitted {
-            return Err(ClaimRefused::Stopped);
+        match admitted {
+            Ok(()) => {}
+            Err(TurnRefusal::Stopped) => return Err(ClaimRefused::Stopped),
+            Err(TurnRefusal::Draining) => return Err(ClaimRefused::Draining),
         }
         // Resolve the window the turn is about to fill, from the catalogue
         // alone. `session/models` also reports it, but a headless client may
@@ -2368,6 +2407,9 @@ enum ClaimRefused {
     Busy,
     /// The engine is stopping or stopped; no new work is admitted.
     Stopped,
+    /// The engine is draining for a planned restart; no new work is admitted
+    /// (`restart pending`, -32016).
+    Draining,
     /// The caller's own admission precondition no longer holds (see
     /// [`ServeHost::try_claim_turn_if`]). Only the idle main-inbox pump
     /// supplies a precondition, so this is unreachable for `session/prompt`,
@@ -2384,6 +2426,7 @@ impl ClaimRefused {
             ClaimRefused::Stopped => RpcError::internal(
                 "engine is shutting down; no new turn was started".to_owned(),
             ),
+            ClaimRefused::Draining => RpcError::restart_pending(),
             ClaimRefused::NoWork => RpcError::internal(
                 "the work this turn was claimed for no longer exists".to_owned(),
             ),
@@ -2576,6 +2619,8 @@ enum PromptRunFailure {
     Busy,
     /// The engine is stopping or stopped; no new turn is admitted.
     Stopped,
+    /// The engine is draining for a planned restart; no new turn is admitted.
+    Draining,
     /// Main-inbox origin only: the admission precondition no longer held at
     /// the instant of the claim — a racing user turn had already drained the
     /// queue. Nothing was claimed, opened or published.
@@ -2590,6 +2635,7 @@ impl From<ClaimRefused> for PromptRunFailure {
         match refused {
             ClaimRefused::Busy => PromptRunFailure::Busy,
             ClaimRefused::Stopped => PromptRunFailure::Stopped,
+            ClaimRefused::Draining => PromptRunFailure::Draining,
             ClaimRefused::NoWork => PromptRunFailure::NoWork,
         }
     }
@@ -2602,6 +2648,7 @@ impl PromptRunFailure {
                 ClaimRefused::Busy.into_error("another prompt is already in progress; busy")
             }
             PromptRunFailure::Stopped => ClaimRefused::Stopped.into_error(""),
+            PromptRunFailure::Draining => ClaimRefused::Draining.into_error(""),
             PromptRunFailure::NoWork => ClaimRefused::NoWork.into_error(""),
             PromptRunFailure::Failed(e) => e,
         }
@@ -2621,6 +2668,7 @@ impl PromptRunFailure {
             },
             PromptRunFailure::Busy
             | PromptRunFailure::Stopped
+            | PromptRunFailure::Draining
             | PromptRunFailure::NoWork => "preflight",
         }
     }
@@ -3829,6 +3877,12 @@ impl ServeBackend for ServeHost {
     }
 
     async fn session_compact(&self, p: CompactParams) -> Result<Value, RpcError> {
+        // Refused before credentials are wired: a draining engine admits no
+        // new work, and wiring would still commit configuration. The turn
+        // gate below refuses it too, for a drain that begins in between.
+        if self.engine_state.is_draining() {
+            return Err(RpcError::restart_pending());
+        }
         // Require credentials (same guard as session/prompt), and wire them
         // through the same announced commit — a client wired here used to
         // leave `config.next.providerId` reporting "not wired" for the rest
@@ -4683,6 +4737,13 @@ impl ServeHost {
             return MainPumpStep::Wait;
         }
 
+        // A draining engine admits no new turn; the queued items stay queued
+        // (they are carried across the restart). Parking here, before the
+        // provider preflight, means each wake costs nothing and never spins.
+        if self.engine_state.is_draining() {
+            return MainPumpStep::Wait;
+        }
+
         if let Some(recorded) = block.as_ref() {
             if !recorded.is_cleared_by(self) {
                 return MainPumpStep::Wait;
@@ -4753,7 +4814,12 @@ impl ServeHost {
             // claim, or the slot was held. Neither is a failure and neither
             // is blocked: the queue state or the slot release will wake this
             // again.
-            Err(PromptRunFailure::NoWork) | Err(PromptRunFailure::Busy) => MainPumpStep::Wait,
+            // Draining: a refused claim never takes the slot, so nothing
+            // signals the pump's own wake — it parks until new work arrives,
+            // and the gate above answers that without another attempt.
+            Err(PromptRunFailure::NoWork)
+            | Err(PromptRunFailure::Busy)
+            | Err(PromptRunFailure::Draining) => MainPumpStep::Wait,
             Err(PromptRunFailure::Stopped) => MainPumpStep::Stop,
             Err(PromptRunFailure::Failed(e)) if delivered_after > delivered_before => {
                 // The items were injected and the model run then failed. The
@@ -8744,6 +8810,174 @@ mod tests {
         );
         assert!(resp["rejectedReason"].is_null());
         assert!(host.session.steering.has_pending());
+    }
+
+    // ── Planned restart: the draining turn gate ───────────────────────────
+
+    fn drain_deadline() -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now() + chrono::Duration::minutes(10)
+    }
+
+    #[tokio::test]
+    async fn draining_refuses_new_prompts_with_restart_pending() {
+        use crate::dispatch::dispatch;
+        let dir = tempfile::tempdir().unwrap();
+        let (host, mut rx) = host_with_events(dir.path());
+        let _ = drain_events(&mut rx);
+
+        host.begin_draining(Some("upgrade".into()), drain_deadline()).await.unwrap();
+        assert!(host.begin_draining(None, drain_deadline()).await.is_err(), "a drain begins once");
+
+        let err = dispatch("session/prompt", Some(json!({ "text": "hello" })), host.as_ref())
+            .await
+            .expect_err("a draining engine admits no new prompt");
+        assert_eq!(err.code, coda_proto::messages::error_code::RESTART_PENDING);
+        assert_eq!(err.code, -32016);
+        assert_eq!(err.message, "restart pending");
+        for method in ["session/fork", "session/rewind"] {
+            let err = dispatch(method, Some(json!({})), host.as_ref()).await.expect_err(method);
+            assert_eq!(err.code, -32016, "{method} must be refused as restart pending");
+        }
+
+        let state = dispatch("session/getState", None, host.as_ref()).await.unwrap();
+        assert_eq!(state["lifecycle"], "draining");
+        assert!(state["drain"]["remainingMs"].as_u64().unwrap() > 0, "{}", state["drain"]);
+        assert_eq!(state["drain"]["reason"], "upgrade");
+        assert_eq!(state["drain"]["completed"], false);
+        assert!(state["turn"].is_null(), "a refused prompt opens no turn");
+
+        let lifecycles: Vec<(Value, Value)> = drain_events(&mut rx)
+            .into_iter()
+            .filter(|(m, _)| m == "event/lifecycle")
+            .map(|(_, p)| (p["lifecycle"].clone(), p["initialized"].clone()))
+            .collect();
+        assert_eq!(lifecycles, vec![(json!("draining"), json!(true))]);
+    }
+
+    #[tokio::test]
+    async fn draining_still_lets_an_open_request_be_answered() {
+        use crate::dispatch::dispatch;
+        let dir = tempfile::tempdir().unwrap();
+        let client = ScriptedClient::new(vec![ask_delete_or_keep_turn(), file_test_done()]);
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let sink = Arc::new(ServeSink::new(tx.clone()));
+        let channel = Arc::new(PromptChannel::new(tx));
+        let host = ServeHost::new_with_client(
+            client,
+            sink,
+            channel,
+            dir.path().to_string_lossy().into_owned(),
+        );
+        host.engine_state.mark_initialized();
+
+        let prompt = {
+            let host = Arc::clone(&host);
+            tokio::spawn(async move {
+                host.session_prompt(PromptParams { text: Some("tidy up".into()), images: None })
+                    .await
+            })
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(std::time::Instant::now() < deadline, "engine never issued request/question");
+            if let Ok(frame) = rx.try_recv() {
+                if String::from_utf8_lossy(&frame).contains("request/question") {
+                    break;
+                }
+                continue;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        host.begin_draining(None, drain_deadline()).await.unwrap();
+
+        let pending = dispatch("session/getPendingRequests", None, host.as_ref()).await.unwrap();
+        let request_id = pending["requests"][0]["requestId"].as_str().expect("the open question").to_owned();
+        let resolved = dispatch(
+            "session/resolveRequest",
+            Some(json!({ "requestId": request_id, "outcome": { "answer": "Keep" } })),
+            host.as_ref(),
+        )
+        .await
+        .expect("an open request is still answerable while draining");
+        assert_eq!(resolved["ok"], true);
+
+        let result = tokio::time::timeout(Duration::from_secs(10), prompt)
+            .await
+            .expect("the turn completes")
+            .expect("task")
+            .expect("the running turn is not refused by the drain");
+        assert_eq!(result["ok"], true, "{result}");
+
+        let state = dispatch("session/getState", None, host.as_ref()).await.unwrap();
+        assert_eq!(state["lifecycle"], "draining", "a released turn never returns the engine to ready");
+        let err = dispatch("session/prompt", Some(json!({ "text": "more" })), host.as_ref())
+            .await
+            .expect_err("still draining");
+        assert_eq!(err.code, -32016);
+    }
+
+    #[tokio::test]
+    async fn steering_is_accepted_while_draining() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, _rx) = host_with_events(dir.path());
+        let turn = host.try_claim_turn("t1", "work", TurnKind::Prompt).expect("claim succeeds");
+
+        host.begin_draining(None, drain_deadline()).await.unwrap();
+        let resp = host
+            .session_steer(SteerParams { text: "finish up".into() })
+            .await
+            .unwrap();
+        assert_eq!(resp["ok"], true, "the running turn still takes steering: {resp}");
+        assert!(host.session.steering.has_pending());
+
+        assert_eq!(
+            host.try_claim_turn("t2", "next", TurnKind::Prompt).err(),
+            Some(ClaimRefused::Draining),
+            "a draining engine says restart pending even while the slot is held"
+        );
+        drop(turn);
+        assert_eq!(
+            host.try_claim_turn("t3", "next", TurnKind::Prompt).err(),
+            Some(ClaimRefused::Draining),
+        );
+    }
+
+    #[tokio::test]
+    async fn draining_pauses_schedule_launches_whenever_the_services_are_built() {
+        let dir = tempfile::tempdir().unwrap();
+        let client: Arc<dyn LlmClient> = ScriptedClient::new(vec![]);
+
+        let (built_first, _rx) = host_with_events(dir.path());
+        let svc = built_first.get_or_init_services(Arc::clone(&client)).await;
+        assert!(!svc.schedule_runtime.launches_paused());
+        built_first.begin_draining(None, drain_deadline()).await.unwrap();
+        assert!(svc.schedule_runtime.launches_paused());
+
+        let (built_later, _rx) = host_with_events(dir.path());
+        built_later.begin_draining(None, drain_deadline()).await.unwrap();
+        let svc = built_later.get_or_init_services(client).await;
+        assert!(svc.schedule_runtime.launches_paused(), "services built while draining start paused");
+    }
+
+    #[tokio::test]
+    async fn draining_refuses_compaction_with_restart_pending() {
+        use crate::dispatch::dispatch;
+        let dir = tempfile::tempdir().unwrap();
+        let (host, _rx) = host_with_events(dir.path());
+        host.begin_draining(None, drain_deadline()).await.unwrap();
+
+        let err = dispatch("session/compact", Some(json!({})), host.as_ref())
+            .await
+            .expect_err("a draining engine admits no compaction");
+        assert_eq!(err.code, -32016);
+        assert_eq!(err.message, "restart pending");
+        // The turn gate itself refuses it too, for a drain that begins after
+        // the handler's early check.
+        assert_eq!(
+            host.try_claim_turn("c1", "", TurnKind::Compaction).err(),
+            Some(ClaimRefused::Draining),
+        );
     }
 
     /// A follow-up sent while the model is working must be visible in what
@@ -15724,6 +15958,34 @@ mod tests {
                 injected_texts(&committed(&host)).len(),
                 2,
                 "both the stranded request and the new one are delivered"
+            );
+        }
+
+        /// A draining engine admits no main-inbox turn either: queued
+        /// requests stay queued (they are carried across the restart) and the
+        /// pump parks instead of attempting — or spinning on — a refused claim.
+        #[tokio::test]
+        async fn main_inbox_draining_parks_the_pump_and_keeps_requests_queued() {
+            let dir = tempfile::tempdir().unwrap();
+            let client = PumpClient::new(vec![answer("never")]);
+            let host = host_with(Some(Arc::clone(&client) as Arc<dyn LlmClient>), dir.path());
+            host.initialize(InitParams::default()).await.unwrap();
+            host.begin_draining(None, chrono::Utc::now() + chrono::Duration::minutes(10))
+                .await
+                .unwrap();
+
+            for i in 0..3 {
+                ask(&host, &format!("t{i}"), &format!("request {i}"));
+            }
+            settle().await;
+
+            assert_eq!(host.message_bus.pending_main_len(), 3, "nothing may be consumed");
+            assert_eq!(client.request_count(), 0);
+            assert!(last_outcome(&host).is_none(), "no turn may run while draining");
+            assert_eq!(
+                host.main_pump_attempts.load(Ordering::SeqCst),
+                0,
+                "every wake is answered by the drain gate without an attempt"
             );
         }
 

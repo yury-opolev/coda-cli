@@ -45,7 +45,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use chrono::Utc;
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::Value;
 
 use coda_agent::message::MainMessage;
@@ -53,7 +53,7 @@ use coda_proto::messages::CapabilityEntry;
 use coda_proto::responses::{AgentMessageDeliveredDto, AgentMessageDeliveredItemDto};
 use coda_proto::state_events as wire;
 use coda_proto::state::{
-    ActiveConfig, ActivityPhase, ConcurrentCounters, EffectiveConfig, EngineLifecycle,
+    ActiveConfig, ActivityPhase, ConcurrentCounters, DrainState, EffectiveConfig, EngineLifecycle,
     LastTurnOutcome, Limits, ModelRequestState, PendingRequestDto, PendingRequestKind,
     StateSnapshot, SteeringOutcomeDto, SteeringOutcomeKind, SteeringPendingDto, SteeringQueueState,
     ToolBatchRef, ToolCallState, ToolCallStateStatus, ToolsState, TurnErrorSummary, TurnState,
@@ -236,6 +236,33 @@ pub(crate) struct StateInner {
     /// took the cursor with. A caller-supplied value would reintroduce
     /// exactly the read-then-project window this exists to close.
     next_config: ActiveConfig,
+    /// Set once a planned-restart drain has begun; never cleared (the engine
+    /// does not return to `ready`/`busy` after draining).
+    drain: Option<DrainInfo>,
+}
+
+/// The engine-side record behind `StateSnapshot.drain`. `remaining_ms` is
+/// derived at projection time, never stored.
+#[derive(Clone, Debug)]
+struct DrainInfo {
+    started_at: DateTime<Utc>,
+    deadline_at: DateTime<Utc>,
+    reason: Option<String>,
+    completed: bool,
+}
+
+/// [`EngineState::begin_draining`] refused: a drain has already begun, or the
+/// engine is stopping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlreadyDraining;
+
+/// Why [`EngineState::try_begin_turn`] refused to open a turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnRefusal {
+    /// The engine is stopping or stopped.
+    Stopped,
+    /// The engine is draining for a planned restart.
+    Draining,
 }
 
 #[derive(Clone, Default)]
@@ -834,6 +861,7 @@ impl EngineState {
             usage: UsageStateInner::default(),
             capabilities,
             next_config,
+            drain: None,
         };
         Self { inner: Mutex::new(Arc::new(inner)), bus }
     }
@@ -900,7 +928,8 @@ impl EngineState {
                 return Vec::new();
             }
             accepted = true;
-            if s.lifecycle == EngineLifecycle::Initializing {
+            if matches!(s.lifecycle, EngineLifecycle::Initializing | EngineLifecycle::Draining) {
+                // A draining engine never goes back through initialization.
                 return Vec::new();
             }
             s.lifecycle = EngineLifecycle::Initializing;
@@ -1005,15 +1034,32 @@ impl EngineState {
         active_config: ActiveConfig,
         phase: ActivityPhase,
     ) -> bool {
+        self.try_begin_turn(turn_id, user_text, active_config, phase).is_ok()
+    }
+
+    /// [`Self::begin_turn`] that says *why* a turn was refused: a draining
+    /// engine refuses new work with its own answer (`restart pending`), which
+    /// a client handles differently from a shutdown.
+    pub fn try_begin_turn(
+        &self,
+        turn_id: impl Into<String>,
+        user_text: &str,
+        active_config: ActiveConfig,
+        phase: ActivityPhase,
+    ) -> Result<(), TurnRefusal> {
         let turn_id = turn_id.into();
         let user_text = user_text.to_string();
-        let mut admitted = false;
+        let mut admitted = Err(TurnRefusal::Stopped);
         let admitted_out = &mut admitted;
         self.transact(move |s| {
             if matches!(s.lifecycle, EngineLifecycle::Stopping | EngineLifecycle::Stopped) {
                 return Vec::new();
             }
-            *admitted_out = true;
+            if s.drain.is_some() {
+                *admitted_out = Err(TurnRefusal::Draining);
+                return Vec::new();
+            }
+            *admitted_out = Ok(());
             s.lifecycle = EngineLifecycle::Busy;
             let now = now_rfc3339();
             let started_instant = Instant::now();
@@ -1301,6 +1347,54 @@ impl EngineState {
             }
             s.lifecycle = EngineLifecycle::Stopped;
             s.lifecycle_event()
+        });
+    }
+
+    // ── Planned-restart drain ─────────────────────────────────────────────
+
+    /// Enters `draining`: from here on no new turn is admitted (see
+    /// [`Self::try_begin_turn`]) and the engine never returns to
+    /// `ready`/`busy`. A turn already running keeps running; its release
+    /// leaves the lifecycle at `draining`. Refused (`Err`) when a drain has
+    /// already begun or the engine is stopping/stopped.
+    pub fn begin_draining(
+        &self,
+        reason: Option<String>,
+        deadline: DateTime<Utc>,
+    ) -> Result<(), AlreadyDraining> {
+        let mut result = Err(AlreadyDraining);
+        let result_out = &mut result;
+        self.transact(move |s| {
+            if s.drain.is_some()
+                || matches!(s.lifecycle, EngineLifecycle::Stopping | EngineLifecycle::Stopped)
+            {
+                return Vec::new();
+            }
+            *result_out = Ok(());
+            s.drain = Some(DrainInfo {
+                started_at: Utc::now(),
+                deadline_at: deadline,
+                reason,
+                completed: false,
+            });
+            s.lifecycle = EngineLifecycle::Draining;
+            s.lifecycle_event()
+        });
+        result
+    }
+
+    /// Whether a planned-restart drain has begun.
+    pub fn is_draining(&self) -> bool {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).drain.is_some()
+    }
+
+    /// Records that the restart file has been written (`drain.completed`).
+    pub fn drain_completed(&self) {
+        self.transact(|s| {
+            if let Some(drain) = s.drain.as_mut() {
+                drain.completed = true;
+            }
+            Vec::new()
         });
     }
 
@@ -1657,7 +1751,13 @@ impl EngineState {
             usage,
             limits,
             capabilities: inner.capabilities.clone(),
-            drain: None,
+            drain: inner.drain.as_ref().map(|d| DrainState {
+                started_at: d.started_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+                deadline_at: d.deadline_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+                remaining_ms: (d.deadline_at - Utc::now()).num_milliseconds().max(0) as u64,
+                reason: d.reason.clone(),
+                completed: d.completed,
+            }),
         }
     }
 }
@@ -2917,6 +3017,54 @@ pub(crate) mod tests {
         // A shutdown must not be re-opened by a stale turn release.
         state.release_turn();
         assert_eq!(state.project("v1", limits()).lifecycle, EngineLifecycle::Stopped);
+    }
+
+    #[test]
+    fn draining_refuses_new_turns_and_survives_the_running_turns_release() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let bus = Arc::new(EventBus::new(tx, "engine-1"));
+        bus.enable_state_events();
+        let state = Arc::new(EngineState::new(Arc::clone(&bus), "s1", "/work", HashMap::new(), active_config()));
+        state.mark_initialized();
+        state.begin_turn("t1", "go", active_config(), ActivityPhase::Preparing);
+        let _ = drain_methods(&mut rx);
+
+        let deadline = Utc::now() + chrono::Duration::minutes(10);
+        assert_eq!(state.begin_draining(Some("upgrade".into()), deadline), Ok(()));
+        assert!(state.is_draining());
+        assert_eq!(state.begin_draining(None, deadline), Err(AlreadyDraining));
+
+        let snap = state.project("v1", limits());
+        assert_eq!(snap.lifecycle, EngineLifecycle::Draining);
+        let drain = snap.drain.expect("drain section");
+        assert!(drain.remaining_ms > 0 && drain.remaining_ms <= 600_000);
+        assert_eq!(drain.reason.as_deref(), Some("upgrade"));
+        assert!(!drain.completed);
+
+        state.end_turn(ended("t1"));
+        state.release_turn();
+        assert_eq!(state.project("v1", limits()).lifecycle, EngineLifecycle::Draining);
+        assert_eq!(
+            state.try_begin_turn("t2", "again", active_config(), ActivityPhase::Preparing),
+            Err(TurnRefusal::Draining),
+        );
+
+        state.drain_completed();
+        assert!(state.project("v1", limits()).drain.unwrap().completed);
+
+        let past = Utc::now() - chrono::Duration::seconds(5);
+        let expired = Arc::new(EngineState::new(Arc::clone(&bus), "s1", "/work", HashMap::new(), active_config()));
+        expired.begin_draining(None, past).unwrap();
+        assert_eq!(expired.project("v1", limits()).drain.unwrap().remaining_ms, 0);
+
+        state.shutdown_started();
+        state.shutdown_completed();
+        let lifecycles: Vec<String> = drain_methods(&mut rx)
+            .into_iter()
+            .filter(|(m, _)| m == coda_proto::events::event_method::LIFECYCLE)
+            .map(|(_, p)| p["lifecycle"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(lifecycles, vec!["draining", "draining", "stopping", "stopped"]);
     }
 
     fn drain_methods(

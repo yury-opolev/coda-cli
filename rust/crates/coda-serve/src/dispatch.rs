@@ -98,6 +98,10 @@ impl RpcError {
     pub fn instance_changed(msg: impl Into<String>) -> Self {
         Self { code: error_code::INSTANCE_CHANGED, message: msg.into() }
     }
+    /// New work refused because the engine is draining for a planned restart.
+    pub fn restart_pending() -> Self {
+        Self { code: error_code::RESTART_PENDING, message: "restart pending".to_owned() }
+    }
 }
 
 /// Coda-specific JSON-RPC error codes used outside the `RpcError` factory
@@ -109,7 +113,8 @@ pub mod error_code {
     /// process's stream.
     pub const INSTANCE_CHANGED: i64 = -32010;
     pub use coda_proto::messages::error_code::{
-        HISTORY_FENCE_MOVED, NOT_INITIALIZED, REQUEST_KIND_MISMATCH, STALE_EPOCH, UNKNOWN_REQUEST,
+        HISTORY_FENCE_MOVED, NOT_INITIALIZED, REQUEST_KIND_MISMATCH, RESTART_PENDING, STALE_EPOCH,
+        UNKNOWN_REQUEST,
     };
 }
 
