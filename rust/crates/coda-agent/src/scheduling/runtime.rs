@@ -313,10 +313,23 @@ impl ScheduleRuntime {
         lifecycle_sink: Arc<dyn ScheduleLifecycleSink>,
         clock: Arc<dyn ScheduleClock>,
     ) -> Arc<Self> {
+        Self::new_with_clock_paused(store, runner, lifecycle_sink, clock, false)
+    }
+
+    /// Like [`Self::new_with_clock`], with launches paused from the start when
+    /// `paused` is set: the loop's first pass already honours it, so a runtime
+    /// built while the engine drains never launches a due definition.
+    pub fn new_with_clock_paused(
+        store: Arc<ScheduledTaskStore>,
+        runner: Arc<dyn ScheduledAgentRunner>,
+        lifecycle_sink: Arc<dyn ScheduleLifecycleSink>,
+        clock: Arc<dyn ScheduleClock>,
+        paused: bool,
+    ) -> Arc<Self> {
         let (tx, rx) = mpsc::unbounded_channel();
         let cancel = CancellationToken::new();
         let view = Arc::new(RwLock::new(HashMap::new()));
-        let launches_paused = Arc::new(AtomicBool::new(false));
+        let launches_paused = Arc::new(AtomicBool::new(paused));
         let launches_resumed = Arc::new(tokio::sync::Notify::new());
 
         let this = Arc::new(Self {

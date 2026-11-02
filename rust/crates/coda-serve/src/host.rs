@@ -2233,10 +2233,14 @@ impl ServeHost {
             Arc::clone(&self.task_manager),
             Arc::clone(&main_subagent) as Arc<dyn SubagentFactory>,
         );
-        let schedule_runtime = ScheduleRuntime::new(
+        // Paused from the start when built during a drain, so its first pass
+        // cannot launch a due schedule before the pause lands.
+        let schedule_runtime = ScheduleRuntime::new_with_clock_paused(
             Arc::clone(&self.schedule_store),
             runner,
             Arc::new(NullScheduleLifecycleSink),
+            Arc::new(coda_agent::scheduling::SystemClock),
+            self.engine_state.is_draining(),
         );
 
         SessionServices {
