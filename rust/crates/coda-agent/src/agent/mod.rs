@@ -229,6 +229,7 @@ impl AgentLoop {
         &self,
         history: &[Message],
         steps_used: usize,
+        parked: bool,
         cancel: &CancellationToken,
     ) -> Result<(), AgentError> {
         let (Some(tasks), Some(id)) = (self.task_manager.as_deref(), self.caller_task_id.as_deref())
@@ -238,7 +239,7 @@ impl AgentLoop {
         if tasks.find_task(id).is_none_or(|t| t.kind != crate::tasks::TaskKind::Subagent) {
             return Ok(());
         }
-        suspend::safe_point(tasks, id, history, steps_used, false, self.steering.as_deref(), cancel)
+        suspend::safe_point(tasks, id, history, steps_used, parked, self.steering.as_deref(), cancel)
             .await
             .map(|_| ())
     }
@@ -362,7 +363,9 @@ impl AgentLoop {
 
             // 1. Cooperative safe point: a subagent asked to suspend pauses
             //    here, between iterations — never mid-stream or mid-batch.
-            self.safe_point(history, self.steps_offset + iteration, &cancel).await?;
+            // A start-parked run is still logically parked before its first iteration.
+            let parked = iteration == 0 && self.start_parked;
+            self.safe_point(history, self.steps_offset + iteration, parked, &cancel).await?;
 
             // A run restored while parked waits for its inbox before its
             // first model call, exactly as it did before the restart.
@@ -4950,6 +4953,41 @@ mod tests {
         let (result, _) = run.await.unwrap();
         result.unwrap();
         assert_eq!(client.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn start_parked_run_suspended_before_its_first_iteration_checkpoints_as_parked() {
+        use crate::tasks::{TaskActionResult, TaskRunStatus};
+        let manager = task_manager_for_test();
+        let owner = register_subagent(&manager, None);
+        let _job = register_job(&manager, &owner.id);
+        assert_eq!(manager.request_suspend(&owner.id), TaskActionResult::Ok);
+        let client = MockLlmClient::new(vec![]);
+        let agent = AgentLoopBuilder::new(
+            client.clone(),
+            Arc::new(AllowAll),
+            Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0])),
+        )
+        .with_task_manager(Arc::clone(&manager))
+        .with_caller_task_id(owner.id.clone())
+        .with_steering(Arc::new(SteeringInbox::new()))
+        .with_park_policy(park::ParkPolicy::subagent(owner.id.clone()))
+        .with_steps_offset(3)
+        .with_start_parked(true)
+        .build();
+        let cancel = CancellationToken::new();
+        let run = spawn_run(
+            agent,
+            vec![Message::user("go"), Message::assistant("parked earlier")],
+            cancel.clone(),
+        );
+        wait_for_status(&owner, TaskRunStatus::Suspended).await;
+        let checkpoint = manager.checkpoint(&owner.id).unwrap();
+        assert!(checkpoint.parked, "still logically parked");
+        assert_eq!(checkpoint.steps_used, 3);
+        assert!(client.requests.lock().unwrap().is_empty());
+        cancel.cancel();
+        let _ = run.await;
     }
 }
 
