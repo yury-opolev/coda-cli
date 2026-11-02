@@ -18,6 +18,7 @@
 //! - `task_events`— `event/taskStarted` / throttled `event/taskOutput` /
 //!   `event/taskCompleted` (non-blocking runtime, Phase 3)
 //! - `aside`      — `session/askAside` side questions (Phase 3)
+//! - `restart`    — the planned-restart file (`session/prepareRestart`)
 
 pub mod aside;
 pub mod catalog;
@@ -32,6 +33,7 @@ pub mod mcp_list;
 pub mod output_budget;
 pub mod prompts;
 pub mod recovery_executor;
+pub mod restart;
 pub mod session;
 pub mod settings;
 pub mod sink;

@@ -190,6 +190,43 @@ impl MessageSource {
             | MessageSource::TaskCompletion { .. } => None,
         }
     }
+
+    /// The scheduled definition's name, when it is a scheduled run that has one.
+    pub fn schedule_definition_name(&self) -> Option<&str> {
+        match self {
+            MessageSource::ScheduledTask { definition_name, .. } => definition_name.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Rebuilds the source of a message saved for a planned restart from its
+    /// stored fields (`kind` is a [`MessageSource::kind`] token). `None` when
+    /// the kind is unknown or a task kind lacks its task id.
+    pub fn from_saved(
+        kind: &str,
+        task_id: Option<&str>,
+        label: &str,
+        definition_id: Option<&str>,
+        definition_name: Option<&str>,
+    ) -> Option<Self> {
+        match kind {
+            "scheduledTask" => Some(MessageSource::ScheduledTask {
+                definition_id: definition_id?.to_owned(),
+                definition_name: definition_name.map(str::to_owned),
+                task_id: task_id?.to_owned(),
+            }),
+            "subagent" => Some(MessageSource::Subagent {
+                task_id: task_id?.to_owned(),
+                label: label.to_owned(),
+            }),
+            "main" => Some(MessageSource::Main),
+            "taskCompletion" => Some(MessageSource::TaskCompletion {
+                task_id: task_id?.to_owned(),
+                label: label.to_owned(),
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// Bound a *derived* display label to at most `max_chars` UTF-8 characters,
@@ -240,6 +277,8 @@ pub struct UserMessage {
     /// the source is a scheduled run (directly or as a nested child of one).
     /// `None` for an ordinary subagent or `Main`.
     pub schedule_definition_id: Option<String>,
+    /// The scheduled definition's name, when the source is a named scheduled run.
+    pub schedule_name: Option<String>,
     /// The caller-supplied idempotency key, if any (opaque, not displayed).
     pub idempotency_key: Option<String>,
     /// Internal idempotency scope id (not part of the wire payload) — kept
@@ -363,6 +402,7 @@ pub struct MainMessage {
     pub source_kind: &'static str,
     pub task_id: Option<String>,
     pub schedule_definition_id: Option<String>,
+    pub schedule_name: Option<String>,
     pub body: String,
     pub context: Option<String>,
     pub idempotency_key: Option<String>,
@@ -726,6 +766,7 @@ impl MessageBus {
             source_kind: source.kind(),
             task_id: source.trusted_task_id().map(str::to_owned),
             schedule_definition_id: source.schedule_definition_id().map(str::to_owned),
+            schedule_name: source.schedule_definition_name().map(str::to_owned),
             idempotency_key: idempotency_key.clone(),
             scope_id: scope_id.clone(),
         };
@@ -832,6 +873,12 @@ impl MessageBus {
     /// `true` when the main FIFO has at least one undelivered item.
     pub fn has_pending_main(&self) -> bool {
         !self.gate.lock().unwrap().main_queue.is_empty()
+    }
+
+    /// Every undelivered main-inbox item, in FIFO order, without removing
+    /// anything (a planned restart saves the queue for the next engine).
+    pub fn pending_main_snapshot(&self) -> Vec<MainMessage> {
+        self.gate.lock().unwrap().main_queue.iter().cloned().collect()
     }
 
     /// The exact number of undelivered items in the main FIFO.
@@ -954,6 +1001,7 @@ impl MessageBus {
             source_kind: source.kind(),
             task_id: source.trusted_task_id().map(str::to_owned),
             schedule_definition_id: source.schedule_definition_id().map(str::to_owned),
+            schedule_name: source.schedule_definition_name().map(str::to_owned),
             body: body.clone(),
             context: context.clone(),
             idempotency_key: idempotency_key.clone(),

@@ -699,3 +699,39 @@ fn publish_races_with_snapshot_reads_never_produce_torn_state() {
     writer.join().unwrap();
     reader.join().unwrap();
 }
+
+#[test]
+fn saved_message_fields_rebuild_the_same_source_and_main_snapshot_keeps_the_queue() {
+    let bus = MessageBus::new();
+    let sources = [
+        scheduled("def-1", Some("nightly"), "task-00000001"),
+        scheduled("def-2", None, "task-00000002"),
+        subagent("task-00000003", "worker"),
+        MessageSource::Main,
+        MessageSource::TaskCompletion { task_id: "task-00000004".into(), label: "build".into() },
+    ];
+    for source in &sources {
+        bus.publish_user(source, "body", None, None).unwrap();
+    }
+    let saved = bus.user_since(0, None).messages;
+    assert_eq!(saved[0].schedule_name.as_deref(), Some("nightly"));
+    assert_eq!(saved[1].schedule_name, None);
+    for (source, msg) in sources.iter().zip(&saved) {
+        let rebuilt = MessageSource::from_saved(
+            msg.source_kind,
+            msg.task_id.as_deref(),
+            &msg.label,
+            msg.schedule_definition_id.as_deref(),
+            msg.schedule_name.as_deref(),
+        );
+        assert_eq!(rebuilt.as_ref(), Some(source));
+    }
+    assert_eq!(MessageSource::from_saved("other", None, "x", None, None), None);
+    assert_eq!(MessageSource::from_saved("subagent", None, "x", None, None), None);
+
+    bus.publish_main(&sources[0], "ask", None, None).unwrap();
+    let snapshot = bus.pending_main_snapshot();
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0].schedule_name.as_deref(), Some("nightly"));
+    assert!(bus.has_pending_main(), "a snapshot does not consume the queue");
+}

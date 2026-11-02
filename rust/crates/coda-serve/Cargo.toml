@@ -13,6 +13,8 @@ coda-mcp = { workspace = true }
 coda-llm = { workspace = true }
 coda-auth = { workspace = true }
 coda-diagnostics = { workspace = true }
+# The product version stamped into planned-restart files.
+coda-boot = { workspace = true }
 
 tokio = { workspace = true, features = ["io-std"] }
 tokio-util = { workspace = true }
@@ -33,8 +35,3 @@ futures = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "time", "test-util"] }
 tempfile = "3"
 coda-mcp = { workspace = true, features = ["test-support"] }
-# Test-only: the engine reads `settings.json`, the auth service writes the two
-# keys it owns through `coda_boot::settings_store`. One test drives both sides
-# over the same file to prove they agree; nothing in the engine's shipped code
-# depends on the bootstrap crate.
-coda-boot = { workspace = true }
