@@ -51,6 +51,13 @@ fn write_temp(temp: &Path, bytes: &[u8]) -> std::io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
+    // No sharing: nobody can open the file in the window before its DACL is
+    // replaced (changing the DACL needs WRITE_DAC, which sharing does not block).
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(0);
+    }
     // The handle is dropped (closed) before the rename: Windows refuses to
     // rename an open file.
     let mut file = options.open(temp)?;
