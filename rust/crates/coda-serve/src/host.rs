@@ -308,6 +308,32 @@ impl Drop for RestartPrepGuard<'_> {
     }
 }
 
+/// The drain results of `session/prepareRestart` that only the first
+/// attempt can observe; kept on the host so a retry after a failure (e.g.
+/// the restart file could not be written) saves them instead of losing them.
+#[derive(Clone, Default)]
+struct RestartCapture {
+    /// Subagents the operator had suspended before the drain suspended the
+    /// rest (which also sets their explicit flag).
+    operator_suspended: std::collections::HashSet<String>,
+    /// Whether an attempt hit the drain timeout.
+    timed_out: bool,
+    interrupted: crate::restart::Interrupted,
+    steering: Vec<String>,
+}
+
+impl RestartCapture {
+    fn add_task(&mut self, task: crate::restart::InterruptedTask) {
+        if !self.interrupted.tasks.iter().any(|t| t.task_id == task.task_id) {
+            self.interrupted.tasks.push(task);
+        }
+    }
+
+    fn is_recorded(&self, task_id: &str) -> bool {
+        self.interrupted.tasks.iter().any(|t| t.task_id == task_id)
+    }
+}
+
 /// A task the drain had to stop, as recorded in the restart file.
 fn interrupted_task(
     task: &coda_agent::tasks::TaskSnapshot,
@@ -1152,10 +1178,18 @@ pub struct ServeHost {
     /// Where `session/prepareRestart` stands: a second call while one runs is
     /// refused, a call after it finished gets the same result again.
     restart_prep: Mutex<RestartPrep>,
+    /// What a failed `session/prepareRestart` already captured and undid
+    /// (stopped tasks, declined requests, recalled steering), reused by the
+    /// retry because that state cannot be observed a second time.
+    restart_capture: Mutex<Option<RestartCapture>>,
     /// Test seam: replaces [`RESTART_SETTLE`] so a test does not wait 30 s
     /// for a subagent that will never reach a safe point.
     #[cfg(test)]
     restart_settle_override: Mutex<Option<Duration>>,
+    /// Test seam: runs once right after the drain timeout interrupted the
+    /// work it found, e.g. to start a task the snapshot did not see.
+    #[cfg(test)]
+    restart_interrupt_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Test seam: invoked inside `run_prompt_inner` after the agent has been
     /// built and before the turn's resolved `activeConfig` is published.
     ///
@@ -1534,8 +1568,11 @@ impl ServeHost {
             engine_state,
             steering_observer,
             restart_prep: Mutex::new(RestartPrep::Idle),
+            restart_capture: Mutex::new(None),
             #[cfg(test)]
             restart_settle_override: Mutex::new(None),
+            #[cfg(test)]
+            restart_interrupt_hook: Mutex::new(None),
             #[cfg(test)]
             after_agent_build_hook: Mutex::new(None),
             #[cfg(test)]
@@ -2323,59 +2360,79 @@ impl ServeHost {
         }
 
         let tasks = &self.task_manager;
-        // Suspended by the operator before the drain: these stay suspended
-        // after a restore, unlike the ones the drain suspends itself.
-        let operator_suspended: std::collections::HashSet<String> = tasks
-            .list()
-            .into_iter()
-            .filter(|t| t.kind == TaskKind::Subagent && !t.status.is_terminal())
-            .filter(|t| tasks.find_task(&t.id).is_some_and(|task| task.suspend_explicit()))
-            .map(|t| t.id)
-            .collect();
+        let stored = self.restart_capture.lock().expect("restart capture poisoned").clone();
+        let mut capture = stored.unwrap_or_else(|| RestartCapture {
+            // Suspended by the operator before the drain: these stay
+            // suspended after a restore, unlike the ones the drain suspends
+            // itself. Only a first attempt can tell them apart.
+            operator_suspended: tasks
+                .list()
+                .into_iter()
+                .filter(|t| t.kind == TaskKind::Subagent && !t.status.is_terminal())
+                .filter(|t| tasks.find_task(&t.id).is_some_and(|task| task.suspend_explicit()))
+                .map(|t| t.id)
+                .collect(),
+            ..RestartCapture::default()
+        });
+        let save = |capture: &RestartCapture| {
+            *self.restart_capture.lock().expect("restart capture poisoned") = Some(capture.clone());
+        };
+        save(&capture);
         tasks.set_restart_mode(true);
         tasks.set_suspend_new(true);
         tasks.suspend_all();
 
         let drained = self.wait_until_or(deadline, Self::restart_drained).await;
-        let mut interrupted = crate::restart::Interrupted::default();
-        let mut steering = Vec::new();
         if !drained {
-            interrupted.tasks = tasks
+            capture.timed_out = true;
+            let snapshot: Vec<_> = tasks
                 .list_with_output(RESTART_OUTPUT_TAIL_CHARS)
                 .into_iter()
                 .filter(|(t, _)| !t.status.is_terminal() && t.kind != TaskKind::Subagent)
                 .map(|(t, output)| interrupted_task(&t, output))
                 .collect();
-            interrupted.requests = self
-                .prompt_channel
-                .registry()
-                .list()
-                .iter()
-                .map(InterruptedRequest::from_pending)
-                .collect();
-            steering = self.recall_restart_steering();
+            capture.interrupted.requests.extend(
+                self.prompt_channel.registry().list().iter().map(InterruptedRequest::from_pending),
+            );
+            capture.steering.extend(self.recall_restart_steering());
+            for task in snapshot {
+                capture.add_task(task);
+            }
+            save(&capture);
             self.cancel_current_turn();
-            for task in &interrupted.tasks {
+            for task in &capture.interrupted.tasks {
                 tasks.stop_with_note(&task.task_id, "planned restart");
             }
             self.prompt_channel.registry().fail_all(coda_tool::NoAnswerReason::Declined);
+            #[cfg(test)]
+            if let Some(hook) = self.restart_interrupt_hook.lock().unwrap().take() {
+                hook();
+            }
 
             let now = tokio::time::Instant::now();
             self.wait_until_or(now + RESTART_TURN_RELEASE, |h| !h.turn_is_active()).await;
             let settle_deadline = tokio::time::Instant::now() + self.restart_settle();
             if !self.wait_until_or(settle_deadline, Self::restart_tasks_settled).await {
+                // Anything still running, including tasks started after the
+                // snapshot (a subagent may launch one before it settles).
                 for (task, output) in tasks.list_with_output(RESTART_OUTPUT_TAIL_CHARS) {
-                    if task.kind == TaskKind::Subagent
-                        && !task.status.is_terminal()
-                        && task.status != TaskRunStatus::Suspended
+                    let suspended_subagent = task.kind == TaskKind::Subagent
+                        && task.status == TaskRunStatus::Suspended;
+                    if task.status.is_terminal()
+                        || suspended_subagent
+                        || capture.is_recorded(&task.id)
                     {
-                        tasks.stop_with_note(&task.id, "planned restart");
-                        interrupted.tasks.push(interrupted_task(&task, output));
+                        continue;
                     }
+                    tasks.stop_with_note(&task.id, "planned restart");
+                    capture.add_task(interrupted_task(&task, output));
                 }
             }
         }
-        steering.extend(self.recall_restart_steering());
+        capture.steering.extend(self.recall_restart_steering());
+        save(&capture);
+        let drained = drained && !capture.timed_out;
+        let RestartCapture { operator_suspended, interrupted, steering, .. } = capture;
 
         let session_id = self.active_session_id();
         let store = SessionTranscriptStore::new(self.working_dir.clone());
@@ -4574,6 +4631,7 @@ impl ServeBackend for ServeHost {
         let mut guard = RestartPrepGuard { state: &self.restart_prep, done: false };
         let result = self.prepare_restart(p, timeout_ms).await?;
         *self.restart_prep.lock().expect("restart prep poisoned") = RestartPrep::Done(result.clone());
+        *self.restart_capture.lock().expect("restart capture poisoned") = None;
         guard.done = true;
         Ok(result)
     }
@@ -17180,6 +17238,121 @@ mod tests {
             assert_eq!(checkpoint.task_id, task_id);
             assert!(!checkpoint.explicitly_suspended, "suspended by the drain, not the operator");
             assert_eq!(client.subagent_requests.load(Ordering::SeqCst), 1, "no model call after the pause");
+        }
+
+        #[tokio::test]
+        async fn prepare_restart_retry_keeps_what_the_failed_attempt_captured() {
+            let dir = tempfile::tempdir().unwrap();
+            let client = Arc::new(ProbeClient {
+                main_requests: AtomicUsize::new(0),
+                subagent_requests: AtomicUsize::new(0),
+                gate: Arc::new(tokio::sync::Notify::new()),
+            });
+            let (host, _rx) = probe_host(Arc::clone(&client) as Arc<dyn LlmClient>, dir.path());
+            host.initialize(InitParams::default()).await.unwrap();
+            host.permission_mode.set(PermissionMode::BypassPermissions);
+            *host.restart_settle_override.lock().unwrap() = Some(Duration::from_millis(200));
+
+            dispatch("session/prompt", Some(json!({ "text": "start the probe" })), host.as_ref())
+                .await
+                .unwrap();
+            let agent_id = host
+                .task_manager
+                .list()
+                .into_iter()
+                .find(|t| t.kind == TaskKind::Subagent)
+                .map(|t| t.id)
+                .expect("the main agent started a subagent");
+            wait_for("the subagent's first model request", || {
+                client.subagent_requests.load(Ordering::SeqCst) == 1
+            })
+            .await;
+            // A command that never finishes on its own keeps the drain from
+            // completing, so it is interrupted at the deadline.
+            let shell = host
+                .task_manager
+                .register(TaskKind::Shell, "long build", None, TaskExecutionMode::Background)
+                .unwrap();
+            host.session
+                .steering
+                .push_item(coda_agent::steering::InboxItemKind::Message, "also check X");
+            // The restart file cannot be written while a directory is in its place.
+            let store = SessionTranscriptStore::new(host.working_dir.clone());
+            let restart_path = store.restart_file_path(&host.active_session_id());
+            std::fs::create_dir_all(&restart_path).unwrap();
+
+            let pending = {
+                let host = Arc::clone(&host);
+                tokio::spawn(async move { prepare(&host, json!({ "drainTimeoutMs": 1_000 })).await })
+            };
+            wait_for("the drain to ask for suspension", || {
+                host.task_manager.is_suspension_requested(&agent_id)
+            })
+            .await;
+            client.gate.notify_one();
+            pending.await.unwrap().expect_err("the restart file cannot be written");
+            assert_eq!(host.task_manager.get(&agent_id).unwrap().status, TaskRunStatus::Suspended);
+
+            std::fs::remove_dir(&restart_path).unwrap();
+            let r = prepare(&host, json!({ "drainTimeoutMs": 0 })).await.unwrap();
+            assert_eq!(r["drained"], false, "the first attempt hit its deadline: {r}");
+            assert_eq!(r["interruptedTasks"], 1, "{r}");
+            assert_eq!(r["suspendedTasks"], json!([agent_id]));
+            let file = read_restart_file(&r);
+            assert_eq!(file.steering, vec!["also check X".to_owned()]);
+            assert_eq!(file.interrupted.tasks.len(), 1, "recorded once: {:?}", file.interrupted);
+            assert_eq!(file.interrupted.tasks[0].task_id, shell.id);
+            let task_file =
+                store.tasks_dir(&host.active_session_id()).join(format!("{agent_id}.json"));
+            let checkpoint = coda_agent::subagents::SubagentCheckpoint::read(&task_file)
+                .expect("the subagent's file was written");
+            assert!(!checkpoint.explicitly_suspended, "suspended by the drain, not the operator");
+        }
+
+        #[tokio::test]
+        async fn prepare_restart_stops_a_task_started_after_the_deadline_snapshot() {
+            let dir = tempfile::tempdir().unwrap();
+            let (host, _rx) = host_with_events(dir.path());
+            *host.restart_settle_override.lock().unwrap() = Some(Duration::from_millis(100));
+            let late_id = Arc::new(Mutex::new(None));
+            *host.restart_interrupt_hook.lock().unwrap() = Some(Box::new({
+                let tasks = Arc::clone(&host.task_manager);
+                let late_id = Arc::clone(&late_id);
+                move || {
+                    let late = tasks
+                        .register(TaskKind::Shell, "late tool", None, TaskExecutionMode::Background)
+                        .unwrap();
+                    *late_id.lock().unwrap() = Some(late.id.clone());
+                }
+            }));
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let (claimed_tx, claimed_rx) = tokio::sync::oneshot::channel();
+            let turn = {
+                let host = Arc::clone(&host);
+                tokio::spawn(async move {
+                    let _turn = host.try_claim_turn("t1", "work", TurnKind::Prompt).expect("slot");
+                    claimed_tx.send(()).unwrap();
+                    let _ = release_rx.await;
+                })
+            };
+            claimed_rx.await.unwrap();
+
+            let pending = {
+                let host = Arc::clone(&host);
+                tokio::spawn(async move { prepare(&host, json!({ "drainTimeoutMs": 0 })).await })
+            };
+            wait_for("the late task to start", || late_id.lock().unwrap().is_some()).await;
+            release_tx.send(()).unwrap();
+            turn.await.unwrap();
+            let r = pending.await.unwrap().unwrap();
+            let late_id = late_id.lock().unwrap().clone().unwrap();
+            let file = read_restart_file(&r);
+            assert_eq!(
+                file.interrupted.tasks.iter().map(|t| t.task_id.as_str()).collect::<Vec<_>>(),
+                vec![late_id.as_str()],
+            );
+            let late = host.task_manager.find_task(&late_id).unwrap();
+            assert_eq!(late.stop_note().as_deref(), Some("planned restart"));
         }
     }
 }
