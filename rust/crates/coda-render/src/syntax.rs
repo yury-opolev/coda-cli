@@ -10,6 +10,7 @@
 
 use crate::line::Span;
 use crate::theme::Role;
+use unicode_segmentation::UnicodeSegmentation;
 
 /// Languages the tokenizer recognises.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -485,13 +486,16 @@ fn to_cell_spans(line: &str, spans: &[(usize, usize, Role)]) -> Vec<Span> {
         return Vec::new();
     }
 
-    // Prefix widths: cell offset of each char index.
+    // Prefix widths: cell offset of each char index. A grapheme's width is
+    // charged to its first char, so combining marks and joiners add nothing.
     let mut offsets = Vec::with_capacity(line.chars().count() + 1);
     let mut cells = 0usize;
     offsets.push(0usize);
-    for c in line.chars() {
-        cells += crate::text::grapheme_width(&c.to_string());
-        offsets.push(cells);
+    for grapheme in line.graphemes(true) {
+        cells += crate::text::grapheme_width(grapheme);
+        for _ in grapheme.chars() {
+            offsets.push(cells);
+        }
     }
 
     spans
@@ -542,6 +546,17 @@ mod tests {
         assert_eq!(Language::from_path(r"src\Program.cs"), Language::CSharp);
         assert_eq!(Language::from_path("a/b/c.tsx"), Language::TypeScript);
         assert_eq!(Language::from_path("Makefile"), Language::None);
+    }
+
+    #[test]
+    fn span_cells_do_not_count_combining_marks_as_columns() {
+        // `"é"` with a combining accent occupies three cells, so `let`
+        // starts at cell 4 — not 5, which is where per-char counting put it.
+        let spans = roles(Language::Rust, "\"e\u{301}\" let");
+        assert!(
+            spans.contains(&(4, 7, Role::SyntaxKeyword)),
+            "spans: {spans:?}"
+        );
     }
 
     #[test]

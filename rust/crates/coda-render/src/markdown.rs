@@ -447,12 +447,13 @@ impl Renderer {
         self.emit_wrapped(&text, links);
     }
 
-    fn emit_wrapped(&mut self, text: &str, links: Vec<InlineLink>) {
+    fn emit_wrapped(&mut self, text: &str, mut links: Vec<InlineLink>) {
         // Sanitize prose text before wrapping. Model output can contain
         // adversarial control characters and ANSI escape sequences; the draw
         // layer must never receive them. Code blocks are already sanitized in
         // flush_code_block(); this closes the same gap for all inline prose
         // that flows through flush_inline → emit_wrapped.
+        remap_links_through_sanitize(text, &mut links);
         let sanitized = text::sanitize(text);
         let text = sanitized.as_str();
 
@@ -630,14 +631,20 @@ impl Renderer {
 }
 
 fn sanitized_table_cell(mut cell: InlineBuffer) -> InlineBuffer {
-    for link in &mut cell.links {
-        let start: String = cell.text.chars().take(link.start).collect();
-        let end: String = cell.text.chars().take(link.end).collect();
+    remap_links_through_sanitize(&cell.text, &mut cell.links);
+    cell.text = text::sanitize(&cell.text).replace('\n', " ");
+    cell
+}
+
+/// Moves link char offsets from `source` to `text::sanitize(source)`, which
+/// can drop escape sequences ahead of a link.
+fn remap_links_through_sanitize(source: &str, links: &mut [InlineLink]) {
+    for link in links {
+        let start: String = source.chars().take(link.start).collect();
+        let end: String = source.chars().take(link.end).collect();
         link.start = text::sanitize(&start).chars().count();
         link.end = text::sanitize(&end).chars().count();
     }
-    cell.text = text::sanitize(&cell.text).replace('\n', " ");
-    cell
 }
 
 fn table_cell_rows(cell: &InlineBuffer, width: usize) -> Vec<RenderLine> {
@@ -831,6 +838,42 @@ mod tests {
             .into_iter()
             .filter(|t| !t.trim().is_empty())
             .collect()
+    }
+
+    #[test]
+    fn table_borders_align_when_cells_hold_invisible_characters() {
+        use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+
+        let markdown = "| Name | Note |\n|---|---|\n| soft\u{AD}hyphen | zero\u{200B}width |\n| \u{FEFF}bom | ok |";
+        let rows: Vec<String> = texts(markdown, 60)
+            .into_iter()
+            .filter(|t| !t.trim().is_empty())
+            .collect();
+        let area = Rect::new(0, 0, 60, 1);
+        let right_edges: Vec<u16> = rows
+            .iter()
+            .map(|row| {
+                let mut buffer = Buffer::empty(area);
+                ratatui::text::Line::raw(row.as_str()).render(area, &mut buffer);
+                (0..area.width)
+                    .rev()
+                    .find(|&x| buffer[(x, 0)].symbol() != " ")
+                    .expect("a drawn border")
+            })
+            .collect();
+        assert!(
+            right_edges.windows(2).all(|pair| pair[0] == pair[1]),
+            "right borders drawn at {right_edges:?} for {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn a_link_after_a_stripped_escape_sequence_keeps_its_cells() {
+        let rows = render("\u{1b}]8;;x\u{7}see [docs](https://example.com) now", 60);
+        let row = rows.iter().find(|r| !r.links.is_empty()).expect("a link row");
+        let link = &row.links[0];
+        let linked: String = row.text.chars().skip(link.start).take(link.end - link.start).collect();
+        assert_eq!(linked, "docs", "{:?} in {:?}", link, row.text);
     }
 
     #[test]
