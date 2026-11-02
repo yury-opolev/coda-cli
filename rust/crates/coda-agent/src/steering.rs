@@ -39,6 +39,27 @@ pub enum InboxItemKind {
     Deadline,
 }
 
+impl InboxItemKind {
+    /// Stable name used when an inbox is serialized (planned restart).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Message => "message",
+            Self::TaskCompleted => "taskCompleted",
+            Self::Deadline => "deadline",
+        }
+    }
+
+    /// Inverse of [`InboxItemKind::as_str`].
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "message" => Some(Self::Message),
+            "taskCompleted" => Some(Self::TaskCompleted),
+            "deadline" => Some(Self::Deadline),
+            _ => None,
+        }
+    }
+}
+
 /// A single item queued for delivery.
 #[derive(Debug, Clone)]
 pub struct SteeringEntry {
@@ -201,6 +222,18 @@ impl SteeringInbox {
         drop(inner);
         self.arrived.notify_waiters();
         Ok(entry)
+    }
+
+    /// Every undelivered item, oldest first, without removing anything
+    /// (a planned restart copies the inbox of a suspended agent).
+    pub fn snapshot_items(&self) -> Vec<(InboxItemKind, String)> {
+        self.gate
+            .lock()
+            .unwrap()
+            .pending
+            .iter()
+            .map(|e| (e.kind, e.text.clone()))
+            .collect()
     }
 
     /// Atomically drain all pending entries for delivery.
@@ -500,6 +533,25 @@ mod tests {
         let items = inbox.take_all_for_delivery();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].kind, InboxItemKind::TaskCompleted);
+    }
+
+    #[test]
+    fn snapshot_items_copies_every_pending_item_without_draining() {
+        let inbox = SteeringInbox::new();
+        inbox.enqueue("check the logs").unwrap();
+        inbox.push_item(InboxItemKind::TaskCompleted, "[task-completed] task-00000002");
+        let items = inbox.snapshot_items();
+        assert_eq!(
+            items,
+            vec![
+                (InboxItemKind::Message, "check the logs".to_owned()),
+                (InboxItemKind::TaskCompleted, "[task-completed] task-00000002".to_owned()),
+            ]
+        );
+        assert_eq!(inbox.take_all_for_delivery().len(), 2, "nothing was removed");
+        for kind in [InboxItemKind::Message, InboxItemKind::TaskCompleted, InboxItemKind::Deadline] {
+            assert_eq!(InboxItemKind::parse(kind.as_str()), Some(kind));
+        }
     }
 
     #[tokio::test]

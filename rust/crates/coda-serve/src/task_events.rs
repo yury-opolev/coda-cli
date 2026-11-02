@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
-use coda_agent::tasks::{ManagedTask, TaskEventObserver, TaskRunStatus};
+use coda_agent::tasks::{ManagedTask, TaskEventObserver, TaskRunStatus, TaskSnapshot};
 use coda_proto::events::Event;
 use tokio::sync::Notify;
 use tokio::time::Instant;
@@ -173,6 +173,7 @@ impl TaskEventObserver for TaskEventPublisher {
             description: task.description.clone(),
             owner_task_id: task.parent_id.clone(),
             mode: task.mode().as_str().to_owned(),
+            resumed: task.was_resumed().then_some(true),
         });
     }
 
@@ -213,6 +214,30 @@ impl TaskEventObserver for TaskEventPublisher {
             owner_task_id: task.parent_id.clone(),
             kind: Some(task.kind.as_str().to_owned()),
             mode: Some(snapshot.mode.as_str().to_owned()),
+        });
+    }
+
+    fn on_suspended(&self, task: &TaskSnapshot, reason: &str) {
+        let mut outputs = self.outputs.lock().unwrap_or_else(|p| p.into_inner());
+        // What it printed before pausing goes out before the pause itself.
+        if let Some(state) = outputs.get_mut(&task.id) {
+            if !self.health.congested() {
+                self.send_output(state, Instant::now());
+            }
+        }
+        self.publish(Event::TaskSuspended {
+            task_id: task.id.clone(),
+            owner_task_id: task.parent_id.clone(),
+            kind: task.kind.as_str().to_owned(),
+            reason: reason.to_owned(),
+        });
+    }
+
+    fn on_resumed(&self, task: &TaskSnapshot) {
+        self.publish(Event::TaskResumed {
+            task_id: task.id.clone(),
+            owner_task_id: task.parent_id.clone(),
+            kind: task.kind.as_str().to_owned(),
         });
     }
 }
@@ -368,5 +393,65 @@ mod tests {
         let output = methods.iter().position(|m| m == "event/taskOutput").expect("output sent");
         let completed = methods.iter().position(|m| m == "event/taskCompleted").unwrap();
         assert!(output < completed, "{methods:?}");
+    }
+
+    #[tokio::test]
+    async fn suspension_publishes_suspended_and_resumed_after_pending_output() {
+        let mut f = fixture();
+        let owner = f.manager.register(TaskKind::Subagent, "lead", None, TaskExecutionMode::Background).unwrap();
+        let task = f
+            .manager
+            .register(TaskKind::Subagent, "worker", Some(&owner.id), TaskExecutionMode::Background)
+            .unwrap();
+        frames(&mut f.rx);
+        f.manager.append_output(&task.id, "halfway\n");
+        assert_eq!(f.manager.request_suspend(&task.id), coda_agent::tasks::TaskActionResult::Ok);
+        let checkpoint = coda_agent::tasks::TaskCheckpoint {
+            history: vec![coda_llm::Message::user("hi")],
+            steps_used: 1,
+            parked: false,
+            suspended_at: std::time::SystemTime::now(),
+        };
+        assert!(f.manager.mark_suspended(&task.id, checkpoint));
+        assert!(f.manager.mark_resumed(&task.id));
+
+        let seen = frames(&mut f.rx);
+        let methods: Vec<&str> = seen.iter().map(|(m, _)| m.as_str()).collect();
+        assert_eq!(methods, ["event/taskOutput", "event/taskSuspended", "event/taskResumed"]);
+        assert_eq!(seen[0].1["text"], "halfway\n");
+        let suspended = &seen[1].1;
+        assert_eq!(suspended["taskId"], task.id.as_str());
+        assert_eq!(suspended["ownerTaskId"], owner.id.as_str());
+        assert_eq!(suspended["kind"], "subagent");
+        assert_eq!(suspended["reason"], "requested");
+        let resumed = &seen[2].1;
+        assert_eq!((resumed["taskId"].as_str(), resumed["kind"].as_str()), (Some(task.id.as_str()), Some("subagent")));
+        assert_eq!(resumed["ownerTaskId"], owner.id.as_str());
+        f.manager.stop(&task.id);
+        f.manager.stop(&owner.id);
+    }
+
+    #[tokio::test]
+    async fn only_a_restored_task_start_is_marked_resumed() {
+        let mut f = fixture();
+        f.manager.register(TaskKind::Subagent, "fresh", None, TaskExecutionMode::Background).unwrap();
+        let restored = f
+            .manager
+            .register_restored(
+                "task-00000042",
+                TaskKind::Subagent,
+                "restored",
+                None,
+                TaskExecutionMode::Background,
+                std::time::SystemTime::now(),
+                false,
+            )
+            .unwrap();
+        let seen = frames(&mut f.rx);
+        assert_eq!((seen[0].0.as_str(), seen[1].0.as_str()), ("event/taskStarted", "event/taskStarted"));
+        assert!(seen[0].1.get("resumed").is_none(), "{:?}", seen[0].1);
+        assert_eq!(seen[1].1["taskId"], restored.id.as_str());
+        assert_eq!(seen[1].1["resumed"], true);
+        f.manager.stop(&restored.id);
     }
 }

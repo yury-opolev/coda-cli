@@ -90,8 +90,21 @@ impl SessionTranscriptStore {
         Self { working_dir: working_dir.into() }
     }
 
-    fn sessions_dir(&self) -> PathBuf {
+    /// `<working_dir>/.coda/sessions`.
+    pub fn sessions_dir(&self) -> PathBuf {
         self.working_dir.join(".coda").join("sessions")
+    }
+
+    /// The planned-restart file for `session_id`: `<id>.restart.json`.
+    pub fn restart_file_path(&self, session_id: &str) -> PathBuf {
+        self.sessions_dir()
+            .join(format!("{session_id}.restart.json"))
+    }
+
+    /// The directory holding suspended-subagent files for `session_id`:
+    /// `<id>.tasks`.
+    pub fn tasks_dir(&self, session_id: &str) -> PathBuf {
+        self.sessions_dir().join(format!("{session_id}.tasks"))
     }
 
     fn file_path(&self, session_id: &str) -> PathBuf {
@@ -225,6 +238,13 @@ impl SessionTranscriptStore {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let is_restart_file = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".restart.json"));
+            if is_restart_file {
                 continue;
             }
             if let Some(s) = read_summary_from_path(&path) {
@@ -606,6 +626,37 @@ mod tests {
         let list = store.list();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].id, "good1234567a");
+    }
+
+    #[tokio::test]
+    async fn list_skips_restart_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(&dir);
+        store
+            .save("abc123456789", &[Message::user("hi")], None)
+            .await
+            .unwrap();
+        std::fs::write(store.restart_file_path("abc123456789"), b"{}").unwrap();
+
+        let list = store.list();
+
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, "abc123456789");
+    }
+
+    #[test]
+    fn restart_file_path_and_tasks_dir_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(&dir);
+        let sessions = Path::new(".coda").join("sessions");
+
+        assert_eq!(store.sessions_dir(), dir.path().join(&sessions));
+        assert!(
+            store
+                .restart_file_path("abc")
+                .ends_with(sessions.join("abc.restart.json"))
+        );
+        assert!(store.tasks_dir("abc").ends_with(sessions.join("abc.tasks")));
     }
 
     #[tokio::test]

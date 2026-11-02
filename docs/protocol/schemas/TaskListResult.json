@@ -52,6 +52,13 @@
             "null"
           ],
           "description": "Completion result or failure, capped at 16 KiB with an explicit marker."
+        },
+        "suspendRequested": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "`true` while a suspension was requested but the task has not yet\nreached a safe point (its `status` is still `running`)."
         }
       },
       "required": [

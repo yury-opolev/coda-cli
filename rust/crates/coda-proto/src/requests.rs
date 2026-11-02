@@ -19,31 +19,41 @@ pub const INITIALIZATION_GATED_METHODS: &[&str] = &[
     crate::messages::method::TASK_STOP,
     crate::messages::method::TASK_SEND,
     crate::messages::method::ASK_ASIDE,
+    crate::messages::method::PREPARE_RESTART,
+    crate::messages::method::TASK_SUSPEND,
+    crate::messages::method::TASK_RESUME,
+    crate::messages::method::SUSPEND_ALL_TASKS,
+    crate::messages::method::RESUME_ALL_TASKS,
 ];
 
 /// Which tasks `session/listTasks` (and the model's `task_list`) return.
 ///
-/// `active` is every task still `running` — foreground or background, with
-/// or without output, including parked subagents. `terminal` is `completed`,
-/// `failed` and `stopped`. `all` is both, the behaviour when no filter is
-/// given. Filtering is presentation only: no record, output or completion is
-/// affected.
+/// `active` is every task not yet finished — `running` (foreground or
+/// background, with or without output, including parked subagents) or
+/// `suspended` (paused at a safe point). `suspended` is only the suspended
+/// ones. `terminal` is `completed`, `failed` and `stopped`. `all` is
+/// everything, the behaviour when no filter is given. Filtering is
+/// presentation only: no record, output or completion is affected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum TaskStatusFilter {
     Active,
+    Suspended,
     Terminal,
     #[default]
     All,
 }
 
 impl TaskStatusFilter {
-    /// Whether a task in a terminal (`true`) or running (`false`) state passes.
-    pub fn admits(self, terminal: bool) -> bool {
+    /// Whether a task whose status has the wire spelling `status`
+    /// (`running`, `suspended`, `completed`, `failed`, `stopped`) passes.
+    pub fn admits_status(self, status: &str) -> bool {
+        let live = matches!(status, "running" | "suspended");
         match self {
-            TaskStatusFilter::Active => !terminal,
-            TaskStatusFilter::Terminal => terminal,
+            TaskStatusFilter::Active => live,
+            TaskStatusFilter::Suspended => status == "suspended",
+            TaskStatusFilter::Terminal => !live,
             TaskStatusFilter::All => true,
         }
     }
@@ -52,6 +62,7 @@ impl TaskStatusFilter {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "active" => Some(TaskStatusFilter::Active),
+            "suspended" => Some(TaskStatusFilter::Suspended),
             "terminal" => Some(TaskStatusFilter::Terminal),
             "all" => Some(TaskStatusFilter::All),
             _ => None,
@@ -92,6 +103,24 @@ pub struct TaskIdParams {
 pub struct TaskSendParams {
     pub task_id: String,
     pub text: String,
+}
+
+/// `session/prepareRestart`. Every field is optional.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct PrepareRestartParams {
+    /// How long to wait for running work before interrupting it. Default
+    /// 600000, maximum 3600000; `0` interrupts immediately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_timeout_ms: Option<u64>,
+    /// Free text recorded in the restart file and the `[restart]` note.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The last `notify_user` cursor the client has shown; later ones are
+    /// saved and re-delivered after the restart. Absent means `0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_cursor: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -284,11 +313,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn list_tasks_params_accept_the_three_filters_and_refuse_others() {
+    fn list_tasks_params_accept_the_four_filters_and_refuse_others() {
         let parse = |v: Value| serde_json::from_value::<ListTasksParams>(v);
         assert_eq!(parse(serde_json::json!({})).unwrap().status_filter, None);
         for (wire, filter) in [
             ("active", TaskStatusFilter::Active),
+            ("suspended", TaskStatusFilter::Suspended),
             ("terminal", TaskStatusFilter::Terminal),
             ("all", TaskStatusFilter::All),
         ] {
@@ -302,9 +332,55 @@ mod tests {
     }
 
     #[test]
-    fn active_admits_only_running_and_terminal_only_finished_tasks() {
-        assert!(TaskStatusFilter::Active.admits(false) && !TaskStatusFilter::Active.admits(true));
-        assert!(TaskStatusFilter::Terminal.admits(true) && !TaskStatusFilter::Terminal.admits(false));
-        assert!(TaskStatusFilter::All.admits(true) && TaskStatusFilter::All.admits(false));
+    fn prepare_restart_params_camel_case() {
+        let params: PrepareRestartParams = serde_json::from_value(serde_json::json!({
+            "drainTimeoutMs": 0, "reason": "upgrade", "deliveredCursor": 12
+        }))
+        .unwrap();
+        assert_eq!(params.drain_timeout_ms, Some(0));
+        assert_eq!(params.reason.as_deref(), Some("upgrade"));
+        assert_eq!(params.delivered_cursor, Some(12));
+        let empty: PrepareRestartParams = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(empty, PrepareRestartParams::default());
+        assert_eq!(serde_json::to_value(&empty).unwrap(), serde_json::json!({}));
+
+        let result = crate::responses::PrepareRestartResult {
+            ok: true,
+            restart_file: "C:\\w\\.coda\\sessions\\s1.restart.json".into(),
+            drained: false,
+            interrupted_tasks: 1,
+            interrupted_requests: 0,
+            suspended_tasks: vec!["task-00000002".into()],
+        };
+        assert_eq!(serde_json::to_value(&result).unwrap(), serde_json::json!({
+            "ok": true, "restartFile": "C:\\w\\.coda\\sessions\\s1.restart.json",
+            "drained": false, "interruptedTasks": 1, "interruptedRequests": 0,
+            "suspendedTasks": ["task-00000002"],
+        }));
+    }
+
+    #[test]
+    fn task_suspension_methods_are_initialization_gated() {
+        use crate::messages::method as m;
+        for method in [
+            m::PREPARE_RESTART, m::TASK_SUSPEND, m::TASK_RESUME, m::SUSPEND_ALL_TASKS,
+            m::RESUME_ALL_TASKS,
+        ] {
+            assert!(INITIALIZATION_GATED_METHODS.contains(&method), "{method}");
+        }
+    }
+
+    #[test]
+    fn each_filter_admits_exactly_its_statuses() {
+        let admitted = |filter: TaskStatusFilter| -> Vec<&str> {
+            ["running", "suspended", "completed", "failed", "stopped"]
+                .into_iter()
+                .filter(|status| filter.admits_status(status))
+                .collect()
+        };
+        assert_eq!(admitted(TaskStatusFilter::Active), ["running", "suspended"]);
+        assert_eq!(admitted(TaskStatusFilter::Suspended), ["suspended"]);
+        assert_eq!(admitted(TaskStatusFilter::Terminal), ["completed", "failed", "stopped"]);
+        assert_eq!(admitted(TaskStatusFilter::All).len(), 5);
     }
 }

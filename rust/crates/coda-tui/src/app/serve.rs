@@ -1619,6 +1619,7 @@ pub(in crate::app) mod tests {
             engine_instance_id: Some(instance.into()),
             event_cursor: Some(cursor),
             capabilities: None,
+            restored: None,
         }
     }
 
@@ -2841,6 +2842,7 @@ pub(in crate::app) mod tests {
                 max_session_page: 200,
             },
             capabilities: Default::default(),
+            drain: None,
         };
         serde_json::to_value(snapshot).expect("snapshot")
     }
@@ -2889,6 +2891,7 @@ pub(in crate::app) mod tests {
                 max_session_page: 200,
             },
             capabilities: Default::default(),
+            drain: None,
         };
         serde_json::to_value(snapshot).expect("snapshot")
     }

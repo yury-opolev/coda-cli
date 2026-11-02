@@ -8,7 +8,6 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::tasks::TaskRunStatus;
 use crate::tool::{Tool, ToolContext, ToolOutcome, ToolResult};
 use crate::tool::ToolContextServiceExt as _;
 
@@ -109,7 +108,7 @@ impl Tool for BackgroundTaskOutputTool {
 
         let output_section = if !text.is_empty() {
             text
-        } else if status == TaskRunStatus::Running {
+        } else if !status.is_terminal() {
             "(no new output yet; still running)".to_owned()
         } else {
             "(no new output since last read)".to_owned()
@@ -121,12 +120,7 @@ impl Tool for BackgroundTaskOutputTool {
             output_section
         };
 
-        let status_label = match status {
-            TaskRunStatus::Running => "running",
-            TaskRunStatus::Completed => "completed",
-            TaskRunStatus::Failed => "failed",
-            TaskRunStatus::Stopped => "stopped",
-        };
+        let status_label = status.as_str();
 
         ToolResult::ok(format!("{output_section}\n[status: {status_label}]"))
     }

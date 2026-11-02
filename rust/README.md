@@ -458,12 +458,17 @@ coda serve [--model <ID>] [--provider <ID>] [--effort <LEVEL>]
      [--system-prompt <TEXT>] [--system-prompt-file <FILE>]
      [--api-key <KEY>] [--endpoint <URL>]
      [--cwd <DIR>] [--no-mcp] [--no-project-mcp]
+     [--restore[=suspended]] [--session <ID>]
      [--log-file <FILE>] [--diagnostic-verbosity normal|debug|trace]
 ```
 
 `--endpoint` requires `--api-key`; using it without one is rejected at parse
 time. `--goal-timeout` and `--max-continuations` require `--goal`. `--yolo`
-and `--permission-mode` are mutually exclusive.
+and `--permission-mode` are mutually exclusive. `--restore` makes `initialize`
+apply a planned-restart file by default (`--restore=suspended` keeps restored
+subagents suspended) and `--session <ID>` supplies the session id `initialize`
+resumes when the client names none; see
+[Planned restart](../docs/serve-protocol.md#planned-restart-rust).
 
 Behaviour notes:
 
@@ -1006,7 +1011,10 @@ placeholder that would imply a limit.
 **Everything here is in memory only.** The engine's schedule store is
 constructed with no persistence path, so definitions, run counters and
 retirements exist for the lifetime of the process and are **lost at restart**.
-There is no restart continuation and no new on-disk state. Live run status is
+The store writes no on-disk state of its own. Only a planned restart carries
+definitions over: `session/prepareRestart` saves them in the restart file and
+`initialize { restore }` re-creates them (see
+[Planned restart](../docs/serve-protocol.md#planned-restart-rust)). Live run status is
 kept in a separate ephemeral side table that is never serialized, so a store
 reloaded from anywhere can never claim to own runs it does not have.
 

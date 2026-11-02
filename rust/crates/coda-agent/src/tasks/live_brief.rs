@@ -64,7 +64,7 @@ pub fn live_task_brief(manager: &TaskManager, owner: Option<&str>) -> Option<Str
         .live_children(owner)
         .iter()
         .map(|task| task.to_snapshot())
-        .filter(|s| s.status == TaskRunStatus::Running)
+        .filter(|s| !s.status.is_terminal())
         .collect();
     if running.is_empty() {
         return None;
@@ -77,10 +77,11 @@ pub fn live_task_brief(manager: &TaskManager, owner: Option<&str>) -> Option<Str
     );
     for s in running.iter().take(BRIEF_MAX_TASKS) {
         text.push_str(&format!(
-            "- {} {} \"{}\" — running {}\n",
+            "- {} {} \"{}\" — {} {}\n",
             s.id,
             s.kind.as_str(),
             one_line(&s.description, DESCRIPTION_CHARS),
+            s.status.as_str(),
             format_age(age_of(s, now)),
         ));
     }
@@ -98,7 +99,7 @@ pub fn task_snapshot(manager: &TaskManager) -> String {
     let now = SystemTime::now();
     let all = manager.list_with_output(4_000);
     let (running, finished): (Vec<_>, Vec<_>) =
-        all.into_iter().partition(|(s, _)| s.status == TaskRunStatus::Running);
+        all.into_iter().partition(|(s, _)| !s.status.is_terminal());
     if running.is_empty() && finished.is_empty() {
         return "No tasks have been started in this session.".to_owned();
     }
@@ -130,7 +131,7 @@ fn push_task(text: &mut String, s: &TaskSnapshot, tail: &str, now: SystemTime) {
         (None, _) => "main agent".to_owned(),
     };
     let age = format_age(age_of(s, now));
-    let timing = if s.status == TaskRunStatus::Running {
+    let timing = if !s.status.is_terminal() {
         format!("for {age}")
     } else {
         format!("after {age}")

@@ -602,6 +602,7 @@ mod tests {
             engine_instance_id: Some(instance.into()),
             event_cursor: Some(cursor),
             capabilities: None,
+            restored: None,
         }
     }
 
@@ -644,6 +645,7 @@ mod tests {
                 max_session_page: 200,
             },
             capabilities: Default::default(),
+            drain: None,
         }
     }
 

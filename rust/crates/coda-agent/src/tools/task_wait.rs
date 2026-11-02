@@ -80,6 +80,9 @@ impl Tool for TaskWaitTool {
         if task.is_terminal() {
             return format_terminal_result(&task.to_snapshot());
         }
+        if task.status() == TaskRunStatus::Suspended {
+            return ToolResult::ok(suspended_text(task_id));
+        }
 
         // Still running: the batch executor attaches to it with the yield
         // contract (bounded, not cut short by messages, never kills).
@@ -95,13 +98,18 @@ impl Tool for TaskWaitTool {
     }
 }
 
+/// What waiting on a suspended task reports: it will not finish until it is
+/// resumed, and its report is pushed then.
+pub(crate) fn suspended_text(task_id: &str) -> String {
+    format!(
+        "Task '{task_id}' is suspended (paused at a safe point); it has not finished. Its report \
+         will be delivered to you automatically after it is resumed and finishes. You may end \
+         your turn or wait again."
+    )
+}
+
 pub(crate) fn format_terminal_result(snap: &crate::tasks::TaskSnapshot) -> ToolOutcome {
-    let status = match snap.status {
-        TaskRunStatus::Completed => "completed",
-        TaskRunStatus::Failed => "failed",
-        TaskRunStatus::Stopped => "stopped",
-        TaskRunStatus::Running => "running",
-    };
+    let status = snap.status.as_str();
     let mut parts = vec![format!("Task '{}' {status}.", snap.id)];
     if let Some(r) = &snap.result {
         if !r.is_empty() {
@@ -177,6 +185,34 @@ mod tests {
             assert!(result.content.contains("end your turn"), "{}", result.content);
         }
         assert_eq!(t.status(), TaskRunStatus::Running, "waiting never touches the task");
+    }
+
+    #[tokio::test]
+    async fn task_wait_reports_suspended_child() {
+        let m = TaskManager::with_defaults("session");
+        let t = m
+            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .unwrap();
+        assert!(m.mark_suspended(&t.id, crate::tasks::TaskCheckpoint {
+            history: Vec::new(),
+            steps_used: 0,
+            parked: false,
+            suspended_at: std::time::SystemTime::now(),
+        }));
+        let result = TaskWaitTool
+            .execute(&serde_json::json!({"taskId": t.id}), &ctx(m), CancellationToken::new())
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.attached_task().is_none(), "nothing to wait for until it is resumed");
+        assert_eq!(
+            result.content,
+            format!(
+                "Task '{}' is suspended (paused at a safe point); it has not finished. Its report \
+                 will be delivered to you automatically after it is resumed and finishes. You may \
+                 end your turn or wait again.",
+                t.id
+            )
+        );
     }
 
     // ── SECURITY: authorization gate ─────────────────────────────────────────

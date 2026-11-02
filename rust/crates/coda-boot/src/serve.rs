@@ -122,6 +122,23 @@ pub struct ServeArgs {
     /// only: GitHub Copilot and Claude.ai resolve their own endpoints.
     #[arg(long, value_name = "URL", requires = "api_key")]
     pub endpoint: Option<String>,
+
+    /// Make `initialize` restore the planned-restart file by default:
+    /// `--restore` lets restored subagents continue, `--restore=suspended`
+    /// keeps them suspended until `task/resume`.
+    #[arg(
+        long,
+        value_name = "MODE",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        value_parser = parse_restore_mode
+    )]
+    pub restore: Option<String>,
+
+    /// Session id `initialize` resumes when the client does not name one.
+    #[arg(long, value_name = "ID")]
+    pub session: Option<String>,
 }
 
 impl Default for ServeArgs {
@@ -147,6 +164,8 @@ impl Default for ServeArgs {
             system_prompt_file: None,
             api_key: None,
             endpoint: None,
+            restore: None,
+            session: None,
         }
     }
 }
@@ -189,6 +208,15 @@ pub fn parse_diagnostic_verbosity(raw: &str) -> Result<String, String> {
         _ => Err(format!(
             "invalid diagnostic verbosity '{raw}' (expected one of: normal, debug, trace)"
         )),
+    }
+}
+
+/// Validates a `--restore` value: `true` (the bare flag) or `suspended`.
+pub fn parse_restore_mode(raw: &str) -> Result<String, String> {
+    let mode = raw.trim().to_ascii_lowercase();
+    match mode.as_str() {
+        "true" | "suspended" => Ok(mode),
+        _ => Err(format!("invalid restore mode '{raw}' (expected --restore or --restore=suspended)")),
     }
 }
 
@@ -269,6 +297,14 @@ pub fn prepare(args: &ServeArgs) -> Result<()> {
     if let Some(url) = &args.endpoint {
         std::env::set_var("CODA_SERVE_ENDPOINT", url);
     }
+    // Planned restart: the defaults `initialize` applies to `restore` and
+    // `sessionId` when the client leaves them out.
+    if let Some(mode) = &args.restore {
+        std::env::set_var("CODA_SERVE_RESTORE", mode);
+    }
+    if let Some(session) = &args.session {
+        std::env::set_var("CODA_SERVE_SESSION", session);
+    }
     Ok(())
 }
 
@@ -344,6 +380,45 @@ mod tests {
         prepare(&args).expect("prepare succeeds");
         assert_eq!(std::env::var("CODA_SERVE_EFFORT").as_deref(), Ok("high"));
         std::env::remove_var("CODA_SERVE_EFFORT");
+    }
+
+    #[test]
+    fn serve_args_restore_and_session_set_env() {
+        use clap::Parser;
+        #[derive(clap::Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            serve: ServeArgs,
+        }
+        let parse = |args: &[&str]| {
+            Wrapper::try_parse_from(std::iter::once("wrapper").chain(args.iter().copied()))
+                .map(|w| w.serve)
+        };
+        let bare = parse(&["--restore", "--session", "s-1"]).expect("parse");
+        assert_eq!(bare.restore.as_deref(), Some("true"));
+        assert_eq!(bare.session.as_deref(), Some("s-1"));
+        let suspended = parse(&["--restore=suspended"]).expect("parse");
+        assert_eq!(suspended.restore.as_deref(), Some("suspended"));
+        assert!(parse(&["--restore=later"]).is_err());
+        assert!(parse(&[]).expect("parse").restore.is_none());
+
+        // Environment mutation runs in a child process (see above).
+        if std::env::var("CODA_BOOT_PREPARE_TEST_CHILD").as_deref() != Ok("1") {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "serve::tests::serve_args_restore_and_session_set_env"])
+                .env("CODA_BOOT_PREPARE_TEST_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        prepare(&suspended).expect("prepare succeeds");
+        assert_eq!(std::env::var("CODA_SERVE_RESTORE").as_deref(), Ok("suspended"));
+        prepare(&bare).expect("prepare succeeds");
+        assert_eq!(std::env::var("CODA_SERVE_RESTORE").as_deref(), Ok("true"));
+        assert_eq!(std::env::var("CODA_SERVE_SESSION").as_deref(), Ok("s-1"));
+        std::env::remove_var("CODA_SERVE_RESTORE");
+        std::env::remove_var("CODA_SERVE_SESSION");
     }
 
     #[test]

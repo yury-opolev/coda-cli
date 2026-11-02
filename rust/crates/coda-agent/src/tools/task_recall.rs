@@ -9,7 +9,6 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::tasks::TaskRunStatus;
 use crate::tool::{Tool, ToolContext, ToolOutcome, ToolResult};
 use crate::tool::ToolContextServiceExt as _;
 
@@ -58,12 +57,7 @@ impl Tool for TaskRecallTool {
         let lines: Vec<String> = entries
             .iter()
             .map(|e| {
-                let status = match e.status {
-                    TaskRunStatus::Completed => "completed",
-                    TaskRunStatus::Failed => "failed",
-                    TaskRunStatus::Stopped => "stopped",
-                    TaskRunStatus::Running => "running",
-                };
+                let status = e.status.as_str();
                 let report = e.report.as_deref().unwrap_or("(no report)");
                 format!("{} [{status}] {} — {report}", e.task_id, e.description)
             })

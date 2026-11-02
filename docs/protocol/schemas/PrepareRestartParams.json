@@ -1,0 +1,33 @@
+{
+  "type": "object",
+  "properties": {
+    "drainTimeoutMs": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0,
+      "description": "How long to wait for running work before interrupting it. Default\n600000, maximum 3600000; `0` interrupts immediately."
+    },
+    "reason": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Free text recorded in the restart file and the `[restart]` note."
+    },
+    "deliveredCursor": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0,
+      "description": "The last `notify_user` cursor the client has shown; later ones are\nsaved and re-delivered after the restart. Absent means `0`."
+    }
+  },
+  "description": "`session/prepareRestart`. Every field is optional.",
+  "title": "PrepareRestartParams",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

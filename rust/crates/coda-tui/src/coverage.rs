@@ -175,6 +175,7 @@ mod tests {
                 max_session_page: 200,
             },
             capabilities: Default::default(),
+            drain: None,
         }
     }
 

@@ -72,6 +72,8 @@ pub fn documents() -> BTreeMap<&'static str, Value> {
         ("TaskBulkControlResult.json", schemars::schema_for!(crate::responses::TaskBulkControlResult).to_value()),
         ("AskAsideParams.json", schemars::schema_for!(crate::requests::AskAsideParams).to_value()),
         ("AskAsideResult.json", schemars::schema_for!(crate::responses::AskAsideResult).to_value()),
+        ("PrepareRestartParams.json", schemars::schema_for!(crate::requests::PrepareRestartParams).to_value()),
+        ("PrepareRestartResult.json", schemars::schema_for!(crate::responses::PrepareRestartResult).to_value()),
     ]);
     for (name, schema) in legacy::documents() {
         assert!(schemas.insert(name, schema).is_none(), "duplicate schema name: {name}");

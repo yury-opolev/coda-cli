@@ -508,6 +508,7 @@ mod tests {
                 mode: "foreground".into(),
                 output_tail: String::new(),
                 report: None,
+                suspend_requested: None,
             }],
         };
         let mut surface = App::browser_surface(BrowserKind::Tasks, crate::browsers::tasks(&listing, crate::browsers::TaskView::Active));

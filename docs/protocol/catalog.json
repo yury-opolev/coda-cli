@@ -426,6 +426,51 @@
       "resultContract": "sharedServerDto",
       "requiresInitialize": true,
       "availability": "reusable"
+    },
+    {
+      "method": "session/prepareRestart",
+      "paramsSchema": "schemas/PrepareRestartParams.json",
+      "resultSchema": "schemas/PrepareRestartResult.json",
+      "paramsContract": "sharedParser",
+      "resultContract": "sharedServerDto",
+      "requiresInitialize": true,
+      "availability": "reusable"
+    },
+    {
+      "method": "task/suspend",
+      "paramsSchema": "schemas/TaskIdParams.json",
+      "resultSchema": "schemas/TaskControlResult.json",
+      "paramsContract": "sharedParser",
+      "resultContract": "sharedServerDto",
+      "requiresInitialize": true,
+      "availability": "reusable"
+    },
+    {
+      "method": "task/resume",
+      "paramsSchema": "schemas/TaskIdParams.json",
+      "resultSchema": "schemas/TaskControlResult.json",
+      "paramsContract": "sharedParser",
+      "resultContract": "sharedServerDto",
+      "requiresInitialize": true,
+      "availability": "reusable"
+    },
+    {
+      "method": "session/suspendAllTasks",
+      "paramsSchema": null,
+      "resultSchema": "schemas/TaskBulkControlResult.json",
+      "paramsContract": null,
+      "resultContract": "sharedServerDto",
+      "requiresInitialize": true,
+      "availability": "reusable"
+    },
+    {
+      "method": "session/resumeAllTasks",
+      "paramsSchema": null,
+      "resultSchema": "schemas/TaskBulkControlResult.json",
+      "paramsContract": null,
+      "resultContract": "sharedServerDto",
+      "requiresInitialize": true,
+      "availability": "reusable"
     }
   ],
   "serverRequests": [
@@ -548,6 +593,18 @@
     {
       "method": "event/taskOutput",
       "paramsSchema": "schemas/TaskOutputEvent.json",
+      "requiresStateEvents": false,
+      "paramsContract": "clientReaderWithRustMetadata"
+    },
+    {
+      "method": "event/taskSuspended",
+      "paramsSchema": "schemas/TaskSuspendedEvent.json",
+      "requiresStateEvents": false,
+      "paramsContract": "clientReaderWithRustMetadata"
+    },
+    {
+      "method": "event/taskResumed",
+      "paramsSchema": "schemas/TaskResumedEvent.json",
       "requiresStateEvents": false,
       "paramsContract": "clientReaderWithRustMetadata"
     },

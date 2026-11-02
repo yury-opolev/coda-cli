@@ -30,6 +30,7 @@
         "initializing",
         "ready",
         "busy",
+        "draining",
         "stopping",
         "stopped"
       ]

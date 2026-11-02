@@ -27,6 +27,9 @@ pub enum EngineLifecycle {
     Initializing,
     Ready,
     Busy,
+    // A planned restart is in progress: new work is refused with
+    // `RESTART_PENDING`. The engine never returns to `ready`/`busy`.
+    Draining,
     Stopping,
     Stopped,
 }
@@ -703,6 +706,26 @@ pub struct StateSnapshot {
     pub usage: UsageState,
     pub limits: Limits,
     pub capabilities: HashMap<String, CapabilityEntry>,
+    /// Present while the engine is draining for a planned restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain: Option<DrainState>,
+}
+
+/// Progress of a planned-restart drain (`StateSnapshot.drain`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct DrainState {
+    /// RFC 3339 UTC.
+    pub started_at: String,
+    /// RFC 3339 UTC; running work is interrupted at this instant.
+    pub deadline_at: String,
+    /// Milliseconds until `deadlineAt`, never negative.
+    pub remaining_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The restart file has been written.
+    pub completed: bool,
 }
 
 #[cfg(test)]
@@ -749,6 +772,24 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_draining_serializes_as_draining() {
+        assert_eq!(serde_json::to_value(EngineLifecycle::Draining).unwrap(), "draining");
+        let back: EngineLifecycle = serde_json::from_value(serde_json::json!("draining")).unwrap();
+        assert_eq!(back, EngineLifecycle::Draining);
+        let drain = DrainState {
+            started_at: "2026-11-02T10:00:00Z".into(),
+            deadline_at: "2026-11-02T10:10:00Z".into(),
+            remaining_ms: 600_000,
+            reason: None,
+            completed: false,
+        };
+        assert_eq!(serde_json::to_value(&drain).unwrap(), serde_json::json!({
+            "startedAt": "2026-11-02T10:00:00Z", "deadlineAt": "2026-11-02T10:10:00Z",
+            "remainingMs": 600_000, "completed": false,
+        }));
+    }
+
+    #[test]
     fn snapshot_round_trips_through_json() {
         let snap = StateSnapshot {
             contract_version: "2026-09-1".into(),
@@ -788,12 +829,14 @@ mod tests {
                 max_session_page: 200,
             },
             capabilities: HashMap::new(),
+            drain: None,
         };
         let v = serde_json::to_value(&snap).unwrap();
         assert_eq!(v["cursor"], 42);
         // Absent optionals must be omitted, not null.
         assert!(v.get("lastTurnOutcome").is_none());
         assert!(v.get("turn").is_none());
+        assert!(v.get("drain").is_none());
         let back: StateSnapshot = serde_json::from_value(v).unwrap();
         assert_eq!(back, snap);
     }

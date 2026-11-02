@@ -1780,6 +1780,9 @@ impl UiState {
             // stale/future caller) still cannot fabricate a transcript
             // block from it.
             | Event::AgentMessageDelivered { .. }
+            // A suspended task is not finished; it stays in `running_tasks`.
+            | Event::TaskSuspended { .. }
+            | Event::TaskResumed { .. }
             | Event::Unknown { .. } => {}
             // When a display-mutating AgentResponse hook rewrites the assistant
             // response, replace the buffer with the hook's display content so
@@ -1965,6 +1968,9 @@ impl UiState {
                 }
             }
             L::Initializing => self.activity = Activity::Initializing,
+            // Draining for a planned restart: the running turn (if any)
+            // still ends normally, so the activity is left to the turn events.
+            L::Draining => {}
             L::Stopping | L::Stopped => {
                 if let Some(progress) = self.turn_progress.as_mut() {
                     progress.finish(now);
@@ -4626,6 +4632,7 @@ mod tests {
                     max_session_page: 200,
                 },
                 capabilities: Default::default(),
+                drain: None,
             }
         }
 

@@ -15,9 +15,10 @@
 //! - The child is at `MAX_SUBAGENT_DEPTH` (grandchild).
 
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use async_trait::async_trait;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use coda_llm::Message;
@@ -30,13 +31,30 @@ use crate::hooks::HookRunner;
 use crate::permission::{PermissionModeState, PermissionPrompt};
 use crate::scheduling::ScheduledTaskStore;
 use crate::steering::SteeringInbox;
-use crate::tasks::{TaskExecutionMode, TaskKind, TaskManager};
+use crate::tasks::{ManagedTask, TaskExecutionMode, TaskKind, TaskManager};
 use crate::tool::{ToolRegistry, ToolQuarantine};
 
+use super::checkpoint::{SubagentCheckpoint, SubagentSpec, SUBAGENT_CHECKPOINT_VERSION};
 use super::{
     BuiltInAgents, SubagentFactory, SubagentRequest, MAX_SUBAGENT_DEPTH,
     MAX_CONCURRENT_SUBAGENTS,
 };
+
+/// A run continued from a planned-restart checkpoint instead of started
+/// fresh: its recorded spec, conversation and loop position.
+struct RestoredRun {
+    spec: SubagentSpec,
+    history: Vec<Message>,
+    steps_used: usize,
+    parked: bool,
+}
+
+/// A restored task that is registered (with its inbox) but not running yet.
+struct PreparedRestore {
+    task: Arc<ManagedTask>,
+    request: SubagentRequest,
+    run: RestoredRun,
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SubagentHost
@@ -232,31 +250,19 @@ impl SubagentHost {
         // Immediate refusal when all slots are taken (matching C# behaviour).
         let _permit = self.try_acquire_slot()?;
 
-        self.run_inner(request, sink, cancel).await
+        self.run_inner(request, sink, cancel, None).await
     }
 
-    /// Core run logic (no depth check, no semaphore management).
-    ///
-    /// Called by both the foreground path (which holds a `SemaphorePermit`)
-    /// and the background spawn (which holds an `OwnedSemaphorePermit` for the
-    /// full lifetime of the background task).
-    async fn run_inner(
+    /// Fires the SubagentStart hook (fail-closed: blocks the spawn on
+    /// error/block) and returns the final system prompt and first prompt.
+    async fn start_prompts(
         &self,
-        request: SubagentRequest,
-        sink: Arc<dyn AgentSink>,
-        cancel: CancellationToken,
-    ) -> Result<String, String> {
+        request: &SubagentRequest,
+        child_tools: &ToolRegistry,
+        sink: &Arc<dyn AgentSink>,
+        cancel: &CancellationToken,
+    ) -> Result<(String, String), String> {
         let definition = BuiltInAgents::resolve(Some(&request.agent_type));
-
-        // Determine the model to use.
-        let model = request.model.clone().unwrap_or_else(|| (self.base_model)());
-        let budget = match &self.budget_source {
-            Some(resolve) => resolve(&model),
-            None => ModelBudget { max_tokens: self.base_max_tokens, context_window: None },
-        };
-
-        // Resolve the tool set for this depth/definition.
-        let child_tools = resolve_child_tools(&self.tools, definition.read_only_tools_only, request.depth);
 
         // Build the system prompt.
         let system_prompt = format!(
@@ -324,6 +330,75 @@ impl SubagentHost {
         } else {
             system_prompt
         };
+        Ok((final_system, effective_prompt))
+    }
+
+    /// Core run logic (no depth check, no semaphore management).
+    ///
+    /// Called by both the foreground path (which holds a `SemaphorePermit`)
+    /// and the background spawn (which holds an `OwnedSemaphorePermit` for the
+    /// full lifetime of the background task). `restored` continues a run from
+    /// a planned-restart checkpoint instead of starting a fresh one.
+    async fn run_inner(
+        &self,
+        request: SubagentRequest,
+        sink: Arc<dyn AgentSink>,
+        cancel: CancellationToken,
+        restored: Option<RestoredRun>,
+    ) -> Result<String, String> {
+        let definition = BuiltInAgents::resolve(Some(&request.agent_type));
+
+        // Determine the model to use.
+        let model = request.model.clone().unwrap_or_else(|| (self.base_model)());
+        let mut budget = match &self.budget_source {
+            Some(resolve) => resolve(&model),
+            None => ModelBudget { max_tokens: self.base_max_tokens, context_window: None },
+        };
+        let max_iterations = match &restored {
+            Some(run) => {
+                budget.max_tokens = run.spec.max_tokens;
+                run.spec.max_steps
+            }
+            None => self.base_max_iterations,
+        };
+
+        // Resolve the tool set for this depth/definition.
+        let child_tools = resolve_child_tools(&self.tools, definition.read_only_tools_only, request.depth);
+
+        // A restored run already has its final system prompt and its
+        // conversation: the SubagentStart hook ran when it was first spawned
+        // and is not re-run, since it could block or rewrite work that is
+        // already under way.
+        let (final_system, mut history, steps_used, start_parked) = match restored {
+            Some(run) => (run.spec.system_prompt, run.history, run.steps_used, run.parked),
+            None => {
+                let (system, prompt) =
+                    self.start_prompts(&request, &child_tools, &sink, &cancel).await?;
+                (system, vec![Message::user(prompt)], 0, false)
+            }
+        };
+
+        // Record how to re-create this run (planned restart). Only a run
+        // registered as a task can ever be suspended and checkpointed.
+        let managed = self.task_manager.find_task(&request.task_id);
+        if let Some(task) = &managed {
+            let spec = SubagentSpec {
+                agent_type: request.agent_type.clone(),
+                prompt: request.prompt.clone(),
+                system_prompt: final_system.clone(),
+                model: model.clone(),
+                provider: Some(self.client.provider_id().to_owned()),
+                effort: None,
+                depth: request.depth,
+                max_steps: max_iterations,
+                max_tokens: budget.max_tokens,
+                foreground: request.foreground,
+                schedule_origin: request.schedule_origin.as_ref().map(SubagentSpec::origin_to_json),
+            };
+            if let Ok(value) = serde_json::to_value(&spec) {
+                task.set_spec(value);
+            }
+        }
 
         // Build the child loop.
         //
@@ -350,7 +425,9 @@ impl SubagentHost {
         .with_model(model)
         .with_system_prompt(final_system)
         .with_model_budget(budget)
-        .with_max_iterations(self.base_max_iterations)
+        .with_max_iterations(max_iterations)
+        .with_steps_offset(steps_used)
+        .with_start_parked(start_parked)
         .with_working_directory(self.working_directory.clone())
         .with_quarantine(self.quarantine.clone())
         .with_task_manager(Arc::clone(&self.task_manager))
@@ -379,8 +456,8 @@ impl SubagentHost {
         // task gets its own inbox (parent messages via `task_send`, pushed
         // completions of the tasks it starts) and parks — instead of ending —
         // while any of those tasks are still running. A run without a
-        // registered task (e.g. an agent-type hook) keeps the old rule.
-        let managed = self.task_manager.find_task(&request.task_id);
+        // registered task (e.g. an agent-type hook) keeps the old rule. A
+        // restored task already has its inbox (with its undelivered items).
         if let Some(task) = &managed {
             task.attach_steering(Arc::new(SteeringInbox::new()));
             if let Some(inbox) = task.steering() {
@@ -397,7 +474,6 @@ impl SubagentHost {
         // Forward to parent sink while collecting.
         let forwarding = ForwardingSink { parent: sink.clone(), collecting: collecting_sink.clone() };
 
-        let mut history = vec![Message::user(effective_prompt)];
         let run_result = loop_.run(&mut history, &forwarding, None, cancel.clone()).await;
 
         // Nothing a subagent started may outlive it: commands and children
@@ -520,19 +596,16 @@ impl SubagentFactory for SubagentHost {
             ).map_err(|e| e)?;
 
             let task_id = task.id.clone();
-            let self_arc = Arc::new(self.clone_for_background());
             // The background run's identity is the task just registered — not
             // the id the caller happened to put in the request. `run_inner`
             // uses `task_id` as the child's `caller_task_id`, so a stale value
             // here would give the child another task's authority.
             let mut req2 = request.clone();
             req2.task_id = task_id.clone();
-            let sink2 = sink.clone();
             // The run is stopped through its own task (`task_stop`, `/stop`,
             // shutdown) or by the caller's token, whichever fires first.
-            let run_cancel = task.cancel.clone();
             {
-                let run_cancel = run_cancel.clone();
+                let run_cancel = task.cancel.clone();
                 tokio::spawn(async move {
                     tokio::select! {
                         _ = cancel.cancelled() => run_cancel.cancel(),
@@ -540,25 +613,160 @@ impl SubagentFactory for SubagentHost {
                     }
                 });
             }
-            let mgr = self.task_manager.clone();
-            let tid2 = task_id.clone();
-
-            tokio::spawn(async move {
-                // Drop the permit only when this future completes (success or
-                // failure), so the slot stays occupied for the full run.
-                let _permit = permit;
-                match self_arc.run_inner(req2, sink2, run_cancel.clone()).await {
-                    Ok(report) => { mgr.complete(&tid2, Some(report)); }
-                    Err(_) if run_cancel.is_cancelled() => { mgr.stop(&tid2); }
-                    Err(e) => { mgr.fail(&tid2, Some(e)); }
-                }
-                // Ends the caller-token watcher; the task is already terminal.
-                run_cancel.cancel();
-            });
+            self.launch_background(&task, req2, sink, Some(permit), None);
 
             // Return just the task id so the calling tool can format its own message.
             Ok(task_id)
         }
+    }
+}
+
+impl SubagentHost {
+    /// Runs `request` as the background task `task` and settles the task
+    /// with the outcome. `permit` is the concurrency slot already taken, or
+    /// `None` to wait for one inside the run (restored work is never refused
+    /// for lack of a slot).
+    fn launch_background(
+        &self,
+        task: &Arc<ManagedTask>,
+        request: SubagentRequest,
+        sink: Arc<dyn AgentSink>,
+        permit: Option<OwnedSemaphorePermit>,
+        restored: Option<RestoredRun>,
+    ) {
+        let host = Arc::new(self.clone_for_background());
+        let semaphore = Arc::clone(&self.semaphore);
+        let mgr = self.task_manager.clone();
+        let task_id = task.id.clone();
+        let run_cancel = task.cancel.clone();
+
+        tokio::spawn(async move {
+            // Drop the permit only when this future completes (success or
+            // failure), so the slot stays occupied for the full run.
+            let _permit = match permit {
+                Some(permit) => Some(permit),
+                None => tokio::select! {
+                    permit = semaphore.acquire_owned() => permit.ok(),
+                    _ = run_cancel.cancelled() => {
+                        mgr.stop(&task_id);
+                        // run_inner never ran, so its descendant cleanup must happen here.
+                        mgr.stop_descendants(&task_id);
+                        return;
+                    }
+                },
+            };
+            match host.run_inner(request, sink, run_cancel.clone(), restored).await {
+                Ok(report) => { mgr.complete(&task_id, Some(report)); }
+                Err(_) if run_cancel.is_cancelled() => { mgr.stop(&task_id); }
+                Err(e) => { mgr.fail(&task_id, Some(e)); }
+            }
+            // Ends the caller-token watcher; the task is already terminal.
+            run_cancel.cancel();
+        });
+    }
+
+    /// Re-creates a subagent from a planned-restart checkpoint under its old
+    /// task id and continues its run in the background, where it left off.
+    /// Its owner (if any) must already be restored, and a parked owner's children
+    /// must be registered before it runs: restore several related tasks with
+    /// [`Self::restore_all`]. With `keep_suspended`
+    /// (or when the checkpoint was explicitly suspended) it stays suspended
+    /// until resumed. Returns the task id.
+    pub async fn restore(
+        self: &Arc<Self>,
+        cp: SubagentCheckpoint,
+        keep_suspended: bool,
+        sink: Arc<dyn AgentSink>,
+    ) -> Result<String, String> {
+        let prepared = self.prepare_restore(cp, keep_suspended)?;
+        let task_id = prepared.task.id.clone();
+        self.start_restored(prepared, sink);
+        Ok(task_id)
+    }
+
+    /// Restores several checkpoints: owners before their children, and every
+    /// task registered before any of them runs (so a parked owner never sees
+    /// its children missing). Returns `(taskId, outcome)` per checkpoint in
+    /// restore order.
+    pub async fn restore_all(
+        self: &Arc<Self>,
+        mut cps: Vec<SubagentCheckpoint>,
+        keep_suspended: bool,
+        sink: Arc<dyn AgentSink>,
+    ) -> Vec<(String, Result<String, String>)> {
+        cps.sort_by_key(|cp| cp.spec.depth);
+        let mut results = Vec::with_capacity(cps.len());
+        let mut prepared = Vec::with_capacity(cps.len());
+        for cp in cps {
+            let task_id = cp.task_id.clone();
+            match self.prepare_restore(cp, keep_suspended) {
+                Ok(p) => {
+                    results.push((task_id.clone(), Ok(task_id)));
+                    prepared.push(p);
+                }
+                Err(e) => results.push((task_id, Err(e))),
+            }
+        }
+        for p in prepared {
+            self.start_restored(p, Arc::clone(&sink));
+        }
+        results
+    }
+
+    /// Registers the restored task under its old id and refills its inbox.
+    fn prepare_restore(
+        &self,
+        cp: SubagentCheckpoint,
+        keep_suspended: bool,
+    ) -> Result<PreparedRestore, String> {
+        if cp.version > SUBAGENT_CHECKPOINT_VERSION {
+            return Err(format!("Unsupported subagent checkpoint version {}.", cp.version));
+        }
+        if cp.kind != TaskKind::Subagent.as_str() {
+            return Err(format!("Task '{}' is not a subagent.", cp.task_id));
+        }
+        let history = cp.messages();
+        if history.is_empty() {
+            return Err(format!("Task '{}' has no conversation to restore.", cp.task_id));
+        }
+        // Always background: no foreground caller survives a restart, and its
+        // report must be pushed to its owner like any background subagent's.
+        let task = self.task_manager.register_restored(
+            &cp.task_id,
+            TaskKind::Subagent,
+            cp.description.clone(),
+            cp.owner_task_id.as_deref(),
+            TaskExecutionMode::Background,
+            SystemTime::from(cp.started_at),
+            keep_suspended || cp.explicitly_suspended,
+        )?;
+        let inbox = Arc::new(SteeringInbox::new());
+        for item in &cp.steering {
+            inbox.push_item(item.inbox_kind(), item.text.clone());
+        }
+        task.attach_steering(inbox);
+        let request = SubagentRequest {
+            agent_type: cp.spec.agent_type.clone(),
+            prompt: cp.spec.prompt.clone(),
+            task_id: task.id.clone(),
+            depth: task.depth,
+            model: Some(cp.spec.model.clone()),
+            foreground: cp.spec.foreground,
+            caller_task_id: cp.owner_task_id.clone(),
+            schedule_origin: cp.spec.schedule_origin(),
+        };
+        let run = RestoredRun {
+            spec: cp.spec,
+            history,
+            steps_used: cp.steps_used,
+            parked: cp.parked,
+        };
+        Ok(PreparedRestore { task, request, run })
+    }
+
+    fn start_restored(&self, prepared: PreparedRestore, sink: Arc<dyn AgentSink>) {
+        let PreparedRestore { task, request, run } = prepared;
+        self.launch_background(&task, request, sink, None, Some(run));
     }
 }
 
@@ -2778,6 +2986,452 @@ mod tests {
             assert_eq!(task.status, TaskRunStatus::Running);
             assert_eq!(task.mode, TaskExecutionMode::Background);
             mgr.stop_all();
+        }
+    }
+
+    // ── Planned restart: subagent checkpoints and restore ──────────────────
+
+    mod restart {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, SystemTime};
+
+        use async_trait::async_trait as at;
+        use chrono::{DateTime, Utc};
+        use coda_llm::{Content, Correlation, Message, Role};
+        use tokio_util::sync::CancellationToken;
+
+        use super::nonblocking::RoutedClient;
+        use super::trusted_child_context::{host_with, manager, text_turn, tool_turn};
+        use crate::events::CollectingSink;
+        use crate::subagents::SubagentFactory as _;
+        use crate::subagents::{
+            CheckpointInboxItem, SubagentCheckpoint, SubagentRequest, SubagentSpec,
+            CHECKPOINT_SIZE_CAP, SUBAGENT_CHECKPOINT_VERSION,
+        };
+        use crate::tasks::{ManagedTask, TaskEventObserver, TaskManager, TaskRunStatus};
+        use crate::tool::{Tool, ToolContext, ToolOutcome, ToolResult};
+
+        /// Blocks until the test opens it.
+        struct GateTool {
+            entered: AtomicBool,
+            open: tokio::sync::Semaphore,
+        }
+
+        impl Default for GateTool {
+            fn default() -> Self {
+                Self { entered: AtomicBool::new(false), open: tokio::sync::Semaphore::new(0) }
+            }
+        }
+
+        #[at]
+        impl Tool for GateTool {
+            fn name(&self) -> &str {
+                "gate"
+            }
+            fn description(&self) -> &str {
+                "waits for the test"
+            }
+            fn input_schema_json(&self) -> &str {
+                r#"{"type":"object","properties":{}}"#
+            }
+            fn is_read_only(&self) -> bool {
+                true
+            }
+            async fn execute(
+                &self,
+                _: &serde_json::Value,
+                _: &ToolContext,
+                _: CancellationToken,
+            ) -> ToolOutcome {
+                self.entered.store(true, Ordering::SeqCst);
+                self.open.acquire().await.unwrap().forget();
+                ToolResult::ok("gate opened")
+            }
+        }
+
+        #[derive(Default)]
+        struct StartedRecorder {
+            started: Mutex<Vec<(String, bool)>>,
+        }
+
+        impl TaskEventObserver for StartedRecorder {
+            fn on_started(&self, task: &Arc<ManagedTask>) {
+                let resumed = task.to_snapshot().resumed;
+                self.started.lock().unwrap().push((task.id.clone(), resumed));
+            }
+            fn on_output(&self, _: &Arc<ManagedTask>) {}
+            fn on_terminal(&self, _: &Arc<ManagedTask>, _: TaskRunStatus) {}
+        }
+
+        async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !done() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+        }
+
+        fn status(mgr: &TaskManager, id: &str) -> TaskRunStatus {
+            mgr.get(id).unwrap().status
+        }
+
+        fn sample_spec() -> SubagentSpec {
+            SubagentSpec {
+                agent_type: "general-purpose".into(),
+                prompt: "parent work".into(),
+                system_prompt: "You are a subagent.".into(),
+                model: "model".into(),
+                provider: Some("routed".into()),
+                effort: None,
+                depth: 1,
+                max_steps: 10,
+                max_tokens: 256,
+                foreground: false,
+                schedule_origin: Some(serde_json::json!({
+                    "definitionId": "def-1",
+                    "definitionName": "nightly"
+                })),
+            }
+        }
+
+        fn tool_exchange(id: &str, output: String) -> Vec<Message> {
+            vec![
+                Message::new(
+                    Role::Assistant,
+                    vec![Content::ToolUse {
+                        id: id.into(),
+                        name: "probe".into(),
+                        input_json: "{}".into(),
+                        correlation: Correlation::default(),
+                    }],
+                ),
+                Message::new(
+                    Role::User,
+                    vec![Content::ToolResult {
+                        tool_use_id: id.into(),
+                        content: output,
+                        is_error: false,
+                        correlation: Correlation::default(),
+                        status: None,
+                    }],
+                ),
+            ]
+        }
+
+        fn sample_checkpoint(history: &[Message]) -> SubagentCheckpoint {
+            let at: DateTime<Utc> = DateTime::<Utc>::from(SystemTime::UNIX_EPOCH)
+                + chrono::Duration::seconds(1_800_000_000);
+            SubagentCheckpoint {
+                version: SUBAGENT_CHECKPOINT_VERSION,
+                task_id: "task-00000003".into(),
+                owner_task_id: None,
+                reports_to: "main".into(),
+                kind: "subagent".into(),
+                description: "parent work".into(),
+                mode: "background".into(),
+                spec: sample_spec(),
+                conversation: crate::session::message_json::serialize_messages(history),
+                steps_used: 2,
+                parked: true,
+                steering: vec![
+                    CheckpointInboxItem { kind: "message".into(), text: "check logs".into() },
+                    CheckpointInboxItem {
+                        kind: "taskCompleted".into(),
+                        text: "[task-completed] task-00000004".into(),
+                    },
+                ],
+                explicitly_suspended: true,
+                started_at: at,
+                suspended_at: at + chrono::Duration::seconds(5),
+                truncated: false,
+            }
+        }
+
+        fn tool_outputs(cp: &SubagentCheckpoint) -> Vec<String> {
+            cp.messages()
+                .into_iter()
+                .flat_map(|m| m.content)
+                .filter_map(|c| match c {
+                    Content::ToolResult { content, .. } => Some(content),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn checkpoint_round_trips_through_json() {
+            let mut history = vec![Message::user("parent work")];
+            history.extend(tool_exchange("p1", "probed".into()));
+            history.push(Message::assistant("waiting"));
+            let cp = sample_checkpoint(&history);
+
+            let (bytes, truncated) = cp.to_json_capped(CHECKPOINT_SIZE_CAP);
+            assert!(!truncated);
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["taskId"], "task-00000003");
+            assert_eq!(json["spec"]["systemPrompt"], "You are a subagent.");
+            assert_eq!(json["reportsTo"], "main");
+
+            let dir = tempfile::tempdir().unwrap();
+            let (path, truncated) = cp.write(dir.path()).await.unwrap();
+            assert!(!truncated);
+            assert_eq!(path, dir.path().join("task-00000003.json"));
+            let back = SubagentCheckpoint::read(&path).unwrap();
+            assert_eq!(back, cp);
+            assert_eq!(back.messages(), history);
+            assert_eq!(back.spec.schedule_origin().unwrap().definition_id, "def-1");
+
+            let mut newer = json.clone();
+            newer["version"] = serde_json::json!(SUBAGENT_CHECKPOINT_VERSION + 1);
+            let newer_path = dir.path().join("newer.json");
+            std::fs::write(&newer_path, serde_json::to_vec(&newer).unwrap()).unwrap();
+            let err = SubagentCheckpoint::read(&newer_path).unwrap_err();
+            assert!(err.contains("version 2"), "{err}");
+        }
+
+        #[test]
+        fn oversized_checkpoint_truncates_oldest_tool_outputs_first() {
+            let mut history = vec![Message::user("parent work")];
+            for (i, fill) in ['a', 'b', 'c'].into_iter().enumerate() {
+                history.extend(tool_exchange(&format!("p{i}"), fill.to_string().repeat(2048)));
+            }
+            let cp = sample_checkpoint(&history);
+
+            let (bytes, truncated) = cp.to_json_capped(4 * 1024);
+            assert!(truncated);
+            assert!(bytes.len() <= 4 * 1024, "{} bytes", bytes.len());
+            let back: SubagentCheckpoint = serde_json::from_slice(&bytes).unwrap();
+            assert!(back.truncated);
+            let outputs = tool_outputs(&back);
+            assert_eq!(
+                outputs[0],
+                "[truncated for a planned restart: 2048 characters omitted]"
+            );
+            assert_eq!(outputs[2], "c".repeat(2048), "the newest output is kept");
+            assert_eq!(back.steering, cp.steering);
+        }
+
+        /// A background parent parked on a child it started with the `task`
+        /// tool, and that child, both suspended at safe points; returns
+        /// their checkpoints (parent, child).
+        async fn suspended_pair() -> (SubagentCheckpoint, SubagentCheckpoint) {
+            let dir = tempfile::tempdir().unwrap();
+            let mgr = manager(&dir);
+            let gate = Arc::new(GateTool::default());
+            let client = RoutedClient::new(vec![
+                (
+                    "parent work",
+                    vec![
+                        tool_turn("t1", "task", r#"{"prompt":"child work"}"#),
+                        text_turn("waiting for the child"),
+                    ],
+                ),
+                ("child work", vec![tool_turn("g1", "gate", "{}")]),
+            ]);
+            let host = host_with(
+                Arc::clone(&client) as Arc<dyn coda_llm::LlmClient>,
+                vec![
+                    Arc::new(crate::tools::TaskTool) as Arc<dyn Tool>,
+                    Arc::clone(&gate) as Arc<dyn Tool>,
+                ],
+                Arc::clone(&mgr),
+                8,
+            );
+            let mut request = SubagentRequest::foreground("general-purpose", "parent work", "", 1);
+            request.foreground = false;
+            let parent = host
+                .spawn(request, Arc::new(CollectingSink::new()), CancellationToken::new())
+                .await
+                .unwrap();
+
+            wait_until("the child to enter the gate", || gate.entered.load(Ordering::SeqCst))
+                .await;
+            wait_until("the parent to park", || client.requests_for("parent work").len() == 2)
+                .await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let child = mgr
+                .list()
+                .into_iter()
+                .find(|t| t.parent_id.as_deref() == Some(parent.as_str()))
+                .unwrap()
+                .id;
+
+            assert_eq!(mgr.request_suspend(&parent), crate::tasks::TaskActionResult::Ok);
+            wait_until("the parent to suspend", || {
+                status(&mgr, &parent) == TaskRunStatus::Suspended
+            })
+            .await;
+            gate.open.add_permits(1);
+            wait_until("the child to suspend", || status(&mgr, &child) == TaskRunStatus::Suspended)
+                .await;
+
+            let mut parent_cp = SubagentCheckpoint::from_task(&mgr, &parent).unwrap();
+            let child_cp = SubagentCheckpoint::from_task(&mgr, &child).unwrap();
+            mgr.stop_all();
+
+            assert!(parent_cp.parked, "the parent suspended while parked");
+            assert!(parent_cp.explicitly_suspended);
+            // Suspending for the restart itself is not an operator's request
+            // to keep it paused; the restart writer records only those.
+            parent_cp.explicitly_suspended = false;
+            assert_eq!(parent_cp.reports_to, "main");
+            assert_eq!(parent_cp.spec.depth, 1);
+            assert!(!child_cp.parked);
+            assert!(!child_cp.explicitly_suspended, "the child inherited the suspension");
+            assert_eq!(child_cp.steps_used, 1);
+            assert_eq!(child_cp.owner_task_id.as_deref(), Some(parent.as_str()));
+            assert_eq!(child_cp.reports_to, parent);
+            assert_eq!(child_cp.spec.depth, 2);
+            (parent_cp, child_cp)
+        }
+
+        fn restored_host(
+            client: &Arc<RoutedClient>,
+            mgr: &Arc<TaskManager>,
+        ) -> Arc<crate::subagents::SubagentHost> {
+            host_with(
+                Arc::clone(client) as Arc<dyn coda_llm::LlmClient>,
+                vec![
+                    Arc::new(crate::tools::TaskTool) as Arc<dyn Tool>,
+                    Arc::new(GateTool::default()) as Arc<dyn Tool>,
+                ],
+                Arc::clone(mgr),
+                8,
+            )
+        }
+
+        fn after_restart_client() -> Arc<RoutedClient> {
+            RoutedClient::new(vec![
+                ("parent work", vec![text_turn("parent final: the child reported")]),
+                ("child work", vec![text_turn("child report after the restart")]),
+            ])
+        }
+
+        fn assert_parent_got_child_report(client: &RoutedClient, mgr: &TaskManager, id: &str) {
+            let requests = client.requests_for("parent work");
+            assert_eq!(requests.len(), 1, "the parked parent waits for the report");
+            assert!(requests[0].contains("waiting for the child"), "{}", requests[0]);
+            assert!(
+                requests[0].contains("[task-completed]")
+                    && requests[0].contains("child report after the restart"),
+                "{}",
+                requests[0]
+            );
+            let parent = mgr.get(id).unwrap();
+            assert_eq!(parent.status, TaskRunStatus::Completed);
+            assert_eq!(parent.result.as_deref(), Some("parent final: the child reported"));
+        }
+
+        #[tokio::test]
+        async fn nested_subagents_suspend_and_restore_under_same_ids() {
+            let (parent_cp, child_cp) = suspended_pair().await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mgr = manager(&dir);
+            let observer = Arc::new(StartedRecorder::default());
+            mgr.set_event_observer(Arc::clone(&observer) as Arc<dyn TaskEventObserver>);
+            let client = after_restart_client();
+            let host = restored_host(&client, &mgr);
+            let sink = Arc::new(CollectingSink::new());
+
+            let restored = host.restore_all(vec![child_cp.clone(), parent_cp.clone()], false, sink).await;
+            let parent = restored[0].1.clone().unwrap();
+            let child = restored[1].1.clone().unwrap();
+            assert_eq!(parent, parent_cp.task_id);
+            assert_eq!(child, child_cp.task_id);
+            assert_eq!(mgr.get(&child).unwrap().parent_id.as_deref(), Some(parent.as_str()));
+
+            wait_until("the parent to finish", || status(&mgr, &parent).is_terminal()).await;
+            let child_requests = client.requests_for("child work");
+            assert_eq!(child_requests.len(), 1);
+            assert!(child_requests[0].contains("gate opened"), "{}", child_requests[0]);
+            assert_eq!(status(&mgr, &child), TaskRunStatus::Completed);
+            assert_parent_got_child_report(&client, &mgr, &parent);
+            assert_eq!(
+                *observer.started.lock().unwrap(),
+                vec![(parent.clone(), true), (child.clone(), true)]
+            );
+        }
+
+        #[tokio::test]
+        async fn restore_keep_suspended_waits_for_resume() {
+            let (parent_cp, child_cp) = suspended_pair().await;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mgr = manager(&dir);
+            let client = after_restart_client();
+            let host = restored_host(&client, &mgr);
+            // Child first: `restore_all` orders owners before their children.
+            let results = host
+                .restore_all(
+                    vec![child_cp.clone(), parent_cp.clone()],
+                    true,
+                    Arc::new(CollectingSink::new()),
+                )
+                .await;
+            assert!(results.iter().all(|(_, r)| r.is_ok()), "{results:?}");
+            let (parent, child) = (parent_cp.task_id.clone(), child_cp.task_id.clone());
+
+            wait_until("both to suspend", || {
+                status(&mgr, &parent) == TaskRunStatus::Suspended
+                    && status(&mgr, &child) == TaskRunStatus::Suspended
+            })
+            .await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(client.requests_for("child work").is_empty(), "no model call while suspended");
+            assert!(client.requests_for("parent work").is_empty());
+            let again = SubagentCheckpoint::from_task(&mgr, &child).unwrap();
+            assert_eq!(again.messages(), child_cp.messages(), "a restored run can checkpoint again");
+            assert!(SubagentCheckpoint::from_task(&mgr, &parent).unwrap().parked);
+
+            assert_eq!(mgr.resume_all(), 2);
+            wait_until("the parent to finish", || status(&mgr, &parent).is_terminal()).await;
+            assert_eq!(status(&mgr, &child), TaskRunStatus::Completed);
+            assert_parent_got_child_report(&client, &mgr, &parent);
+        }
+
+        #[tokio::test]
+        async fn restored_parent_receives_child_report_after_resume() {
+            let (parent_cp, mut child_cp) = suspended_pair().await;
+            // An operator suspended the child before the restart: it stays
+            // suspended after the restore until it is resumed.
+            child_cp.explicitly_suspended = true;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mgr = manager(&dir);
+            let client = after_restart_client();
+            let host = restored_host(&client, &mgr);
+            let sink = Arc::new(CollectingSink::new());
+            let restored = host.restore_all(vec![child_cp, parent_cp], false, sink).await;
+            let parent = restored[0].1.clone().unwrap();
+            let child = restored[1].1.clone().unwrap();
+
+            wait_until("the child to suspend", || status(&mgr, &child) == TaskRunStatus::Suspended)
+                .await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(status(&mgr, &parent), TaskRunStatus::Running, "parked on the child");
+            assert!(client.requests_for("parent work").is_empty());
+
+            assert_eq!(mgr.request_resume(&child), crate::tasks::TaskActionResult::Ok);
+            wait_until("the parent to finish", || status(&mgr, &parent).is_terminal()).await;
+            assert_parent_got_child_report(&client, &mgr, &parent);
+        }
+
+        #[tokio::test]
+        async fn restore_refuses_a_child_whose_owner_is_missing() {
+            let (_, child_cp) = suspended_pair().await;
+            let dir = tempfile::tempdir().unwrap();
+            let mgr = manager(&dir);
+            let host = restored_host(&after_restart_client(), &mgr);
+            let err = host
+                .restore(child_cp, false, Arc::new(CollectingSink::new()))
+                .await
+                .unwrap_err();
+            assert!(err.contains("Unknown parent"), "{err}");
+            assert!(mgr.list().is_empty());
         }
     }
 }

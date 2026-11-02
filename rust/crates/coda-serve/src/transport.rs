@@ -323,6 +323,10 @@ fn dispatch_frame(
                 match serde_json::to_vec(&response) {
                     Ok(bytes) => {
                         let _ = outgoing.send(encode_frame(&bytes));
+                        // Restored messages follow the response that reported them.
+                        if method == "initialize" {
+                            backend.after_initialize_response();
+                        }
                     }
                     Err(e) => tracing::error!(%e, "failed to serialise response"),
                 }

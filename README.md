@@ -373,11 +373,16 @@ wakes it if it is parked. `/stop` interrupts the running turn and stops **every*
 **process-local** and **stops when Coda exits**.
 
 `coda serve` exposes the same controls to any client: `session/listTasks` (optional
-`statusFilter`: `active`, `terminal` or `all`, the default),
+`statusFilter`: `active` — running or suspended —, `suspended`, `terminal` or `all`, the default),
 `session/backgroundAll`, `task/background {taskId}`, `task/stop {taskId}`,
 `task/send {taskId, text}`, `session/stopAllTasks` and `session/askAside {question}`, plus the
 `event/taskStarted`, throttled `event/taskOutput` and `event/taskCompleted` (with the owning
-agent) notifications (see [docs/serve-protocol.md](docs/serve-protocol.md)).
+agent) notifications (see [docs/serve-protocol.md](docs/serve-protocol.md)). Serve clients can
+also pause subagents at a safe point (`task/suspend`, `task/resume`,
+`session/suspendAllTasks`, `session/resumeAllTasks`) and replace the engine without losing
+its in-memory state: `session/prepareRestart` drains it into a restart file that the next
+engine applies on `initialize { sessionId, restore: true }` (or `coda serve --restore
+--session <id>`) — see [Planned restart](docs/serve-protocol.md#planned-restart-rust).
 
 ### Model, effort & context
 
@@ -1034,7 +1039,10 @@ open** — there is **no background daemon and no OS scheduler**.
 
 > **The Rust engine keeps schedules in memory only.** Definitions, run counters
 > and retirements live for the lifetime of the process and are **lost at
-> restart**: nothing is written to disk and nothing resumes. The legacy C#
+> restart**: nothing is written to disk and nothing resumes. The one exception
+> is a planned restart of `coda serve` (`session/prepareRestart`, then
+> `initialize { restore: true }` on the new engine), which carries them over —
+> see [Planned restart](docs/serve-protocol.md#planned-restart-rust). The legacy C#
 > engine persists them in `<project>/.coda/scheduled_tasks.json` and resumes on
 > the next startup; where the two differ, the paragraphs below describe the C#
 > behaviour.

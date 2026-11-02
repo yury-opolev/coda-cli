@@ -31,6 +31,14 @@
     "mode": {
       "type": "string",
       "default": ""
+    },
+    "resumed": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "description": "`true` for a subagent re-created after a planned restart.",
+      "default": null
     }
   },
   "required": [

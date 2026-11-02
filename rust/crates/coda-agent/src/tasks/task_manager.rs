@@ -21,8 +21,8 @@ use std::time::Duration;
 use super::log_retention;
 use super::log_writer::TaskLogWriter;
 use super::managed_task::{
-    ManagedTask, TaskActionResult, TaskExecutionMode, TaskKind, TaskRunStatus, TaskSnapshot,
-    MAIN_CONSUMER_ID,
+    ManagedTask, TaskActionResult, TaskCheckpoint, TaskExecutionMode, TaskKind, TaskRunStatus,
+    TaskSnapshot, MAIN_CONSUMER_ID,
 };
 use super::task_subscription::{TaskChange, TaskChangeKind, TaskSubscription, DEFAULT_CAPACITY};
 
@@ -69,6 +69,11 @@ pub trait TaskEventObserver: Send + Sync {
     fn on_started(&self, task: &Arc<ManagedTask>);
     fn on_output(&self, task: &Arc<ManagedTask>);
     fn on_terminal(&self, task: &Arc<ManagedTask>, status: TaskRunStatus);
+    /// A task paused at a safe point; `reason` is `"requested"`, `"parent"`
+    /// or `"restart"` (see [`TaskManager::suspension_reason`]).
+    fn on_suspended(&self, _task: &TaskSnapshot, _reason: &str) {}
+    /// A suspended task is running again.
+    fn on_resumed(&self, _task: &TaskSnapshot) {}
 }
 
 /// How many shell commands may be running at once (§6.9 resource bounds).
@@ -91,6 +96,9 @@ struct ManagerState {
     /// The number of the most recently issued task id. Ids are never reused
     /// within a session; see [`TaskManager::register`].
     next_id: u64,
+    /// Set once [`TaskManager::register`] has issued an id: from then on a
+    /// restored id must lie above `next_id`.
+    allocated: bool,
     shutting_down: bool,
     disposed: bool,
 }
@@ -104,13 +112,14 @@ impl ManagerState {
     fn is_idle(&self) -> bool {
         !self.shutting_down
             && !self.disposed
-            && self.order.iter().all(|t| t.status() != TaskRunStatus::Running)
+            && self.order.iter().all(|t| t.status().is_terminal())
     }
 
+    /// Every task not yet terminal: running or suspended.
     fn running_tasks(&self) -> Vec<Arc<ManagedTask>> {
         self.order
             .iter()
-            .filter(|t| t.status() == TaskRunStatus::Running)
+            .filter(|t| !t.status().is_terminal())
             .cloned()
             .collect()
     }
@@ -130,6 +139,13 @@ pub struct TaskManager {
     /// Signalled after every task settles (its terminal transition has been
     /// fully reported). A parked agent waits on it to re-check its live tasks.
     settle_signal: tokio::sync::Notify,
+    /// Subagents registered while set start with an explicit suspension
+    /// request (a planned restart is draining).
+    suspend_new: std::sync::atomic::AtomicBool,
+    /// Suspensions are reported with reason `"restart"`.
+    restart_mode: std::sync::atomic::AtomicBool,
+    /// Signalled on every suspension flag or task status change.
+    suspend_signal: tokio::sync::Notify,
 }
 
 impl TaskManager {
@@ -157,6 +173,7 @@ impl TaskManager {
                 subscriptions: Vec::new(),
                 outbox: HashMap::new(),
                 next_id: 0,
+                allocated: false,
                 shutting_down: false,
                 disposed: false,
             }),
@@ -164,6 +181,9 @@ impl TaskManager {
             event_observer: Mutex::new(None),
             max_live_shell_tasks: std::sync::atomic::AtomicUsize::new(DEFAULT_MAX_LIVE_SHELL_TASKS),
             settle_signal: tokio::sync::Notify::new(),
+            suspend_new: std::sync::atomic::AtomicBool::new(false),
+            restart_mode: std::sync::atomic::AtomicBool::new(false),
+            suspend_signal: tokio::sync::Notify::new(),
             session_id,
         })
     }
@@ -202,6 +222,7 @@ impl TaskManager {
             listener.on_terminal(task, status);
         }
         self.settle(task);
+        self.suspend_signal.notify_waiters();
         // Pruning only removes settled tasks, so run it again now that this
         // one is (see `prune_terminal_tasks`).
         self.prune_terminal_tasks();
@@ -230,7 +251,8 @@ impl TaskManager {
         let Some(parent_id) = task.parent_id.as_deref() else { return };
         let Some(parent) = self.find_task(parent_id) else { return };
         let Some(inbox) = parent.steering() else { return };
-        if parent.status() != TaskRunStatus::Running {
+        // A suspended owner keeps its inbox: the report waits for its resume.
+        if parent.status().is_terminal() {
             return;
         }
         inbox.push_item(
@@ -261,8 +283,9 @@ impl TaskManager {
             .collect()
     }
 
-    /// Stops every running strict descendant of `id` (and their process
-    /// trees). Used when a subagent ends: nothing it started may outlive it.
+    /// Stops every live (running or suspended) strict descendant of `id`
+    /// (and their process trees). Used when a subagent ends: nothing it
+    /// started may outlive it.
     pub fn stop_descendants(&self, id: &str) -> usize {
         let running = self.state.lock().unwrap().running_tasks();
         let mut stopped = 0;
@@ -299,8 +322,8 @@ impl TaskManager {
         }
     }
 
-    /// Stops awaiting every running foreground shell task. Returns how many
-    /// were asked to move to the background.
+    /// Stops awaiting every live (running or suspended) foreground shell or
+    /// tool task. Returns how many were asked to move to the background.
     pub fn background_all(&self) -> usize {
         let running = self.state.lock().unwrap().running_tasks();
         running
@@ -314,7 +337,7 @@ impl TaskManager {
     /// operator stop, so its completion does not wake the agent.
     pub fn stop_task(&self, id: &str) -> TaskActionResult {
         if let Some(task) = self.find_task(id) {
-            if task.status() == TaskRunStatus::Running {
+            if !task.status().is_terminal() {
                 task.mark_operator_stop();
             }
         }
@@ -329,11 +352,13 @@ impl TaskManager {
 
     /// Delivers an operator message to a running agent task's inbox (Phase 2,
     /// `task/send`): it is delivered at the agent's next boundary (a running
-    /// wait is not cut short), or wakes it when parked. `Rejected` for a task with no inbox (a shell command),
-    /// `InvalidState` when it is not running or no longer accepts messages.
+    /// wait is not cut short), or wakes it when parked; a suspended agent
+    /// keeps it for after its resume. `Rejected` for a task with no inbox (a
+    /// shell command), `InvalidState` when it is terminal or no longer
+    /// accepts messages.
     pub fn send_message(&self, id: &str, text: &str) -> TaskActionResult {
         let Some(task) = self.find_task(id) else { return TaskActionResult::NotFound };
-        if task.status() != TaskRunStatus::Running {
+        if task.status().is_terminal() {
             return TaskActionResult::InvalidState;
         }
         let Some(inbox) = task.steering() else { return TaskActionResult::Rejected };
@@ -343,7 +368,8 @@ impl TaskManager {
         }
     }
 
-    /// Stops every running task. Returns how many were asked to stop.
+    /// Stops every live (running or suspended) task. Returns how many were
+    /// asked to stop.
     pub fn stop_all(&self) -> usize {
         let running = self.state.lock().unwrap().running_tasks();
         for task in &running {
@@ -352,6 +378,179 @@ impl TaskManager {
             task.kill_attached_shell();
         }
         running.len()
+    }
+
+    /// [`Self::stop_task`] recording why (`ManagedTask::stop_note`), e.g.
+    /// `"planned restart"`. The note is kept only when the stop is accepted.
+    pub fn stop_with_note(&self, id: &str, note: &str) -> TaskActionResult {
+        if let Some(task) = self.find_task(id) {
+            if !task.status().is_terminal() {
+                task.set_stop_note(note);
+            }
+        }
+        self.stop_task(id)
+    }
+
+    // ── Suspension (planned restart) ──────────────────────────────────────────
+
+    /// Whether `id` should pause at its next safe point: a live subagent
+    /// whose own explicit flag, or any ancestor's, is set.
+    pub fn is_suspension_requested(&self, id: &str) -> bool {
+        let Some(task) = self.find_task(id) else { return false };
+        if task.kind != TaskKind::Subagent || task.status().is_terminal() {
+            return false;
+        }
+        self.explicit_on_self_or_ancestor(&task)
+    }
+
+    fn explicit_on_self_or_ancestor(&self, task: &Arc<ManagedTask>) -> bool {
+        if task.suspend_explicit() {
+            return true;
+        }
+        let s = self.state.lock().unwrap();
+        let mut parent_id = task.parent_id.as_deref();
+        // Defensive cap, as in `is_authorized_caller`.
+        for _ in 0..=64 {
+            let Some(parent) = parent_id.and_then(|pid| s.find(pid)) else { return false };
+            if parent.suspend_explicit() {
+                return true;
+            }
+            parent_id = parent.parent_id.as_deref();
+        }
+        false
+    }
+
+    /// Why `id` is (to be) suspended: `"restart"` while a planned restart
+    /// drains, `"requested"` when asked for this task itself, `"parent"` when
+    /// inherited from an ancestor. `None` when no suspension is requested.
+    pub fn suspension_reason(&self, id: &str) -> Option<&'static str> {
+        if !self.is_suspension_requested(id) {
+            return None;
+        }
+        let restart = self.suspend_new.load(std::sync::atomic::Ordering::Acquire)
+            || self.restart_mode.load(std::sync::atomic::Ordering::Acquire);
+        if restart {
+            Some("restart")
+        } else if self.find_task(id).is_some_and(|t| t.suspend_explicit()) {
+            Some("requested")
+        } else {
+            Some("parent")
+        }
+    }
+
+    /// Asks a live subagent (and, by inheritance, its descendants) to pause
+    /// at its next safe point. `Rejected` for any other kind of task,
+    /// `InvalidState` when it already finished.
+    pub fn request_suspend(&self, id: &str) -> TaskActionResult {
+        let Some(task) = self.find_task(id) else { return TaskActionResult::NotFound };
+        if task.kind != TaskKind::Subagent {
+            return TaskActionResult::Rejected;
+        }
+        if task.status().is_terminal() {
+            return TaskActionResult::InvalidState;
+        }
+        task.set_suspend_explicit(true);
+        self.suspend_signal.notify_waiters();
+        TaskActionResult::Ok
+    }
+
+    /// Clears a subagent's own suspension request. Its descendants resume
+    /// too unless they were suspended explicitly themselves. `InvalidState`
+    /// when it finished or was neither requested nor suspended.
+    pub fn request_resume(&self, id: &str) -> TaskActionResult {
+        let Some(task) = self.find_task(id) else { return TaskActionResult::NotFound };
+        if task.kind != TaskKind::Subagent {
+            return TaskActionResult::Rejected;
+        }
+        let status = task.status();
+        if status.is_terminal()
+            || (!task.suspend_explicit() && status != TaskRunStatus::Suspended)
+        {
+            return TaskActionResult::InvalidState;
+        }
+        task.set_suspend_explicit(false);
+        self.suspend_signal.notify_waiters();
+        TaskActionResult::Ok
+    }
+
+    /// Requests suspension of every live subagent. Returns how many were
+    /// newly requested.
+    pub fn suspend_all(&self) -> usize {
+        let live = self.state.lock().unwrap().running_tasks();
+        let count = live
+            .iter()
+            .filter(|t| t.kind == TaskKind::Subagent && !t.set_suspend_explicit(true))
+            .count();
+        self.suspend_signal.notify_waiters();
+        count
+    }
+
+    /// Clears every explicit suspension request. Returns how many were set.
+    pub fn resume_all(&self) -> usize {
+        let tasks = self.state.lock().unwrap().order.clone();
+        let count = tasks.iter().filter(|t| t.set_suspend_explicit(false)).count();
+        self.suspend_signal.notify_waiters();
+        count
+    }
+
+    /// While on, subagents registered start with an explicit suspension
+    /// request (they pause at their first safe point).
+    pub fn set_suspend_new(&self, on: bool) {
+        self.suspend_new.store(on, std::sync::atomic::Ordering::Release);
+        self.suspend_signal.notify_waiters();
+    }
+
+    /// While on, every suspension is reported with reason `"restart"`.
+    pub fn set_restart_mode(&self, on: bool) {
+        self.restart_mode.store(on, std::sync::atomic::Ordering::Release);
+        self.suspend_signal.notify_waiters();
+    }
+
+    /// Signalled (`notify_waiters`) on every suspension flag change and
+    /// every task status change.
+    pub fn suspend_signal(&self) -> &tokio::sync::Notify {
+        &self.suspend_signal
+    }
+
+    /// Running → Suspended at a safe point, keeping `checkpoint`. Returns
+    /// `false` when the task is unknown or not running.
+    pub fn mark_suspended(&self, id: &str, checkpoint: TaskCheckpoint) -> bool {
+        let Some(task) = self.find_task(id) else { return false };
+        let Some(version) = task.try_suspend(checkpoint) else { return false };
+        self.publish(&task.id, version, TaskChangeKind::Status);
+        if let Some(observer) = self.event_observer() {
+            let reason = self.suspension_reason(id).unwrap_or("requested");
+            observer.on_suspended(&self.snapshot_of(&task), reason);
+        }
+        self.suspend_signal.notify_waiters();
+        true
+    }
+
+    /// Suspended → Running, dropping the checkpoint. Returns `false` when the
+    /// task is unknown or not suspended.
+    pub fn mark_resumed(&self, id: &str) -> bool {
+        let Some(task) = self.find_task(id) else { return false };
+        let Some(version) = task.try_resume() else { return false };
+        self.publish(&task.id, version, TaskChangeKind::Status);
+        if let Some(observer) = self.event_observer() {
+            observer.on_resumed(&self.snapshot_of(&task));
+        }
+        self.suspend_signal.notify_waiters();
+        true
+    }
+
+    /// The checkpoint of a suspended task.
+    pub fn checkpoint(&self, id: &str) -> Option<TaskCheckpoint> {
+        self.find_task(id).and_then(|t| t.checkpoint())
+    }
+
+    /// A snapshot whose `suspend_requested` includes inherited requests.
+    fn snapshot_of(&self, task: &Arc<ManagedTask>) -> TaskSnapshot {
+        let mut snapshot = task.to_snapshot();
+        snapshot.suspend_requested = task.kind == TaskKind::Subagent
+            && !snapshot.status.is_terminal()
+            && self.explicit_on_self_or_ancestor(task);
+        snapshot
     }
 
     /// Test hook: makes the next registration take number `last + 1`, so the
@@ -421,24 +620,102 @@ impl TaskManager {
                 .into());
         };
         s.next_id = number;
+        s.allocated = true;
         // Eight digits minimum; larger numbers simply grow wider.
         let id = format!("task-{number:08}");
         let log_path = self.log_root.join(&self.session_id).join(format!("{id}.log"));
 
         let task = ManagedTask::new(
-            id.clone(),
+            id,
             parent_task_id.map(str::to_owned),
             depth,
             kind,
             description.into(),
-            log_path.clone(),
+            log_path,
             self.output_ring_bytes,
             mode,
         );
+        if kind == TaskKind::Subagent
+            && self.suspend_new.load(std::sync::atomic::Ordering::Acquire)
+        {
+            task.set_suspend_explicit(true);
+        }
+        Ok(self.insert_registered(s, task))
+    }
 
+    /// Re-creates a task from a planned-restart file under its old `id`
+    /// (the canonical `task-{:08}` form) and start time. Fails for a
+    /// malformed or taken id, a number at or below one [`Self::register`]
+    /// already issued, an unknown parent, or while shutting down. Later
+    /// [`Self::register`] calls never reuse a number at or below a restored one.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_restored(
+        &self,
+        id: &str,
+        kind: TaskKind,
+        description: impl Into<String>,
+        parent_task_id: Option<&str>,
+        mode: TaskExecutionMode,
+        started_at: std::time::SystemTime,
+        suspended_explicit: bool,
+    ) -> Result<Arc<ManagedTask>, String> {
+        let number = id
+            .strip_prefix("task-")
+            .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|digits| digits.parse::<u64>().ok())
+            .filter(|number| format!("task-{number:08}") == id)
+            .ok_or_else(|| format!("Invalid task id '{id}'."))?;
+
+        let mut s = self.state.lock().unwrap();
+        if s.shutting_down || s.disposed {
+            return Err("Task manager is shutting down; no new tasks may be registered.".into());
+        }
+        if s.find(id).is_some() {
+            return Err(format!("Task '{id}' already exists."));
+        }
+        if s.allocated && number <= s.next_id {
+            return Err(format!("Task id '{id}' was already issued in this session."));
+        }
+        let depth = match parent_task_id {
+            Some(pid) => match s.find(pid) {
+                Some(parent) => parent.depth + 1,
+                None => return Err(format!("Unknown parent task '{pid}'.")),
+            },
+            None => 1,
+        };
+        s.next_id = s.next_id.max(number);
+
+        let log_path = self.log_root.join(&self.session_id).join(format!("{id}.log"));
+        let task = ManagedTask::new_started_at(
+            id.to_owned(),
+            parent_task_id.map(str::to_owned),
+            depth,
+            kind,
+            description.into(),
+            log_path,
+            self.output_ring_bytes,
+            mode,
+            started_at,
+        );
+        task.mark_resumed_from_restart();
+        let explicit = suspended_explicit
+            || (kind == TaskKind::Subagent
+                && self.suspend_new.load(std::sync::atomic::Ordering::Acquire));
+        task.set_suspend_explicit(explicit);
+        Ok(self.insert_registered(s, task))
+    }
+
+    /// Adds a new task to the registry, opens its log, then (lock released)
+    /// announces it to subscribers and the event observer.
+    fn insert_registered(
+        &self,
+        mut s: std::sync::MutexGuard<'_, ManagerState>,
+        task: Arc<ManagedTask>,
+    ) -> Arc<ManagedTask> {
+        let id = task.id.clone();
         // Log writer stored as Arc so it can be cloned out before file I/O.
         let log = Arc::new(TaskLogWriter::with_tail(
-            log_path,
+            task.log_path.clone(),
             super::log_writer::DEFAULT_MAX_BYTES,
             task.redacted_output.clone(),
         ));
@@ -465,23 +742,19 @@ impl TaskManager {
             observer.on_started(&task);
         }
 
-        Ok(task)
+        task
     }
 
     /// Returns a snapshot for the task, or `None` if the id is unknown.
     pub fn get(&self, id: &str) -> Option<TaskSnapshot> {
-        self.state.lock().unwrap().find(id).map(|t| t.to_snapshot())
+        let task = self.find_task(id)?;
+        Some(self.snapshot_of(&task))
     }
 
     /// Returns snapshots for all tasks in registration order.
     pub fn list(&self) -> Vec<TaskSnapshot> {
-        self.state
-            .lock()
-            .unwrap()
-            .order
-            .iter()
-            .map(|t| t.to_snapshot())
-            .collect()
+        let tasks = self.state.lock().unwrap().order.clone();
+        tasks.iter().map(|t| self.snapshot_of(t)).collect()
     }
 
     /// Registration-ordered snapshots and redacted output tails. Cloning the
@@ -489,7 +762,7 @@ impl TaskManager {
     pub fn list_with_output(&self, max_chars: usize) -> Vec<(TaskSnapshot, String)> {
         let tasks = self.state.lock().unwrap().order.clone();
         tasks.into_iter()
-            .map(|task| (task.to_snapshot(), task.redacted_output.peek(max_chars)))
+            .map(|task| (self.snapshot_of(&task), task.redacted_output.peek(max_chars)))
             .collect()
     }
 
@@ -504,9 +777,9 @@ impl TaskManager {
     ) -> Vec<(TaskSnapshot, String)> {
         let tasks = self.state.lock().unwrap().order.clone();
         tasks.into_iter()
-            .filter(|task| filter.admits(task.status().is_terminal()))
-            .map(|task| (task.to_snapshot(), task))
-            .filter(|(snapshot, _)| filter.admits(snapshot.status.is_terminal()))
+            .filter(|task| filter.admits_status(task.status().as_str()))
+            .map(|task| (self.snapshot_of(&task), task))
+            .filter(|(snapshot, _)| filter.admits_status(snapshot.status.as_str()))
             .map(|(snapshot, task)| (snapshot, task.redacted_output.peek(max_chars)))
             .collect()
     }
@@ -631,7 +904,7 @@ impl TaskManager {
         };
 
         let task = &s.order[idx];
-        if task.status() == TaskRunStatus::Running {
+        if !task.status().is_terminal() {
             return TaskActionResult::Rejected;
         }
 
@@ -726,7 +999,7 @@ impl TaskManager {
         if !self.is_authorized_caller(id, caller_task_id) {
             return TaskActionResult::Denied;
         }
-        if task.status() != TaskRunStatus::Running {
+        if task.status().is_terminal() {
             return TaskActionResult::InvalidState;
         }
         task.cancel_task();
@@ -750,7 +1023,7 @@ impl TaskManager {
             Some(t) => t,
             None => return TaskActionResult::NotFound,
         };
-        if task.status() != TaskRunStatus::Running {
+        if task.status().is_terminal() {
             return TaskActionResult::InvalidState;
         }
         task.cancel_task();
@@ -1678,6 +1951,294 @@ mod tests {
         fn on_terminal(&self, task: &Arc<ManagedTask>, status: TaskRunStatus) {
             self.0.lock().unwrap().push(format!("{} {}", status.as_str(), task.id));
         }
+        fn on_suspended(&self, task: &TaskSnapshot, reason: &str) {
+            self.0.lock().unwrap().push(format!("suspended {} {reason}", task.id));
+        }
+        fn on_resumed(&self, task: &TaskSnapshot) {
+            self.0.lock().unwrap().push(format!("resumed {}", task.id));
+        }
+    }
+
+    // ── suspension ────────────────────────────────────────────────────────────
+
+    fn subagent(m: &TaskManager, parent: Option<&str>) -> Arc<ManagedTask> {
+        m.register(TaskKind::Subagent, "agent", parent, TaskExecutionMode::Background).unwrap()
+    }
+
+    fn checkpoint(steps_used: usize) -> TaskCheckpoint {
+        TaskCheckpoint {
+            history: vec![coda_llm::Message::user("hi")],
+            steps_used,
+            parked: false,
+            suspended_at: std::time::SystemTime::now(),
+        }
+    }
+
+    #[test]
+    fn suspend_request_is_inherited_by_descendants_and_resume_respects_explicit_children() {
+        let m = mgr();
+        let a = subagent(&m, None);
+        let b = subagent(&m, Some(&a.id));
+        let c = subagent(&m, Some(&b.id));
+        let requested = |t: &Arc<ManagedTask>| m.is_suspension_requested(&t.id);
+
+        assert_eq!(m.request_suspend(&b.id), TaskActionResult::Ok);
+        assert!(!requested(&a) && requested(&b) && requested(&c));
+        assert_eq!(m.suspension_reason(&b.id), Some("requested"));
+        assert_eq!(m.suspension_reason(&c.id), Some("parent"));
+        assert_eq!(m.suspension_reason(&a.id), None);
+
+        assert_eq!(m.request_suspend(&a.id), TaskActionResult::Ok);
+        assert!(requested(&a) && requested(&b) && requested(&c));
+        assert!(m.get(&c.id).unwrap().suspend_requested);
+
+        assert_eq!(m.request_resume(&a.id), TaskActionResult::Ok);
+        assert!(!requested(&a), "resume clears the explicit flag");
+        assert!(requested(&b) && requested(&c), "an explicitly suspended child stays suspended");
+
+        assert_eq!(m.request_resume(&b.id), TaskActionResult::Ok);
+        assert!(!requested(&a) && !requested(&b) && !requested(&c));
+        assert_eq!(m.request_resume(&c.id), TaskActionResult::InvalidState, "nothing to resume");
+    }
+
+    #[test]
+    fn suspend_rejects_non_subagent_and_terminal_tasks() {
+        let m = mgr();
+        let shell = m.register(TaskKind::Shell, "sh", None, TaskExecutionMode::Background).unwrap();
+        let done = subagent(&m, None);
+        m.complete(&done.id, None);
+        let live = subagent(&m, None);
+
+        assert_eq!(m.request_suspend("task-99999999"), TaskActionResult::NotFound);
+        assert_eq!(m.request_suspend(&shell.id), TaskActionResult::Rejected);
+        assert_eq!(m.request_resume(&shell.id), TaskActionResult::Rejected);
+        assert_eq!(m.request_suspend(&done.id), TaskActionResult::InvalidState);
+        assert_eq!(m.request_resume(&done.id), TaskActionResult::InvalidState);
+        assert!(!m.is_suspension_requested(&shell.id));
+
+        assert_eq!(m.suspend_all(), 1, "only the live subagent is suspendable");
+        assert_eq!(m.suspend_all(), 0, "already requested");
+        assert!(m.is_suspension_requested(&live.id));
+        assert_eq!(m.resume_all(), 1);
+        assert!(!m.is_suspension_requested(&live.id));
+    }
+
+    #[tokio::test]
+    async fn mark_suspended_and_resumed_round_trip_status_and_observer() {
+        let m = mgr();
+        let observer = Arc::new(RecordingObserver::default());
+        m.set_event_observer(observer.clone());
+        let t = subagent(&m, None);
+        let sub = m.subscribe();
+
+        let signalled = m.suspend_signal().notified();
+        tokio::pin!(signalled);
+        signalled.as_mut().enable();
+        assert_eq!(m.request_suspend(&t.id), TaskActionResult::Ok);
+        timeout(TDuration::from_secs(1), signalled).await.expect("flag change signals");
+
+        assert!(m.mark_suspended(&t.id, checkpoint(3)));
+        assert!(!m.mark_suspended(&t.id, checkpoint(4)), "already suspended");
+        assert_eq!(t.status(), TaskRunStatus::Suspended);
+        assert!(!t.is_terminal() && !TaskRunStatus::Suspended.is_terminal());
+        assert_eq!(TaskRunStatus::Suspended.as_str(), "suspended");
+        assert_eq!(m.checkpoint(&t.id).unwrap().steps_used, 3);
+        assert_eq!(m.live_children(None).len(), 1, "a suspended task is still live");
+        assert!(!sub.drain().0.is_empty(), "the status change is published");
+
+        assert_eq!(m.request_resume(&t.id), TaskActionResult::Ok);
+        assert!(m.mark_resumed(&t.id));
+        assert!(!m.mark_resumed(&t.id), "already running");
+        assert_eq!(t.status(), TaskRunStatus::Running);
+        assert!(m.checkpoint(&t.id).is_none(), "resuming clears the checkpoint");
+
+        assert!(m.mark_suspended(&t.id, checkpoint(5)));
+        assert!(m.stop(&t.id), "a suspended task can be stopped");
+        assert_eq!(t.status(), TaskRunStatus::Stopped);
+
+        let seen = observer.0.lock().unwrap().clone();
+        assert_eq!(seen, vec![
+            format!("started {}", t.id),
+            format!("suspended {} requested", t.id),
+            format!("resumed {}", t.id),
+            format!("suspended {} requested", t.id),
+            format!("stopped {}", t.id),
+        ]);
+    }
+
+    #[test]
+    fn register_restored_keeps_id_and_advances_counter() {
+        let m = mgr();
+        let observer = Arc::new(RecordingObserver::default());
+        m.set_event_observer(observer.clone());
+        let started = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let restored = m
+            .register_restored(
+                "task-00000007",
+                TaskKind::Subagent,
+                "restored",
+                None,
+                TaskExecutionMode::Background,
+                started,
+                true,
+            )
+            .unwrap();
+        assert_eq!(restored.id, "task-00000007");
+        assert_eq!(restored.started_at, started);
+        assert!(restored.was_resumed());
+        let snapshot = m.get(&restored.id).unwrap();
+        assert!(snapshot.resumed && snapshot.suspend_requested);
+        assert_eq!(snapshot.status, TaskRunStatus::Running);
+
+        let next = subagent(&m, None);
+        assert_eq!(next.id, "task-00000008");
+        assert!(!m.get(&next.id).unwrap().resumed);
+
+        let restore = |id: &str| {
+            m.register_restored(
+                id,
+                TaskKind::Subagent,
+                "x",
+                None,
+                TaskExecutionMode::Background,
+                started,
+                false,
+            )
+        };
+        assert!(restore("task-00000007").is_err(), "duplicate id");
+        assert!(restore("task-abc").is_err());
+        assert!(restore("job-00000009").is_err());
+        assert!(restore("task-").is_err());
+        assert!(restore("task-00000002").is_err(), "an allocated number is never reused");
+        let high = restore("task-00000010").unwrap();
+        assert!(!m.is_suspension_requested(&high.id));
+        assert_eq!(subagent(&m, None).id, "task-00000011", "the counter never goes back");
+        assert_eq!(
+            observer.0.lock().unwrap().first().cloned(),
+            Some("started task-00000007".to_owned())
+        );
+    }
+
+    #[test]
+    fn register_restored_requires_canonical_ids_and_never_reuses_allocated_numbers() {
+        let m = mgr();
+        let restore = |id: &str| {
+            m.register_restored(
+                id,
+                TaskKind::Subagent,
+                "x",
+                None,
+                TaskExecutionMode::Background,
+                std::time::SystemTime::now(),
+                false,
+            )
+        };
+        assert!(restore("task-7").is_err(), "not zero-padded");
+        assert!(restore("task-000000007").is_err(), "over-padded");
+        assert!(restore("task-+0000007").is_err());
+        assert!(restore("task-00000005").is_ok());
+        assert!(restore("task-00000003").is_ok(), "restores may arrive in any order");
+
+        let fresh = subagent(&m, None);
+        assert_eq!(fresh.id, "task-00000006");
+        assert!(restore("task-00000004").is_err(), "below an allocated number");
+        assert!(restore("task-00000006").is_err(), "the allocated number itself");
+        assert!(restore("task-00000009").is_ok(), "above the counter");
+        assert!(restore("task-123456789").is_ok(), "wider numbers are canonical");
+    }
+
+    #[test]
+    fn background_moves_a_suspended_foreground_task_to_the_background() {
+        let m = mgr();
+        let one = m.register(TaskKind::Tool, "a", None, TaskExecutionMode::Foreground).unwrap();
+        let two = m.register(TaskKind::Tool, "b", None, TaskExecutionMode::Foreground).unwrap();
+        assert!(m.mark_suspended(&one.id, checkpoint(1)));
+        assert!(m.mark_suspended(&two.id, checkpoint(1)));
+        assert_eq!(m.background(&one.id), TaskActionResult::Ok);
+        assert!(one.try_promote_to_background().is_some(), "a suspended task is promotable");
+        assert_eq!(one.mode(), TaskExecutionMode::Background);
+        assert_eq!(one.status(), TaskRunStatus::Suspended);
+        assert_eq!(m.background_all(), 1, "the other suspended foreground task");
+        assert!(two.try_promote_to_background().is_some());
+    }
+
+    #[test]
+    fn suspend_new_marks_tasks_created_while_draining() {
+        let m = mgr();
+        let before = subagent(&m, None);
+        m.set_suspend_new(true);
+        let during = subagent(&m, None);
+        let shell = m.register(TaskKind::Shell, "sh", None, TaskExecutionMode::Background).unwrap();
+        assert!(!m.is_suspension_requested(&before.id));
+        assert!(m.is_suspension_requested(&during.id));
+        assert!(!m.is_suspension_requested(&shell.id));
+        assert_eq!(m.suspension_reason(&during.id), Some("restart"));
+        m.set_suspend_new(false);
+        assert!(m.is_suspension_requested(&during.id), "the flag is sticky per task");
+        assert_eq!(m.suspension_reason(&during.id), Some("requested"));
+        m.set_restart_mode(true);
+        assert_eq!(m.suspension_reason(&during.id), Some("restart"));
+    }
+
+    #[test]
+    fn active_filter_includes_suspended_and_suspended_filter_only_suspended() {
+        use coda_proto::requests::TaskStatusFilter as F;
+        let m = mgr();
+        let running = subagent(&m, None);
+        let paused = subagent(&m, None);
+        let done = subagent(&m, None);
+        m.complete(&done.id, None);
+        m.request_suspend(&paused.id);
+        assert!(m.mark_suspended(&paused.id, checkpoint(1)));
+        let ids = |filter| -> Vec<String> {
+            m.list_with_output_matching(4000, filter).into_iter().map(|(t, _)| t.id).collect()
+        };
+        assert_eq!(ids(F::Active), [running.id.clone(), paused.id.clone()]);
+        assert_eq!(ids(F::Suspended), [paused.id.clone()]);
+        assert_eq!(ids(F::Terminal), [done.id.clone()]);
+        assert_eq!(ids(F::All).len(), 3);
+    }
+
+    #[test]
+    fn owner_inbox_receives_child_completion_while_owner_suspended() {
+        let m = mgr();
+        let owner = subagent(&m, None);
+        let inbox = Arc::new(crate::steering::SteeringInbox::new());
+        owner.attach_steering(Arc::clone(&inbox));
+        let child = subagent(&m, Some(&owner.id));
+        m.request_suspend(&owner.id);
+        assert!(m.mark_suspended(&owner.id, checkpoint(2)));
+        assert_eq!(m.send_message(&owner.id, "hello"), TaskActionResult::Ok);
+
+        assert!(m.complete(&child.id, Some("child report".into())));
+        let items = inbox.take_all_for_delivery();
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert!(items.iter().any(|i| i.text.contains("child report")), "{items:?}");
+    }
+
+    #[test]
+    fn stop_with_note_records_note_and_stops() {
+        let m = mgr();
+        let shell = m.register(TaskKind::Shell, "sh", None, TaskExecutionMode::Background).unwrap();
+        let killed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = killed.clone();
+        shell.attach_shell_kill(move || flag.store(true, std::sync::atomic::Ordering::SeqCst));
+
+        assert_eq!(m.stop_with_note(&shell.id, "planned restart"), TaskActionResult::Ok);
+        assert!(shell.cancel.is_cancelled());
+        assert!(killed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(shell.stopped_by_operator());
+        assert_eq!(shell.stop_note().as_deref(), Some("planned restart"));
+
+        let paused = subagent(&m, None);
+        m.request_suspend(&paused.id);
+        assert!(m.mark_suspended(&paused.id, checkpoint(1)));
+        assert_eq!(m.stop_with_note(&paused.id, "planned restart"), TaskActionResult::Ok);
+        assert!(paused.cancel.is_cancelled(), "suspended tasks can be stopped");
+
+        m.stop(&shell.id);
+        assert_eq!(m.stop_with_note(&shell.id, "late"), TaskActionResult::InvalidState);
+        assert_eq!(shell.stop_note().as_deref(), Some("planned restart"));
     }
 
     #[test]

@@ -74,7 +74,7 @@ use crate::dispatch::AdjustEffortParams;
 use crate::prompts::{PromptChannel, WirePermissionPrompt, WirePlanApprover, WireUserQuestion};
 use crate::mcp::McpBundle;
 use crate::session::Session;
-use crate::state::{EngineState, SteeringStateObserver, TurnEnd};
+use crate::state::{AlreadyDraining, EngineState, SteeringStateObserver, TurnEnd, TurnRefusal};
 use coda_proto::state::ActivityPhase;
 use crate::state_sink::StateSink;
 use crate::capabilities::capability_catalog;
@@ -269,6 +269,92 @@ struct GoalParams {
     goal: Option<String>,
     max_duration: Option<String>,
     max_continuations: Option<i32>,
+}
+
+/// `drainTimeoutMs` when `session/prepareRestart` gives none.
+const RESTART_DEFAULT_DRAIN_MS: u64 = 600_000;
+/// The largest `drainTimeoutMs` accepted.
+const RESTART_MAX_DRAIN_MS: u64 = 3_600_000;
+/// After the drain timeout interrupts work, how long subagents get to reach
+/// a safe point before they are stopped and reported as interrupted.
+const RESTART_SETTLE: Duration = Duration::from_secs(30);
+/// How long an interrupted main turn gets to release the turn slot.
+const RESTART_TURN_RELEASE: Duration = Duration::from_secs(10);
+/// Output kept for each interrupted task in the restart file.
+const RESTART_OUTPUT_TAIL_CHARS: usize = 2000;
+/// How often the drain re-checks its condition besides task notifications.
+const RESTART_POLL: Duration = Duration::from_millis(50);
+
+/// The progress of `session/prepareRestart` on this engine.
+enum RestartPrep {
+    Idle,
+    InProgress,
+    /// The result returned again to every later call.
+    Done(Value),
+}
+
+/// Resets an unfinished `session/prepareRestart` to `Idle` when its future
+/// is dropped or fails, so a later call can try again.
+struct RestartPrepGuard<'a> {
+    state: &'a Mutex<RestartPrep>,
+    done: bool,
+}
+
+impl Drop for RestartPrepGuard<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            *self.state.lock().unwrap_or_else(|p| p.into_inner()) = RestartPrep::Idle;
+        }
+    }
+}
+
+/// The drain results of `session/prepareRestart` that only the first
+/// attempt can observe; kept on the host so a retry after a failure (e.g.
+/// the restart file could not be written) saves them instead of losing them.
+#[derive(Clone, Default)]
+struct RestartCapture {
+    /// Subagents the operator had suspended before the drain suspended the
+    /// rest (which also sets their explicit flag).
+    operator_suspended: std::collections::HashSet<String>,
+    /// Whether an attempt hit the drain timeout.
+    timed_out: bool,
+    interrupted: crate::restart::Interrupted,
+    steering: Vec<String>,
+}
+
+impl RestartCapture {
+    fn add_task(&mut self, task: crate::restart::InterruptedTask) {
+        if !self.interrupted.tasks.iter().any(|t| t.task_id == task.task_id) {
+            self.interrupted.tasks.push(task);
+        }
+    }
+
+    fn is_recorded(&self, task_id: &str) -> bool {
+        self.interrupted.tasks.iter().any(|t| t.task_id == task_id)
+    }
+}
+
+/// Saved subagents waiting for a client before they can be re-created.
+struct PendingSubagentRestore {
+    checkpoints: Vec<coda_agent::subagents::SubagentCheckpoint>,
+    keep_suspended: bool,
+    /// Removed once the subagents are re-created.
+    tasks_dir: PathBuf,
+}
+
+/// A task the drain had to stop, as recorded in the restart file.
+fn interrupted_task(
+    task: &coda_agent::tasks::TaskSnapshot,
+    output_tail: String,
+) -> crate::restart::InterruptedTask {
+    crate::restart::InterruptedTask {
+        task_id: task.id.clone(),
+        kind: task.kind.as_str().to_owned(),
+        description: task.description.clone(),
+        command: (task.kind == coda_agent::tasks::TaskKind::Shell).then(|| task.description.clone()),
+        started_at: chrono::DateTime::<Utc>::from(task.started_at),
+        output_tail,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -530,6 +616,12 @@ pub struct StartupOptions {
     /// Copilot or Claude.ai session resolves its own endpoints and starts
     /// normally whatever this holds.
     pub anthropic_endpoint: ApiKeyEndpoint,
+    /// `coda serve --restore[=suspended]`: the `restore` an `initialize`
+    /// that leaves it out gets.
+    pub restore: Option<coda_proto::messages::RestoreMode>,
+    /// `coda serve --session <id>`: the `sessionId` an `initialize` that
+    /// leaves it out resumes.
+    pub session_id: Option<String>,
 }
 
 impl std::fmt::Debug for StartupOptions {
@@ -546,6 +638,8 @@ impl std::fmt::Debug for StartupOptions {
             // Never surface the key itself, in Debug or anywhere else.
             .field("api_key", &self.api_key.as_ref().map(|_| "***"))
             .field("endpoint", &self.endpoint)
+            .field("restore", &self.restore)
+            .field("session_id", &self.session_id)
             // The resolved decision is deliberately absent: it either repeats
             // `endpoint` or came from the environment, and a resolved base URL
             // can carry a path — which can carry a tenant id.
@@ -615,6 +709,15 @@ impl StartupOptions {
         let provider = non_empty("CODA_SERVE_PROVIDER").map(|p| canonical_provider(&p));
         let api_key = non_empty("CODA_SERVE_API_KEY");
         let endpoint = non_empty("CODA_SERVE_ENDPOINT");
+        let restore = match non_empty("CODA_SERVE_RESTORE") {
+            None => None,
+            Some(raw) => Some(parse_startup_restore(&raw).ok_or_else(|| {
+                StartupError(format!(
+                    "invalid CODA_SERVE_RESTORE '{raw}' (expected true, false, or suspended)"
+                ))
+            })?),
+        };
+        let session_id = non_empty("CODA_SERVE_SESSION");
 
         let opts = Self {
             model,
@@ -628,6 +731,8 @@ impl StartupOptions {
             api_key,
             endpoint,
             anthropic_endpoint: ApiKeyEndpoint::Unresolved,
+            restore,
+            session_id,
         };
         opts.validate()?;
         // Resolved after `validate`, so `--endpoint requires --api-key` is
@@ -731,6 +836,17 @@ impl StartupOptions {
             max_duration: self.goal_max_duration.clone(),
             max_continuations: self.goal_max_continuations,
         }
+    }
+}
+
+/// Maps a `CODA_SERVE_RESTORE` value (`coda serve --restore[=suspended]`).
+fn parse_startup_restore(raw: &str) -> Option<coda_proto::messages::RestoreMode> {
+    use coda_proto::messages::RestoreMode;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" => Some(RestoreMode::Resume),
+        "false" | "0" => Some(RestoreMode::Off),
+        "suspended" => Some(RestoreMode::Suspended),
+        _ => None,
     }
 }
 
@@ -1097,6 +1213,31 @@ pub struct ServeHost {
     /// `engine_state`; also tracks which turn is currently delivering so
     /// `event/steeringOutcome` can tag `delivered` with the owning `turnId`.
     steering_observer: Arc<SteeringStateObserver>,
+    /// Where `session/prepareRestart` stands: a second call while one runs is
+    /// refused, a call after it finished gets the same result again.
+    restart_prep: Mutex<RestartPrep>,
+    /// What a failed `session/prepareRestart` already captured and undid
+    /// (stopped tasks, declined requests, recalled steering), reused by the
+    /// retry because that state cannot be observed a second time.
+    restart_capture: Mutex<Option<RestartCapture>>,
+    /// `coda serve --restore` / `--session`: what `initialize` assumes when
+    /// the client leaves `restore` / `sessionId` out.
+    startup_restore: Option<coda_proto::messages::RestoreMode>,
+    startup_session_id: Option<String>,
+    /// Subagents a restore could not re-create yet because no client was
+    /// wired; restored the first time the session services are built.
+    pending_restore: Mutex<Option<PendingSubagentRestore>>,
+    /// Restored messages, re-published once the `initialize` response has
+    /// been written (see [`ServeHost::after_initialize_response`]).
+    restored_messages: Mutex<Vec<crate::restart::SavedMessage>>,
+    /// Test seam: replaces [`RESTART_SETTLE`] so a test does not wait 30 s
+    /// for a subagent that will never reach a safe point.
+    #[cfg(test)]
+    restart_settle_override: Mutex<Option<Duration>>,
+    /// Test seam: runs once right after the drain timeout interrupted the
+    /// work it found, e.g. to start a task the snapshot did not see.
+    #[cfg(test)]
+    restart_interrupt_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Test seam: invoked inside `run_prompt_inner` after the agent has been
     /// built and before the turn's resolved `activeConfig` is published.
     ///
@@ -1474,6 +1615,16 @@ impl ServeHost {
             diagnostics,
             engine_state,
             steering_observer,
+            restart_prep: Mutex::new(RestartPrep::Idle),
+            restart_capture: Mutex::new(None),
+            startup_restore: startup_opts.restore,
+            startup_session_id: startup_opts.session_id.clone(),
+            pending_restore: Mutex::new(None),
+            restored_messages: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            restart_settle_override: Mutex::new(None),
+            #[cfg(test)]
+            restart_interrupt_hook: Mutex::new(None),
             #[cfg(test)]
             after_agent_build_hook: Mutex::new(None),
             #[cfg(test)]
@@ -2107,13 +2258,605 @@ impl ServeHost {
         &self,
         client: Arc<dyn LlmClient>,
     ) -> Arc<SessionServices> {
+        self.services_restoring(client).await.0
+    }
+
+    /// [`Self::get_or_init_services`], also returning the ids of the saved
+    /// subagents re-created if this call built the services.
+    async fn services_restoring(
+        &self,
+        client: Arc<dyn LlmClient>,
+    ) -> (Arc<SessionServices>, Option<Vec<String>>) {
         let mut guard = self.session_services.lock().await;
         if let Some(ref svc) = *guard {
-            return Arc::clone(svc);
+            return (Arc::clone(svc), None);
         }
         let svc = Arc::new(self.build_session_services(client));
+        // Built while draining (lazily, by work admitted before the drain):
+        // start with launches paused. Checked under the services lock, which
+        // `begin_draining` also takes, so one of the two always pauses it.
+        if self.engine_state.is_draining() {
+            svc.schedule_runtime.pause_launches(true);
+        }
         *guard = Some(Arc::clone(&svc));
-        svc
+        // Restored under the services lock, so nothing can register a task
+        // (whose new id would refuse the saved ones) before they are back.
+        let pending = self.pending_restore.lock().expect("pending restore poisoned").take();
+        let restored = match pending {
+            Some(pending) => Some(self.restore_subagents(&svc, pending).await),
+            None => None,
+        };
+        (svc, restored)
+    }
+
+    /// Re-creates saved subagents under their old ids (all registered before
+    /// any runs), then removes the files of those re-created. Returns their
+    /// ids.
+    async fn restore_subagents(
+        &self,
+        svc: &SessionServices,
+        pending: PendingSubagentRestore,
+    ) -> Vec<String> {
+        let PendingSubagentRestore { checkpoints, keep_suspended, tasks_dir } = pending;
+        let results = svc
+            .subagent_host
+            .restore_all(checkpoints, keep_suspended, Arc::new(coda_agent::NullSink))
+            .await;
+        let mut restored = Vec::with_capacity(results.len());
+        for (task_id, outcome) in results {
+            match outcome {
+                Ok(id) => restored.push(id),
+                Err(error) => {
+                    tracing::warn!(%task_id, %error, "a saved subagent could not be restored")
+                }
+            }
+        }
+        // File by file: one that was not re-created stays on disk.
+        for id in &restored {
+            if let Err(error) = tokio::fs::remove_file(tasks_dir.join(format!("{id}.json"))).await {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(task_id = %id, %error, "cannot remove a restored subagent's file");
+                }
+            }
+        }
+        // Only succeeds once the directory is empty.
+        let _ = tokio::fs::remove_dir(&tasks_dir).await;
+        restored
+    }
+
+    /// Enters the planned-restart `draining` lifecycle: every new turn
+    /// (prompt, main-inbox pump, compaction, fork, rewind) is refused with
+    /// `restart pending`, and the schedule runtime stops launching. Work
+    /// already running — including an open turn and its pending requests —
+    /// continues.
+    pub(crate) async fn begin_draining(
+        &self,
+        reason: Option<String>,
+        deadline: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), AlreadyDraining> {
+        self.engine_state.begin_draining(reason, deadline)?;
+        self.pause_schedule_launches(true).await;
+        Ok(())
+    }
+
+    /// Pauses or resumes launching due schedules. A no-op until the session
+    /// services exist; services built later while draining start paused.
+    pub(crate) async fn pause_schedule_launches(&self, paused: bool) {
+        if let Some(svc) = self.session_services.lock().await.as_ref() {
+            svc.schedule_runtime.pause_launches(paused);
+        }
+    }
+
+    fn turn_is_active(&self) -> bool {
+        *self.turn_active.lock().expect("turn_active poisoned")
+    }
+
+    /// Nothing is left running: every task finished, or is a suspended subagent.
+    fn restart_tasks_settled(&self) -> bool {
+        use coda_agent::tasks::{TaskKind, TaskRunStatus};
+        self.task_manager.list().iter().all(|t| {
+            t.status.is_terminal()
+                || (t.kind == TaskKind::Subagent && t.status == TaskRunStatus::Suspended)
+        })
+    }
+
+    /// The drain is complete: no turn and nothing running.
+    fn restart_drained(&self) -> bool {
+        !self.turn_is_active() && self.restart_tasks_settled()
+    }
+
+    /// Waits until `done` holds or `deadline` passes, re-checking on every
+    /// task status change and at least every [`RESTART_POLL`].
+    async fn wait_until_or(
+        &self,
+        deadline: tokio::time::Instant,
+        done: impl Fn(&Self) -> bool,
+    ) -> bool {
+        loop {
+            let suspended = self.task_manager.suspend_signal().notified();
+            let settled = self.task_manager.settle_signal().notified();
+            if done(self) {
+                return true;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            tokio::select! {
+                _ = suspended => {}
+                _ = settled => {}
+                _ = tokio::time::sleep_until(deadline.min(now + RESTART_POLL)) => {}
+            }
+        }
+    }
+
+    fn restart_settle(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(settle) = *self.restart_settle_override.lock().unwrap() {
+            return settle;
+        }
+        RESTART_SETTLE
+    }
+
+    /// Cancels the running turn, or the next one to publish its token.
+    fn cancel_current_turn(&self) {
+        let token = self.current_cancel.lock().expect("cancel poisoned").take();
+        match token {
+            Some(token) => token.cancel(),
+            None if self.turn_is_active() => {
+                *self.pending_interrupt.lock().expect("pending_interrupt poisoned") = true;
+            }
+            None => {}
+        }
+    }
+
+    /// The operator's queued steering, withdrawn so it is saved instead of
+    /// dropped when the turn ends.
+    fn recall_restart_steering(&self) -> Vec<String> {
+        self.session
+            .steering
+            .recall_all()
+            .into_iter()
+            .filter(|e| e.kind == coda_agent::steering::InboxItemKind::Message)
+            .map(|e| e.text)
+            .collect()
+    }
+
+    /// The settings a restore re-applies.
+    fn restart_settings(&self) -> crate::restart::SavedSettings {
+        let capture = self.capture_runtime();
+        let goal = self.goal_params.lock().expect("goal poisoned").clone();
+        crate::restart::SavedSettings {
+            model: Some(capture.config.model.clone()),
+            provider: capture.config.provider_id.clone(),
+            effort: capture.config.effort.map(|e| e.as_str().to_owned()),
+            goal: goal.goal.filter(|g| !g.trim().is_empty()).map(|g| crate::restart::SavedGoal {
+                goal: g,
+                max_duration: goal.max_duration,
+                max_continuations: goal.max_continuations,
+            }),
+            permission_mode: Some(wire_permission_mode(capture.permission_mode).to_owned()),
+            system_prompt: capture.config.system_prompt.as_deref().map(str::to_owned),
+        }
+    }
+
+    /// `session/prepareRestart`: drains (subagents suspend, everything else
+    /// must finish), interrupts what is still running at the deadline, then
+    /// writes every suspended subagent's file and — last — the restart file.
+    /// The engine stays draining afterwards.
+    async fn prepare_restart(
+        &self,
+        p: coda_proto::requests::PrepareRestartParams,
+        timeout_ms: u64,
+    ) -> Result<Value, RpcError> {
+        use crate::restart::{InterruptedRequest, RestartFile, RESTART_FILE_VERSION};
+        use coda_agent::subagents::SubagentCheckpoint;
+        use coda_agent::tasks::{TaskKind, TaskRunStatus};
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+        let deadline_utc = Utc::now() + chrono::Duration::milliseconds(timeout_ms as i64);
+        if self.begin_draining(p.reason.clone(), deadline_utc).await.is_err() {
+            if !self.engine_state.is_draining() {
+                return Err(RpcError::internal("the engine is shutting down"));
+            }
+            self.pause_schedule_launches(true).await;
+        }
+
+        let tasks = &self.task_manager;
+        let stored = self.restart_capture.lock().expect("restart capture poisoned").clone();
+        let mut capture = stored.unwrap_or_else(|| RestartCapture {
+            // Suspended by the operator before the drain: these stay
+            // suspended after a restore, unlike the ones the drain suspends
+            // itself. Only a first attempt can tell them apart.
+            operator_suspended: tasks
+                .list()
+                .into_iter()
+                .filter(|t| t.kind == TaskKind::Subagent && !t.status.is_terminal())
+                .filter(|t| tasks.find_task(&t.id).is_some_and(|task| task.suspend_explicit()))
+                .map(|t| t.id)
+                .collect(),
+            ..RestartCapture::default()
+        });
+        let save = |capture: &RestartCapture| {
+            *self.restart_capture.lock().expect("restart capture poisoned") = Some(capture.clone());
+        };
+        save(&capture);
+        tasks.set_restart_mode(true);
+        tasks.set_suspend_new(true);
+        tasks.suspend_all();
+
+        let drained = self.wait_until_or(deadline, Self::restart_drained).await;
+        if !drained {
+            capture.timed_out = true;
+            let snapshot: Vec<_> = tasks
+                .list_with_output(RESTART_OUTPUT_TAIL_CHARS)
+                .into_iter()
+                .filter(|(t, _)| !t.status.is_terminal() && t.kind != TaskKind::Subagent)
+                .map(|(t, output)| interrupted_task(&t, output))
+                .collect();
+            capture.interrupted.requests.extend(
+                self.prompt_channel.registry().list().iter().map(InterruptedRequest::from_pending),
+            );
+            capture.steering.extend(self.recall_restart_steering());
+            for task in snapshot {
+                capture.add_task(task);
+            }
+            save(&capture);
+            self.cancel_current_turn();
+            for task in &capture.interrupted.tasks {
+                tasks.stop_with_note(&task.task_id, "planned restart");
+            }
+            self.prompt_channel.registry().fail_all(coda_tool::NoAnswerReason::Declined);
+            #[cfg(test)]
+            if let Some(hook) = self.restart_interrupt_hook.lock().unwrap().take() {
+                hook();
+            }
+
+            let now = tokio::time::Instant::now();
+            self.wait_until_or(now + RESTART_TURN_RELEASE, |h| !h.turn_is_active()).await;
+            let settle_deadline = tokio::time::Instant::now() + self.restart_settle();
+            if !self.wait_until_or(settle_deadline, Self::restart_tasks_settled).await {
+                // Anything still running, including tasks started after the
+                // snapshot (a subagent may launch one before it settles).
+                for (task, output) in tasks.list_with_output(RESTART_OUTPUT_TAIL_CHARS) {
+                    let suspended_subagent = task.kind == TaskKind::Subagent
+                        && task.status == TaskRunStatus::Suspended;
+                    if task.status.is_terminal()
+                        || suspended_subagent
+                        || capture.is_recorded(&task.id)
+                    {
+                        continue;
+                    }
+                    tasks.stop_with_note(&task.id, "planned restart");
+                    capture.add_task(interrupted_task(&task, output));
+                }
+            }
+        }
+        capture.steering.extend(self.recall_restart_steering());
+        save(&capture);
+        let drained = drained && !capture.timed_out;
+        let RestartCapture { operator_suspended, interrupted, steering, .. } = capture;
+
+        let session_id = self.active_session_id();
+        let store = SessionTranscriptStore::new(self.working_dir.clone());
+        let tasks_dir = store.tasks_dir(&session_id);
+        // Held until the restart file is written: a first build of the
+        // services re-creates any subagents a restore left pending under this
+        // lock, so each is seen either as a task below or as still pending.
+        let services = self.session_services.lock().await;
+        let mut suspended = Vec::new();
+        for task in tasks.list() {
+            if task.kind != TaskKind::Subagent || task.status != TaskRunStatus::Suspended {
+                continue;
+            }
+            let Some(mut checkpoint) = SubagentCheckpoint::from_task(tasks, &task.id) else {
+                tracing::warn!(task_id = %task.id, "a suspended subagent has no checkpoint to save");
+                continue;
+            };
+            checkpoint.explicitly_suspended = operator_suspended.contains(&task.id);
+            checkpoint.write(&tasks_dir).await.map_err(|e| {
+                RpcError::internal(format!("cannot save subagent {}: {e}", task.id))
+            })?;
+            suspended.push(task.id);
+        }
+        // Restored subagents still waiting for the services (no provider was
+        // wired) are carried over to the next restore as they were saved.
+        let deferred: Vec<SubagentCheckpoint> = self
+            .pending_restore
+            .lock()
+            .expect("pending restore poisoned")
+            .as_ref()
+            .map(|pending| pending.checkpoints.clone())
+            .unwrap_or_default();
+        for checkpoint in deferred {
+            if suspended.contains(&checkpoint.task_id) {
+                continue;
+            }
+            checkpoint.write(&tasks_dir).await.map_err(|e| {
+                RpcError::internal(format!("cannot save subagent {}: {e}", checkpoint.task_id))
+            })?;
+            suspended.push(checkpoint.task_id);
+        }
+
+        let file = RestartFile {
+            version: RESTART_FILE_VERSION,
+            coda_version: coda_boot::version().to_owned(),
+            session_id: session_id.clone(),
+            working_dir: self.working_dir.clone(),
+            prepared_at: Utc::now(),
+            reason: p.reason,
+            schedules: self
+                .schedule_store
+                .items()
+                .iter()
+                .filter_map(|s| serde_json::to_value(s).ok())
+                .collect(),
+            messages: crate::restart::snapshot_messages(
+                &self.message_bus,
+                p.delivered_cursor.unwrap_or(0),
+            ),
+            settings: self.restart_settings(),
+            steering,
+            interrupted,
+            tasks: suspended.clone(),
+        };
+        let bytes =
+            serde_json::to_vec_pretty(&file).map_err(|e| RpcError::internal(e.to_string()))?;
+        let path = store.restart_file_path(&session_id);
+        coda_agent::session::private_file::write_private_atomic(&path, &bytes)
+            .await
+            .map_err(|e| RpcError::internal(format!("cannot write the restart file: {e}")))?;
+        // They belong to the restart file now: a later build of this
+        // engine's services must not re-create them (and remove their files).
+        *self.pending_restore.lock().expect("pending restore poisoned") = None;
+        drop(services);
+        let path = std::path::absolute(&path).unwrap_or(path);
+        self.engine_state.drain_completed();
+
+        serde_json::to_value(coda_proto::responses::PrepareRestartResult {
+            ok: true,
+            restart_file: path.display().to_string(),
+            drained,
+            interrupted_tasks: file.interrupted.tasks.len(),
+            interrupted_requests: file.interrupted.requests.len(),
+            suspended_tasks: suspended,
+        })
+        .map_err(|e| RpcError::internal(e.to_string()))
+    }
+
+    /// Applies a validated (and already consumed) restart file: schedules,
+    /// settings and subagents now; its messages are re-published once the
+    /// `initialize` response is out. The `[restart]` history entry is added
+    /// by `initialize` itself, together with the transcript.
+    async fn apply_restart_file(
+        &self,
+        file: crate::restart::RestartFile,
+        mode: coda_proto::messages::RestoreMode,
+    ) -> coda_proto::messages::RestoredSummary {
+        use coda_agent::scheduling::{ScheduleKind, ScheduleRecurrence, ScheduledTask};
+        use coda_agent::subagents::SubagentCheckpoint;
+        use coda_proto::messages::{RestoreMode, RestoredSummary};
+
+        let now = Utc::now();
+        let mut summary = RestoredSummary {
+            applied: true,
+            prepared_at: Some(file.prepared_at.to_rfc3339()),
+            reason: file.reason.clone(),
+            from_version: Some(file.coda_version.clone()),
+            to_version: Some(coda_boot::version().to_owned()),
+            interrupted_tasks: file.interrupted.tasks.len(),
+            interrupted_requests: file.interrupted.requests.len(),
+            steering: file.steering.len(),
+            tasks_suspended: mode == RestoreMode::Suspended,
+            ..RestoredSummary::default()
+        };
+
+        for value in &file.schedules {
+            let mut task = match serde_json::from_value::<ScheduledTask>(value.clone()) {
+                Ok(task) => task,
+                Err(error) => {
+                    tracing::warn!(%error, "a saved schedule could not be read");
+                    continue;
+                }
+            };
+            // A recurring slot missed while the engine was down moves to the
+            // first one after now: no burst, no catch-up run. A one-shot
+            // `at` stays due and fires once.
+            if task.kind != ScheduleKind::At && !task.is_retired() && task.next_run_utc <= now {
+                match ScheduleRecurrence::advance_recurring_past(&task, now) {
+                    Ok(next) => task.next_run_utc = next,
+                    Err(error) => tracing::warn!(%error, "a saved schedule could not be advanced"),
+                }
+            }
+            if self.schedule_store.restore(task) {
+                summary.schedules += 1;
+            }
+        }
+
+        self.apply_restart_settings(&file.settings, &mut summary).await;
+
+        let messages: Vec<crate::restart::SavedMessage> = file
+            .messages
+            .into_iter()
+            .filter(|m| matches!(m.channel.as_str(), "user" | "main") && m.message_source().is_some())
+            .collect();
+        summary.messages = messages.len();
+        *self.restored_messages.lock().expect("restored messages poisoned") = messages;
+
+        let store = SessionTranscriptStore::new(&self.working_dir);
+        let tasks_dir = store.tasks_dir(&file.session_id);
+        let mut checkpoints = Vec::new();
+        for id in &file.tasks {
+            let canonical = id
+                .strip_prefix("task-")
+                .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()));
+            let checkpoint = if canonical {
+                SubagentCheckpoint::read(&tasks_dir.join(format!("{id}.json")))
+                    .and_then(|cp| if cp.task_id == *id { Ok(cp) } else { Err("id mismatch".into()) })
+            } else {
+                Err("not a task id".into())
+            };
+            match checkpoint {
+                Ok(cp) => checkpoints.push(cp),
+                Err(error) => {
+                    tracing::warn!(task_id = %id, %error, "a saved subagent is unreadable");
+                    summary.interrupted_tasks += 1;
+                }
+            }
+        }
+        let pending = PendingSubagentRestore {
+            checkpoints,
+            keep_suspended: mode == RestoreMode::Suspended,
+            tasks_dir,
+        };
+
+        // Services (subagent host, schedule runtime) are built now when a
+        // client is wired, so the restored schedules run and the subagents
+        // continue without waiting for a prompt; otherwise the subagents wait
+        // for the first time the services are built. `tasks` lists only the
+        // subagents actually re-created; deferred ones keep their files (and
+        // a `session/prepareRestart` before then carries them over).
+        if self.wire_client_from_env_if_missing().await.is_err() {
+            tracing::warn!("no provider could be wired for the restore");
+        }
+        let client = self.client.lock().await.clone();
+        let deferred = pending.checkpoints.len();
+        *self.pending_restore.lock().expect("pending restore poisoned") = Some(pending);
+        if let Some(client) = client {
+            let (svc, restored) = self.services_restoring(client).await;
+            summary.tasks = match restored {
+                Some(restored) => restored,
+                // The services already existed: restore directly.
+                None => {
+                    let left = self.pending_restore.lock().expect("pending restore poisoned").take();
+                    match left {
+                        Some(left) => self.restore_subagents(&svc, left).await,
+                        None => Vec::new(),
+                    }
+                }
+            };
+        } else if deferred > 0 {
+            tracing::info!(deferred, "saved subagents wait until a provider is wired");
+        }
+        summary
+    }
+
+    /// Re-applies the saved settings through the same paths as their
+    /// setters; what is refused or deliberately skipped is reported.
+    async fn apply_restart_settings(
+        &self,
+        settings: &crate::restart::SavedSettings,
+        summary: &mut coda_proto::messages::RestoredSummary,
+    ) {
+        use coda_proto::messages::SettingNotRestored;
+        let mut skip = |name: &str, value: Option<&str>, reason: String| {
+            summary.settings_not_restored.push(SettingNotRestored {
+                name: name.to_owned(),
+                value: value.map(str::to_owned),
+                reason,
+            });
+        };
+        let note = |r: &Value| r["note"].as_str().unwrap_or("refused").to_owned();
+        let mut applied = Vec::new();
+
+        let wired = self.runtime.lock().expect("runtime config poisoned").provider_id.clone();
+        let other_provider = match (&settings.provider, &wired) {
+            (Some(saved), Some(wired)) if !saved.eq_ignore_ascii_case(wired) => Some(wired.clone()),
+            _ => None,
+        };
+        if let Some(wired) = &other_provider {
+            skip(
+                "provider",
+                settings.provider.as_deref(),
+                format!("this engine runs provider {wired}; the provider is not switched on restore"),
+            );
+        }
+
+        if let Some(model) = &settings.model {
+            if other_provider.is_some() {
+                skip("model", Some(model), "it was chosen for another provider".into());
+            } else {
+                match self.session_set_model(SetModelParams { model: model.clone() }).await {
+                    Ok(r) if r["ok"] == true => applied.push("model"),
+                    Ok(r) => skip("model", Some(model), note(&r)),
+                    Err(e) => skip("model", Some(model), e.message),
+                }
+            }
+        }
+        if let Some(effort) = &settings.effort {
+            if other_provider.is_some() {
+                skip("effort", Some(effort), "it was chosen for another provider".into());
+            } else {
+                let params = SetEffortParams { effort: Some(effort.clone()), ..Default::default() };
+                match self.session_set_effort(params).await {
+                    Ok(r) if r["ok"] == true => applied.push("effort"),
+                    Ok(r) => skip("effort", Some(effort), note(&r)),
+                    Err(e) => skip("effort", Some(effort), e.message),
+                }
+            }
+        }
+        if let Some(goal) = &settings.goal {
+            let params = SetGoalParams {
+                goal: Some(goal.goal.clone()),
+                max_duration: goal.max_duration.clone(),
+                max_continuations: goal.max_continuations,
+            };
+            match self.session_set_goal(params).await {
+                Ok(_) => applied.push("goal"),
+                Err(e) => skip("goal", Some(&goal.goal), e.message),
+            }
+        }
+        if let Some(text) = &settings.system_prompt {
+            let params = SetSystemPromptParams { text: Some(text.clone()) };
+            match self.session_set_system_prompt(params).await {
+                Ok(_) => applied.push("systemPrompt"),
+                Err(e) => skip("systemPrompt", None, e.message),
+            }
+        }
+        if let Some(mode) = &settings.permission_mode {
+            if parse_permission_mode(mode) == Some(PermissionMode::BypassPermissions) {
+                skip(
+                    "permissionMode",
+                    Some("bypassPermissions"),
+                    "bypassPermissions is never restored automatically; the mode is back to default"
+                        .into(),
+                );
+            } else {
+                let params = SetPermissionModeParams { mode: mode.clone() };
+                match self.session_set_permission_mode(params).await {
+                    Ok(r) if r["ok"] == true => applied.push("permissionMode"),
+                    Ok(_) => skip("permissionMode", Some(mode), "not a known permission mode".into()),
+                    Err(e) => skip("permissionMode", Some(mode), e.message),
+                }
+            }
+        }
+        summary.settings = applied.into_iter().map(str::to_owned).collect();
+    }
+
+    /// Re-publishes the messages a restore saved, after the `initialize`
+    /// response that reported them: notifications as new `event/agentMessage`
+    /// entries, main-inbox items re-queued (which wakes the idle pump). The
+    /// transport calls this once the response is written.
+    pub(crate) fn after_initialize_response(&self) {
+        let messages =
+            std::mem::take(&mut *self.restored_messages.lock().expect("restored messages poisoned"));
+        for m in messages {
+            let Some(source) = m.message_source() else { continue };
+            let outcome = if m.channel == "main" {
+                self.message_bus
+                    .publish_main(&source, m.text, m.context, m.idempotency_key)
+                    .map(|_| ())
+                    .map_err(|e| format!("{e:?}"))
+            } else {
+                self.message_bus
+                    .publish_user(&source, m.text, m.context, m.idempotency_key)
+                    .map(|_| ())
+                    .map_err(|e| format!("{e:?}"))
+            };
+            if let Err(error) = outcome {
+                tracing::warn!(%error, "a restored message could not be re-published");
+            }
+        }
     }
 
     /// Construct all session-scoped services that require a live client.
@@ -2201,10 +2944,14 @@ impl ServeHost {
             Arc::clone(&self.task_manager),
             Arc::clone(&main_subagent) as Arc<dyn SubagentFactory>,
         );
-        let schedule_runtime = ScheduleRuntime::new(
+        // Paused from the start when built during a drain, so its first pass
+        // cannot launch a due schedule before the pause lands.
+        let schedule_runtime = ScheduleRuntime::new_with_clock_paused(
             Arc::clone(&self.schedule_store),
             runner,
             Arc::new(NullScheduleLifecycleSink),
+            Arc::new(coda_agent::scheduling::SystemClock),
+            self.engine_state.is_draining(),
         );
 
         SessionServices {
@@ -2303,6 +3050,11 @@ impl ServeHost {
         precondition: Option<&dyn Fn() -> bool>,
     ) -> Result<TurnGuard<'_>, ClaimRefused> {
         let mut busy = self.turn_active.lock().expect("turn_active poisoned");
+        // Checked before `busy`: a draining engine's answer is "restart
+        // pending" whether or not the slot happens to be held right now.
+        if self.engine_state.is_draining() {
+            return Err(ClaimRefused::Draining);
+        }
         if *busy {
             return Err(ClaimRefused::Busy);
         }
@@ -2318,10 +3070,12 @@ impl ServeHost {
         let admitted = {
             let runtime = self.runtime.lock().expect("runtime config poisoned");
             let active_config = runtime.active_config(self.permission_mode.get());
-            self.engine_state.begin_turn(turn_id, user_text, active_config, kind.phase())
+            self.engine_state.try_begin_turn(turn_id, user_text, active_config, kind.phase())
         };
-        if !admitted {
-            return Err(ClaimRefused::Stopped);
+        match admitted {
+            Ok(()) => {}
+            Err(TurnRefusal::Stopped) => return Err(ClaimRefused::Stopped),
+            Err(TurnRefusal::Draining) => return Err(ClaimRefused::Draining),
         }
         // Resolve the window the turn is about to fill, from the catalogue
         // alone. `session/models` also reports it, but a headless client may
@@ -2368,6 +3122,9 @@ enum ClaimRefused {
     Busy,
     /// The engine is stopping or stopped; no new work is admitted.
     Stopped,
+    /// The engine is draining for a planned restart; no new work is admitted
+    /// (`restart pending`, -32016).
+    Draining,
     /// The caller's own admission precondition no longer holds (see
     /// [`ServeHost::try_claim_turn_if`]). Only the idle main-inbox pump
     /// supplies a precondition, so this is unreachable for `session/prompt`,
@@ -2384,6 +3141,7 @@ impl ClaimRefused {
             ClaimRefused::Stopped => RpcError::internal(
                 "engine is shutting down; no new turn was started".to_owned(),
             ),
+            ClaimRefused::Draining => RpcError::restart_pending(),
             ClaimRefused::NoWork => RpcError::internal(
                 "the work this turn was claimed for no longer exists".to_owned(),
             ),
@@ -2519,8 +3277,7 @@ fn safe_engine_error(code: i64) -> coda_proto::state::TurnErrorSummary {
     }
 }
 
-/// The `task/background` / `task/stop` reply: `ok` exactly when no refusal
-/// reason applies.
+/// The `task/*` control reply: `ok` exactly when no refusal reason applies.
 fn task_control_result(task_id: String, reason: Option<&str>) -> Result<Value, RpcError> {
     serde_json::to_value(coda_proto::responses::TaskControlResult {
         ok: reason.is_none(),
@@ -2576,6 +3333,8 @@ enum PromptRunFailure {
     Busy,
     /// The engine is stopping or stopped; no new turn is admitted.
     Stopped,
+    /// The engine is draining for a planned restart; no new turn is admitted.
+    Draining,
     /// Main-inbox origin only: the admission precondition no longer held at
     /// the instant of the claim — a racing user turn had already drained the
     /// queue. Nothing was claimed, opened or published.
@@ -2590,6 +3349,7 @@ impl From<ClaimRefused> for PromptRunFailure {
         match refused {
             ClaimRefused::Busy => PromptRunFailure::Busy,
             ClaimRefused::Stopped => PromptRunFailure::Stopped,
+            ClaimRefused::Draining => PromptRunFailure::Draining,
             ClaimRefused::NoWork => PromptRunFailure::NoWork,
         }
     }
@@ -2602,6 +3362,7 @@ impl PromptRunFailure {
                 ClaimRefused::Busy.into_error("another prompt is already in progress; busy")
             }
             PromptRunFailure::Stopped => ClaimRefused::Stopped.into_error(""),
+            PromptRunFailure::Draining => ClaimRefused::Draining.into_error(""),
             PromptRunFailure::NoWork => ClaimRefused::NoWork.into_error(""),
             PromptRunFailure::Failed(e) => e,
         }
@@ -2621,6 +3382,7 @@ impl PromptRunFailure {
             },
             PromptRunFailure::Busy
             | PromptRunFailure::Stopped
+            | PromptRunFailure::Draining
             | PromptRunFailure::NoWork => "preflight",
         }
     }
@@ -2821,6 +3583,47 @@ impl Drop for TurnGuard<'_> {
 #[async_trait]
 impl ServeBackend for ServeHost {
     async fn initialize(&self, p: InitParams) -> Result<Value, RpcError> {
+        use crate::restart::RestartFileCheck;
+        use coda_proto::messages::{RestoreMode, RestoredSummary};
+
+        let session_id = p.session_id.clone().or_else(|| self.startup_session_id.clone());
+        let restore_mode = p.restore.or(self.startup_restore).unwrap_or(RestoreMode::Off);
+        // The restart file is read and validated before the slot is claimed:
+        // a file this engine cannot understand refuses the handshake with no
+        // side effects, so the client can retry without `restore`.
+        let mut restart = None;
+        if restore_mode != RestoreMode::Off {
+            let Some(id) = session_id.as_deref() else {
+                return Err(RpcError::invalid_params("restore requires a sessionId"));
+            };
+            if !session_id_is_valid(id) {
+                return Err(RpcError::session_not_found());
+            }
+            let path = SessionTranscriptStore::new(&self.working_dir).restart_file_path(id);
+            let check = match tokio::fs::read(&path).await {
+                Ok(bytes) => crate::restart::check(Some(&bytes), id, &self.working_dir, Utc::now()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    RestartFileCheck::Ignored("missing")
+                }
+                Err(_) => RestartFileCheck::Ignored("unreadable"),
+            };
+            if let RestartFileCheck::Unsupported(version) = check {
+                return Err(RpcError {
+                    code: coda_proto::messages::error_code::RESTART_FILE_UNSUPPORTED,
+                    message: format!(
+                        "restart file format {version} is newer than this Coda supports ({})",
+                        crate::restart::RESTART_FILE_VERSION
+                    ),
+                });
+            }
+            restart = Some((path, check));
+        }
+        let ignored = |reason: &str| RestoredSummary {
+            applied: false,
+            ignored_reason: Some(reason.to_owned()),
+            ..RestoredSummary::default()
+        };
+
         let initialization = self.try_claim_initialization()?;
         // Negotiate before resume publishes its sessionChanged event, but only
         // after claiming the slot: a refused handshake must have no side effects.
@@ -2829,52 +3632,42 @@ impl ServeBackend for ServeHost {
         }
 
         let mut resumed = false;
+        let mut restored_summary: Option<RestoredSummary> = None;
+        let mut restart_to_apply = None;
+        // The session is loaded (read only) before anything fallible runs,
+        // and adopted after: a handshake refused below leaves the engine,
+        // the transcript and the restart file as they were, so a retry can
+        // still restore.
+        let mut loaded = None;
         // If the client supplied a session_id, attempt to resume it.
         // Security: session_id comes from an untrusted wire message — validate it
         // before using it as a file-system key.
-        if let Some(ref req_id) = p.session_id {
+        if let Some(ref req_id) = session_id {
             if !session_id_is_valid(req_id) {
                 // Invalid id format — treat as not found.
                 return Err(RpcError::session_not_found());
             }
             let store = SessionTranscriptStore::new(&self.working_dir);
-            match store.load_session(req_id).await {
-                Some(stored) => {
-                    let messages = stored.messages;
-                    // Adopt the resumed id so future saves go to the right file.
-                    *self.current_session_id.lock().expect("session_id poisoned") =
-                        req_id.clone();
-                    resumed = true;
-                    // F2: resume changes the whole conversation view; announce it.
-                    // F3 (review): seeding the committed history and announcing
-                    // the new epoch/fence are one critical section under
-                    // HISTORY (order HISTORY -> STATE -> BUS, no `.await`
-                    // inside), so no concurrent read can be handed the resumed
-                    // conversation under the pre-resume `historyEpoch`.
-                    let mut committed =
-                        self.session.history.lock().expect("history poisoned");
-                    *committed = messages;
-                    let restored = committed.len() as i64;
-                    // The saved accounting, before anything can display the
-                    // resumed session's totals. A transcript saved before
-                    // accounting existed resumes with partial totals.
-                    self.engine_state.usage_restored(stored.usage, restored > 0);
-                    self.engine_state.session_changed("resume", req_id.clone(), restored);
+            let stored = store.load_session(req_id).await;
+            let valid_restart = matches!(restart, Some((_, RestartFileCheck::Valid(_))));
+            // A valid restart file stands in for a missing transcript: the
+            // session restarts empty under its id.
+            let (messages, usage) = match stored {
+                Some(stored) => (stored.messages, stored.usage),
+                None if valid_restart => (Vec::new(), None),
+                // Session not found in the working directory.
+                None => return Err(RpcError::session_not_found()),
+            };
+            match restart.take() {
+                Some((path, RestartFileCheck::Valid(file))) => {
+                    restart_to_apply = Some((path, file));
                 }
-                None => {
-                    // Session not found in the working directory.
-                    return Err(RpcError::session_not_found());
+                Some((_, RestartFileCheck::Ignored(reason))) => {
+                    restored_summary = Some(ignored(reason));
                 }
+                _ => {}
             }
-        }
-
-        if let Some(ctx) = &self.diagnostics {
-            let session_ctx = ctx.with_session(self.active_session_id());
-            session_ctx.record(if resumed {
-                coda_diagnostics::Event::SessionResumed
-            } else {
-                coda_diagnostics::Event::SessionInitialized
-            });
+            loaded = Some((req_id.clone(), store, messages, usage));
         }
 
         // Wire an explicitly provided API key; otherwise leave client as-is
@@ -2924,6 +3717,73 @@ impl ServeBackend for ServeHost {
             }
         }
         self.apply_pending_startup_effort().await?;
+
+        // Nothing below refuses the handshake (short of a racing shutdown),
+        // so the restore commits here.
+        let mut restart_file = None;
+        if let Some((req_id, store, mut messages, usage)) = loaded {
+            if let Some((path, file)) = restart_to_apply {
+                // Consumed before anything is applied, so a restore can
+                // never happen twice.
+                match tokio::fs::remove_file(&path).await {
+                    Ok(()) => {
+                        coda_agent::agent::tools::recover_interrupted_history(&mut messages);
+                        messages.push(Message::user(crate::restart::restart_note(
+                            &file,
+                            coda_boot::version(),
+                        )));
+                        restart_file = Some(file);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "cannot consume the restart file");
+                        restored_summary = Some(ignored("consumeFailed"));
+                    }
+                }
+            }
+            // Adopt the resumed id so future saves go to the right file.
+            *self.current_session_id.lock().expect("session_id poisoned") = req_id.clone();
+            resumed = true;
+            // F2: resume changes the whole conversation view; announce it.
+            // F3 (review): seeding the committed history and announcing
+            // the new epoch/fence are one critical section under
+            // HISTORY (order HISTORY -> STATE -> BUS, no `.await`
+            // inside), so no concurrent read can be handed the resumed
+            // conversation under the pre-resume `historyEpoch`.
+            let persisted = {
+                let mut committed = self.session.history.lock().expect("history poisoned");
+                *committed = messages;
+                let restored = committed.len() as i64;
+                // The saved accounting, before anything can display the
+                // resumed session's totals. A transcript saved before
+                // accounting existed resumes with partial totals.
+                self.engine_state.usage_restored(usage, restored > 0);
+                self.engine_state.session_changed("resume", req_id.clone(), restored);
+                restart_file.is_some().then(|| committed.clone())
+            };
+            // The `[restart]` entry is persisted at once, so it survives
+            // even if the engine stops before the next turn.
+            if let Some(history) = persisted {
+                let usage = self.engine_state.stored_usage();
+                if let Err(error) =
+                    store.save_with_usage(&req_id, &history, None, Some(&usage)).await
+                {
+                    tracing::warn!(%error, "cannot persist the restored conversation");
+                }
+            }
+        }
+
+        if let Some(ctx) = &self.diagnostics {
+            let session_ctx = ctx.with_session(self.active_session_id());
+            session_ctx.record(if resumed {
+                coda_diagnostics::Event::SessionResumed
+            } else {
+                coda_diagnostics::Event::SessionInitialized
+            });
+        }
+
+        if let Some(file) = restart_file {
+            restored_summary = Some(self.apply_restart_file(file, restore_mode).await);
+        }
         // Capability negotiation already happened at the top of this method
         // (§2.1, S4): absent `clientCapabilities` means legacy behaviour — no
         // gated `event/*` method is ever written to the connection.
@@ -2954,6 +3814,7 @@ impl ServeBackend for ServeHost {
             engine_instance_id: self.engine_state.bus_ref().engine_instance_id().to_string(),
             event_cursor: self.engine_state.bus_ref().cursor(),
             capabilities: capability_catalog(),
+            restored: restored_summary,
         };
 
         // Surface any MCP connection/config failures now that a client is
@@ -3828,6 +4689,12 @@ impl ServeBackend for ServeHost {
     }
 
     async fn session_compact(&self, p: CompactParams) -> Result<Value, RpcError> {
+        // Refused before credentials are wired: a draining engine admits no
+        // new work, and wiring would still commit configuration. The turn
+        // gate below refuses it too, for a drain that begins in between.
+        if self.engine_state.is_draining() {
+            return Err(RpcError::restart_pending());
+        }
         // Require credentials (same guard as session/prompt), and wire them
         // through the same announced commit — a client wired here used to
         // leave `config.next.providerId` reporting "not wired" for the rest
@@ -4114,9 +4981,7 @@ impl ServeBackend for ServeHost {
             coda_agent::tasks::TaskActionResult::NotFound => Some("notFound"),
             coda_agent::tasks::TaskActionResult::Rejected => Some("notBackgroundable"),
             _ => match self.task_manager.get(&p.task_id) {
-                Some(task) if task.status == coda_agent::tasks::TaskRunStatus::Running => {
-                    Some("notForeground")
-                }
+                Some(task) if !task.status.is_terminal() => Some("notForeground"),
                 _ => Some("notRunning"),
             },
         };
@@ -4134,7 +4999,7 @@ impl ServeBackend for ServeHost {
 
     /// Phase 2: a user message for one running subagent's inbox.
     async fn task_send(&self, p: crate::dispatch::TaskSendParams) -> Result<Value, RpcError> {
-        use coda_agent::tasks::{TaskActionResult, TaskRunStatus};
+        use coda_agent::tasks::TaskActionResult;
         if p.text.trim().is_empty() {
             return task_control_result(p.task_id, Some("emptyText"));
         }
@@ -4143,11 +5008,94 @@ impl ServeBackend for ServeHost {
             TaskActionResult::NotFound => Some("notFound"),
             TaskActionResult::Rejected => Some("notAgent"),
             _ => match self.task_manager.get(&p.task_id) {
-                Some(task) if task.status == TaskRunStatus::Running => Some("notAccepting"),
+                Some(task) if !task.status.is_terminal() => Some("notAccepting"),
                 _ => Some("notRunning"),
             },
         };
         task_control_result(p.task_id, reason)
+    }
+
+    /// Asks one running subagent to pause at its next safe point.
+    async fn task_suspend(&self, p: crate::dispatch::TaskIdParams) -> Result<Value, RpcError> {
+        use coda_agent::tasks::TaskActionResult;
+        let reason = match self.task_manager.request_suspend(&p.task_id) {
+            TaskActionResult::Ok => None,
+            TaskActionResult::NotFound => Some("notFound"),
+            TaskActionResult::Rejected => Some("notSuspendable"),
+            _ => Some("notRunning"),
+        };
+        task_control_result(p.task_id, reason)
+    }
+
+    /// Clears one subagent's suspension. Refused while a planned restart
+    /// drains: the work would only have to be suspended again.
+    async fn task_resume(&self, p: crate::dispatch::TaskIdParams) -> Result<Value, RpcError> {
+        use coda_agent::tasks::TaskActionResult;
+        if self.engine_state.is_draining() {
+            return Err(RpcError::restart_pending());
+        }
+        // Paused only because an ancestor is suspended: clearing this task's
+        // own (unset) flag would change nothing, so say so instead of `ok`.
+        if let Some(task) = self.task_manager.find_task(&p.task_id) {
+            if task.kind == coda_agent::tasks::TaskKind::Subagent
+                && !task.status().is_terminal()
+                && !task.suspend_explicit()
+                && self.task_manager.is_suspension_requested(&p.task_id)
+            {
+                return task_control_result(p.task_id, Some("suspendedByParent"));
+            }
+        }
+        let reason = match self.task_manager.request_resume(&p.task_id) {
+            TaskActionResult::Ok => None,
+            TaskActionResult::NotFound => Some("notFound"),
+            TaskActionResult::Rejected => Some("notSuspendable"),
+            _ => match self.task_manager.get(&p.task_id) {
+                Some(task) if !task.status.is_terminal() => Some("notSuspended"),
+                _ => Some("notRunning"),
+            },
+        };
+        task_control_result(p.task_id, reason)
+    }
+
+    async fn session_suspend_all_tasks(&self) -> Result<Value, RpcError> {
+        let count = self.task_manager.suspend_all();
+        serde_json::to_value(coda_proto::responses::TaskBulkControlResult { ok: true, count })
+            .map_err(|e| RpcError::internal(e.to_string()))
+    }
+
+    async fn session_resume_all_tasks(&self) -> Result<Value, RpcError> {
+        if self.engine_state.is_draining() {
+            return Err(RpcError::restart_pending());
+        }
+        let count = self.task_manager.resume_all();
+        serde_json::to_value(coda_proto::responses::TaskBulkControlResult { ok: true, count })
+            .map_err(|e| RpcError::internal(e.to_string()))
+    }
+
+    async fn session_prepare_restart(
+        &self,
+        p: coda_proto::requests::PrepareRestartParams,
+    ) -> Result<Value, RpcError> {
+        let timeout_ms = p.drain_timeout_ms.unwrap_or(RESTART_DEFAULT_DRAIN_MS);
+        if timeout_ms > RESTART_MAX_DRAIN_MS {
+            return Err(RpcError::invalid_params(format!(
+                "drainTimeoutMs must be at most {RESTART_MAX_DRAIN_MS}"
+            )));
+        }
+        {
+            let mut prep = self.restart_prep.lock().expect("restart prep poisoned");
+            match &*prep {
+                RestartPrep::Done(result) => return Ok(result.clone()),
+                RestartPrep::InProgress => return Err(RpcError::restart_pending()),
+                RestartPrep::Idle => *prep = RestartPrep::InProgress,
+            }
+        }
+        let mut guard = RestartPrepGuard { state: &self.restart_prep, done: false };
+        let result = self.prepare_restart(p, timeout_ms).await?;
+        *self.restart_prep.lock().expect("restart prep poisoned") = RestartPrep::Done(result.clone());
+        *self.restart_capture.lock().expect("restart capture poisoned") = None;
+        guard.done = true;
+        Ok(result)
     }
 
     /// Phase 3 (`/btw`): one tool-less model request that sees the
@@ -4223,6 +5171,9 @@ impl ServeBackend for ServeHost {
                     mode: task.mode.as_str().into(),
                     output_tail,
                     report,
+                    suspend_requested: (task.suspend_requested
+                        && task.status == coda_agent::tasks::TaskRunStatus::Running)
+                        .then_some(true),
                 }
             }).collect();
         serde_json::to_value(TaskListResult {
@@ -4683,6 +5634,13 @@ impl ServeHost {
             return MainPumpStep::Wait;
         }
 
+        // A draining engine admits no new turn; the queued items stay queued
+        // (they are carried across the restart). Parking here, before the
+        // provider preflight, means each wake costs nothing and never spins.
+        if self.engine_state.is_draining() {
+            return MainPumpStep::Wait;
+        }
+
         if let Some(recorded) = block.as_ref() {
             if !recorded.is_cleared_by(self) {
                 return MainPumpStep::Wait;
@@ -4753,7 +5711,12 @@ impl ServeHost {
             // claim, or the slot was held. Neither is a failure and neither
             // is blocked: the queue state or the slot release will wake this
             // again.
-            Err(PromptRunFailure::NoWork) | Err(PromptRunFailure::Busy) => MainPumpStep::Wait,
+            // Draining: a refused claim never takes the slot, so nothing
+            // signals the pump's own wake — it parks until new work arrives,
+            // and the gate above answers that without another attempt.
+            Err(PromptRunFailure::NoWork)
+            | Err(PromptRunFailure::Busy)
+            | Err(PromptRunFailure::Draining) => MainPumpStep::Wait,
             Err(PromptRunFailure::Stopped) => MainPumpStep::Stop,
             Err(PromptRunFailure::Failed(e)) if delivered_after > delivered_before => {
                 // The items were injected and the model run then failed. The
@@ -8744,6 +9707,174 @@ mod tests {
         );
         assert!(resp["rejectedReason"].is_null());
         assert!(host.session.steering.has_pending());
+    }
+
+    // ── Planned restart: the draining turn gate ───────────────────────────
+
+    fn drain_deadline() -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now() + chrono::Duration::minutes(10)
+    }
+
+    #[tokio::test]
+    async fn draining_refuses_new_prompts_with_restart_pending() {
+        use crate::dispatch::dispatch;
+        let dir = tempfile::tempdir().unwrap();
+        let (host, mut rx) = host_with_events(dir.path());
+        let _ = drain_events(&mut rx);
+
+        host.begin_draining(Some("upgrade".into()), drain_deadline()).await.unwrap();
+        assert!(host.begin_draining(None, drain_deadline()).await.is_err(), "a drain begins once");
+
+        let err = dispatch("session/prompt", Some(json!({ "text": "hello" })), host.as_ref())
+            .await
+            .expect_err("a draining engine admits no new prompt");
+        assert_eq!(err.code, coda_proto::messages::error_code::RESTART_PENDING);
+        assert_eq!(err.code, -32016);
+        assert_eq!(err.message, "restart pending");
+        for method in ["session/fork", "session/rewind"] {
+            let err = dispatch(method, Some(json!({})), host.as_ref()).await.expect_err(method);
+            assert_eq!(err.code, -32016, "{method} must be refused as restart pending");
+        }
+
+        let state = dispatch("session/getState", None, host.as_ref()).await.unwrap();
+        assert_eq!(state["lifecycle"], "draining");
+        assert!(state["drain"]["remainingMs"].as_u64().unwrap() > 0, "{}", state["drain"]);
+        assert_eq!(state["drain"]["reason"], "upgrade");
+        assert_eq!(state["drain"]["completed"], false);
+        assert!(state["turn"].is_null(), "a refused prompt opens no turn");
+
+        let lifecycles: Vec<(Value, Value)> = drain_events(&mut rx)
+            .into_iter()
+            .filter(|(m, _)| m == "event/lifecycle")
+            .map(|(_, p)| (p["lifecycle"].clone(), p["initialized"].clone()))
+            .collect();
+        assert_eq!(lifecycles, vec![(json!("draining"), json!(true))]);
+    }
+
+    #[tokio::test]
+    async fn draining_still_lets_an_open_request_be_answered() {
+        use crate::dispatch::dispatch;
+        let dir = tempfile::tempdir().unwrap();
+        let client = ScriptedClient::new(vec![ask_delete_or_keep_turn(), file_test_done()]);
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let sink = Arc::new(ServeSink::new(tx.clone()));
+        let channel = Arc::new(PromptChannel::new(tx));
+        let host = ServeHost::new_with_client(
+            client,
+            sink,
+            channel,
+            dir.path().to_string_lossy().into_owned(),
+        );
+        host.engine_state.mark_initialized();
+
+        let prompt = {
+            let host = Arc::clone(&host);
+            tokio::spawn(async move {
+                host.session_prompt(PromptParams { text: Some("tidy up".into()), images: None })
+                    .await
+            })
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(std::time::Instant::now() < deadline, "engine never issued request/question");
+            if let Ok(frame) = rx.try_recv() {
+                if String::from_utf8_lossy(&frame).contains("request/question") {
+                    break;
+                }
+                continue;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        host.begin_draining(None, drain_deadline()).await.unwrap();
+
+        let pending = dispatch("session/getPendingRequests", None, host.as_ref()).await.unwrap();
+        let request_id = pending["requests"][0]["requestId"].as_str().expect("the open question").to_owned();
+        let resolved = dispatch(
+            "session/resolveRequest",
+            Some(json!({ "requestId": request_id, "outcome": { "answer": "Keep" } })),
+            host.as_ref(),
+        )
+        .await
+        .expect("an open request is still answerable while draining");
+        assert_eq!(resolved["ok"], true);
+
+        let result = tokio::time::timeout(Duration::from_secs(10), prompt)
+            .await
+            .expect("the turn completes")
+            .expect("task")
+            .expect("the running turn is not refused by the drain");
+        assert_eq!(result["ok"], true, "{result}");
+
+        let state = dispatch("session/getState", None, host.as_ref()).await.unwrap();
+        assert_eq!(state["lifecycle"], "draining", "a released turn never returns the engine to ready");
+        let err = dispatch("session/prompt", Some(json!({ "text": "more" })), host.as_ref())
+            .await
+            .expect_err("still draining");
+        assert_eq!(err.code, -32016);
+    }
+
+    #[tokio::test]
+    async fn steering_is_accepted_while_draining() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, _rx) = host_with_events(dir.path());
+        let turn = host.try_claim_turn("t1", "work", TurnKind::Prompt).expect("claim succeeds");
+
+        host.begin_draining(None, drain_deadline()).await.unwrap();
+        let resp = host
+            .session_steer(SteerParams { text: "finish up".into() })
+            .await
+            .unwrap();
+        assert_eq!(resp["ok"], true, "the running turn still takes steering: {resp}");
+        assert!(host.session.steering.has_pending());
+
+        assert_eq!(
+            host.try_claim_turn("t2", "next", TurnKind::Prompt).err(),
+            Some(ClaimRefused::Draining),
+            "a draining engine says restart pending even while the slot is held"
+        );
+        drop(turn);
+        assert_eq!(
+            host.try_claim_turn("t3", "next", TurnKind::Prompt).err(),
+            Some(ClaimRefused::Draining),
+        );
+    }
+
+    #[tokio::test]
+    async fn draining_pauses_schedule_launches_whenever_the_services_are_built() {
+        let dir = tempfile::tempdir().unwrap();
+        let client: Arc<dyn LlmClient> = ScriptedClient::new(vec![]);
+
+        let (built_first, _rx) = host_with_events(dir.path());
+        let svc = built_first.get_or_init_services(Arc::clone(&client)).await;
+        assert!(!svc.schedule_runtime.launches_paused());
+        built_first.begin_draining(None, drain_deadline()).await.unwrap();
+        assert!(svc.schedule_runtime.launches_paused());
+
+        let (built_later, _rx) = host_with_events(dir.path());
+        built_later.begin_draining(None, drain_deadline()).await.unwrap();
+        let svc = built_later.get_or_init_services(client).await;
+        assert!(svc.schedule_runtime.launches_paused(), "services built while draining start paused");
+    }
+
+    #[tokio::test]
+    async fn draining_refuses_compaction_with_restart_pending() {
+        use crate::dispatch::dispatch;
+        let dir = tempfile::tempdir().unwrap();
+        let (host, _rx) = host_with_events(dir.path());
+        host.begin_draining(None, drain_deadline()).await.unwrap();
+
+        let err = dispatch("session/compact", Some(json!({})), host.as_ref())
+            .await
+            .expect_err("a draining engine admits no compaction");
+        assert_eq!(err.code, -32016);
+        assert_eq!(err.message, "restart pending");
+        // The turn gate itself refuses it too, for a drain that begins after
+        // the handler's early check.
+        assert_eq!(
+            host.try_claim_turn("c1", "", TurnKind::Compaction).err(),
+            Some(ClaimRefused::Draining),
+        );
     }
 
     /// A follow-up sent while the model is working must be visible in what
@@ -15727,6 +16858,34 @@ mod tests {
             );
         }
 
+        /// A draining engine admits no main-inbox turn either: queued
+        /// requests stay queued (they are carried across the restart) and the
+        /// pump parks instead of attempting — or spinning on — a refused claim.
+        #[tokio::test]
+        async fn main_inbox_draining_parks_the_pump_and_keeps_requests_queued() {
+            let dir = tempfile::tempdir().unwrap();
+            let client = PumpClient::new(vec![answer("never")]);
+            let host = host_with(Some(Arc::clone(&client) as Arc<dyn LlmClient>), dir.path());
+            host.initialize(InitParams::default()).await.unwrap();
+            host.begin_draining(None, chrono::Utc::now() + chrono::Duration::minutes(10))
+                .await
+                .unwrap();
+
+            for i in 0..3 {
+                ask(&host, &format!("t{i}"), &format!("request {i}"));
+            }
+            settle().await;
+
+            assert_eq!(host.message_bus.pending_main_len(), 3, "nothing may be consumed");
+            assert_eq!(client.request_count(), 0);
+            assert!(last_outcome(&host).is_none(), "no turn may run while draining");
+            assert_eq!(
+                host.main_pump_attempts.load(Ordering::SeqCst),
+                0,
+                "every wake is answered by the drain gate without an attempt"
+            );
+        }
+
         /// An interrupt that lands AFTER injection keeps the framed history
         /// (the ordinary transcript writer runs on the cancelled path too)
         /// and releases the slot.
@@ -15985,6 +17144,1443 @@ mod tests {
                     "the canary must run against a log that actually recorded this turn"
                 );
             }
+        }
+    }
+
+    // ── Planned restart: task suspension over the wire ───────────────────
+
+    mod task_suspension {
+        use super::*;
+        use crate::dispatch::dispatch;
+        use coda_agent::tasks::{TaskExecutionMode, TaskKind, TaskRunStatus};
+        use coda_llm::anthropic::StreamEvent;
+        use coda_llm::{Content, Correlation, Usage};
+        use serde_json::json;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        const PROBE: &str = "SUBAGENT-PROBE: list the tasks, then report";
+
+        /// Main agent: starts one `task` subagent, then answers in text.
+        /// Subagent: its first model request is held at `gate` (so a test can
+        /// ask for suspension while it is mid-request), then calls
+        /// `task_list`; every later request reports.
+        struct ProbeClient {
+            main_requests: AtomicUsize,
+            subagent_requests: AtomicUsize,
+            gate: Arc<tokio::sync::Notify>,
+        }
+
+        fn tool_use(name: &str, input: Value) -> Vec<StreamEvent> {
+            vec![
+                StreamEvent::ToolUse(Content::ToolUse {
+                    id: format!("call-{name}"),
+                    name: name.into(),
+                    input_json: input.to_string(),
+                    correlation: Correlation::default(),
+                }),
+                StreamEvent::Done { stop_reason: Some("tool_use".into()), usage: Usage::ZERO },
+            ]
+        }
+
+        fn answer(text: &str) -> Vec<StreamEvent> {
+            vec![
+                StreamEvent::TextDelta(text.into()),
+                StreamEvent::Done { stop_reason: Some("end_turn".into()), usage: Usage::ZERO },
+            ]
+        }
+
+        #[async_trait]
+        impl LlmClient for ProbeClient {
+            fn provider_id(&self) -> &str {
+                "probe-mock"
+            }
+            async fn stream(
+                &self,
+                request: coda_llm::ChatRequest,
+            ) -> Result<coda_llm::ResponseStream, coda_llm::LlmError> {
+                let subagent = request.messages.first().is_some_and(|m| m.text().contains(PROBE));
+                let events = if subagent {
+                    if self.subagent_requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                        self.gate.notified().await;
+                        tool_use("task_list", json!({}))
+                    } else {
+                        answer("probe done")
+                    }
+                } else if self.main_requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                    tool_use("task", json!({ "prompt": PROBE }))
+                } else {
+                    answer("noted")
+                };
+                let (tx, rx) = tokio::sync::mpsc::channel(64);
+                tokio::spawn(async move {
+                    for event in events {
+                        let _ = tx.send(Ok(event)).await;
+                    }
+                });
+                Ok(coda_llm::ResponseStream::new(rx))
+            }
+        }
+
+        fn probe_host(
+            client: Arc<dyn LlmClient>,
+            dir: &std::path::Path,
+        ) -> (Arc<ServeHost>, mpsc::UnboundedReceiver<Vec<u8>>) {
+            let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            let sink = Arc::new(ServeSink::new(tx.clone()));
+            let ch = Arc::new(PromptChannel::new(tx));
+            let host = ServeHost::new_with_optional_client_and_mcp(
+                Some(client),
+                sink,
+                ch,
+                dir.display().to_string(),
+                crate::mcp::McpBundle::disabled(),
+                StartupOptions::default(),
+                None,
+                None,
+            );
+            (host, rx)
+        }
+
+        async fn wait_for(label: &str, mut cond: impl FnMut() -> bool) {
+            for _ in 0..1000 {
+                if cond() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("timed out waiting for: {label}");
+        }
+
+        async fn listed(host: &ServeHost, task_id: &str) -> Value {
+            let listing = dispatch("session/listTasks", None, host).await.unwrap();
+            listing["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["id"] == task_id)
+                .cloned()
+                .unwrap_or_else(|| panic!("{task_id} is listed: {listing}"))
+        }
+
+        async fn call(host: &ServeHost, method: &str, task_id: &str) -> Result<Value, RpcError> {
+            dispatch(method, Some(json!({ "taskId": task_id })), host).await
+        }
+
+        #[tokio::test]
+        async fn task_suspend_and_resume_without_restart() {
+            let dir = tempfile::tempdir().unwrap();
+            let client = Arc::new(ProbeClient {
+                main_requests: AtomicUsize::new(0),
+                subagent_requests: AtomicUsize::new(0),
+                gate: Arc::new(tokio::sync::Notify::new()),
+            });
+            let (host, mut rx) = probe_host(Arc::clone(&client) as Arc<dyn LlmClient>, dir.path());
+            host.initialize(InitParams::default()).await.unwrap();
+            host.permission_mode.set(PermissionMode::BypassPermissions);
+
+            dispatch("session/prompt", Some(json!({ "text": "start the probe" })), host.as_ref())
+                .await
+                .unwrap();
+            let task_id = host
+                .task_manager
+                .list_with_output_matching(0, Default::default())
+                .into_iter()
+                .find(|(t, _)| t.kind == TaskKind::Subagent)
+                .map(|(t, _)| t.id)
+                .expect("the main agent started a subagent");
+            wait_for("the subagent's first model request", || {
+                client.subagent_requests.load(Ordering::SeqCst) == 1
+            })
+            .await;
+
+            let r = call(&host, "task/suspend", &task_id).await.unwrap();
+            assert_eq!(r, json!({ "ok": true, "taskId": task_id }));
+            let pending = listed(&host, &task_id).await;
+            assert_eq!(pending["status"], "running", "it pauses only at a safe point");
+            assert_eq!(pending["suspendRequested"], true);
+
+            client.gate.notify_one();
+            let status = |host: &ServeHost| host.task_manager.get(&task_id).unwrap().status;
+            wait_for("the subagent to reach its safe point", || {
+                status(&host) == TaskRunStatus::Suspended
+            })
+            .await;
+            let paused = listed(&host, &task_id).await;
+            assert_eq!(paused["status"], "suspended");
+            assert!(paused.get("suspendRequested").is_none(), "{paused}");
+            let events = drain_events(&mut rx);
+            let suspended = events
+                .iter()
+                .find(|(m, p)| m == "event/taskSuspended" && p["taskId"] == task_id.as_str())
+                .unwrap_or_else(|| panic!("event/taskSuspended was published: {events:?}"));
+            assert_eq!(suspended.1["reason"], "requested");
+            assert_eq!(suspended.1["kind"], "subagent");
+            assert_eq!(client.subagent_requests.load(Ordering::SeqCst), 1, "no model call while paused");
+
+            let r = call(&host, "task/resume", &task_id).await.unwrap();
+            assert_eq!(r["ok"], true);
+            wait_for("the resumed subagent to finish", || status(&host).is_terminal()).await;
+            assert_eq!(status(&host), TaskRunStatus::Completed);
+            assert_eq!(client.subagent_requests.load(Ordering::SeqCst), 2);
+            let events = drain_events(&mut rx);
+            let position = |method: &str| {
+                events
+                    .iter()
+                    .position(|(m, p)| m == method && p["taskId"] == task_id.as_str())
+                    .unwrap_or_else(|| panic!("{method} was published: {events:?}"))
+            };
+            assert!(position("event/taskResumed") < position("event/taskCompleted"));
+        }
+
+        #[tokio::test]
+        async fn task_suspend_rejects_shell_tasks() {
+            let dir = tempfile::tempdir().unwrap();
+            let (host, _rx) = host_with_events(dir.path());
+            let m = &host.task_manager;
+            let shell = m.register(TaskKind::Shell, "build", None, TaskExecutionMode::Background).unwrap();
+            let agent = m.register(TaskKind::Subagent, "agent", None, TaskExecutionMode::Background).unwrap();
+            let done = m.register(TaskKind::Subagent, "done", None, TaskExecutionMode::Background).unwrap();
+            m.complete(&done.id, Some("report".into()));
+
+            let reason = |r: Result<Value, RpcError>| r.unwrap()["reason"].as_str().map(str::to_owned);
+            for method in ["task/suspend", "task/resume"] {
+                assert_eq!(reason(call(&host, method, &shell.id).await).as_deref(), Some("notSuspendable"));
+                assert_eq!(reason(call(&host, method, "task-99999999").await).as_deref(), Some("notFound"));
+                assert_eq!(reason(call(&host, method, &done.id).await).as_deref(), Some("notRunning"));
+            }
+            assert_eq!(reason(call(&host, "task/resume", &agent.id).await).as_deref(), Some("notSuspended"));
+            assert!(!shell.cancel.is_cancelled(), "a refused suspension leaves the shell running");
+
+            let r = call(&host, "task/suspend", &agent.id).await.unwrap();
+            assert_eq!(r, json!({ "ok": true, "taskId": agent.id }));
+            assert_eq!(call(&host, "task/suspend", &agent.id).await.unwrap()["ok"], true, "idempotent");
+            assert_eq!(call(&host, "task/resume", &agent.id).await.unwrap()["ok"], true);
+            assert!(!m.is_suspension_requested(&agent.id));
+        }
+
+        #[tokio::test]
+        async fn resuming_a_child_paused_by_its_parent_reports_suspended_by_parent() {
+            let dir = tempfile::tempdir().unwrap();
+            let (host, _rx) = host_with_events(dir.path());
+            let m = &host.task_manager;
+            let parent = m.register(TaskKind::Subagent, "p", None, TaskExecutionMode::Background).unwrap();
+            let child = m
+                .register(TaskKind::Subagent, "c", Some(&parent.id), TaskExecutionMode::Background)
+                .unwrap();
+            assert_eq!(call(&host, "task/suspend", &parent.id).await.unwrap()["ok"], true);
+
+            let r = call(&host, "task/resume", &child.id).await.unwrap();
+            assert_eq!(r["reason"], "suspendedByParent");
+            assert!(m.is_suspension_requested(&child.id), "still paused through its parent");
+
+            assert_eq!(call(&host, "task/resume", &parent.id).await.unwrap()["ok"], true);
+            assert!(!m.is_suspension_requested(&child.id));
+        }
+
+        #[tokio::test]
+        async fn suspend_all_and_resume_all_counts() {
+            let dir = tempfile::tempdir().unwrap();
+            let (host, _rx) = host_with_events(dir.path());
+            let m = &host.task_manager;
+            let a = m.register(TaskKind::Subagent, "a", None, TaskExecutionMode::Background).unwrap();
+            let b = m.register(TaskKind::Subagent, "b", None, TaskExecutionMode::Background).unwrap();
+            let shell = m.register(TaskKind::Shell, "build", None, TaskExecutionMode::Background).unwrap();
+
+            let r = dispatch("session/suspendAllTasks", None, host.as_ref()).await.unwrap();
+            assert_eq!(r, json!({ "ok": true, "count": 2 }), "shell tasks are not suspendable");
+            let r = dispatch("session/suspendAllTasks", None, host.as_ref()).await.unwrap();
+            assert_eq!(r["count"], 0, "nothing newly requested");
+            for id in [&a.id, &b.id] {
+                assert_eq!(listed(&host, id).await["suspendRequested"], true);
+            }
+            assert!(listed(&host, &shell.id).await.get("suspendRequested").is_none());
+
+            let r = dispatch("session/resumeAllTasks", None, host.as_ref()).await.unwrap();
+            assert_eq!(r, json!({ "ok": true, "count": 2 }));
+            assert!(listed(&host, &a.id).await.get("suspendRequested").is_none());
+        }
+
+        #[tokio::test]
+        async fn resume_refused_while_draining() {
+            let dir = tempfile::tempdir().unwrap();
+            let (host, _rx) = host_with_events(dir.path());
+            let agent = host
+                .task_manager
+                .register(TaskKind::Subagent, "agent", None, TaskExecutionMode::Background)
+                .unwrap();
+            host.begin_draining(None, chrono::Utc::now() + chrono::Duration::minutes(10))
+                .await
+                .unwrap();
+
+            assert_eq!(call(&host, "task/suspend", &agent.id).await.unwrap()["ok"], true);
+            let err = call(&host, "task/resume", &agent.id).await.unwrap_err();
+            assert_eq!(err, RpcError::restart_pending());
+            assert_eq!(err.code, coda_proto::messages::error_code::RESTART_PENDING);
+            let err = dispatch("session/resumeAllTasks", None, host.as_ref()).await.unwrap_err();
+            assert_eq!(err.code, coda_proto::messages::error_code::RESTART_PENDING);
+            assert!(host.task_manager.is_suspension_requested(&agent.id), "nothing was resumed");
+        }
+
+        // ── session/prepareRestart ────────────────────────────────────────
+
+        async fn prepare(host: &ServeHost, params: Value) -> Result<Value, RpcError> {
+            dispatch("session/prepareRestart", Some(params), host).await
+        }
+
+        fn read_restart_file(result: &Value) -> crate::restart::RestartFile {
+            let path = std::path::Path::new(result["restartFile"].as_str().expect("a path"));
+            assert!(path.is_absolute(), "{}", path.display());
+            serde_json::from_slice(&std::fs::read(path).expect("the restart file exists"))
+                .expect("the restart file parses")
+        }
+
+        #[tokio::test]
+        async fn prepare_restart_writes_owner_only_file_with_all_sections() {
+            let dir = tempfile::tempdir().unwrap();
+            let (host, _rx) = host_with_events(dir.path());
+            dispatch(
+                "session/scheduleCreate",
+                Some(json!({ "prompt": "check the build", "every": "1h" })),
+                host.as_ref(),
+            )
+            .await
+            .unwrap();
+            dispatch(
+                "session/setGoal",
+                Some(json!({ "goal": "ship it", "maxContinuations": 3 })),
+                host.as_ref(),
+            )
+            .await
+            .unwrap();
+            host.set_model_for_test("claude-restart-test");
+            let source = coda_agent::MessageSource::ScheduledTask {
+                definition_id: "def-1".into(),
+                definition_name: Some("nightly".into()),
+                task_id: "task-00000009".into(),
+            };
+            host.message_bus
+                .publish_user(&source, "build is green", Some("ci".into()), Some("k-1".into()))
+                .unwrap();
+
+            let r = prepare(&host, json!({ "drainTimeoutMs": 0, "reason": "upgrade" })).await.unwrap();
+            assert_eq!(r["ok"], true);
+            assert_eq!(r["drained"], true, "nothing was running: {r}");
+            assert_eq!(r["interruptedTasks"], 0);
+            assert_eq!(r["interruptedRequests"], 0);
+            assert_eq!(r["suspendedTasks"], json!([]));
+            let session_id = host.active_session_id();
+            assert!(
+                r["restartFile"].as_str().unwrap().ends_with(&format!("{session_id}.restart.json")),
+                "{r}"
+            );
+
+            let file = read_restart_file(&r);
+            assert_eq!(file.version, 1);
+            assert_eq!(file.coda_version, coda_boot::version());
+            assert_eq!(file.session_id, session_id);
+            assert_eq!(file.reason.as_deref(), Some("upgrade"));
+            assert_eq!(file.schedules.len(), 1);
+            assert_eq!(file.schedules[0]["prompt"], "check the build");
+            assert_eq!(file.messages.len(), 1);
+            let message = &file.messages[0];
+            assert_eq!(message.channel, "user");
+            assert_eq!(message.source, "scheduledTask");
+            assert_eq!(message.text, "build is green");
+            assert_eq!(message.schedule_name.as_deref(), Some("nightly"));
+            assert_eq!(message.message_source(), Some(source));
+            assert_eq!(file.settings.model.as_deref(), Some("claude-restart-test"));
+            let goal = file.settings.goal.as_ref().expect("the goal is saved");
+            assert_eq!((goal.goal.as_str(), goal.max_continuations), ("ship it", Some(3)));
+            assert_eq!(file.settings.permission_mode.as_deref(), Some("default"));
+            assert!(file.steering.is_empty() && file.tasks.is_empty());
+            assert!(matches!(
+                crate::restart::check(
+                    std::fs::read(r["restartFile"].as_str().unwrap()).ok().as_deref(),
+                    &session_id,
+                    &host.working_dir,
+                    chrono::Utc::now(),
+                ),
+                crate::restart::RestartFileCheck::Valid(_)
+            ));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let meta = std::fs::metadata(r["restartFile"].as_str().unwrap()).unwrap();
+                assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+            }
+
+            let state = dispatch("session/getState", None, host.as_ref()).await.unwrap();
+            assert_eq!(state["lifecycle"], "draining", "the engine stays draining");
+            assert_eq!(state["drain"]["completed"], true);
+        }
+
+        #[tokio::test]
+        async fn prepare_restart_interrupts_a_long_running_command_and_saves_queued_steering() {
+            #[cfg(windows)]
+            const LONG: &str = "ping -n 30 127.0.0.1";
+            #[cfg(not(windows))]
+            const LONG: &str = "sleep 30";
+            let dir = tempfile::tempdir().unwrap();
+            let client: Arc<dyn LlmClient> = ScriptedClient::new(vec![
+                tool_use("run_command", json!({ "command": LONG })),
+                answer("stopped"),
+                answer("stopped"),
+            ]);
+            let (host, _rx) = probe_host(client, dir.path());
+            host.initialize(InitParams::default()).await.unwrap();
+            host.permission_mode.set(PermissionMode::BypassPermissions);
+
+            let prompt = {
+                let host = Arc::clone(&host);
+                tokio::spawn(async move {
+                    dispatch("session/prompt", Some(json!({ "text": "run it" })), host.as_ref()).await
+                })
+            };
+            let shell = |host: &ServeHost| {
+                host.task_manager.list().into_iter().find(|t| t.kind == TaskKind::Shell)
+            };
+            wait_for("the command to start", || shell(&host).is_some()).await;
+            let steer = host.session_steer(SteerParams { text: "also check X".into() }).await.unwrap();
+            assert_eq!(steer["ok"], true, "{steer}");
+
+            let started = std::time::Instant::now();
+            let r = prepare(&host, json!({ "drainTimeoutMs": 300 })).await.unwrap();
+            assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+            assert_eq!(r["drained"], false, "{r}");
+            assert_eq!(r["interruptedTasks"], 1, "{r}");
+            let file = read_restart_file(&r);
+            let task = &file.interrupted.tasks[0];
+            assert_eq!(task.kind, "shell");
+            assert_eq!(task.command.as_deref(), Some(LONG));
+            assert_eq!(file.steering, vec!["also check X".to_owned()]);
+
+            let shell = shell(&host).unwrap();
+            assert!(shell.status.is_terminal(), "the command was stopped: {:?}", shell.status);
+            assert!(!host.turn_is_active(), "the turn was released");
+            tokio::time::timeout(Duration::from_secs(10), prompt)
+                .await
+                .expect("the interrupted prompt returns")
+                .expect("task")
+                .ok();
+        }
+
+        #[tokio::test]
+        async fn prepare_restart_records_declined_requests() {
+            use crate::state::requests::RequestOutcome;
+            use coda_proto::state::PendingRequestKind;
+            let dir = tempfile::tempdir().unwrap();
+            let (host, _rx) = host_with_events(dir.path());
+            let registry = Arc::clone(host.prompt_channel.registry());
+            let register = |kind, display| {
+                let (numeric, _handle) = registry.mint_id();
+                registry.register(numeric, kind, display, None)
+            };
+            let permission =
+                register(PendingRequestKind::Permission, json!({ "toolName": "run_command" }));
+            let question =
+                register(PendingRequestKind::Question, json!({ "question": "Delete it?" }));
+            // A turn that ends once its open permission request is answered.
+            let (claimed_tx, claimed_rx) = tokio::sync::oneshot::channel();
+            let turn = {
+                let host = Arc::clone(&host);
+                tokio::spawn(async move {
+                    let _turn = host.try_claim_turn("t1", "work", TurnKind::Prompt).expect("slot");
+                    claimed_tx.send(()).unwrap();
+                    permission.await.expect("answered")
+                })
+            };
+            claimed_rx.await.unwrap();
+
+            let r = prepare(&host, json!({ "drainTimeoutMs": 0 })).await.unwrap();
+            assert_eq!(r["drained"], false);
+            assert_eq!(r["interruptedRequests"], 2, "{r}");
+            let file = read_restart_file(&r);
+            assert_eq!(
+                serde_json::to_value(&file.interrupted.requests).unwrap(),
+                json!([
+                    { "kind": "permission", "toolName": "run_command" },
+                    { "kind": "question", "question": "Delete it?" },
+                ])
+            );
+            assert_eq!(turn.await.unwrap(), RequestOutcome::Permission { allow: false });
+            assert!(matches!(question.await.unwrap(), RequestOutcome::Question(_)));
+            assert!(host.prompt_channel.registry().is_empty());
+        }
+
+        #[tokio::test]
+        async fn prepare_restart_twice_returns_cached_result() {
+            let dir = tempfile::tempdir().unwrap();
+            let (host, _rx) = host_with_events(dir.path());
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let (claimed_tx, claimed_rx) = tokio::sync::oneshot::channel();
+            let turn = {
+                let host = Arc::clone(&host);
+                tokio::spawn(async move {
+                    let _turn = host.try_claim_turn("t1", "work", TurnKind::Prompt).expect("slot");
+                    claimed_tx.send(()).unwrap();
+                    let _ = release_rx.await;
+                })
+            };
+            claimed_rx.await.unwrap();
+
+            let first = {
+                let host = Arc::clone(&host);
+                tokio::spawn(async move { prepare(&host, json!({ "drainTimeoutMs": 10_000 })).await })
+            };
+            wait_for("the drain to begin", || host.engine_state.is_draining()).await;
+            let err = prepare(&host, json!({})).await.expect_err("one prepare at a time");
+            assert_eq!(err, RpcError::restart_pending());
+
+            release_tx.send(()).unwrap();
+            turn.await.unwrap();
+            let first = first.await.unwrap().unwrap();
+            assert_eq!(first["drained"], true, "{first}");
+            let again = prepare(&host, json!({ "drainTimeoutMs": 0, "reason": "other" })).await.unwrap();
+            assert_eq!(again, first, "a finished prepare is answered from its result");
+        }
+
+        #[tokio::test]
+        async fn prepare_restart_rejects_timeout_above_max() {
+            let dir = tempfile::tempdir().unwrap();
+            let (host, _rx) = host_with_events(dir.path());
+            let err = prepare(&host, json!({ "drainTimeoutMs": 3_600_001 })).await.unwrap_err();
+            assert_eq!(err.code, -32602);
+            assert!(!host.engine_state.is_draining(), "a refused prepare does not drain");
+        }
+
+        #[tokio::test]
+        async fn prepare_restart_suspends_a_running_subagent_and_writes_its_task_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let client = Arc::new(ProbeClient {
+                main_requests: AtomicUsize::new(0),
+                subagent_requests: AtomicUsize::new(0),
+                gate: Arc::new(tokio::sync::Notify::new()),
+            });
+            let (host, _rx) = probe_host(Arc::clone(&client) as Arc<dyn LlmClient>, dir.path());
+            host.initialize(InitParams::default()).await.unwrap();
+            host.permission_mode.set(PermissionMode::BypassPermissions);
+            *host.restart_settle_override.lock().unwrap() = Some(Duration::from_millis(500));
+
+            dispatch("session/prompt", Some(json!({ "text": "start the probe" })), host.as_ref())
+                .await
+                .unwrap();
+            let task_id = host
+                .task_manager
+                .list()
+                .into_iter()
+                .find(|t| t.kind == TaskKind::Subagent)
+                .map(|t| t.id)
+                .expect("the main agent started a subagent");
+            wait_for("the subagent's first model request", || {
+                client.subagent_requests.load(Ordering::SeqCst) == 1
+            })
+            .await;
+
+            let pending = {
+                let host = Arc::clone(&host);
+                tokio::spawn(async move { prepare(&host, json!({ "drainTimeoutMs": 10_000 })).await })
+            };
+            wait_for("the drain to ask for suspension", || {
+                host.task_manager.is_suspension_requested(&task_id)
+            })
+            .await;
+            client.gate.notify_one();
+            let r = pending.await.unwrap().unwrap();
+            assert_eq!(r["drained"], true, "{r}");
+            assert_eq!(r["suspendedTasks"], json!([task_id]));
+            assert_eq!(host.task_manager.get(&task_id).unwrap().status, TaskRunStatus::Suspended);
+
+            let file = read_restart_file(&r);
+            assert_eq!(file.tasks, vec![task_id.clone()]);
+            let store = SessionTranscriptStore::new(host.working_dir.clone());
+            let task_file = store.tasks_dir(&host.active_session_id()).join(format!("{task_id}.json"));
+            let checkpoint = coda_agent::subagents::SubagentCheckpoint::read(&task_file)
+                .expect("the subagent's file was written");
+            assert_eq!(checkpoint.task_id, task_id);
+            assert!(!checkpoint.explicitly_suspended, "suspended by the drain, not the operator");
+            assert_eq!(client.subagent_requests.load(Ordering::SeqCst), 1, "no model call after the pause");
+        }
+
+        #[tokio::test]
+        async fn prepare_restart_retry_keeps_what_the_failed_attempt_captured() {
+            let dir = tempfile::tempdir().unwrap();
+            let client = Arc::new(ProbeClient {
+                main_requests: AtomicUsize::new(0),
+                subagent_requests: AtomicUsize::new(0),
+                gate: Arc::new(tokio::sync::Notify::new()),
+            });
+            let (host, _rx) = probe_host(Arc::clone(&client) as Arc<dyn LlmClient>, dir.path());
+            host.initialize(InitParams::default()).await.unwrap();
+            host.permission_mode.set(PermissionMode::BypassPermissions);
+            *host.restart_settle_override.lock().unwrap() = Some(Duration::from_millis(200));
+
+            dispatch("session/prompt", Some(json!({ "text": "start the probe" })), host.as_ref())
+                .await
+                .unwrap();
+            let agent_id = host
+                .task_manager
+                .list()
+                .into_iter()
+                .find(|t| t.kind == TaskKind::Subagent)
+                .map(|t| t.id)
+                .expect("the main agent started a subagent");
+            wait_for("the subagent's first model request", || {
+                client.subagent_requests.load(Ordering::SeqCst) == 1
+            })
+            .await;
+            // A command that never finishes on its own keeps the drain from
+            // completing, so it is interrupted at the deadline.
+            let shell = host
+                .task_manager
+                .register(TaskKind::Shell, "long build", None, TaskExecutionMode::Background)
+                .unwrap();
+            host.session
+                .steering
+                .push_item(coda_agent::steering::InboxItemKind::Message, "also check X");
+            // The restart file cannot be written while a directory is in its place.
+            let store = SessionTranscriptStore::new(host.working_dir.clone());
+            let restart_path = store.restart_file_path(&host.active_session_id());
+            std::fs::create_dir_all(&restart_path).unwrap();
+
+            let pending = {
+                let host = Arc::clone(&host);
+                tokio::spawn(async move { prepare(&host, json!({ "drainTimeoutMs": 1_000 })).await })
+            };
+            wait_for("the drain to ask for suspension", || {
+                host.task_manager.is_suspension_requested(&agent_id)
+            })
+            .await;
+            client.gate.notify_one();
+            pending.await.unwrap().expect_err("the restart file cannot be written");
+            assert_eq!(host.task_manager.get(&agent_id).unwrap().status, TaskRunStatus::Suspended);
+
+            std::fs::remove_dir(&restart_path).unwrap();
+            let r = prepare(&host, json!({ "drainTimeoutMs": 0 })).await.unwrap();
+            assert_eq!(r["drained"], false, "the first attempt hit its deadline: {r}");
+            assert_eq!(r["interruptedTasks"], 1, "{r}");
+            assert_eq!(r["suspendedTasks"], json!([agent_id]));
+            let file = read_restart_file(&r);
+            assert_eq!(file.steering, vec!["also check X".to_owned()]);
+            assert_eq!(file.interrupted.tasks.len(), 1, "recorded once: {:?}", file.interrupted);
+            assert_eq!(file.interrupted.tasks[0].task_id, shell.id);
+            let task_file =
+                store.tasks_dir(&host.active_session_id()).join(format!("{agent_id}.json"));
+            let checkpoint = coda_agent::subagents::SubagentCheckpoint::read(&task_file)
+                .expect("the subagent's file was written");
+            assert!(!checkpoint.explicitly_suspended, "suspended by the drain, not the operator");
+        }
+
+        #[tokio::test]
+        async fn prepare_restart_stops_a_task_started_after_the_deadline_snapshot() {
+            let dir = tempfile::tempdir().unwrap();
+            let (host, _rx) = host_with_events(dir.path());
+            *host.restart_settle_override.lock().unwrap() = Some(Duration::from_millis(100));
+            let late_id = Arc::new(Mutex::new(None));
+            *host.restart_interrupt_hook.lock().unwrap() = Some(Box::new({
+                let tasks = Arc::clone(&host.task_manager);
+                let late_id = Arc::clone(&late_id);
+                move || {
+                    let late = tasks
+                        .register(TaskKind::Shell, "late tool", None, TaskExecutionMode::Background)
+                        .unwrap();
+                    *late_id.lock().unwrap() = Some(late.id.clone());
+                }
+            }));
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let (claimed_tx, claimed_rx) = tokio::sync::oneshot::channel();
+            let turn = {
+                let host = Arc::clone(&host);
+                tokio::spawn(async move {
+                    let _turn = host.try_claim_turn("t1", "work", TurnKind::Prompt).expect("slot");
+                    claimed_tx.send(()).unwrap();
+                    let _ = release_rx.await;
+                })
+            };
+            claimed_rx.await.unwrap();
+
+            let pending = {
+                let host = Arc::clone(&host);
+                tokio::spawn(async move { prepare(&host, json!({ "drainTimeoutMs": 0 })).await })
+            };
+            wait_for("the late task to start", || late_id.lock().unwrap().is_some()).await;
+            release_tx.send(()).unwrap();
+            turn.await.unwrap();
+            let r = pending.await.unwrap().unwrap();
+            let late_id = late_id.lock().unwrap().clone().unwrap();
+            let file = read_restart_file(&r);
+            assert_eq!(
+                file.interrupted.tasks.iter().map(|t| t.task_id.as_str()).collect::<Vec<_>>(),
+                vec![late_id.as_str()],
+            );
+            let late = host.task_manager.find_task(&late_id).unwrap();
+            assert_eq!(late.stop_note().as_deref(), Some("planned restart"));
+        }
+    }
+
+    mod planned_restore {
+        use super::*;
+        use crate::dispatch::dispatch;
+        use crate::restart::RestartFile;
+        use coda_agent::tasks::{TaskKind, TaskRunStatus};
+        use coda_llm::anthropic::StreamEvent;
+        use coda_llm::{Content, Correlation, Usage};
+        use serde_json::json;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        #[cfg(windows)]
+        const LONG: &str = "ping -n 30 127.0.0.1";
+        #[cfg(not(windows))]
+        const LONG: &str = "sleep 30";
+        const OUTER: &str = "OUTER-AGENT: start the inner agent and wait for it";
+        const INNER: &str = "INNER-AGENT: run the command";
+
+        /// What a model request looked like, as the scripts see it.
+        struct Request {
+            /// `main`, `outer` or `inner`, from the conversation's first message.
+            role: &'static str,
+            last_text: String,
+            tool_results: Vec<String>,
+            /// Everything sent, for substring checks.
+            dump: String,
+        }
+
+        impl Request {
+            fn of(request: &coda_llm::ChatRequest) -> Self {
+                let first = request.messages.first().map(|m| m.text()).unwrap_or_default();
+                let role = if first.contains(OUTER) {
+                    "outer"
+                } else if first.contains(INNER) {
+                    "inner"
+                } else {
+                    "main"
+                };
+                let tool_results = request
+                    .messages
+                    .iter()
+                    .flat_map(|m| m.content.iter())
+                    .filter_map(|c| match c {
+                        Content::ToolResult { content, .. } => Some(content.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                Self {
+                    role,
+                    last_text: request.messages.last().map(|m| m.text()).unwrap_or_default(),
+                    tool_results,
+                    dump: format!("{:?} {:?}", request.system, request.messages),
+                }
+            }
+        }
+
+        enum Reply {
+            Now(Vec<StreamEvent>),
+            /// Held until the client's gate is notified.
+            Gated(Vec<StreamEvent>),
+        }
+
+        /// Answers by looking at each request (so concurrent subagents get
+        /// the right reply whatever the order) and records every request.
+        struct RecordingClient {
+            respond: Box<dyn Fn(&Request) -> Reply + Send + Sync>,
+            requests: Mutex<Vec<Request>>,
+            gate: tokio::sync::Notify,
+        }
+
+        impl RecordingClient {
+            fn new(respond: impl Fn(&Request) -> Reply + Send + Sync + 'static) -> Arc<Self> {
+                Arc::new(Self {
+                    respond: Box::new(respond),
+                    requests: Mutex::new(Vec::new()),
+                    gate: tokio::sync::Notify::new(),
+                })
+            }
+
+            fn dumps(&self, role: &str) -> Vec<String> {
+                let requests = self.requests.lock().unwrap();
+                requests.iter().filter(|r| r.role == role).map(|r| r.dump.clone()).collect()
+            }
+        }
+
+        #[async_trait]
+        impl LlmClient for RecordingClient {
+            fn provider_id(&self) -> &str {
+                "recording"
+            }
+            async fn stream(
+                &self,
+                request: coda_llm::ChatRequest,
+            ) -> Result<coda_llm::ResponseStream, coda_llm::LlmError> {
+                let seen = Request::of(&request);
+                let reply = (self.respond)(&seen);
+                self.requests.lock().unwrap().push(seen);
+                let events = match reply {
+                    Reply::Now(events) => events,
+                    Reply::Gated(events) => {
+                        self.gate.notified().await;
+                        events
+                    }
+                };
+                let (tx, rx) = tokio::sync::mpsc::channel(64);
+                tokio::spawn(async move {
+                    for event in events {
+                        let _ = tx.send(Ok(event)).await;
+                    }
+                });
+                Ok(coda_llm::ResponseStream::new(rx))
+            }
+        }
+
+        fn tool_use(name: &str, input: Value) -> Vec<StreamEvent> {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let n = NEXT.fetch_add(1, Ordering::SeqCst);
+            vec![
+                StreamEvent::ToolUse(Content::ToolUse {
+                    id: format!("call-{name}-{n}"),
+                    name: name.into(),
+                    input_json: input.to_string(),
+                    correlation: Correlation::default(),
+                }),
+                StreamEvent::Done { stop_reason: Some("tool_use".into()), usage: Usage::ZERO },
+            ]
+        }
+
+        fn answer(text: &str) -> Vec<StreamEvent> {
+            vec![
+                StreamEvent::TextDelta(text.into()),
+                StreamEvent::Done { stop_reason: Some("end_turn".into()), usage: Usage::ZERO },
+            ]
+        }
+
+        /// Main starts the outer agent; the outer agent starts the inner one
+        /// and waits for it (ending its turn, i.e. parking, while the inner
+        /// one is suspended); the inner one runs `inner_command` once.
+        fn team(inner_command: &'static str, gate_inner: bool) -> impl Fn(&Request) -> Reply {
+            move |r: &Request| {
+                let last_result = r.tool_results.last().map(String::as_str).unwrap_or("");
+                match r.role {
+                    "outer" if r.dump.contains("inner done") => Reply::Now(answer("outer done")),
+                    "outer" if last_result.contains("Started subagent task") => {
+                        let at = last_result.find("task-").expect("a task id");
+                        let id = &last_result[at..at + 13];
+                        Reply::Now(tool_use("task_wait", json!({ "taskId": id, "timeoutSeconds": 120 })))
+                    }
+                    "outer" if r.tool_results.is_empty() => {
+                        Reply::Now(tool_use("task", json!({ "prompt": INNER })))
+                    }
+                    "outer" => Reply::Now(answer("waiting for the inner agent")),
+                    "inner" if r.tool_results.is_empty() => {
+                        let call = tool_use("run_command", json!({ "command": inner_command }));
+                        if gate_inner { Reply::Gated(call) } else { Reply::Now(call) }
+                    }
+                    "inner" => Reply::Now(answer("inner done")),
+                    _ if r.tool_results.is_empty() && r.last_text.contains("start the team") => {
+                        Reply::Now(tool_use("task", json!({ "prompt": OUTER })))
+                    }
+                    _ => Reply::Now(answer("DONE")),
+                }
+            }
+        }
+
+        fn new_host(
+            client: Arc<dyn LlmClient>,
+            dir: &std::path::Path,
+            startup: StartupOptions,
+        ) -> (Arc<ServeHost>, mpsc::UnboundedReceiver<Vec<u8>>) {
+            new_host_with(Some(client), dir, startup)
+        }
+
+        fn new_host_with(
+            client: Option<Arc<dyn LlmClient>>,
+            dir: &std::path::Path,
+            startup: StartupOptions,
+        ) -> (Arc<ServeHost>, mpsc::UnboundedReceiver<Vec<u8>>) {
+            let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            let sink = Arc::new(ServeSink::new(tx.clone()));
+            let ch = Arc::new(PromptChannel::new(tx));
+            let host = ServeHost::new_with_optional_client_and_mcp(
+                client,
+                sink,
+                ch,
+                dir.display().to_string(),
+                crate::mcp::McpBundle::disabled(),
+                startup,
+                None,
+                None,
+            );
+            (host, rx)
+        }
+
+        /// `initialize` as the transport runs it: the response, then the
+        /// restored messages.
+        async fn initialize(host: &ServeHost, params: Value) -> Result<Value, RpcError> {
+            let result = dispatch("initialize", Some(params), host).await;
+            host.after_initialize_response();
+            result
+        }
+
+        async fn wait_for(label: &str, mut cond: impl FnMut() -> bool) {
+            for _ in 0..2000 {
+                if cond() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("timed out waiting for: {label}");
+        }
+
+        fn restart_path(dir: &std::path::Path, session_id: &str) -> PathBuf {
+            SessionTranscriptStore::new(dir).restart_file_path(session_id)
+        }
+
+        fn minimal_file(
+            dir: &std::path::Path,
+            session_id: &str,
+            prepared_at: chrono::DateTime<Utc>,
+        ) -> RestartFile {
+            RestartFile {
+                version: crate::restart::RESTART_FILE_VERSION,
+                coda_version: "0.0.1".into(),
+                session_id: session_id.into(),
+                working_dir: dir.display().to_string(),
+                prepared_at,
+                reason: None,
+                schedules: Vec::new(),
+                messages: Vec::new(),
+                settings: Default::default(),
+                steering: Vec::new(),
+                interrupted: Default::default(),
+                tasks: Vec::new(),
+            }
+        }
+
+        /// A session with a transcript and the given restart file on disk.
+        async fn session_with_file(dir: &std::path::Path, bytes: &[u8]) -> String {
+            let session_id = Uuid::new_v4().to_string();
+            SessionTranscriptStore::new(dir)
+                .save(&session_id, &[Message::user("hello")], None)
+                .await
+                .unwrap();
+            std::fs::write(restart_path(dir, &session_id), bytes).unwrap();
+            session_id
+        }
+
+        fn idle_client() -> Arc<dyn LlmClient> {
+            RecordingClient::new(|_| Reply::Now(answer("DONE")))
+        }
+
+        #[tokio::test]
+        async fn restart_round_trip_restores_schedules_messages_settings_and_reports_interruption() {
+            let dir = tempfile::tempdir().unwrap();
+
+            // ── Engine A: build up state, then prepare the restart ──────────
+            let client_a = RecordingClient::new(|r| {
+                if r.tool_results.is_empty() && r.last_text.contains("run it") {
+                    Reply::Now(tool_use("run_command", json!({ "command": LONG })))
+                } else {
+                    Reply::Now(answer("DONE"))
+                }
+            });
+            let (a, _rx_a) = new_host(client_a, dir.path(), StartupOptions::default());
+            a.initialize(InitParams::default()).await.unwrap();
+            for schedule in [
+                json!({ "prompt": "check the build", "every": "1h" }),
+                json!({ "prompt": "tidy up", "cron": "*/30 * * * *" }),
+            ] {
+                dispatch("session/scheduleCreate", Some(schedule), a.as_ref()).await.unwrap();
+            }
+            let call = |method: &'static str, params: Value| {
+                let a = Arc::clone(&a);
+                async move { dispatch(method, Some(params), a.as_ref()).await.unwrap() }
+            };
+            call("session/setGoal", json!({ "goal": "ship it", "maxContinuations": 3 })).await;
+            let r = call("session/setModel", json!({ "model": "claude-restart-test" })).await;
+            assert_eq!(r["ok"], true, "{r}");
+            call("session/setPermissionMode", json!({ "mode": "bypassPermissions" })).await;
+            let source = coda_agent::MessageSource::Subagent {
+                task_id: "task-00000042".into(),
+                label: "reviewer".into(),
+            };
+            a.message_bus
+                .publish_user(&source, "review finished", Some("diff".into()), Some("k-1".into()))
+                .unwrap();
+
+            let prompt = {
+                let a = Arc::clone(&a);
+                tokio::spawn(async move {
+                    dispatch("session/prompt", Some(json!({ "text": "run it" })), a.as_ref()).await
+                })
+            };
+            wait_for("the command to start", || {
+                a.task_manager.list().iter().any(|t| t.kind == TaskKind::Shell)
+            })
+            .await;
+            let steer = a.session_steer(SteerParams { text: "also check X".into() }).await.unwrap();
+            assert_eq!(steer["ok"], true, "{steer}");
+            let r = dispatch("session/prepareRestart", Some(json!({ "drainTimeoutMs": 300 })), a.as_ref())
+                .await
+                .unwrap();
+            assert_eq!((r["drained"].as_bool(), r["interruptedTasks"].as_u64()), (Some(false), Some(1)));
+            let _ = tokio::time::timeout(Duration::from_secs(10), prompt).await;
+            dispatch("shutdown", None, a.as_ref()).await.unwrap();
+            let session_id = a.active_session_id();
+            drop(a);
+
+            // A long restart window: both schedules' slots passed meanwhile.
+            let path = restart_path(dir.path(), &session_id);
+            let mut file: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let past = (Utc::now() - chrono::Duration::hours(3)).to_rfc3339();
+            let mut saved = Vec::new();
+            for schedule in file["schedules"].as_array_mut().unwrap() {
+                schedule["nextRunUtc"] = json!(past);
+                saved.push((schedule["id"].clone(), schedule["runsStarted"].clone()));
+            }
+            assert_eq!(saved.len(), 2);
+            std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+
+            // ── Engine B: restore ─────────────────────────────────────────────
+            let client_b = RecordingClient::new(|_| Reply::Now(answer("DONE")));
+            let (b, mut rx_b) =
+                new_host(Arc::clone(&client_b) as Arc<dyn LlmClient>, dir.path(), StartupOptions::default());
+            let result = dispatch(
+                "initialize",
+                Some(json!({ "sessionId": session_id, "restore": true })),
+                b.as_ref(),
+            )
+            .await
+            .unwrap();
+            let restored = &result["restored"];
+            assert_eq!(restored["applied"], true, "{restored}");
+            assert_eq!(restored["schedules"], 2, "{restored}");
+            assert_eq!(restored["messages"], 1, "{restored}");
+            assert_eq!(restored["interruptedTasks"], 1, "{restored}");
+            assert_eq!(restored["steering"], 1, "{restored}");
+            assert_eq!(restored["toVersion"], coda_boot::version());
+            let settings: Vec<&str> =
+                restored["settings"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+            assert!(settings.contains(&"model") && settings.contains(&"goal"), "{restored}");
+            let not_restored = &restored["settingsNotRestored"];
+            assert_eq!(not_restored[0]["name"], "permissionMode", "{restored}");
+            assert_eq!(not_restored[0]["value"], "bypassPermissions");
+            assert!(!path.exists(), "the restart file is consumed");
+
+            let events = drain_events(&mut rx_b);
+            assert!(
+                !events.iter().any(|(m, _)| m == "event/agentMessage"),
+                "messages follow the initialize response"
+            );
+            b.after_initialize_response();
+            let events = drain_events(&mut rx_b);
+            let message = events
+                .iter()
+                .find(|(m, _)| m == "event/agentMessage")
+                .unwrap_or_else(|| panic!("the notification is re-delivered: {events:?}"));
+            assert_eq!(message.1["text"], "review finished");
+            assert_eq!(message.1["context"], "diff");
+            let pending = dispatch("session/pendingMessages", None, b.as_ref()).await.unwrap();
+            assert_eq!(pending["messages"][0]["cursor"], message.1["cursor"], "a cursor of this engine");
+
+            let now = Utc::now();
+            let list = dispatch("session/scheduleList", None, b.as_ref()).await.unwrap();
+            let schedules = list["schedules"].as_array().unwrap();
+            assert_eq!(schedules.len(), 2, "{list}");
+            for (id, runs_started) in &saved {
+                let s = schedules.iter().find(|s| &s["id"] == id).unwrap_or_else(|| panic!("{id} kept"));
+                assert_eq!(&s["runsStarted"], runs_started);
+                let next: chrono::DateTime<Utc> = s["nextRunUtc"].as_str().unwrap().parse().unwrap();
+                assert!(next > now, "the missed slot moved past now: {s}");
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert!(
+                !b.task_manager.list().iter().any(|t| t.kind == TaskKind::Scheduled),
+                "no catch-up run"
+            );
+
+            let state = dispatch("session/getState", None, b.as_ref()).await.unwrap();
+            assert_eq!(state["config"]["next"]["model"], "claude-restart-test");
+            assert_eq!(state["config"]["next"]["permissionMode"], "default");
+            let goal = b.goal_params.lock().unwrap().clone();
+            assert_eq!((goal.goal.as_deref(), goal.max_continuations), (Some("ship it"), Some(3)));
+
+            dispatch("session/prompt", Some(json!({ "text": "continue" })), b.as_ref()).await.unwrap();
+            let first = client_b
+                .dumps("main")
+                .into_iter()
+                .find(|d| d.contains("continue"))
+                .expect("the prompt reached the model");
+            assert!(first.contains("[restart]"), "{first}");
+            assert!(first.contains(LONG), "{first}");
+            assert!(first.contains("also check X"), "{first}");
+
+            // ── Engine C: a restore happens once ─────────────────────────────
+            let (c, _rx_c) = new_host(idle_client(), dir.path(), StartupOptions::default());
+            let result =
+                initialize(&c, json!({ "sessionId": session_id, "restore": true })).await.unwrap();
+            assert_eq!(result["restored"], json!({
+                "applied": false,
+                "ignoredReason": "missing",
+                "schedules": 0,
+                "messages": 0,
+                "settings": [],
+                "settingsNotRestored": [],
+                "interruptedTasks": 0,
+                "interruptedRequests": 0,
+                "steering": 0,
+                "tasks": [],
+                "tasksSuspended": false,
+            }));
+        }
+
+        #[tokio::test]
+        async fn restore_ignores_file_older_than_24h() {
+            let dir = tempfile::tempdir().unwrap();
+            let file = minimal_file(dir.path(), "placeholder", Utc::now() - chrono::Duration::hours(25));
+            let session_id = session_with_file(dir.path(), b"").await;
+            let file = RestartFile { session_id: session_id.clone(), ..file };
+            std::fs::write(restart_path(dir.path(), &session_id), serde_json::to_vec(&file).unwrap())
+                .unwrap();
+
+            let (host, _rx) = new_host(idle_client(), dir.path(), StartupOptions::default());
+            let r = initialize(&host, json!({ "sessionId": session_id, "restore": true })).await.unwrap();
+            assert_eq!(r["restored"]["applied"], false);
+            assert_eq!(r["restored"]["ignoredReason"], "expired");
+            assert!(restart_path(dir.path(), &session_id).exists(), "an ignored file is left on disk");
+        }
+
+        #[tokio::test]
+        async fn restore_ignores_file_for_another_session() {
+            let dir = tempfile::tempdir().unwrap();
+            let file = minimal_file(dir.path(), "someone-else", Utc::now());
+            let session_id = session_with_file(dir.path(), &serde_json::to_vec(&file).unwrap()).await;
+
+            let (host, _rx) = new_host(idle_client(), dir.path(), StartupOptions::default());
+            let r = initialize(&host, json!({ "sessionId": session_id, "restore": true })).await.unwrap();
+            assert_eq!(r["restored"]["applied"], false);
+            assert_eq!(r["restored"]["ignoredReason"], "sessionMismatch");
+            assert_eq!(r["sessionId"], session_id.as_str(), "the transcript still resumes");
+            assert!(restart_path(dir.path(), &session_id).exists(), "an ignored file is left on disk");
+            let history = host.session.history.lock().unwrap().clone();
+            assert_eq!(history.len(), 1, "no [restart] entry for an ignored file");
+        }
+
+        #[tokio::test]
+        async fn restore_refuses_newer_format_and_allows_retry() {
+            let dir = tempfile::tempdir().unwrap();
+            let session_id = session_with_file(dir.path(), br#"{"version":2}"#).await;
+            let (host, _rx) = new_host(idle_client(), dir.path(), StartupOptions::default());
+
+            let err = initialize(&host, json!({ "restore": true })).await.unwrap_err();
+            assert_eq!(err.code, -32602, "restore needs a sessionId");
+            let err = initialize(&host, json!({ "sessionId": session_id, "restore": true }))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, coda_proto::messages::error_code::RESTART_FILE_UNSUPPORTED);
+            assert_eq!(err.message, "restart file format 2 is newer than this Coda supports (1)");
+            assert!(!host.engine_state.is_initialized(), "initialization was not claimed");
+
+            let r = initialize(&host, json!({ "sessionId": session_id })).await.unwrap();
+            assert_eq!(r["sessionId"], session_id.as_str());
+            assert!(r.get("restored").is_none(), "{r}");
+            assert!(restart_path(dir.path(), &session_id).exists());
+        }
+
+        #[tokio::test]
+        async fn restore_without_transcript_starts_the_session_empty() {
+            let dir = tempfile::tempdir().unwrap();
+            let session_id = Uuid::new_v4().to_string();
+            let path = restart_path(dir.path(), &session_id);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let file = minimal_file(dir.path(), &session_id, Utc::now());
+            std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+
+            // Defaults from `coda serve --restore --session <id>`.
+            let startup = StartupOptions {
+                restore: Some(coda_proto::messages::RestoreMode::Resume),
+                session_id: Some(session_id.clone()),
+                ..StartupOptions::default()
+            };
+            let (host, _rx) = new_host(idle_client(), dir.path(), startup);
+            let r = initialize(&host, json!({})).await.unwrap();
+            assert_eq!(r["sessionId"], session_id.as_str());
+            assert_eq!(r["restored"]["applied"], true, "{r}");
+            let history = host.session.history.lock().unwrap().clone();
+            assert_eq!(history.len(), 1);
+            assert!(history[0].text().starts_with("[restart]"), "{:?}", history[0]);
+            let stored = SessionTranscriptStore::new(dir.path()).load(&session_id).await.unwrap();
+            assert_eq!(stored.len(), 1, "the [restart] entry is persisted");
+        }
+
+        #[tokio::test]
+        async fn restore_failing_initialize_keeps_the_file_for_a_retry() {
+            let dir = tempfile::tempdir().unwrap();
+            let session_id = session_with_file(dir.path(), b"").await;
+            let file = minimal_file(dir.path(), &session_id, Utc::now());
+            std::fs::write(restart_path(dir.path(), &session_id), serde_json::to_vec(&file).unwrap())
+                .unwrap();
+            // An effort the model cannot take fails initialize late, after
+            // the transcript and the restart file were read.
+            let startup = StartupOptions {
+                model: Some("claude-haiku-4.5".into()),
+                effort: StartupEffort::Level(Effort::High),
+                ..StartupOptions::default()
+            };
+            let (host, _rx) = new_host(idle_client(), dir.path(), startup);
+            let restarts = |history: &[Message]| {
+                history.iter().filter(|m| m.text().starts_with("[restart]")).count()
+            };
+
+            initialize(&host, json!({ "sessionId": session_id, "restore": true }))
+                .await
+                .expect_err("the startup effort is refused");
+            assert!(restart_path(dir.path(), &session_id).exists(), "the restore is not lost");
+            assert_eq!(restarts(&host.session.history.lock().unwrap()), 0);
+            let stored = SessionTranscriptStore::new(dir.path()).load(&session_id).await.unwrap();
+            assert_eq!(restarts(&stored), 0, "no [restart] entry is persisted");
+
+            *host.pending_startup_effort.lock().unwrap() = None;
+            let r = initialize(&host, json!({ "sessionId": session_id, "restore": true }))
+                .await
+                .unwrap();
+            assert_eq!(r["restored"]["applied"], true, "{r}");
+            assert!(!restart_path(dir.path(), &session_id).exists(), "consumed by the retry");
+            assert_eq!(restarts(&host.session.history.lock().unwrap()), 1);
+            let stored = SessionTranscriptStore::new(dir.path()).load(&session_id).await.unwrap();
+            assert_eq!(restarts(&stored), 1);
+        }
+
+        /// Engine A runs the team until the inner agent is in a long command,
+        /// then prepares a restart. Returns `(session id, outer id, inner id)`.
+        async fn prepare_team(dir: &std::path::Path) -> (String, String, String) {
+            let client = RecordingClient::new(team(LONG, false));
+            let (a, _rx) = new_host(Arc::clone(&client) as Arc<dyn LlmClient>, dir, StartupOptions::default());
+            a.initialize(InitParams::default()).await.unwrap();
+            a.permission_mode.set(PermissionMode::BypassPermissions);
+            *a.restart_settle_override.lock().unwrap() = Some(Duration::from_secs(10));
+
+            dispatch("session/prompt", Some(json!({ "text": "start the team" })), a.as_ref())
+                .await
+                .unwrap();
+            wait_for("the inner command to start", || {
+                a.task_manager.list().iter().any(|t| t.kind == TaskKind::Shell)
+            })
+            .await;
+            wait_for("the outer agent to wait", || {
+                client.dumps("outer").len() >= 2
+            })
+            .await;
+            let subagents = |a: &ServeHost| {
+                let mut ids: Vec<(u32, String)> = a
+                    .task_manager
+                    .list()
+                    .into_iter()
+                    .filter(|t| t.kind == TaskKind::Subagent)
+                    .map(|t| (a.task_manager.find_task(&t.id).unwrap().depth, t.id))
+                    .collect();
+                ids.sort();
+                ids
+            };
+            let ids = subagents(&a);
+            assert_eq!(ids.len(), 2, "{ids:?}");
+            let (outer, inner) = (ids[0].1.clone(), ids[1].1.clone());
+
+            let r = dispatch("session/prepareRestart", Some(json!({ "drainTimeoutMs": 300 })), a.as_ref())
+                .await
+                .unwrap();
+            let mut suspended: Vec<String> =
+                serde_json::from_value(r["suspendedTasks"].clone()).unwrap();
+            suspended.sort();
+            assert_eq!(suspended, vec![outer.clone(), inner.clone()], "{r}");
+            for id in [&outer, &inner] {
+                assert_eq!(a.task_manager.get(id).unwrap().status, TaskRunStatus::Suspended);
+            }
+            let session_id = a.active_session_id();
+            let tasks_dir = SessionTranscriptStore::new(dir).tasks_dir(&session_id);
+            let inner_cp = coda_agent::subagents::SubagentCheckpoint::read(
+                &tasks_dir.join(format!("{inner}.json")),
+            )
+            .unwrap();
+            let interrupted = inner_cp
+                .messages()
+                .iter()
+                .flat_map(|m| m.content.clone())
+                .any(|c| matches!(c, Content::ToolResult { content, .. }
+                    if content.contains("Interrupted by a planned restart")));
+            assert!(interrupted, "the inner command's result says it was interrupted");
+            assert!(tasks_dir.join(format!("{outer}.json")).exists());
+            dispatch("shutdown", None, a.as_ref()).await.unwrap();
+            (session_id, outer, inner)
+        }
+
+        #[tokio::test]
+        async fn subagents_suspend_on_prepare_and_continue_after_restore() {
+            let dir = tempfile::tempdir().unwrap();
+            let (session_id, outer, inner) = prepare_team(dir.path()).await;
+
+            let client = RecordingClient::new(team(LONG, false));
+            let (b, mut rx) =
+                new_host(Arc::clone(&client) as Arc<dyn LlmClient>, dir.path(), StartupOptions::default());
+            let r = initialize(&b, json!({ "sessionId": session_id, "restore": true })).await.unwrap();
+            let mut tasks: Vec<String> =
+                serde_json::from_value(r["restored"]["tasks"].clone()).unwrap();
+            tasks.sort();
+            assert_eq!(tasks, vec![outer.clone(), inner.clone()], "{r}");
+            assert_eq!(r["restored"]["tasksSuspended"], false);
+
+            let status = |id: &str| b.task_manager.get(id).map(|t| t.status);
+            wait_for("both subagents to finish", || {
+                status(&outer) == Some(TaskRunStatus::Completed)
+                    && status(&inner) == Some(TaskRunStatus::Completed)
+            })
+            .await;
+            let events = drain_events(&mut rx);
+            for id in [&outer, &inner] {
+                assert!(
+                    events.iter().any(|(m, p)| m == "event/taskStarted"
+                        && p["taskId"] == id.as_str()
+                        && p["resumed"] == true),
+                    "{id} started as resumed: {events:?}"
+                );
+            }
+            let inner_next = client.dumps("inner").into_iter().next().expect("the inner agent continued");
+            assert!(inner_next.contains(INNER) && inner_next.contains(LONG), "{inner_next}");
+            assert!(inner_next.contains("Interrupted by a planned restart"), "{inner_next}");
+            let outer_next = client.dumps("outer").into_iter().next().expect("the outer agent continued");
+            assert!(outer_next.contains(OUTER) && outer_next.contains("is suspended"), "{outer_next}");
+            assert!(
+                !SessionTranscriptStore::new(dir.path()).tasks_dir(&session_id).exists(),
+                "the subagent files are removed once restored"
+            );
+        }
+
+        #[tokio::test]
+        async fn restore_deferred_subagents_survive_another_restart() {
+            let dir = tempfile::tempdir().unwrap();
+            let (session_id, outer, inner) = prepare_team(dir.path()).await;
+            let tasks_dir = SessionTranscriptStore::new(dir.path()).tasks_dir(&session_id);
+            let sorted = |value: &Value| {
+                let mut ids: Vec<String> = serde_json::from_value(value.clone()).unwrap();
+                ids.sort();
+                ids
+            };
+
+            // Engine B has no provider: the subagents wait for its services,
+            // which are never built before it restarts again.
+            let (b, _rx) = new_host_with(None, dir.path(), StartupOptions::default());
+            let r = initialize(&b, json!({ "sessionId": session_id, "restore": true })).await.unwrap();
+            assert_eq!(r["restored"]["applied"], true, "{r}");
+            assert_eq!(r["restored"]["tasks"], json!([]), "nothing re-created yet: {r}");
+            let r = dispatch("session/prepareRestart", Some(json!({ "drainTimeoutMs": 300 })), b.as_ref())
+                .await
+                .unwrap();
+            assert_eq!(sorted(&r["suspendedTasks"]), vec![outer.clone(), inner.clone()], "{r}");
+            let path = r["restartFile"].as_str().expect("a path");
+            let file: RestartFile = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            let mut carried = file.tasks.clone();
+            carried.sort();
+            assert_eq!(carried, vec![outer.clone(), inner.clone()]);
+            for id in [&outer, &inner] {
+                assert!(tasks_dir.join(format!("{id}.json")).exists(), "{id} is still saved");
+            }
+            dispatch("shutdown", None, b.as_ref()).await.unwrap();
+            drop(b);
+
+            // Engine C has one: they are re-created and continue.
+            let client = RecordingClient::new(team(LONG, false));
+            let (c, _rx) =
+                new_host(Arc::clone(&client) as Arc<dyn LlmClient>, dir.path(), StartupOptions::default());
+            let r = initialize(&c, json!({ "sessionId": session_id, "restore": true })).await.unwrap();
+            assert_eq!(sorted(&r["restored"]["tasks"]), vec![outer.clone(), inner.clone()], "{r}");
+            let status = |id: &str| c.task_manager.get(id).map(|t| t.status);
+            wait_for("both subagents to finish", || {
+                status(&outer) == Some(TaskRunStatus::Completed)
+                    && status(&inner) == Some(TaskRunStatus::Completed)
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn restore_suspended_mode_keeps_subagents_paused_until_task_resume() {
+            let dir = tempfile::tempdir().unwrap();
+            let (session_id, outer, inner) = prepare_team(dir.path()).await;
+
+            let client = RecordingClient::new(team(LONG, false));
+            let (b, _rx) =
+                new_host(Arc::clone(&client) as Arc<dyn LlmClient>, dir.path(), StartupOptions::default());
+            let r = initialize(&b, json!({ "sessionId": session_id, "restore": "suspended" }))
+                .await
+                .unwrap();
+            assert_eq!(r["restored"]["tasksSuspended"], true);
+
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let listing = dispatch(
+                "session/listTasks",
+                Some(json!({ "statusFilter": "suspended" })),
+                b.as_ref(),
+            )
+            .await
+            .unwrap();
+            let mut listed: Vec<String> = listing["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["id"].as_str().unwrap().to_owned())
+                .collect();
+            listed.sort();
+            assert_eq!(listed, vec![outer.clone(), inner.clone()], "{listing}");
+            assert!(client.dumps("outer").is_empty() && client.dumps("inner").is_empty());
+
+            for id in [&outer, &inner] {
+                let r = dispatch("task/resume", Some(json!({ "taskId": id })), b.as_ref()).await.unwrap();
+                assert_eq!(r["ok"], true, "{r}");
+            }
+            let status = |id: &str| b.task_manager.get(id).map(|t| t.status);
+            wait_for("both subagents to finish", || {
+                status(&outer) == Some(TaskRunStatus::Completed)
+                    && status(&inner) == Some(TaskRunStatus::Completed)
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn parent_task_wait_sees_suspended_child_then_gets_report() {
+            const QUICK: &str = "echo hi";
+            let dir = tempfile::tempdir().unwrap();
+            let client = RecordingClient::new(team(QUICK, true));
+            let (host, _rx) =
+                new_host(Arc::clone(&client) as Arc<dyn LlmClient>, dir.path(), StartupOptions::default());
+            host.initialize(InitParams::default()).await.unwrap();
+            host.permission_mode.set(PermissionMode::BypassPermissions);
+
+            dispatch("session/prompt", Some(json!({ "text": "start the team" })), host.as_ref())
+                .await
+                .unwrap();
+            wait_for("the inner agent's first request", || client.dumps("inner").len() == 1).await;
+            let inner = host
+                .task_manager
+                .list()
+                .into_iter()
+                .filter(|t| t.kind == TaskKind::Subagent)
+                .find(|t| host.task_manager.find_task(&t.id).unwrap().depth == 2)
+                .expect("the inner agent runs")
+                .id;
+            let r = dispatch("task/suspend", Some(json!({ "taskId": inner })), host.as_ref()).await.unwrap();
+            assert_eq!(r["ok"], true, "{r}");
+            client.gate.notify_one();
+            let status = |id: &str| host.task_manager.get(id).map(|t| t.status);
+            wait_for("the inner agent to pause", || status(&inner) == Some(TaskRunStatus::Suspended)).await;
+            wait_for("the outer agent to see it", || {
+                client.dumps("outer").iter().any(|d| d.contains("is suspended"))
+            })
+            .await;
+
+            let r = dispatch("task/resume", Some(json!({ "taskId": inner })), host.as_ref()).await.unwrap();
+            assert_eq!(r["ok"], true, "{r}");
+            wait_for("the outer agent to get the report", || {
+                client.dumps("outer").iter().any(|d| d.contains("inner done"))
+            })
+            .await;
+            assert_eq!(status(&inner), Some(TaskRunStatus::Completed));
         }
     }
 }

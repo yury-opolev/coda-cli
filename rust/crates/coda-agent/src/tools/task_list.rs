@@ -5,7 +5,6 @@ use coda_proto::requests::TaskStatusFilter;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::tasks::TaskRunStatus;
 use crate::tool::{Tool, ToolContext, ToolOutcome, ToolResult};
 use crate::tool::ToolContextServiceExt as _;
 
@@ -19,9 +18,9 @@ impl Tool for TaskListTool {
 
     fn description(&self) -> &str {
         "List background tasks for the current session with their id, description, status, \
-         and kind. Lists all tasks by default; statusFilter \"active\" lists only running work \
-         and \"terminal\" only completed, failed or stopped tasks. Returns an empty list when \
-         no tasks match."
+         and kind. Lists all tasks by default; statusFilter \"active\" lists only unfinished \
+         work (running or suspended), \"suspended\" only suspended tasks and \"terminal\" only \
+         completed, failed or stopped tasks. Returns an empty list when no tasks match."
     }
 
     fn input_schema_json(&self) -> &str {
@@ -30,8 +29,8 @@ impl Tool for TaskListTool {
           "properties":{
             "statusFilter":{
               "type":"string",
-              "enum":["active","terminal","all"],
-              "description":"Which tasks to list: active (running), terminal (completed, failed or stopped) or all (default)"
+              "enum":["active","suspended","terminal","all"],
+              "description":"Which tasks to list: active (running or suspended), suspended, terminal (completed, failed or stopped) or all (default)"
             }
           }
         }"#
@@ -48,13 +47,14 @@ impl Tool for TaskListTool {
                 Some(filter) => filter,
                 None => {
                     return ToolResult::error(format!(
-                        "Invalid statusFilter {value}; expected one of: active, terminal, all."
+                        "Invalid statusFilter {value}; expected one of: active, suspended, terminal, all."
                     ))
                 }
             },
         };
         let empty = match filter {
             TaskStatusFilter::Active => "No active tasks.",
+            TaskStatusFilter::Suspended => "No suspended tasks.",
             TaskStatusFilter::Terminal => "No finished tasks.",
             TaskStatusFilter::All => "No tasks.",
         };
@@ -72,7 +72,7 @@ impl Tool for TaskListTool {
         // Only show tasks visible to the caller.
         let visible: Vec<_> = tasks
             .iter()
-            .filter(|t| filter.admits(t.status.is_terminal()))
+            .filter(|t| filter.admits_status(t.status.as_str()))
             .filter(|t| is_visible(ctx.caller_task_id.as_deref(), t, mgr))
             .collect();
 
@@ -82,12 +82,7 @@ impl Tool for TaskListTool {
 
         let mut lines = Vec::new();
         for t in &visible {
-            let status = match t.status {
-                TaskRunStatus::Running => "running",
-                TaskRunStatus::Completed => "completed",
-                TaskRunStatus::Failed => "failed",
-                TaskRunStatus::Stopped => "stopped",
-            };
+            let status = t.status.as_str();
             let mode = match t.mode {
                 crate::tasks::TaskExecutionMode::Foreground => "foreground",
                 crate::tasks::TaskExecutionMode::Background => "background",
@@ -204,7 +199,7 @@ mod tests {
         for bad in [serde_json::json!("finished"), serde_json::json!(3)] {
             let result = list(&m, serde_json::json!({ "statusFilter": bad })).await;
             assert!(result.is_error, "{}", result.content);
-            assert!(result.content.contains("active, terminal, all"), "{}", result.content);
+            assert!(result.content.contains("active, suspended, terminal, all"), "{}", result.content);
         }
     }
 
