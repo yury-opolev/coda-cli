@@ -4225,6 +4225,17 @@ impl ServeBackend for ServeHost {
         if self.engine_state.is_draining() {
             return Err(RpcError::restart_pending());
         }
+        // Paused only because an ancestor is suspended: clearing this task's
+        // own (unset) flag would change nothing, so say so instead of `ok`.
+        if let Some(task) = self.task_manager.find_task(&p.task_id) {
+            if task.kind == coda_agent::tasks::TaskKind::Subagent
+                && !task.status().is_terminal()
+                && !task.suspend_explicit()
+                && self.task_manager.is_suspension_requested(&p.task_id)
+            {
+                return task_control_result(p.task_id, Some("suspendedByParent"));
+            }
+        }
         let reason = match self.task_manager.request_resume(&p.task_id) {
             TaskActionResult::Ok => None,
             TaskActionResult::NotFound => Some("notFound"),
@@ -16518,6 +16529,25 @@ mod tests {
             assert_eq!(call(&host, "task/suspend", &agent.id).await.unwrap()["ok"], true, "idempotent");
             assert_eq!(call(&host, "task/resume", &agent.id).await.unwrap()["ok"], true);
             assert!(!m.is_suspension_requested(&agent.id));
+        }
+
+        #[tokio::test]
+        async fn resuming_a_child_paused_by_its_parent_reports_suspended_by_parent() {
+            let dir = tempfile::tempdir().unwrap();
+            let (host, _rx) = host_with_events(dir.path());
+            let m = &host.task_manager;
+            let parent = m.register(TaskKind::Subagent, "p", None, TaskExecutionMode::Background).unwrap();
+            let child = m
+                .register(TaskKind::Subagent, "c", Some(&parent.id), TaskExecutionMode::Background)
+                .unwrap();
+            assert_eq!(call(&host, "task/suspend", &parent.id).await.unwrap()["ok"], true);
+
+            let r = call(&host, "task/resume", &child.id).await.unwrap();
+            assert_eq!(r["reason"], "suspendedByParent");
+            assert!(m.is_suspension_requested(&child.id), "still paused through its parent");
+
+            assert_eq!(call(&host, "task/resume", &parent.id).await.unwrap()["ok"], true);
+            assert!(!m.is_suspension_requested(&child.id));
         }
 
         #[tokio::test]
