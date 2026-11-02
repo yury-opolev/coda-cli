@@ -34,6 +34,11 @@ pub mod event_method {
     /// New, secret-redacted output of a running task. Throttled per task and
     /// bounded per frame; a frame says when output was skipped.
     pub const TASK_OUTPUT: &str = "event/taskOutput";
+    /// A subagent paused at a safe point (`reason`: `requested`, `parent`
+    /// or `restart`). It is not finished; its status is `suspended`.
+    pub const TASK_SUSPENDED: &str = "event/taskSuspended";
+    /// A suspended subagent continues running.
+    pub const TASK_RESUMED: &str = "event/taskResumed";
     pub const SCHEDULE_LIFECYCLE: &str = "event/scheduleLifecycle";
     pub const PROMPT_REWRITTEN: &str = "event/promptRewritten";
     pub const RESPONSE_REWRITTEN: &str = "event/responseRewritten";
@@ -219,6 +224,22 @@ pub enum Event {
         owner_task_id: Option<String>,
         /// `"foreground"` (an agent is waiting on it) or `"background"`.
         mode: String,
+        /// `Some(true)` for a subagent re-created after a planned restart.
+        resumed: Option<bool>,
+    },
+    /// A subagent paused at a safe point.
+    TaskSuspended {
+        task_id: String,
+        owner_task_id: Option<String>,
+        kind: String,
+        /// `"requested"`, `"parent"` or `"restart"`.
+        reason: String,
+    },
+    /// A suspended subagent continues.
+    TaskResumed {
+        task_id: String,
+        owner_task_id: Option<String>,
+        kind: String,
     },
     /// New output of a running task: secret-redacted, at most a few frames
     /// per second per task and a bounded number of characters per frame.
@@ -521,6 +542,40 @@ struct TaskStartedPayload {
     owner_task_id: Option<String>,
     #[serde(default)]
     mode: String,
+    /// `true` for a subagent re-created after a planned restart.
+    #[serde(default)]
+    resumed: Option<bool>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+struct TaskSuspendedPayload {
+    #[serde(default)]
+    task_id: String,
+    /// The task id of the agent that started the task; absent for the main
+    /// agent.
+    #[serde(default)]
+    owner_task_id: Option<String>,
+    #[serde(default)]
+    kind: String,
+    /// `"requested"`, `"parent"` or `"restart"`.
+    #[serde(default)]
+    reason: String,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+struct TaskResumedPayload {
+    #[serde(default)]
+    task_id: String,
+    /// The task id of the agent that started the task; absent for the main
+    /// agent.
+    #[serde(default)]
+    owner_task_id: Option<String>,
+    #[serde(default)]
+    kind: String,
 }
 
 #[derive(Default, Deserialize)]
@@ -859,7 +914,21 @@ impl Event {
                     description: p.description,
                     owner_task_id: p.owner_task_id,
                     mode: p.mode,
+                    resumed: p.resumed,
                 }
+            }
+            m::TASK_SUSPENDED => {
+                let p: TaskSuspendedPayload = parse(params);
+                Event::TaskSuspended {
+                    task_id: p.task_id,
+                    owner_task_id: p.owner_task_id,
+                    kind: p.kind,
+                    reason: p.reason,
+                }
+            }
+            m::TASK_RESUMED => {
+                let p: TaskResumedPayload = parse(params);
+                Event::TaskResumed { task_id: p.task_id, owner_task_id: p.owner_task_id, kind: p.kind }
             }
             m::TASK_OUTPUT => {
                 let p: TaskOutputPayload = parse(params);
@@ -1108,14 +1177,32 @@ impl Event {
                 put_opt(&mut map, "mode", mode);
                 (m::TASK_COMPLETED, Value::Object(map))
             }
-            Event::TaskStarted { task_id, kind, description, owner_task_id, mode } => {
+            Event::TaskStarted { task_id, kind, description, owner_task_id, mode, resumed } => {
                 let mut map = Map::new();
                 map.insert("taskId".into(), task_id.clone().into());
                 map.insert("kind".into(), kind.clone().into());
                 map.insert("description".into(), description.clone().into());
                 put_opt(&mut map, "ownerTaskId", owner_task_id);
                 map.insert("mode".into(), mode.clone().into());
+                if let Some(resumed) = resumed {
+                    map.insert("resumed".into(), (*resumed).into());
+                }
                 (m::TASK_STARTED, Value::Object(map))
+            }
+            Event::TaskSuspended { task_id, owner_task_id, kind, reason } => {
+                let mut map = Map::new();
+                map.insert("taskId".into(), task_id.clone().into());
+                put_opt(&mut map, "ownerTaskId", owner_task_id);
+                map.insert("kind".into(), kind.clone().into());
+                map.insert("reason".into(), reason.clone().into());
+                (m::TASK_SUSPENDED, Value::Object(map))
+            }
+            Event::TaskResumed { task_id, owner_task_id, kind } => {
+                let mut map = Map::new();
+                map.insert("taskId".into(), task_id.clone().into());
+                put_opt(&mut map, "ownerTaskId", owner_task_id);
+                map.insert("kind".into(), kind.clone().into());
+                (m::TASK_RESUMED, Value::Object(map))
             }
             Event::TaskOutput { task_id, text, truncated } => (
                 m::TASK_OUTPUT,
@@ -1418,6 +1505,7 @@ mod tests {
                 description: "deep review".into(),
                 owner_task_id: None,
                 mode: "background".into(),
+                resumed: None,
             });
             assert_round_trips(Event::TaskStarted {
                 task_id: "t4".into(),
@@ -1425,6 +1513,7 @@ mod tests {
                 description: "cargo test".into(),
                 owner_task_id: Some("t3".into()),
                 mode: "foreground".into(),
+                resumed: None,
             });
             assert_round_trips(Event::TaskOutput {
                 task_id: "t4".into(),
@@ -1767,6 +1856,52 @@ mod tests {
         };
         assert_eq!(owner_task_id.as_deref(), Some("task-0001"));
         assert_eq!((kind.as_deref(), mode.as_deref()), (Some("shell"), Some("background")));
+    }
+
+    #[test]
+    fn task_suspended_event_shape() {
+        let suspended = Event::TaskSuspended {
+            task_id: "task-00000002".into(),
+            owner_task_id: Some("task-00000001".into()),
+            kind: "subagent".into(),
+            reason: "restart".into(),
+        };
+        let (method, params) = suspended.to_notification().unwrap();
+        assert_eq!(method, "event/taskSuspended");
+        assert_eq!(params, json!({
+            "taskId": "task-00000002", "ownerTaskId": "task-00000001",
+            "kind": "subagent", "reason": "restart",
+        }));
+        assert_eq!(format!("{:?}", Event::parse(&method, Some(&params))), format!("{suspended:?}"));
+
+        let resumed = Event::TaskResumed {
+            task_id: "task-00000002".into(),
+            owner_task_id: None,
+            kind: "subagent".into(),
+        };
+        let (method, params) = resumed.to_notification().unwrap();
+        assert_eq!(method, "event/taskResumed");
+        assert_eq!(params, json!({ "taskId": "task-00000002", "kind": "subagent" }));
+        assert_eq!(format!("{:?}", Event::parse(&method, Some(&params))), format!("{resumed:?}"));
+
+        let started = Event::TaskStarted {
+            task_id: "task-00000002".into(),
+            kind: "subagent".into(),
+            description: "review".into(),
+            owner_task_id: None,
+            mode: "background".into(),
+            resumed: Some(true),
+        };
+        let (_, params) = started.to_notification().unwrap();
+        assert_eq!(params["resumed"], true);
+        assert_eq!(format!("{:?}", Event::parse(event_method::TASK_STARTED, Some(&params))), format!("{started:?}"));
+        let fresh = parse_event(
+            event_method::TASK_STARTED,
+            json!({ "taskId": "t1", "kind": "shell", "description": "x", "mode": "foreground" }),
+        );
+        assert!(matches!(fresh, Event::TaskStarted { resumed: None, .. }));
+        let (_, params) = fresh.to_notification().unwrap();
+        assert!(params.get("resumed").is_none());
     }
 
     #[test]

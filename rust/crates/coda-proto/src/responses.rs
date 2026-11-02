@@ -24,6 +24,28 @@ pub struct TaskSummaryDto {
     pub output_tail: String,
     /// Completion result or failure, capped at 16 KiB with an explicit marker.
     pub report: Option<String>,
+    /// `true` while a suspension was requested but the task has not yet
+    /// reached a safe point (its `status` is still `running`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspend_requested: Option<bool>,
+}
+
+/// Result of `session/prepareRestart`. The engine stays `draining`
+/// afterwards; the client is expected to shut it down and start the new one
+/// with `initialize.restore`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct PrepareRestartResult {
+    pub ok: bool,
+    /// Absolute path of the written restart file.
+    pub restart_file: String,
+    /// `true` when all work finished or suspended before the timeout.
+    pub drained: bool,
+    pub interrupted_tasks: usize,
+    pub interrupted_requests: usize,
+    /// Ids of the subagents saved suspended for the next engine.
+    pub suspended_tasks: Vec<String>,
 }
 
 /// Outcome of `task/background`, `task/stop` or `task/send` for one task.
@@ -34,7 +56,8 @@ pub struct TaskSummaryDto {
 /// background, as every subagent is) or `notBackgroundable` (a kind that
 /// cannot be released); for `task/send` only `notAgent` (a shell command
 /// cannot receive messages), `notAccepting` (the agent is finishing) or
-/// `emptyText`.
+/// `emptyText`; for `task/suspend` and `task/resume` `notSuspendable` (only
+/// subagents can be suspended) and, for `task/resume` only, `notSuspended`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

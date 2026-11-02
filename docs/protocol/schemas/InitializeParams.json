@@ -33,6 +33,17 @@
         }
       ],
       "description": "Additive, optional (§2.1): absent means legacy behaviour."
+    },
+    "restore": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RestoreMode"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Restore the state saved by `session/prepareRestart` for `sessionId`.\nAbsent or `false` restores nothing."
     }
   },
   "required": [
@@ -67,6 +78,18 @@
         }
       },
       "description": "Optional capability negotiation from the client (§2.1 of the serve API\nimplementation plan). Absence of the whole struct, or of any field inside\nit, means legacy behaviour: no gated event method is emitted."
+    },
+    "RestoreMode": {
+      "description": "`true` restores and lets suspended subagents continue, `false` restores nothing, `\"suspended\"` restores and keeps restored subagents suspended.",
+      "oneOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "string",
+          "const": "suspended"
+        }
+      ]
     }
   }
 }

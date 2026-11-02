@@ -18,7 +18,7 @@
     "ok",
     "taskId"
   ],
-  "description": "Outcome of `task/background`, `task/stop` or `task/send` for one task.\n\n`ok:false` carries a stable `reason`: `notFound` (no such task),\n`notRunning` (already finished); for `task/background` only\n`notForeground` (nothing is waiting on it — it is already in the\nbackground, as every subagent is) or `notBackgroundable` (a kind that\ncannot be released); for `task/send` only `notAgent` (a shell command\ncannot receive messages), `notAccepting` (the agent is finishing) or\n`emptyText`.",
+  "description": "Outcome of `task/background`, `task/stop` or `task/send` for one task.\n\n`ok:false` carries a stable `reason`: `notFound` (no such task),\n`notRunning` (already finished); for `task/background` only\n`notForeground` (nothing is waiting on it — it is already in the\nbackground, as every subagent is) or `notBackgroundable` (a kind that\ncannot be released); for `task/send` only `notAgent` (a shell command\ncannot receive messages), `notAccepting` (the agent is finishing) or\n`emptyText`; for `task/suspend` and `task/resume` `notSuspendable` (only\nsubagents can be suspended) and, for `task/resume` only, `notSuspended`.",
   "title": "TaskControlResult",
   "$schema": "https://json-schema.org/draft/2020-12/schema"
 }

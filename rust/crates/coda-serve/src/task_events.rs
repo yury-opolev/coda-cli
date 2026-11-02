@@ -173,6 +173,7 @@ impl TaskEventObserver for TaskEventPublisher {
             description: task.description.clone(),
             owner_task_id: task.parent_id.clone(),
             mode: task.mode().as_str().to_owned(),
+            resumed: None,
         });
     }
 

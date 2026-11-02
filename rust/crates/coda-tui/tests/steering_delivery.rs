@@ -91,6 +91,7 @@ fn snapshot(steering: SteeringQueueState, live: Vec<HistoryEntry>) -> StateSnaps
             max_session_page: 200,
         },
         capabilities: Default::default(),
+        drain: None,
     }
 }
 

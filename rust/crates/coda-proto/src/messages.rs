@@ -109,6 +109,19 @@ pub mod method {
     /// request that sees the conversation so far and the live task table.
     /// Never added to the history; works while a turn is running.
     pub const ASK_ASIDE: &str = "session/askAside";
+
+    // ── Planned restart ──────────────────────────────────────────────────
+    /// Drain the engine (refusing new work with `RESTART_PENDING`), suspend
+    /// subagents at a safe point and write the restart file.
+    pub const PREPARE_RESTART: &str = "session/prepareRestart";
+    /// Pause one running subagent at its next safe point.
+    pub const TASK_SUSPEND: &str = "task/suspend";
+    /// Let one suspended subagent continue.
+    pub const TASK_RESUME: &str = "task/resume";
+    /// Suspend every running subagent.
+    pub const SUSPEND_ALL_TASKS: &str = "session/suspendAllTasks";
+    /// Clear every explicit suspension.
+    pub const RESUME_ALL_TASKS: &str = "session/resumeAllTasks";
 }
 
 /// Method names the server may call on us. Each expects a reply.
@@ -137,6 +150,13 @@ pub mod error_code {
     pub const UNKNOWN_REQUEST: i64 = -32014;
     /// The outcome offered does not match the pending request's kind.
     pub const REQUEST_KIND_MISMATCH: i64 = -32015;
+    /// The engine is draining for a planned restart and refuses new work
+    /// (message `"restart pending"`).
+    pub const RESTART_PENDING: i64 = -32016;
+    /// `initialize` asked to restore from a restart file whose format is
+    /// newer than this engine supports. Initialization is not claimed, so
+    /// the client may retry without `restore`.
+    pub const RESTART_FILE_UNSUPPORTED: i64 = -32017;
 }
 
 // ---------------------------------------------------------------------------
@@ -210,6 +230,10 @@ pub struct InitializeParams {
     /// Additive, optional (§2.1): absent means legacy behaviour.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_capabilities: Option<ClientCapabilities>,
+    /// Restore the state saved by `session/prepareRestart` for `sessionId`.
+    /// Absent or `false` restores nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restore: Option<RestoreMode>,
 }
 
 impl InitializeParams {
@@ -220,7 +244,13 @@ impl InitializeParams {
             api_key: None,
             session_id: None,
             client_capabilities: None,
+            restore: None,
         }
+    }
+
+    pub fn with_restore(mut self, restore: RestoreMode) -> Self {
+        self.restore = Some(restore);
+        self
     }
 
     pub fn resume(mut self, session_id: impl Into<String>) -> Self {
@@ -255,6 +285,122 @@ pub struct InitializeResult {
     pub event_cursor: Option<i64>,
     #[serde(default)]
     pub capabilities: Option<std::collections::HashMap<String, CapabilityEntry>>,
+    /// Present when the client asked for `restore`.
+    #[serde(default)]
+    pub restored: Option<RestoredSummary>,
+}
+
+/// `initialize.restore`: `true` (restore and let suspended subagents
+/// continue), `false` (restore nothing) or `"suspended"` (restore and keep
+/// restored subagents suspended until `task/resume`). Anything else is
+/// refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreMode {
+    Off,
+    Resume,
+    Suspended,
+}
+
+impl Serialize for RestoreMode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            RestoreMode::Off => serializer.serialize_bool(false),
+            RestoreMode::Resume => serializer.serialize_bool(true),
+            RestoreMode::Suspended => serializer.serialize_str("suspended"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RestoreMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = RestoreMode;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("true, false or \"suspended\"")
+            }
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<RestoreMode, E> {
+                Ok(if value { RestoreMode::Resume } else { RestoreMode::Off })
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<RestoreMode, E> {
+                match value {
+                    "suspended" => Ok(RestoreMode::Suspended),
+                    other => Err(E::invalid_value(serde::de::Unexpected::Str(other), &self)),
+                }
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+#[cfg(feature = "schema")]
+impl schemars::JsonSchema for RestoreMode {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "RestoreMode".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "description": "`true` restores and lets suspended subagents continue, `false` restores nothing, `\"suspended\"` restores and keeps restored subagents suspended.",
+            "oneOf": [
+                { "type": "boolean" },
+                { "type": "string", "const": "suspended" }
+            ]
+        })
+    }
+}
+
+/// A saved setting that was deliberately not applied on restore.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SettingNotRestored {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    pub reason: String,
+}
+
+/// `InitializeResponse.restored`: what a `restore` request applied, or why
+/// the restart file was ignored (`ignoredReason`: `missing`, `unreadable`,
+/// `sessionMismatch`, `workingDirMismatch`, `expired`, `consumeFailed`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RestoredSummary {
+    pub applied: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignored_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_version: Option<String>,
+    #[serde(default)]
+    pub schedules: usize,
+    #[serde(default)]
+    pub messages: usize,
+    /// Names of the settings that were applied.
+    #[serde(default)]
+    pub settings: Vec<String>,
+    #[serde(default)]
+    pub settings_not_restored: Vec<SettingNotRestored>,
+    #[serde(default)]
+    pub interrupted_tasks: usize,
+    #[serde(default)]
+    pub interrupted_requests: usize,
+    /// Steering messages that were queued but undelivered at the restart.
+    #[serde(default)]
+    pub steering: usize,
+    /// Ids of the subagents re-created under their original ids.
+    #[serde(default)]
+    pub tasks: Vec<String>,
+    /// Whether restored subagents were kept suspended (`restore: "suspended"`).
+    #[serde(default)]
+    pub tasks_suspended: bool,
 }
 
 /// The current Rust engine's initialize response. Unlike `InitializeResult`,
@@ -272,6 +418,9 @@ pub struct InitializeResponse {
     pub engine_instance_id: String,
     pub event_cursor: i64,
     pub capabilities: std::collections::HashMap<String, CapabilityEntry>,
+    /// Present exactly when the client asked for `restore`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored: Option<RestoredSummary>,
 }
 
 /// Shared `{ "ok": true }` shape used by interrupt and shutdown.
@@ -1108,6 +1257,88 @@ impl Correlation {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── Planned restart ──────────────────────────────────────────────────
+
+    #[test]
+    fn restore_mode_accepts_true_false_and_suspended_only() {
+        for (wire, mode) in [
+            (json!(true), RestoreMode::Resume),
+            (json!(false), RestoreMode::Off),
+            (json!("suspended"), RestoreMode::Suspended),
+        ] {
+            let parsed: RestoreMode = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(parsed, mode);
+            assert_eq!(serde_json::to_value(mode).unwrap(), wire);
+        }
+        for bad in [json!("true"), json!("resume"), json!(1), json!(null), json!({})] {
+            assert!(serde_json::from_value::<RestoreMode>(bad.clone()).is_err(), "{bad}");
+        }
+        let params = InitializeParams::new("tui").resume("s1").with_restore(RestoreMode::Suspended);
+        let value = serde_json::to_value(&params).unwrap();
+        assert_eq!(value["restore"], "suspended");
+        assert!(serde_json::to_value(InitializeParams::new("tui")).unwrap().get("restore").is_none());
+    }
+
+    #[test]
+    fn initialize_response_restored_shape() {
+        let restored = RestoredSummary {
+            applied: true,
+            prepared_at: Some("2026-11-02T10:00:00Z".into()),
+            from_version: Some("0.1.176".into()),
+            to_version: Some("0.1.177".into()),
+            schedules: 2,
+            messages: 1,
+            settings: vec!["model".into()],
+            settings_not_restored: vec![SettingNotRestored {
+                name: "permissionMode".into(),
+                value: Some("bypassPermissions".into()),
+                reason: "bypassPermissions is never restored".into(),
+            }],
+            tasks: vec!["task-00000002".into()],
+            ..Default::default()
+        };
+        let response = InitializeResponse {
+            protocol_version: "1".into(),
+            session_id: "s1".into(),
+            server_info: "coda".into(),
+            telemetry_log_path: None,
+            contract_version: CONTRACT_VERSION.into(),
+            engine_instance_id: "e1".into(),
+            event_cursor: 0,
+            capabilities: Default::default(),
+            restored: Some(restored),
+        };
+        let value = serde_json::to_value(&response).unwrap();
+        let restored = &value["restored"];
+        assert_eq!(restored["applied"], true);
+        assert_eq!(restored["preparedAt"], "2026-11-02T10:00:00Z");
+        assert_eq!(restored["fromVersion"], "0.1.176");
+        assert_eq!(restored["settingsNotRestored"][0]["name"], "permissionMode");
+        assert_eq!(restored["settingsNotRestored"][0]["value"], "bypassPermissions");
+        assert_eq!(restored["tasksSuspended"], false);
+        assert_eq!(restored["interruptedTasks"], 0);
+        assert!(restored.get("ignoredReason").is_none());
+        let lenient: InitializeResult = serde_json::from_value(value).unwrap();
+        let summary = lenient.restored.expect("lenient reader keeps restored");
+        assert_eq!(summary.schedules, 2);
+        assert_eq!(summary.tasks, ["task-00000002"]);
+
+        let ignored: InitializeResult = serde_json::from_value(json!({
+            "protocolVersion": "1", "sessionId": "s1", "serverInfo": "coda",
+            "restored": { "applied": false, "ignoredReason": "missing" }
+        }))
+        .unwrap();
+        let summary = ignored.restored.unwrap();
+        assert!(!summary.applied);
+        assert_eq!(summary.ignored_reason.as_deref(), Some("missing"));
+        assert!(serde_json::from_value::<InitializeResult>(json!({
+            "protocolVersion": "1", "sessionId": "s1", "serverInfo": "coda"
+        }))
+        .unwrap()
+        .restored
+        .is_none());
+    }
 
     // ── Reverse-request public handle (Stage E) ──────────────────────────
 

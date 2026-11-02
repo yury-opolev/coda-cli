@@ -19,6 +19,11 @@ pub const INITIALIZATION_GATED_METHODS: &[&str] = &[
     crate::messages::method::TASK_STOP,
     crate::messages::method::TASK_SEND,
     crate::messages::method::ASK_ASIDE,
+    crate::messages::method::PREPARE_RESTART,
+    crate::messages::method::TASK_SUSPEND,
+    crate::messages::method::TASK_RESUME,
+    crate::messages::method::SUSPEND_ALL_TASKS,
+    crate::messages::method::RESUME_ALL_TASKS,
 ];
 
 /// Which tasks `session/listTasks` (and the model's `task_list`) return.
@@ -98,6 +103,24 @@ pub struct TaskIdParams {
 pub struct TaskSendParams {
     pub task_id: String,
     pub text: String,
+}
+
+/// `session/prepareRestart`. Every field is optional.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct PrepareRestartParams {
+    /// How long to wait for running work before interrupting it. Default
+    /// 600000, maximum 3600000; `0` interrupts immediately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_timeout_ms: Option<u64>,
+    /// Free text recorded in the restart file and the `[restart]` note.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The last `notify_user` cursor the client has shown; later ones are
+    /// saved and re-delivered after the restart. Absent means `0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_cursor: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -306,6 +329,45 @@ mod tests {
         let error = parse(serde_json::json!({ "statusFilter": "done" })).unwrap_err().to_string();
         assert!(error.contains("done") && error.contains("active"), "{error}");
         assert_eq!(TaskStatusFilter::parse("Active"), None);
+    }
+
+    #[test]
+    fn prepare_restart_params_camel_case() {
+        let params: PrepareRestartParams = serde_json::from_value(serde_json::json!({
+            "drainTimeoutMs": 0, "reason": "upgrade", "deliveredCursor": 12
+        }))
+        .unwrap();
+        assert_eq!(params.drain_timeout_ms, Some(0));
+        assert_eq!(params.reason.as_deref(), Some("upgrade"));
+        assert_eq!(params.delivered_cursor, Some(12));
+        let empty: PrepareRestartParams = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(empty, PrepareRestartParams::default());
+        assert_eq!(serde_json::to_value(&empty).unwrap(), serde_json::json!({}));
+
+        let result = crate::responses::PrepareRestartResult {
+            ok: true,
+            restart_file: "C:\\w\\.coda\\sessions\\s1.restart.json".into(),
+            drained: false,
+            interrupted_tasks: 1,
+            interrupted_requests: 0,
+            suspended_tasks: vec!["task-00000002".into()],
+        };
+        assert_eq!(serde_json::to_value(&result).unwrap(), serde_json::json!({
+            "ok": true, "restartFile": "C:\\w\\.coda\\sessions\\s1.restart.json",
+            "drained": false, "interruptedTasks": 1, "interruptedRequests": 0,
+            "suspendedTasks": ["task-00000002"],
+        }));
+    }
+
+    #[test]
+    fn task_suspension_methods_are_initialization_gated() {
+        use crate::messages::method as m;
+        for method in [
+            m::PREPARE_RESTART, m::TASK_SUSPEND, m::TASK_RESUME, m::SUSPEND_ALL_TASKS,
+            m::RESUME_ALL_TASKS,
+        ] {
+            assert!(INITIALIZATION_GATED_METHODS.contains(&method), "{method}");
+        }
     }
 
     #[test]

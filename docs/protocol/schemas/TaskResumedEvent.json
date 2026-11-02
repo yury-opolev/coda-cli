@@ -1,0 +1,34 @@
+{
+  "type": "object",
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "engineInstanceId": {
+      "type": "string"
+    },
+    "taskId": {
+      "type": "string",
+      "default": ""
+    },
+    "ownerTaskId": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The task id of the agent that started the task; absent for the main\nagent.",
+      "default": null
+    },
+    "kind": {
+      "type": "string",
+      "default": ""
+    }
+  },
+  "required": [
+    "seq",
+    "engineInstanceId"
+  ],
+  "title": "TaskResumedEvent",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

@@ -1382,6 +1382,7 @@ mod lifecycle {
                 engine_instance_id: Some("e2".into()),
                 event_cursor: Some(0),
                 capabilities: None,
+                restored: None,
             },
             session_id: "resumed-session".into(),
             forked_from: None,

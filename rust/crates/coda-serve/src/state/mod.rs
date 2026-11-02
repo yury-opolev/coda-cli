@@ -1657,6 +1657,7 @@ impl EngineState {
             usage,
             limits,
             capabilities: inner.capabilities.clone(),
+            drain: None,
         }
     }
 }

@@ -82,6 +82,17 @@
       "additionalProperties": {
         "$ref": "#/$defs/CapabilityEntry"
       }
+    },
+    "drain": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/DrainState"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Present while the engine is draining for a planned restart."
     }
   },
   "required": [
@@ -110,6 +121,7 @@
         "initializing",
         "ready",
         "busy",
+        "draining",
         "stopping",
         "stopped"
       ]
@@ -1256,6 +1268,42 @@
         "supported"
       ],
       "description": "One entry in `InitializeResult.capabilities` — whether a named capability\nis supported by this engine build, with an explanatory reason when not."
+    },
+    "DrainState": {
+      "type": "object",
+      "properties": {
+        "startedAt": {
+          "type": "string",
+          "description": "RFC 3339 UTC."
+        },
+        "deadlineAt": {
+          "type": "string",
+          "description": "RFC 3339 UTC; running work is interrupted at this instant."
+        },
+        "remainingMs": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "Milliseconds until `deadlineAt`, never negative."
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "completed": {
+          "type": "boolean",
+          "description": "The restart file has been written."
+        }
+      },
+      "required": [
+        "startedAt",
+        "deadlineAt",
+        "remainingMs",
+        "completed"
+      ],
+      "description": "Progress of a planned-restart drain (`StateSnapshot.drain`)."
     }
   }
 }

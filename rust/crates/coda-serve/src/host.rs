@@ -2954,6 +2954,7 @@ impl ServeBackend for ServeHost {
             engine_instance_id: self.engine_state.bus_ref().engine_instance_id().to_string(),
             event_cursor: self.engine_state.bus_ref().cursor(),
             capabilities: capability_catalog(),
+            restored: None,
         };
 
         // Surface any MCP connection/config failures now that a client is
@@ -4221,6 +4222,7 @@ impl ServeBackend for ServeHost {
                     mode: task.mode.as_str().into(),
                     output_tail,
                     report,
+                    suspend_requested: None,
                 }
             }).collect();
         serde_json::to_value(TaskListResult {

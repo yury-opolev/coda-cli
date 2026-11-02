@@ -31,6 +31,17 @@
       "additionalProperties": {
         "$ref": "#/$defs/CapabilityEntry"
       }
+    },
+    "restored": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RestoredSummary"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Present exactly when the client asked for `restore`."
     }
   },
   "required": [
@@ -63,6 +74,129 @@
         "supported"
       ],
       "description": "One entry in `InitializeResult.capabilities` — whether a named capability\nis supported by this engine build, with an explanatory reason when not."
+    },
+    "RestoredSummary": {
+      "type": "object",
+      "properties": {
+        "applied": {
+          "type": "boolean"
+        },
+        "ignoredReason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "preparedAt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fromVersion": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "toVersion": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "schedules": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        },
+        "messages": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        },
+        "settings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Names of the settings that were applied.",
+          "default": []
+        },
+        "settingsNotRestored": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SettingNotRestored"
+          },
+          "default": []
+        },
+        "interruptedTasks": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        },
+        "interruptedRequests": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        },
+        "steering": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "description": "Steering messages that were queued but undelivered at the restart.",
+          "default": 0
+        },
+        "tasks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Ids of the subagents re-created under their original ids.",
+          "default": []
+        },
+        "tasksSuspended": {
+          "type": "boolean",
+          "description": "Whether restored subagents were kept suspended (`restore: \"suspended\"`).",
+          "default": false
+        }
+      },
+      "required": [
+        "applied"
+      ],
+      "description": "`InitializeResponse.restored`: what a `restore` request applied, or why\nthe restart file was ignored (`ignoredReason`: `missing`, `unreadable`,\n`sessionMismatch`, `workingDirMismatch`, `expired`, `consumeFailed`)."
+    },
+    "SettingNotRestored": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "value": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "reason"
+      ],
+      "description": "A saved setting that was deliberately not applied on restore."
     }
   }
 }
