@@ -20,6 +20,7 @@ pub mod bundle;
 pub mod forking;
 pub mod ids;
 pub mod message_json;
+pub mod private_file;
 pub mod store;
 
 // Convenience re-exports.
