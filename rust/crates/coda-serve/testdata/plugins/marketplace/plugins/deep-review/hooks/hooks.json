@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo {\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"DEEP-REVIEW-HOOK-RAN\"}}",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

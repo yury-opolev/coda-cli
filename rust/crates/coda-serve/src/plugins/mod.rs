@@ -25,6 +25,7 @@ pub mod install;
 pub mod manifest;
 pub mod settings;
 pub mod trust;
+pub mod wiring;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -83,6 +84,8 @@ pub struct PluginDescriptor {
     pub command_dirs: Vec<PathBuf>,
     /// Existing agent directories (each holds `*.md`).
     pub agent_dirs: Vec<PathBuf>,
+    /// Components that execute or connect; each needs approval.
+    pub exec: Vec<trust::ExecComponent>,
 }
 
 impl PluginDescriptor {
@@ -114,6 +117,14 @@ impl PluginSet {
     pub fn find(&self, name: &str) -> Option<&PluginDescriptor> {
         self.plugins.iter().find(|p| p.name.eq_ignore_ascii_case(name))
     }
+}
+
+/// Discovers the plugins visible from `workspace` with the user's settings
+/// (`<CODA_HOME>/.coda/settings.json`).
+pub fn load_for_workspace(workspace: &Path) -> PluginSet {
+    let coda_dir = coda_auth::coda_dir();
+    let settings = crate::settings::load_settings_json(&coda_dir.join("settings.json"));
+    discover_from_settings(workspace, &coda_dir, &settings)
 }
 
 /// Discovers plugins using the user settings file and legacy state under
@@ -273,6 +284,7 @@ fn load_descriptor(root: &Path, source: PluginSource, settings: &PluginSettings)
         skill_dirs: Vec::new(),
         command_dirs: Vec::new(),
         agent_dirs: Vec::new(),
+        exec: Vec::new(),
     };
     match manifest::load(&root) {
         Some(Ok((m, bytes))) => {
@@ -283,6 +295,7 @@ fn load_descriptor(root: &Path, source: PluginSource, settings: &PluginSettings)
             descriptor.command_dirs =
                 component_dirs(&root, "commands", &m.commands, &mut descriptor.errors);
             descriptor.agent_dirs = component_dirs(&root, "agents", &m.agents, &mut descriptor.errors);
+            descriptor.exec = components::exec_components(&root, &m, &mut descriptor.errors);
             descriptor.manifest = Some(m);
             descriptor.manifest_bytes = bytes;
         }
