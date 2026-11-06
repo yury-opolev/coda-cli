@@ -249,9 +249,10 @@ Subagent types from this plugin (use with the `task` tool's subagentType): deep-
 <skill body>
 ```
 
-Plugin roots (and the directories of user-level skills) are added to the file tools' granted
-directories, so `read_file ../review/SKILL.md` or reading `scripts/helper.ps1` works without
-leaving default permission mode. Running a script still goes through the normal `run_command`
+Plugin roots (and the directories of user-level skills) are **readable** by the read-only file
+tools (`read_file`, `list_dir`, `glob`, `grep`), so `read_file ../review/SKILL.md` or reading
+`scripts/helper.ps1` works without leaving default permission mode. They are never writable by
+the write tools: otherwise the model could rewrite a script an approved hook runs. Running a script still goes through the normal `run_command`
 permission prompt. The TUI's `/skill <name>` runs local project/user skills directly and hands any
 other name (for example `deep-review:review`) to the model's `skill` tool.
 
@@ -284,7 +285,9 @@ Coda never silently runs third-party code:
   **approval**. An approval is keyed by SHA-256 of the plugin manifest bytes plus the component's
   kind, name and definition (and, for project plugins, the plugin directory, binding it to one
   checkout). Any change to the manifest or the definition yields a new key, so it must be
-  approved again. Approvals live in `~/.coda/plugin-trust.json` under
+  approved again. The key covers the definition, not the files a command points at, which is why
+  plugin directories are read-only to the agent's file tools. Approvals live in
+  `~/.coda/plugin-trust.json` under
   `pluginApprovals: { "<hash>": ["mcpServer" | "lspServer" | "hook"] }`.
 - The engine never prompts: unapproved components are not started (`plugins/list` reports them in
   `pendingApproval`; their hooks are listed by `hooks/list` disabled and untrusted). Approve with
