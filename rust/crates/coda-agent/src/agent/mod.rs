@@ -1193,6 +1193,13 @@ impl AgentLoopBuilder {
         self
     }
 
+    /// Extra roots file tools may access beyond the working directory (e.g.
+    /// the directories of loaded plugins, whose skills read sibling files).
+    pub fn with_granted_directories(mut self, dirs: std::collections::HashSet<String>) -> Self {
+        self.granted_directories = if dirs.is_empty() { None } else { Some(dirs) };
+        self
+    }
+
     pub fn with_working_directory(mut self, dir: impl Into<String>) -> Self {
         self.working_directory = dir.into();
         self

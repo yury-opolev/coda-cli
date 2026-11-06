@@ -36,7 +36,7 @@ use crate::tool::{ToolRegistry, ToolQuarantine};
 
 use super::checkpoint::{SubagentCheckpoint, SubagentSpec, SUBAGENT_CHECKPOINT_VERSION};
 use super::{
-    BuiltInAgents, SubagentFactory, SubagentRequest, MAX_SUBAGENT_DEPTH,
+    SubagentFactory, SubagentRegistry, SubagentRequest, MAX_SUBAGENT_DEPTH,
     MAX_CONCURRENT_SUBAGENTS,
 };
 
@@ -93,6 +93,10 @@ pub struct SubagentHost {
     working_directory: String,
     hook_runner: Option<Arc<HookRunner>>,
     semaphore: Arc<Semaphore>,
+    /// Plugin-contributed agent definitions; built-ins always win.
+    registry: Arc<SubagentRegistry>,
+    /// Extra roots file tools may read (plugin directories), handed to every child.
+    granted_directories: Option<std::collections::HashSet<String>>,
 }
 
 impl SubagentHost {
@@ -129,6 +133,8 @@ impl SubagentHost {
             working_directory: working_directory.into(),
             hook_runner,
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            registry: Arc::new(SubagentRegistry::empty()),
+            granted_directories: None,
         })
     }
 
@@ -187,6 +193,20 @@ impl SubagentHost {
     /// Read-only accessor for the message bus this host was wired with.
     pub fn message_bus(&self) -> Option<&Arc<crate::message::MessageBus>> {
         self.message_bus.as_ref()
+    }
+
+    /// Resolve subagent types through `registry` (plugin agents) as well as the built-ins.
+    pub fn with_registry(self: Arc<Self>, registry: Arc<SubagentRegistry>) -> Arc<Self> {
+        let mut host = self.clone_for_background();
+        host.registry = registry;
+        Arc::new(host)
+    }
+
+    /// Extra directories children's file tools may access (plugin roots).
+    pub fn with_granted_directories(self: Arc<Self>, dirs: std::collections::HashSet<String>) -> Arc<Self> {
+        let mut host = self.clone_for_background();
+        host.granted_directories = if dirs.is_empty() { None } else { Some(dirs) };
+        Arc::new(host)
     }
 
     /// Share the run's outage-retry policy with every child this host spawns.
@@ -262,7 +282,7 @@ impl SubagentHost {
         sink: &Arc<dyn AgentSink>,
         cancel: &CancellationToken,
     ) -> Result<(String, String), String> {
-        let definition = BuiltInAgents::resolve(Some(&request.agent_type));
+        let definition = self.registry.try_resolve(Some(&request.agent_type))?;
 
         // Build the system prompt.
         let system_prompt = format!(
@@ -346,7 +366,7 @@ impl SubagentHost {
         cancel: CancellationToken,
         restored: Option<RestoredRun>,
     ) -> Result<String, String> {
-        let definition = BuiltInAgents::resolve(Some(&request.agent_type));
+        let definition = self.registry.try_resolve(Some(&request.agent_type))?;
 
         // Determine the model to use.
         let model = request.model.clone().unwrap_or_else(|| (self.base_model)());
@@ -433,6 +453,10 @@ impl SubagentHost {
         .with_task_manager(Arc::clone(&self.task_manager))
         .with_caller_task_id(request.task_id.clone())
         .with_subagent_factory(child_factory);
+
+        if let Some(dirs) = &self.granted_directories {
+            builder = builder.with_granted_directories(dirs.clone());
+        }
 
         if let Some(store) = &self.schedule_store {
             builder = builder.with_schedule_store(Arc::clone(store));
@@ -790,6 +814,8 @@ impl SubagentHost {
             hook_runner: self.hook_runner.clone(),
             outage_policy: self.outage_policy.clone(),
             semaphore: self.semaphore.clone(),
+            registry: self.registry.clone(),
+            granted_directories: self.granted_directories.clone(),
         }
     }
 }
@@ -1159,6 +1185,86 @@ mod tests {
         );
         // Nothing should have been registered in the task manager.
         assert_eq!(mgr.list().len(), 0, "no task must be registered when refused");
+    }
+
+    /// A plugin agent named by its short name runs with its own body as the
+    /// system prompt; an ambiguous short name is refused before any model call.
+    #[tokio::test]
+    async fn plugin_agents_resolve_through_the_registry() {
+        use coda_llm::anthropic::StreamEvent;
+        use coda_llm::{LlmError, Usage};
+        use async_trait::async_trait as at;
+        use crate::permission::PermissionPrompt;
+
+        struct Capture(std::sync::Mutex<Vec<String>>);
+        #[at]
+        impl coda_llm::LlmClient for Capture {
+            fn provider_id(&self) -> &str { "mock" }
+            async fn stream(&self, r: coda_llm::ChatRequest) -> Result<coda_llm::ResponseStream, LlmError> {
+                self.0.lock().unwrap().push(r.system.clone().unwrap_or_default());
+                let events = vec![
+                    Ok(StreamEvent::TextDelta("done".into())),
+                    Ok(StreamEvent::Done { stop_reason: Some("end_turn".into()), usage: Usage::ZERO }),
+                ];
+                let (tx, rx) = tokio::sync::mpsc::channel(8);
+                tokio::spawn(async move { for e in events { let _ = tx.send(e).await; } });
+                Ok(coda_llm::ResponseStream::new(rx))
+            }
+        }
+        struct AllowAll;
+        #[at]
+        impl PermissionPrompt for AllowAll {
+            async fn request(&self, _: &dyn crate::tool::Tool, _: &str, _: CancellationToken) -> bool { true }
+        }
+
+        let def = |t: &str, body: &str| super::super::SubagentDefinition {
+            agent_type: t.to_owned(),
+            description: String::new(),
+            system_prompt_body: body.to_owned(),
+            read_only_tools_only: false,
+            default_model: None,
+        };
+        let client = Arc::new(Capture(std::sync::Mutex::new(Vec::new())));
+        let mgr = crate::tasks::TaskManager::new(
+            "plugin-agent-session",
+            Some(std::env::temp_dir().join("coda-host-plugin-agent-tests")),
+            4096,
+            10,
+        );
+        let host = SubagentHost::new(
+            Arc::clone(&client) as Arc<dyn coda_llm::LlmClient>,
+            Arc::new(AllowAll),
+            Arc::new(PermissionModeState::new(crate::permission::PermissionMode::Default)),
+            Arc::new(crate::tool::ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0])),
+            Arc::new(crate::tool::ToolQuarantine::new()),
+            mgr,
+            "model",
+            4096,
+            5,
+            ".",
+            None,
+            2,
+        )
+        .with_registry(Arc::new(SubagentRegistry::new(vec![
+            def("deep-review:skeptic", "You are the skeptic."),
+            def("a:advocate", "A"),
+            def("b:advocate", "B"),
+        ])));
+
+        let request = SubagentRequest::foreground("skeptic", "go", "t1", 1);
+        host.run_foreground(request, Arc::new(crate::events::NullSink), CancellationToken::new())
+            .await
+            .expect("plugin agent run completes");
+        let seen = client.0.lock().unwrap().clone();
+        assert!(seen[0].starts_with("You are the skeptic."), "{seen:?}");
+
+        let ambiguous = SubagentRequest::foreground("advocate", "go", "t2", 1);
+        let err = host
+            .run_foreground(ambiguous, Arc::new(crate::events::NullSink), CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(err.contains("a:advocate") && err.contains("b:advocate"), "{err}");
+        assert_eq!(client.0.lock().unwrap().len(), 1, "no model call for an ambiguous type");
     }
 
     /// A subagent requests the budget resolved for the model it runs on, not

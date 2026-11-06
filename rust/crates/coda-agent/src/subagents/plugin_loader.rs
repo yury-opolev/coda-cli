@@ -71,6 +71,33 @@ impl PluginAgentLoader {
 
         results
     }
+
+    /// Loads a plugin's agents and namespaces them as `<plugin>:<type>`, so
+    /// two plugins shipping `reviewer` never shadow each other.
+    /// `${CLAUDE_PLUGIN_ROOT}` and `${CODA_PLUGIN_ROOT}` in the body expand to
+    /// `plugin_root`, so an agent can reference its plugin's files.
+    pub fn load_for_plugin(
+        agents_dir: &Path,
+        plugin_name: &str,
+        is_project_plugin: bool,
+        plugin_root: &Path,
+    ) -> Vec<SubagentDefinition> {
+        let root = plugin_root.to_string_lossy();
+        let mut defs = Self::load_from_directory(
+            &agents_dir.to_string_lossy(),
+            plugin_name,
+            is_project_plugin,
+        );
+        for def in &mut defs {
+            def.agent_type = format!("{plugin_name}:{}", def.agent_type);
+            def.system_prompt_body = def
+                .system_prompt_body
+                .replace("${CLAUDE_PLUGIN_ROOT}", &root)
+                .replace("${CODA_PLUGIN_ROOT}", &root);
+        }
+        defs.sort_by(|a, b| a.agent_type.cmp(&b.agent_type));
+        defs
+    }
 }
 
 /// Parse a single `.md` agent file. Returns `None` and logs on any fatal parse issue.
@@ -111,13 +138,25 @@ fn parse_agent_file(
         }
     }
 
-    // `type` is not a standard skill key — it lands in unknown_keys.
-    let agent_type = fm.unknown_keys.get("type").map(String::as_str).unwrap_or("").trim().to_owned();
+    // `type` is Coda's key; Claude-format agents use `name`; the file stem is
+    // the last resort, as in other Claude-format CLIs. Neither is a standard
+    // skill key, so both land in unknown_keys.
+    let stem = Path::new(file_name)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let agent_type = ["type", "name"]
+        .iter()
+        .filter_map(|k| fm.unknown_keys.get(*k))
+        .map(|v| v.trim())
+        .find(|v| !v.is_empty())
+        .unwrap_or(stem.trim())
+        .to_owned();
     if agent_type.is_empty() {
         tracing::warn!(
             plugin = plugin_name,
             file = file_name,
-            "agent file has no 'type' field — skipped"
+            "agent file has no 'type' or 'name' field — skipped"
         );
         return None;
     }
@@ -375,12 +414,29 @@ mod tests {
     }
 
     #[test]
-    fn skips_file_without_type_field() {
-        let (_dir, agents) = load_from(&[(
-            "no-type.md",
-            "---\ndescription: No type declared\n---\nBody.",
-        )]);
-        assert!(agents.is_empty());
+    fn falls_back_to_the_claude_name_key_then_the_file_stem() {
+        let (_dir, agents) = load_from(&[
+            ("claude.md", "---\nname: skeptic\ndescription: Doubts\n---\nBody."),
+            ("no-type.md", "---\ndescription: No type declared\n---\nBody."),
+        ]);
+        let mut types: Vec<&str> = agents.iter().map(|a| a.agent_type.as_str()).collect();
+        types.sort();
+        assert_eq!(types, vec!["no-type", "skeptic"]);
+    }
+
+    #[test]
+    fn plugin_agents_are_namespaced_and_see_their_root() {
+        let dir = TempDir::new();
+        std::fs::write(
+            dir.path().join("advocate.md"),
+            "---\nname: advocate\n---\nRead ${CLAUDE_PLUGIN_ROOT}/x and ${CODA_PLUGIN_ROOT}/y.",
+        )
+        .unwrap();
+        let root = std::path::Path::new("R:/plug");
+        let agents = PluginAgentLoader::load_for_plugin(dir.path(), "deep-review", false, root);
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].agent_type, "deep-review:advocate");
+        assert_eq!(agents[0].system_prompt_body, "Read R:/plug/x and R:/plug/y.");
     }
 
     #[test]

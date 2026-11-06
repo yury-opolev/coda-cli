@@ -28,6 +28,48 @@ impl SubagentRegistry {
         Self { plugin_agents: Vec::new() }
     }
 
+    /// The plugin-contributed definitions, in registration order.
+    pub fn plugin_agents(&self) -> &[SubagentDefinition] {
+        &self.plugin_agents
+    }
+
+    /// Resolves a subagent type name, accepting a plugin agent's short name.
+    ///
+    /// Priority: built-in > exact plugin type (`plugin:agent`) > the unique
+    /// plugin agent whose short name matches > general-purpose fallback. A
+    /// short name shared by agents of several plugins is an error naming every
+    /// candidate rather than a silent pick.
+    pub fn try_resolve(&self, agent_type: Option<&str>) -> Result<SubagentDefinition, String> {
+        if let Some(t) = agent_type.map(str::trim).filter(|t| !t.is_empty()) {
+            if !BuiltInAgents::is_builtin(Some(t)) {
+                if let Some(def) = self.plugin_agents.iter().find(|d| d.agent_type.eq_ignore_ascii_case(t)) {
+                    return Ok(def.clone());
+                }
+                let short: Vec<&SubagentDefinition> = self
+                    .plugin_agents
+                    .iter()
+                    .filter(|d| {
+                        d.agent_type
+                            .rsplit_once(':')
+                            .is_some_and(|(_, s)| s.eq_ignore_ascii_case(t))
+                    })
+                    .collect();
+                match short.as_slice() {
+                    [one] => return Ok((*one).clone()),
+                    [] => {}
+                    many => {
+                        let names: Vec<&str> = many.iter().map(|d| d.agent_type.as_str()).collect();
+                        return Err(format!(
+                            "Subagent type '{t}' is ambiguous; use one of: {}",
+                            names.join(", ")
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(self.resolve(agent_type))
+    }
+
     /// Resolves a subagent type name.
     ///
     /// Priority: built-in (case-insensitive) > plugin-provided > fallback to general-purpose.
@@ -104,6 +146,21 @@ mod tests {
         let resolved = registry.resolve(Some("custom-type"));
         assert_eq!(resolved.agent_type, "custom-type");
         assert_eq!(resolved.system_prompt_body, "Custom body");
+    }
+
+    #[test]
+    fn plugin_agents_resolve_by_qualified_or_unique_short_name() {
+        let registry = SubagentRegistry::new(vec![
+            def("deep-review:skeptic", "skeptic body", false),
+            def("deep-review:advocate", "a1", false),
+            def("other:advocate", "a2", false),
+        ]);
+        assert_eq!(registry.try_resolve(Some("deep-review:skeptic")).unwrap().system_prompt_body, "skeptic body");
+        assert_eq!(registry.try_resolve(Some("SKEPTIC")).unwrap().agent_type, "deep-review:skeptic");
+        let err = registry.try_resolve(Some("advocate")).unwrap_err();
+        assert!(err.contains("deep-review:advocate") && err.contains("other:advocate"), "{err}");
+        assert_eq!(registry.try_resolve(Some("explore")).unwrap().agent_type, "explore");
+        assert_eq!(registry.try_resolve(Some("nobody")).unwrap().agent_type, "general-purpose");
     }
 
     #[test]
