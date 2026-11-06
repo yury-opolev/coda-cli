@@ -23,9 +23,10 @@ pub struct PluginWiring {
     pub skills: Vec<SkillInfo>,
     pub catalog: Vec<SkillEntry>,
     pub agents: Vec<SubagentDefinition>,
-    /// Plugin roots and non-project skill directories: file tools may read
-    /// there so skills can open their sibling files.
-    pub granted_directories: HashSet<String>,
+    /// Plugin roots and non-project skill directories: the read-only file
+    /// tools may read there so skills can open their sibling files. Never
+    /// writable.
+    pub readable_directories: HashSet<String>,
     /// Plugin hooks; unapproved ones are disabled.
     pub hooks: Vec<UserHook>,
     /// Content hashes of approved plugin hooks, to pre-trust for the session.
@@ -45,11 +46,11 @@ impl PluginWiring {
         let skills = skills::discover(workspace, plugins);
         let catalog = skills::catalog(&skills, &agents_by_plugin);
 
-        let mut granted_directories: HashSet<String> =
+        let mut readable_directories: HashSet<String> =
             plugins.active().map(|p| p.root.to_string_lossy().into_owned()).collect();
         for s in skills.iter().filter(|s| s.plugin.is_none() && s.source_path.is_none()) {
             if let Some(dir) = s.file.parent() {
-                granted_directories.insert(dir.to_string_lossy().into_owned());
+                readable_directories.insert(dir.to_string_lossy().into_owned());
             }
         }
 
@@ -66,7 +67,7 @@ impl PluginWiring {
             skills,
             catalog,
             agents,
-            granted_directories,
+            readable_directories,
             hooks,
             trusted_hook_hashes,
             lsp_servers: components::approved_lsp_servers(plugins, trust),
@@ -157,7 +158,7 @@ mod tests {
         assert_eq!(wiring.agents[0].agent_type, "deep-review:skeptic");
         let entry = wiring.catalog.iter().find(|e| e.name == "deep-review:review").unwrap();
         assert_eq!(entry.plugin_agents, vec!["deep-review:skeptic".to_owned()]);
-        assert!(wiring.granted_directories.contains(&*set.plugins[0].root.to_string_lossy()));
+        assert!(wiring.readable_directories.contains(&*set.plugins[0].root.to_string_lossy()));
         assert_eq!(wiring.hooks.len(), 1);
         assert!(!wiring.hooks[0].enabled, "unapproved hooks never run");
         assert!(wiring.trusted_hook_hashes.is_empty());

@@ -190,6 +190,7 @@ pub struct AgentLoop {
     effort: Option<Effort>,
     working_directory: String,
     granted_directories: Option<std::collections::HashSet<String>>,
+    readable_directories: Option<std::collections::HashSet<String>>,
 
     // Tuning knobs.
     tool_max_duration: Option<Duration>,
@@ -793,6 +794,7 @@ impl AgentLoop {
                     steering: self.steering.as_deref(),
                     working_directory: &self.working_directory,
                     granted_directories: self.granted_directories.as_ref(),
+                    readable_directories: self.readable_directories.as_ref(),
                     tool_max_duration: self.tool_max_duration,
                     tool_progress_interval: self.tool_progress_interval,
                     // Service handles forwarded into every ToolContext (CRITICAL 1).
@@ -1076,6 +1078,7 @@ pub struct AgentLoopBuilder {
     effort: Option<Effort>,
     working_directory: String,
     granted_directories: Option<std::collections::HashSet<String>>,
+    readable_directories: Option<std::collections::HashSet<String>>,
     tool_max_duration: Option<Duration>,
     tool_progress_interval: Duration,
     max_transport_retries: Option<u32>,
@@ -1124,6 +1127,7 @@ impl AgentLoopBuilder {
             effort: None,
             working_directory: String::new(),
             granted_directories: None,
+            readable_directories: None,
             tool_max_duration: Some(Duration::from_secs(30 * 60)),
             tool_progress_interval: Duration::from_secs(15),
             max_transport_retries: None,
@@ -1193,10 +1197,11 @@ impl AgentLoopBuilder {
         self
     }
 
-    /// Extra roots file tools may access beyond the working directory (e.g.
-    /// the directories of loaded plugins, whose skills read sibling files).
-    pub fn with_granted_directories(mut self, dirs: std::collections::HashSet<String>) -> Self {
-        self.granted_directories = if dirs.is_empty() { None } else { Some(dirs) };
+    /// Extra roots the read-only file tools may read beyond the working
+    /// directory (e.g. the directories of loaded plugins, whose skills read
+    /// sibling files). Write tools never see them.
+    pub fn with_readable_directories(mut self, dirs: std::collections::HashSet<String>) -> Self {
+        self.readable_directories = if dirs.is_empty() { None } else { Some(dirs) };
         self
     }
 
@@ -1377,6 +1382,7 @@ impl AgentLoopBuilder {
             effort: self.effort,
             working_directory: self.working_directory,
             granted_directories: self.granted_directories,
+            readable_directories: self.readable_directories,
             tool_max_duration: self.tool_max_duration,
             tool_progress_interval: self.tool_progress_interval,
             max_transport_retries: self.max_transport_retries,

@@ -46,8 +46,30 @@ pub fn git(dir: Option<&Path>, args: &[&str]) -> Result<String, String> {
     }
 }
 
+/// Refuses refs and URLs git would read as options (`--upload-pack=…`).
+fn check_arg(kind: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() || value.starts_with('-') {
+        return Err(format!("invalid git {kind}: '{value}'"));
+    }
+    Ok(())
+}
+
+/// `true` when `dir` is the top level of its own git checkout. Never act on
+/// a directory that is merely *inside* some other repository: `reset --hard`
+/// there would rewrite the enclosing workspace.
+pub fn is_own_checkout(dir: &Path) -> bool {
+    dir.join(".git").exists()
+        && git(Some(dir), &["rev-parse", "--show-toplevel"])
+            .map(|top| super::canonical(Path::new(&top)) == super::canonical(dir))
+            .unwrap_or(false)
+}
+
 /// Clones `url` (at `git_ref` when given) into `dest`, shallowly.
 pub fn clone(url: &str, git_ref: Option<&str>, dest: &Path) -> Result<(), String> {
+    check_arg("URL", url)?;
+    if let Some(r) = git_ref {
+        check_arg("ref", r)?;
+    }
     let dest_s = dest.to_string_lossy().into_owned();
     let mut args = vec!["clone", "--depth", "1", "--quiet"];
     if let Some(r) = git_ref {
@@ -60,6 +82,12 @@ pub fn clone(url: &str, git_ref: Option<&str>, dest: &Path) -> Result<(), String
 /// Moves a checkout to the commit `git_ref` (or the remote's default branch)
 /// currently points at. Returns the new commit.
 pub fn fetch_and_reset(dir: &Path, git_ref: Option<&str>) -> Result<String, String> {
+    if let Some(r) = git_ref {
+        check_arg("ref", r)?;
+    }
+    if !is_own_checkout(dir) {
+        return Err(format!("{} is not a git checkout of its own; not updating it", dir.display()));
+    }
     git(Some(dir), &["fetch", "--depth", "1", "--quiet", "origin", git_ref.unwrap_or("HEAD")])?;
     git(Some(dir), &["reset", "--hard", "--quiet", "FETCH_HEAD"])?;
     head_commit(dir)
@@ -145,6 +173,24 @@ mod tests {
         assert!(!looks_like_git_url("review@local"));
         assert_eq!(split_ref("https://x/r.git#v2"), ("https://x/r.git".to_owned(), Some("v2".to_owned())));
         assert_eq!(split_ref("https://x/r.git"), ("https://x/r.git".to_owned(), None));
+        assert!(check_arg("ref", "--upload-pack=evil").is_err());
+        assert!(clone("https://x/r.git", Some("-x"), Path::new("unused")).is_err());
+    }
+
+    /// A directory inside another repository is not updated: `reset --hard`
+    /// there would rewrite the enclosing checkout.
+    #[test]
+    fn only_a_checkout_of_its_own_is_reset() {
+        if git(None, &["--version"]).is_err() {
+            return;
+        }
+        let repo = tempfile::tempdir().unwrap();
+        git(Some(repo.path()), &["init", "--quiet"]).unwrap();
+        let nested = repo.path().join(".coda/plugins/x");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert!(!is_own_checkout(&nested));
+        assert!(fetch_and_reset(&nested, None).unwrap_err().contains("not a git checkout of its own"));
+        assert!(is_own_checkout(repo.path()));
     }
 
     #[test]

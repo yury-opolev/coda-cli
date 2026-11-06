@@ -95,8 +95,9 @@ pub struct SubagentHost {
     semaphore: Arc<Semaphore>,
     /// Plugin-contributed agent definitions; built-ins always win.
     registry: Arc<SubagentRegistry>,
-    /// Extra roots file tools may read (plugin directories), handed to every child.
-    granted_directories: Option<std::collections::HashSet<String>>,
+    /// Extra roots the read-only file tools may read (plugin directories),
+    /// handed to every child.
+    readable_directories: Option<std::collections::HashSet<String>>,
 }
 
 impl SubagentHost {
@@ -134,7 +135,7 @@ impl SubagentHost {
             hook_runner,
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
             registry: Arc::new(SubagentRegistry::empty()),
-            granted_directories: None,
+            readable_directories: None,
         })
     }
 
@@ -202,10 +203,10 @@ impl SubagentHost {
         Arc::new(host)
     }
 
-    /// Extra directories children's file tools may access (plugin roots).
-    pub fn with_granted_directories(self: Arc<Self>, dirs: std::collections::HashSet<String>) -> Arc<Self> {
+    /// Extra directories children's read-only file tools may read (plugin roots).
+    pub fn with_readable_directories(self: Arc<Self>, dirs: std::collections::HashSet<String>) -> Arc<Self> {
         let mut host = self.clone_for_background();
-        host.granted_directories = if dirs.is_empty() { None } else { Some(dirs) };
+        host.readable_directories = if dirs.is_empty() { None } else { Some(dirs) };
         Arc::new(host)
     }
 
@@ -454,8 +455,8 @@ impl SubagentHost {
         .with_caller_task_id(request.task_id.clone())
         .with_subagent_factory(child_factory);
 
-        if let Some(dirs) = &self.granted_directories {
-            builder = builder.with_granted_directories(dirs.clone());
+        if let Some(dirs) = &self.readable_directories {
+            builder = builder.with_readable_directories(dirs.clone());
         }
 
         if let Some(store) = &self.schedule_store {
@@ -815,7 +816,7 @@ impl SubagentHost {
             outage_policy: self.outage_policy.clone(),
             semaphore: self.semaphore.clone(),
             registry: self.registry.clone(),
-            granted_directories: self.granted_directories.clone(),
+            readable_directories: self.readable_directories.clone(),
         }
     }
 }

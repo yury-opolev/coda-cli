@@ -380,6 +380,9 @@ fn update(env: &mut CliEnv, name: Option<&str>, yes: bool) -> Result<(), String>
                 continue;
             }
             if m.path.is_dir() {
+                if !install::is_own_checkout(&m.path) {
+                    return Err(format!("marketplace '{}' at {} is not a git checkout of its own", m.id, m.path.display()));
+                }
                 install::git(Some(&m.path), &["pull", "--ff-only", "--quiet"])?;
             } else {
                 install::clone(url, None, &m.path)?;
@@ -389,11 +392,16 @@ fn update(env: &mut CliEnv, name: Option<&str>, yes: bool) -> Result<(), String>
         }
     }
     let set = discover(env)?;
+    let user_dir = super::canonical(&env.coda_dir.join("plugins"));
     for plugin in &set.plugins {
         if name.is_some_and(|n| !n.eq_ignore_ascii_case(&plugin.name)) {
             continue;
         }
-        if let Some(receipt) = install::read_receipt(&plugin.root) {
+        // Only git installs this command made: a receipt in a project or
+        // referenced directory is just a file someone shipped.
+        let installed_here = plugin.source == PluginSource::User && plugin.root.starts_with(&user_dir);
+        let receipt = if installed_here { install::read_receipt(&plugin.root) } else { None };
+        if let Some(receipt) = receipt {
             let url = receipt["url"].as_str().unwrap_or_default().to_owned();
             let git_ref = receipt["ref"].as_str().map(str::to_owned);
             let before = receipt["commit"].as_str().unwrap_or_default().to_owned();
@@ -403,8 +411,8 @@ fn update(env: &mut CliEnv, name: Option<&str>, yes: bool) -> Result<(), String>
                 env.out,
                 "Updated '{}': {} -> {}.",
                 plugin.name,
-                &before.get(..12).unwrap_or(&before),
-                &commit.get(..12).unwrap_or(&commit)
+                before.get(..12).unwrap_or(&before),
+                commit.get(..12).unwrap_or(&commit)
             )
             .ok();
             updated += 1;
@@ -657,6 +665,17 @@ mod tests {
         h.run(&["marketplace", "remove", "local"]).unwrap();
         assert!(h.settings()["plugins"]["marketplaces"].as_object().unwrap().is_empty());
         assert!(h.run(&["install", "alpha@nope"]).unwrap_err().contains("no marketplace 'nope'"));
+    }
+
+    #[test]
+    fn update_ignores_receipts_outside_the_user_plugin_directory() {
+        let mut h = Harness::new();
+        let root = h.ws.join(".coda/plugins/p");
+        plugin(&root, "shipped");
+        write(&root.join(install::RECEIPT_FILE), r#"{"source":"git","url":"https://x/r.git","ref":"--upload-pack=evil"}"#);
+        let out = h.run(&["update"]).unwrap();
+        assert!(out.contains("Nothing to update"), "{out}");
+        assert!(root.join(".claude-plugin/plugin.json").exists());
     }
 
     #[test]

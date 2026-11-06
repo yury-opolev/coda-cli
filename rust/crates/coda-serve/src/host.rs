@@ -1172,8 +1172,8 @@ pub struct ServeHost {
     plugin_trust: crate::plugins::trust::PluginTrustStore,
     /// Plugin-contributed subagent types, shared with every subagent host.
     subagent_registry: Arc<coda_agent::SubagentRegistry>,
-    /// Plugin roots and skill directories the file tools may read.
-    granted_directories: std::collections::HashSet<String>,
+    /// Plugin roots and skill directories the read-only file tools may read.
+    readable_directories: std::collections::HashSet<String>,
     /// `SessionStart` hooks fire once, on this instance's first prompt.
     session_start_fired: std::sync::atomic::AtomicBool,
     /// SubagentHost, HookRunner, ScheduleRuntime — built lazily on first prompt.
@@ -1488,8 +1488,8 @@ impl ServeHost {
         let subagent_registry = Arc::new(coda_agent::SubagentRegistry::new(
             wiring.as_ref().map(|w| w.agents.clone()).unwrap_or_default(),
         ));
-        let granted_directories =
-            wiring.as_ref().map(|w| w.granted_directories.clone()).unwrap_or_default();
+        let readable_directories =
+            wiring.as_ref().map(|w| w.readable_directories.clone()).unwrap_or_default();
 
         let mut registry =
             ToolRegistry::new(built_in_tools().into_iter().chain(mcp_tools).chain(plugin_tools));
@@ -1662,7 +1662,7 @@ impl ServeHost {
             plugins,
             plugin_trust,
             subagent_registry,
-            granted_directories,
+            readable_directories,
             session_start_fired: std::sync::atomic::AtomicBool::new(false),
             session_services: tokio::sync::Mutex::new(None),
             mcp_manager,
@@ -2984,7 +2984,7 @@ impl ServeHost {
         .with_message_bus(Arc::clone(&self.message_bus))
         .with_outage_policy(Arc::clone(&self.outage_policy))
         .with_registry(Arc::clone(&self.subagent_registry))
-        .with_granted_directories(self.granted_directories.clone());
+        .with_readable_directories(self.readable_directories.clone());
 
         // 2. Trust guard using the session-scoped trust store.
         let trust_guard = HookTrustGuard::new(
@@ -3025,7 +3025,7 @@ impl ServeHost {
         .with_schedule_store(Arc::clone(&self.schedule_store))
         .with_message_bus(Arc::clone(&self.message_bus))
         .with_registry(Arc::clone(&self.subagent_registry))
-        .with_granted_directories(self.granted_directories.clone());
+        .with_readable_directories(self.readable_directories.clone());
 
         // 5. Schedule runtime — fires due scheduled tasks via the main subagent.
         let runner = TaskManagerRunner::new(
@@ -6131,7 +6131,7 @@ impl ServeHost {
         .with_model(captured.config.model.clone())
         .with_model_budget(output_budget.budget)
         .with_working_directory(&self.working_dir)
-        .with_granted_directories(self.granted_directories.clone())
+        .with_readable_directories(self.readable_directories.clone())
         .with_effort(captured.config.effort)
         .with_steering(Arc::clone(&self.session.steering))
         .with_tool_user_question(uq_tool)
