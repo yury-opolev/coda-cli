@@ -53,7 +53,7 @@ impl Tool for GlobTool {
                 &ctx.working_directory,
                 p,
                 ctx.allow_outside_working_directory,
-                ctx.granted_directories.as_ref(),
+                ctx.read_roots().as_ref(),
             ) {
                 Ok(d) => d,
                 Err(e) => return ToolResult::error(e),

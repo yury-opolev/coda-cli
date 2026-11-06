@@ -216,6 +216,31 @@ pub fn load_http_connectable_checked(
     (merged, notices)
 }
 
+/// Enabled stdio and HTTP servers from an in-memory `{ name: definition }`
+/// map, parsed exactly like a `.mcp.json` file. Used for servers that do not
+/// come from a file of their own (plugin-contributed servers).
+pub fn connectables_from_map(servers: &Value) -> (Vec<McpConnectable>, Vec<McpHttpConnectable>) {
+    let mut stdio = Vec::new();
+    let mut http = Vec::new();
+    let Some(map) = servers.as_object() else {
+        return (stdio, http);
+    };
+    for (name, def) in map {
+        if let Some(entry) = parse_http_entry(name, def) {
+            if !entry.disabled {
+                http.push(McpHttpConnectable::from(entry));
+            }
+            continue;
+        }
+        if let Some(raw) = parse_entry(name, def, McpScope::User) {
+            if let (false, Some(command)) = (raw.disabled, raw.command) {
+                stdio.push(McpConnectable { name: raw.name, command, args: raw.args, env: raw.env });
+            }
+        }
+    }
+    (stdio, http)
+}
+
 // ── Internal HTTP server storage ──────────────────────────────────────────────
 
 /// All HTTP server definitions, including disabled ones (for /mcp list).
@@ -520,6 +545,23 @@ fn string_map(def: &Value, key: &str) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connectables_from_map_splits_transports_and_skips_disabled() {
+        let servers: Value = serde_json::from_str(
+            r#"{"s":{"command":"run","args":["a"],"env":{"K":"V"}},
+                "h":{"type":"http","url":"http://localhost:1/mcp","headers":{"X":"y"}},
+                "off":{"command":"x","disabled":true}}"#,
+        )
+        .unwrap();
+        let (stdio, http) = connectables_from_map(&servers);
+        assert_eq!(stdio.len(), 1);
+        assert_eq!(stdio[0].command, "run");
+        assert_eq!(stdio[0].env["K"], "V");
+        assert_eq!(http.len(), 1);
+        assert_eq!(http[0].headers["X"], "y");
+    }
+
     struct TempDir(PathBuf);
 
     /// Guarantees a distinct directory per instance.

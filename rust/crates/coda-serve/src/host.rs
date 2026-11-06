@@ -622,6 +622,10 @@ pub struct StartupOptions {
     /// `coda serve --session <id>`: the `sessionId` an `initialize` that
     /// leaves it out resumes.
     pub session_id: Option<String>,
+    /// Plugins discovered once by the transport (shared with MCP startup).
+    /// `None` — tests and embedding hosts — loads no plugins and no skill
+    /// tool, so a host never reads the real profile unless asked to.
+    pub plugins: Option<Arc<crate::plugins::PluginSet>>,
 }
 
 impl std::fmt::Debug for StartupOptions {
@@ -640,6 +644,7 @@ impl std::fmt::Debug for StartupOptions {
             .field("endpoint", &self.endpoint)
             .field("restore", &self.restore)
             .field("session_id", &self.session_id)
+            .field("plugins", &self.plugins.as_ref().map(|p| p.plugins.len()))
             // The resolved decision is deliberately absent: it either repeats
             // `endpoint` or came from the environment, and a resolved base URL
             // can carry a path — which can carry a tenant id.
@@ -733,6 +738,7 @@ impl StartupOptions {
             anthropic_endpoint: ApiKeyEndpoint::Unresolved,
             restore,
             session_id,
+            plugins: None,
         };
         opts.validate()?;
         // Resolved after `validate`, so `--endpoint requires --api-key` is
@@ -1160,6 +1166,16 @@ pub struct ServeHost {
     hook_trust_store: Arc<InMemoryHookTrustStore>,
     /// Hooks loaded once at session start with scopes stamped by the loader.
     user_hooks: Vec<UserHook>,
+    /// Installed plugins, discovered once per engine instance.
+    plugins: Arc<crate::plugins::PluginSet>,
+    /// Plugin approvals as read at startup (what this instance runs).
+    plugin_trust: crate::plugins::trust::PluginTrustStore,
+    /// Plugin-contributed subagent types, shared with every subagent host.
+    subagent_registry: Arc<coda_agent::SubagentRegistry>,
+    /// Plugin roots and skill directories the read-only file tools may read.
+    readable_directories: std::collections::HashSet<String>,
+    /// `SessionStart` hooks fire once, on this instance's first prompt.
+    session_start_fired: std::sync::atomic::AtomicBool,
     /// SubagentHost, HookRunner, ScheduleRuntime — built lazily on first prompt.
     session_services: tokio::sync::Mutex<Option<Arc<SessionServices>>>,
     /// Live MCP manager for connected servers; `None` when MCP is disabled or
@@ -1446,7 +1462,37 @@ impl ServeHost {
         // built-in. This same shared registry is handed to the subagent host,
         // so subagents see the MCP tools too.
         let McpBundle { tools: mcp_tools, manager: mcp_manager, notices: mcp_notices } = mcp;
-        let mut registry = ToolRegistry::new(built_in_tools().into_iter().chain(mcp_tools));
+
+        // Plugins: skills (through the `skill` tool), agents, hooks and LSP.
+        // Skipped entirely when the transport did not discover any, so tests
+        // and embedding hosts never read the real profile.
+        let plugins = startup_opts.plugins.clone();
+        let plugin_trust = match &plugins {
+            Some(_) => crate::plugins::trust::PluginTrustStore::load(&coda_auth::coda_dir()),
+            None => Default::default(),
+        };
+        let wiring = plugins.as_ref().map(|set| {
+            crate::plugins::wiring::PluginWiring::build(Path::new(&working_dir), set, &plugin_trust)
+        });
+        let plugins = plugins.unwrap_or_default();
+        let mut plugin_tools: Vec<Arc<dyn coda_agent::tool::Tool>> = Vec::new();
+        if let Some(w) = &wiring {
+            if !w.catalog.is_empty() {
+                plugin_tools.push(Arc::new(coda_agent::tools::SkillTool::new(w.catalog.clone())));
+            }
+            if !w.agents.is_empty() {
+                // Same name as the built-in: the registry keeps the last.
+                plugin_tools.push(Arc::new(coda_agent::tools::PluginAwareTaskTool::new(&w.agent_summaries())));
+            }
+        }
+        let subagent_registry = Arc::new(coda_agent::SubagentRegistry::new(
+            wiring.as_ref().map(|w| w.agents.clone()).unwrap_or_default(),
+        ));
+        let readable_directories =
+            wiring.as_ref().map(|w| w.readable_directories.clone()).unwrap_or_default();
+
+        let mut registry =
+            ToolRegistry::new(built_in_tools().into_iter().chain(mcp_tools).chain(plugin_tools));
         if let Some(manager) = &mcp_manager {
             registry = registry.with_source(manager.tool_source());
         }
@@ -1460,10 +1506,19 @@ impl ServeHost {
         let schedule_store = ScheduledTaskStore::new();
 
         let settings_json = load_settings_value();
-        let lsp_configs = load_lsp_configs(&settings_json, &working_dir);
+        let plugin_lsp = wiring.as_ref().map(|w| w.lsp_servers.clone()).unwrap_or_default();
+        let lsp_configs = load_lsp_configs(&settings_json, &plugin_lsp);
         let lsp_manager = Arc::new(LspServerManager::new(lsp_configs, Some(working_dir.clone())));
-        let user_hooks = load_user_hooks(&working_dir);
+        let mut user_hooks = load_user_hooks(&working_dir);
         let hook_trust_store = Arc::new(InMemoryHookTrustStore::new());
+        // Plugin hooks join the same pipeline. Approved ones are trusted for
+        // this session; unapproved ones arrive disabled and never run.
+        if let Some(w) = &wiring {
+            user_hooks.extend(w.hooks.iter().cloned());
+            for hash in &w.trusted_hook_hashes {
+                hook_trust_store.trust(&working_dir, hash);
+            }
+        }
 
         // Load the per-model effort saved by the TUI. The key mirrors the TUI's
         // `Settings::effort_for` format so the two sides agree on where to read
@@ -1604,6 +1659,11 @@ impl ServeHost {
             lsp_manager,
             hook_trust_store,
             user_hooks,
+            plugins,
+            plugin_trust,
+            subagent_registry,
+            readable_directories,
+            session_start_fired: std::sync::atomic::AtomicBool::new(false),
             session_services: tokio::sync::Mutex::new(None),
             mcp_manager,
             pending_mcp_notices: Mutex::new(mcp_notices),
@@ -2249,6 +2309,30 @@ impl ServeHost {
             resolve_goal_budget(params.max_duration.as_deref(), params.max_continuations);
         let judge = Box::new(LlmForkedAgent { client, model: self.current_model() });
         Some(AutonomySupervisor::new(judge, goal_text, GoalBudget::start_now(max_dur, max_cont, 0.5), None))
+    }
+
+    /// User-authored user-scope hooks are trusted implicitly; project and
+    /// plugin hooks only once the session trust store holds their hash
+    /// (approved plugin hooks are put there at startup).
+    fn hook_is_trusted(&self, h: &UserHook) -> bool {
+        (h.scope == HookScope::User && h.plugin_origin.is_none())
+            || self.hook_trust_store.is_trusted(&self.working_dir, &HookContentHash::compute(h))
+    }
+
+    /// Fires `SessionStart` hooks once per engine instance (fail-open) and
+    /// returns their additional context, framed for the first prompt.
+    async fn session_start_context(&self, services: &SessionServices) -> Option<String> {
+        use std::sync::atomic::Ordering;
+        if !services.hook_runner.has_session_start || self.session_start_fired.swap(true, Ordering::SeqCst) {
+            return None;
+        }
+        let result = services
+            .hook_runner
+            .run_session_start("startup", &self.active_session_id(), &self.working_dir, CancellationToken::new())
+            .await;
+        result
+            .additional_context
+            .map(|c| format!("<session-start-hook-context>\n{c}\n</session-start-hook-context>\n\n"))
     }
 
     /// Get or initialise the per-session services (SubagentHost, HookRunner,
@@ -2898,7 +2982,9 @@ impl ServeHost {
         .with_budget_source(Arc::clone(&budget_source))
         .with_schedule_store(Arc::clone(&self.schedule_store))
         .with_message_bus(Arc::clone(&self.message_bus))
-        .with_outage_policy(Arc::clone(&self.outage_policy));
+        .with_outage_policy(Arc::clone(&self.outage_policy))
+        .with_registry(Arc::clone(&self.subagent_registry))
+        .with_readable_directories(self.readable_directories.clone());
 
         // 2. Trust guard using the session-scoped trust store.
         let trust_guard = HookTrustGuard::new(
@@ -2937,7 +3023,9 @@ impl ServeHost {
         .with_model_source(model_source)
         .with_budget_source(budget_source)
         .with_schedule_store(Arc::clone(&self.schedule_store))
-        .with_message_bus(Arc::clone(&self.message_bus));
+        .with_message_bus(Arc::clone(&self.message_bus))
+        .with_registry(Arc::clone(&self.subagent_registry))
+        .with_readable_directories(self.readable_directories.clone());
 
         // 5. Schedule runtime — fires due scheduled tasks via the main subagent.
         let runner = TaskManagerRunner::new(
@@ -4627,14 +4715,10 @@ impl ServeBackend for ServeHost {
                         HookScope::Project => "project",
                     };
                     m.insert("scope".into(), scope_str.into());
-                    let trusted = match h.scope {
-                        HookScope::User => h.plugin_origin.is_none(),
-                        HookScope::Project => self.hook_trust_store.is_trusted(
-                            &self.working_dir,
-                            &HookContentHash::compute(h),
-                        ),
-                    };
-                    m.insert("trusted".into(), trusted.into());
+                    m.insert("trusted".into(), self.hook_is_trusted(h).into());
+                    if let Some((plugin, _)) = &h.plugin_origin {
+                        m.insert("plugin".into(), plugin.clone().into());
+                    }
                 }
                 obj
             })
@@ -4657,14 +4741,10 @@ impl ServeBackend for ServeHost {
                 HookScope::Project => "project",
             };
             m.insert("scope".into(), scope_str.into());
-            let trusted = match h.scope {
-                HookScope::User => h.plugin_origin.is_none(),
-                HookScope::Project => self.hook_trust_store.is_trusted(
-                    &self.working_dir,
-                    &HookContentHash::compute(h),
-                ),
-            };
-            m.insert("trusted".into(), trusted.into());
+            m.insert("trusted".into(), self.hook_is_trusted(h).into());
+            if let Some((plugin, _)) = &h.plugin_origin {
+                m.insert("plugin".into(), plugin.clone().into());
+            }
         }
         Ok(obj)
     }
@@ -4679,13 +4759,17 @@ impl ServeBackend for ServeHost {
     }
 
     async fn skills_list(&self) -> Result<Value, RpcError> {
-        let found = crate::skills::discover(std::path::Path::new(&self.working_dir));
+        let found = crate::skills::discover(std::path::Path::new(&self.working_dir), &self.plugins);
         serde_json::to_value(serde_json::json!({ "skills": found }))
             .map_err(|e| RpcError::internal(e.to_string()))
     }
 
     async fn plugins_list(&self) -> Result<Value, RpcError> {
-        Ok(json!({ "plugins": [] }))
+        Ok(crate::plugins::wiring::inventory(
+            Path::new(&self.working_dir),
+            &self.plugins,
+            &self.plugin_trust,
+        ))
     }
 
     async fn session_compact(&self, p: CompactParams) -> Result<Value, RpcError> {
@@ -5898,8 +5982,14 @@ impl ServeHost {
             g.clone().ok_or_else(|| self.no_client_error())?
         };
 
+        // Initialise session-scoped services lazily (Finding 1: first turn only).
+        let services = self.get_or_init_services(Arc::clone(&client)).await;
+
         // Append user message to a local copy of history.
         let mut user_msg = build_user_message(&p);
+        if let Some(context) = self.session_start_context(&services).await {
+            user_msg.content.insert(0, Content::Text(context));
+        }
         let mut history = self.session.history.lock().expect("history poisoned").clone();
         if !user_msg.content.is_empty() {
             // A new message cannot change work that is already running
@@ -5930,8 +6020,6 @@ impl ServeHost {
         // Optional goal supervisor.
         let goal = self.build_autonomy_supervisor(Arc::clone(&client));
 
-        // Initialise session-scoped services lazily (Finding 1: first turn only).
-        let services = self.get_or_init_services(Arc::clone(&client)).await;
 
         // Build the agent loop with all services wired (Finding 1).
         //
@@ -6043,6 +6131,7 @@ impl ServeHost {
         .with_model(captured.config.model.clone())
         .with_model_budget(output_budget.budget)
         .with_working_directory(&self.working_dir)
+        .with_readable_directories(self.readable_directories.clone())
         .with_effort(captured.config.effort)
         .with_steering(Arc::clone(&self.session.steering))
         .with_tool_user_question(uq_tool)
@@ -7334,13 +7423,13 @@ fn resolve_effective_effort(
 /// Build the merged LSP server config from settings + plugins.
 fn load_lsp_configs(
     settings: &Value,
-    _working_dir: &str,
+    plugin_servers: &HashMap<String, LspServerConfig>,
 ) -> HashMap<String, LspServerConfig> {
     let settings_servers = settings
         .get("lspServers")
         .map(|v| LspServerConfig::parse_map(v))
         .unwrap_or_default();
-    LspServerMapBuilder::build(&settings_servers, &HashMap::new())
+    LspServerMapBuilder::build(&settings_servers, plugin_servers)
 }
 
 /// Load hooks from both the user settings file and the project settings file,
@@ -13864,6 +13953,67 @@ mod tests {
             system.as_deref().unwrap_or("").contains("You are a pirate."),
             "startup system prompt must reach the LLM: {system:?}"
         );
+    }
+
+    /// The acceptance scenario's fixtures (two review plugins referenced by
+    /// path): 4 skills and 3 agents attributed, the skill tool and plugin
+    /// agent types offered to the model, and the unapproved SessionStart hook
+    /// listed but never run.
+    #[tokio::test]
+    async fn review_plugins_referenced_by_path_are_loaded() {
+        use crate::plugins::{discover_plugins, PluginSettings};
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/plugins/marketplace/plugins");
+        let ws = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let settings = PluginSettings {
+            paths: vec![fixtures.join("deep-review"), fixtures.join("owasp-pr-review")],
+            ..Default::default()
+        };
+        let set = discover_plugins(ws.path(), home.path(), &settings);
+        let opts = StartupOptions { plugins: Some(Arc::new(set)), ..StartupOptions::default() };
+        let (host, client) = make_capturing_host_with_options(opts);
+
+        let list = host.plugins_list().await.unwrap();
+        let plugins = list["plugins"].as_array().unwrap();
+        assert_eq!(plugins.len(), 2, "{list}");
+        let count = |key: &str| -> usize {
+            plugins.iter().map(|p| p["components"][key].as_array().unwrap().len()).sum()
+        };
+        assert_eq!(count("skills"), 4, "{list}");
+        assert_eq!(count("agents"), 3, "{list}");
+        let deep = plugins.iter().find(|p| p["name"] == "deep-review").unwrap();
+        assert_eq!(deep["source"], "path");
+        assert_eq!(deep["enabled"], true);
+        assert_eq!(deep["components"]["hooks"][0], "SessionStart");
+        let owasp = plugins.iter().find(|p| p["name"] == "owasp-pr-review").unwrap();
+        assert_eq!(owasp["pendingApproval"][0], "mcpServer:pr-feed");
+        assert!(plugins.iter().all(|p| p["errors"].as_array().unwrap().is_empty()), "{list}");
+
+        let hooks = host.hooks_list().await.unwrap();
+        let plugin_hook = hooks["hooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h["plugin"] == "deep-review")
+            .expect("plugin hook listed");
+        assert_eq!(plugin_hook["trusted"], false);
+        assert_eq!(plugin_hook["enabled"], false);
+
+        let skills = host.skills_list().await.unwrap();
+        let names: Vec<&str> =
+            skills["skills"].as_array().unwrap().iter().filter_map(|s| s["name"].as_str()).collect();
+        assert!(names.contains(&"deep-review:extreme-review"), "{names:?}");
+
+        host.session_prompt(PromptParams { text: Some("review please".into()), images: None })
+            .await
+            .unwrap();
+        let request = client.last_request.lock().unwrap().clone().expect("a request was sent");
+        let skill_tool = request.tools.iter().find(|t| t.name == "skill").expect("skill tool offered");
+        assert!(skill_tool.description.contains("owasp-pr-review:teams-owasp-pr-review"));
+        let task_tool = request.tools.iter().find(|t| t.name == "task").expect("task tool offered");
+        assert!(task_tool.description.contains("deep-review:advocate"));
+        let sent = format!("{:?}", request.messages);
+        assert!(!sent.contains("DEEP-REVIEW-HOOK-RAN"), "an unapproved hook must not run");
     }
 
     /// An explicit `--effort auto` startup override clears effort and does NOT

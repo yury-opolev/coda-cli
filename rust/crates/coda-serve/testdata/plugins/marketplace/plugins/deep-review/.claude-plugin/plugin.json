@@ -1,0 +1,8 @@
+{
+  "name": "deep-review",
+  "version": "1.0.0",
+  "description": "Adversarial code review: advocate, skeptic and architect review in parallel, then the findings are merged.",
+  "author": {
+    "name": "coda-tests"
+  }
+}

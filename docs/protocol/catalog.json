@@ -227,7 +227,7 @@
       "paramsContract": null,
       "resultContract": "clientReader",
       "requiresInitialize": false,
-      "availability": "limited"
+      "availability": "reusable"
     },
     {
       "method": "session/compact",

@@ -1,0 +1,16 @@
+{
+  "name": "review-fixtures",
+  "owner": {
+    "name": "coda-tests"
+  },
+  "plugins": [
+    {
+      "name": "deep-review",
+      "source": "./plugins/deep-review"
+    },
+    {
+      "name": "owasp-pr-review",
+      "source": "./plugins/owasp-pr-review"
+    }
+  ]
+}

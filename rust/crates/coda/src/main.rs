@@ -59,6 +59,11 @@ enum Command {
     /// `coda-engine auth` through `coda-boot`. It never starts, stops or
     /// reconnects an engine.
     Auth(coda_boot::auth_args::AuthArgs),
+    /// List, install, enable, disable, update, approve or remove plugins.
+    ///
+    /// Host-local maintenance of this profile's plugin settings, approvals
+    /// and git installs. Changes apply to the next engine instance.
+    Plugin(coda_serve::plugins::cli::PluginArgs),
 }
 
 #[derive(Debug, Args)]
@@ -325,13 +330,18 @@ fn main() -> Result<()> {
         std::process::exit(coda_boot::auth_cli::run(auth));
     }
 
+    if matches!(cli.command, Some(Command::Plugin(_))) {
+        let Some(Command::Plugin(args)) = cli.command.take() else { unreachable!() };
+        std::process::exit(coda_serve::plugins::cli::run(args));
+    }
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("failed to start the async runtime")?;
 
     match cli.command {
-        Some(Command::Auth(_)) => unreachable!("handled above"),
+        Some(Command::Auth(_)) | Some(Command::Plugin(_)) => unreachable!("handled above"),
         Some(Command::Serve(args)) => {
             let (ctx, _forward_dir) = init_diagnostics(
                 coda_diagnostics::ProcessRole::Serve,
@@ -871,6 +881,15 @@ mod tests {
     fn no_arguments_selects_interactive_mode() {
         let cli = Cli::try_parse_from(["coda"]).expect("parse");
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn plugin_is_a_subcommand() {
+        let cli = Cli::try_parse_from(["coda", "plugin", "install", "x@m", "--yes"]).expect("parse");
+        assert!(matches!(cli.command, Some(Command::Plugin(_))));
+        let cli = Cli::try_parse_from(["coda", "plugin", "marketplace", "add", "m", "--path", "."]).expect("parse");
+        assert!(matches!(cli.command, Some(Command::Plugin(_))));
+        assert!(Cli::try_parse_from(["coda", "plugin", "marketplace", "add", "m"]).is_err(), "--path or --git required");
     }
 
     #[test]

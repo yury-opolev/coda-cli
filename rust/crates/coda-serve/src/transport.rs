@@ -38,7 +38,7 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
     // Parse and validate every startup variable exactly once. An invalid
     // explicit value fails startup here rather than silently defaulting deep
     // inside the host (Findings I2/I4).
-    let startup = crate::host::StartupOptions::from_env()
+    let mut startup = crate::host::StartupOptions::from_env()
         .map_err(|e| {
             coda_diagnostics::record(coda_diagnostics::Event::StartupFailure { category: "configuration" });
             anyhow::anyhow!("invalid startup configuration: {e}")
@@ -106,7 +106,10 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
     // Connect enabled MCP servers before the host is built so their tools are
     // in the registry from the first turn. Disabled/failed servers are handled
     // inside `connect_mcp` and never block startup.
-    let mcp = crate::mcp::connect_mcp(&working_dir).await;
+    // Plugins are discovered once: MCP startup and the host share the set.
+    let plugins = Arc::new(crate::plugins::load_for_workspace(std::path::Path::new(&working_dir)));
+    let mcp = crate::mcp::connect_mcp(&working_dir, &plugins).await;
+    startup.plugins = Some(plugins);
     serve_inner(tokio::io::stdin(), tokio::io::stdout(), client, working_dir, mcp, startup, copilot_diagnostic).await
 }
 

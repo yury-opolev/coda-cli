@@ -25,7 +25,7 @@ use super::content_hash::HookContentHash;
 use super::matcher::HookMatcher;
 use super::output::{
     AgentResponseResult, HookOutput, PermissionDecision, PermissionRequestResult,
-    PostToolUseResult, PreCompactResult, PostCompactResult, SubagentStartResult,
+    PostToolUseResult, PreCompactResult, PostCompactResult, SessionStartResult, SubagentStartResult,
     SubagentStopResult, UserHookResult, UserPromptSubmitResult, UserPromptSubmitShape,
 };
 use super::policy::HookEventPolicy;
@@ -49,6 +49,19 @@ pub trait HookExecutor: Send + Sync {
         payload: &str,
         cancel: CancellationToken,
     ) -> anyhow::Result<(i32, String, String)>;
+
+    /// Like [`HookExecutor::exec`] with extra environment variables. The
+    /// default ignores `env`, so test doubles need not care.
+    async fn exec_with_env(
+        &self,
+        command: &str,
+        env: &std::collections::HashMap<String, String>,
+        payload: &str,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<(i32, String, String)> {
+        let _ = env;
+        self.exec(command, payload, cancel).await
+    }
 }
 
 /// Real shell-based executor.  Spawns the system shell, writes payload to
@@ -63,6 +76,16 @@ impl HookExecutor for ShellHookExecutor {
         payload: &str,
         cancel: CancellationToken,
     ) -> anyhow::Result<(i32, String, String)> {
+        self.exec_with_env(command, &std::collections::HashMap::new(), payload, cancel).await
+    }
+
+    async fn exec_with_env(
+        &self,
+        command: &str,
+        env: &std::collections::HashMap<String, String>,
+        payload: &str,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<(i32, String, String)> {
         use tokio::io::AsyncWriteExt;
         use tokio::io::AsyncReadExt;
 
@@ -74,6 +97,7 @@ impl HookExecutor for ShellHookExecutor {
         let mut child = tokio::process::Command::new(shell)
             .arg(flag)
             .arg(command)
+            .envs(env)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -144,6 +168,7 @@ pub struct HookRunner {
     pub has_subagent_stop: bool,
     pub has_pre_compact: bool,
     pub has_post_compact: bool,
+    pub has_session_start: bool,
     /// True when any `AgentResponse` hook declares `"displayContent"` or
     /// `"modifiedResponse"` in its `mutates` list.
     pub any_hook_mutates_display: bool,
@@ -197,6 +222,7 @@ impl HookRunner {
             has_subagent_stop: has("SubagentStop"),
             has_pre_compact: has("PreCompact"),
             has_post_compact: has("PostCompact"),
+            has_session_start: has("SessionStart"),
             any_hook_mutates_display: any_mutates_display,
             hooks,
             executor,
@@ -368,6 +394,43 @@ impl HookRunner {
         match self.run_hooks(&matching, "PostCompact", &payload, cancel).await {
             Ok(outputs) => merge_post_compact(outputs),
             Err(_) => PostCompactResult::NO_CHANGE,
+        }
+    }
+
+    /// Runs all `SessionStart` hooks.  Fail-open. `source` is `startup`,
+    /// `resume`, `clear` or `compact` and is what a hook's matcher sees.
+    pub async fn run_session_start(
+        &self,
+        source: &str,
+        session_id: &str,
+        cwd: &str,
+        cancel: CancellationToken,
+    ) -> SessionStartResult {
+        let matching = self.matching("SessionStart", Some(source));
+        if matching.is_empty() {
+            return SessionStartResult::default();
+        }
+        let payload = serde_json::json!({
+            "event": "SessionStart",
+            "hook_event_name": "SessionStart",
+            "source": source,
+            "session_id": session_id,
+            "cwd": cwd,
+        })
+        .to_string();
+        let outputs = self
+            .run_hooks(&matching, "SessionStart", &payload, cancel)
+            .await
+            .unwrap_or_default();
+        let contexts: Vec<String> = outputs
+            .iter()
+            .filter_map(|o| o.specific.as_ref())
+            .filter_map(|s| s.get("additionalContext").and_then(serde_json::Value::as_str))
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_owned)
+            .collect();
+        SessionStartResult {
+            additional_context: (!contexts.is_empty()).then(|| contexts.join("\n\n")),
         }
     }
 
@@ -614,7 +677,7 @@ impl HookRunner {
 
                 let combined = hook_cancel.clone();
 
-                let exec_future = self.executor.exec(&cmd, payload, combined);
+                let exec_future = self.executor.exec_with_env(&cmd, &hook.env, payload, combined);
 
                 tokio::select! {
                     result = exec_future => {
@@ -1462,6 +1525,7 @@ mod tests {
             enabled: true,
             scope: HookScope::User,
             plugin_origin: None,
+            env: Default::default(),
         }
     }
 
@@ -1484,6 +1548,59 @@ mod tests {
     }
 
     // ── Tests ─────────────────────────────────────────────────────────────────
+
+    // SessionStart merges every hook's additionalContext; a disabled hook
+    // never runs and an untrusted plugin hook is skipped (fail-open).
+    #[tokio::test]
+    async fn session_start_merges_additional_context() {
+        let exec = MockExecutor::new(vec![
+            (0, r#"{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"one"}}"#),
+            (0, r#"{"hookSpecificOutput":{"additionalContext":"two"}}"#),
+        ]);
+        let mut disabled = hook("SessionStart", "never.sh");
+        disabled.enabled = false;
+        let mut untrusted = hook("SessionStart", "plugin.sh");
+        untrusted.plugin_origin = Some(("p".into(), "1".into()));
+        let store = Arc::new(crate::hooks::InMemoryHookTrustStore::new());
+        let guard = Arc::new(HookTrustGuard::new(store, "/project", None));
+        let runner = HookRunner::with_executor_and_guard(
+            vec![hook("SessionStart", "a.sh"), disabled, untrusted, hook("SessionStart", "b.sh")],
+            exec.clone(),
+            Some(guard),
+        );
+        assert!(runner.has_session_start);
+        let result = runner.run_session_start("startup", "s1", "/w", CancellationToken::new()).await;
+        assert_eq!(result.additional_context.as_deref(), Some("one\n\ntwo"));
+        assert_eq!(exec.call_count.load(Ordering::SeqCst), 2);
+    }
+
+    // Plugin hooks receive their environment through the executor.
+    #[tokio::test]
+    async fn command_hooks_pass_their_env_to_the_executor() {
+        struct EnvCapture(std::sync::Mutex<Vec<String>>);
+        #[async_trait]
+        impl HookExecutor for EnvCapture {
+            async fn exec(&self, _: &str, _: &str, _: CancellationToken) -> anyhow::Result<(i32, String, String)> {
+                unreachable!("the runner must call exec_with_env")
+            }
+            async fn exec_with_env(
+                &self,
+                _: &str,
+                env: &std::collections::HashMap<String, String>,
+                _: &str,
+                _: CancellationToken,
+            ) -> anyhow::Result<(i32, String, String)> {
+                self.0.lock().unwrap().push(env.get("CODA_PLUGIN_ROOT").cloned().unwrap_or_default());
+                Ok((0, String::new(), String::new()))
+            }
+        }
+        let capture = Arc::new(EnvCapture(std::sync::Mutex::new(Vec::new())));
+        let mut h = hook("SessionStart", "x");
+        h.env.insert("CODA_PLUGIN_ROOT".into(), "R:/p".into());
+        let runner = HookRunner::with_executor(vec![h], capture.clone());
+        runner.run_session_start("startup", "s", "/w", CancellationToken::new()).await;
+        assert_eq!(capture.0.lock().unwrap().as_slice(), ["R:/p".to_owned()]);
+    }
 
     // A PreToolUse hook that blocks returns block=true.
     #[tokio::test]

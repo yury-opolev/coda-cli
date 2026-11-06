@@ -70,7 +70,7 @@ might infer from its name. Unsupported operations are listed separately.
 | `hooks/trust` | Reusable | Apply the engine's hook trust operation; caller authorization must be supplied by the external control plane. |
 | `skills/list` | Reusable | Discover skills on the engine host. |
 | `skills/trust` | Unsupported | Always refused in serve mode. |
-| `plugins/list` | Limited | Compatibility route currently returns an empty list; not an authoritative installed-plugin inventory. |
+| `plugins/list` | Reusable | Installed-plugin inventory: name, version, source, root, enabled, trust state, contributed components, pending approvals and per-plugin errors (see [skills-and-plugins](../skills-and-plugins.md#serve-protocol)). |
 | `session/pendingMessages` | Reusable | Non-destructive recovery of engine-owned background notifications (`notify_user`, Stage 2). Available before initialize; see [Background notifications](#background-notifications-notify_user). |
 | `session/backgroundAll`, `task/background` | Reusable | Stop *waiting* on foreground tasks (all, or one); the work keeps running and reports later. Requires initialize. |
 | `session/stopAllTasks`, `task/stop` | Reusable | Stop running tasks and their process trees. Requires initialize. |
@@ -472,8 +472,7 @@ Legacy client contracts describe the writer/reader types used by the client,
 not stricter validation of every tolerated legacy request. A successful
 JSON-RPC response can still contain `ok: false`; check the operation result
 before reporting a change. Schema presence does not make a limited or
-unsupported operation functional: for example, `plugins/list` remains an
-empty compatibility inventory and `skills/trust` always errors.
+unsupported operation functional: for example, `skills/trust` always errors.
 
 Reserved but undeclared event names have no schema. `EventEnvelope.params` remains arbitrary JSON
 rather than pretending every event has the same payload.

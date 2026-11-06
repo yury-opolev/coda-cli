@@ -31,6 +31,7 @@ pub mod host;
 mod mcp;
 pub mod mcp_list;
 pub mod output_budget;
+pub mod plugins;
 pub mod prompts;
 pub mod recovery_executor;
 pub mod restart;

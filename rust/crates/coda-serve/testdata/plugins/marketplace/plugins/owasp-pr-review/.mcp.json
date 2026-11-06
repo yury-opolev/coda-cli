@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "pr-feed": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/scripts/pr-feed.cmd",
+      "args": []
+    }
+  }
+}

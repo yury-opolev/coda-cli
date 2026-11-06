@@ -82,13 +82,24 @@ pub(crate) fn project_mcp_disabled() -> bool {
 /// secret resolution treats an unresolvable `coda-secret:` reference as an
 /// empty value, so without the notice a server would simply fail to
 /// authenticate with no explanation.
-pub(crate) async fn connect_mcp(working_dir: &str) -> McpBundle {
+pub(crate) async fn connect_mcp(working_dir: &str, plugins: &crate::plugins::PluginSet) -> McpBundle {
+    // Approved plugin servers join the user/project layers. Unapproved ones
+    // are never started (plugins/list reports them as pending approval).
+    let plugin_servers = if plugins.plugins.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        let trust = crate::plugins::trust::PluginTrustStore::load(&coda_auth::coda_dir());
+        crate::plugins::components::approved_mcp_servers(plugins, &trust)
+    };
     match crate::host::credential_storage() {
-        Ok(storage) => connect_mcp_with_store(working_dir, Arc::clone(&storage.store)).await,
+        Ok(storage) => {
+            connect_mcp_with_store_and_extra(working_dir, Arc::clone(&storage.store), plugin_servers).await
+        }
         Err(e) => {
-            let mut bundle = connect_mcp_with_store(
+            let mut bundle = connect_mcp_with_store_and_extra(
                 working_dir,
                 Arc::new(coda_auth::store::InMemoryStore::new()),
+                plugin_servers,
             )
             .await;
             // Sanitised: the raw error can carry paths and store details.
@@ -108,9 +119,20 @@ pub(crate) async fn connect_mcp(working_dir: &str) -> McpBundle {
 /// [`coda_auth::store::InMemoryStore`] without touching the OS keyring.
 /// Never fails: a server that will not start is reported as a notice, and
 /// the remaining servers still connect.
+#[cfg(test)]
 pub(crate) async fn connect_mcp_with_store(
     working_dir: &str,
     store: Arc<dyn CredentialStore>,
+) -> McpBundle {
+    connect_mcp_with_store_and_extra(working_dir, store, (Vec::new(), Vec::new())).await
+}
+
+/// [`connect_mcp_with_store`] plus extra servers (approved plugin servers),
+/// which a same-named user or project server shadows.
+pub(crate) async fn connect_mcp_with_store_and_extra(
+    working_dir: &str,
+    store: Arc<dyn CredentialStore>,
+    extra: (Vec<McpConnectable>, Vec<McpHttpConnectable>),
 ) -> McpBundle {
     if env_flag("CODA_SERVE_DISABLE_MCP") {
         tracing::info!("MCP disabled by CODA_SERVE_DISABLE_MCP");
@@ -132,6 +154,16 @@ pub(crate) async fn connect_mcp_with_store(
         coda_mcp::config::load_connectable_checked(&user_mcp, &effective_project);
     let (http, http_notices) =
         coda_mcp::config::load_http_connectable_checked(&user_mcp, &effective_project);
+
+    let (extra_stdio, extra_http) = extra;
+    let mut stdio = stdio;
+    let mut http = http;
+    let extra_stdio: Vec<_> =
+        extra_stdio.into_iter().filter(|e| !stdio.iter().any(|s| s.name == e.name)).collect();
+    let extra_http: Vec<_> =
+        extra_http.into_iter().filter(|e| !http.iter().any(|s| s.name == e.name)).collect();
+    stdio.extend(extra_stdio);
+    http.extend(extra_http);
 
     let mut notices: Vec<String> = stdio_notices.into_iter().chain(http_notices).collect();
     let mut seen = std::collections::HashSet::new();

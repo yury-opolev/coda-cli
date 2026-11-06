@@ -174,6 +174,9 @@ for limits, failure behavior, and compatibility with older logging flags.
   loop** that keeps working until a judge says the goal is met. Plus automatic
   history **compaction**, output-style personas, and a plugin/skills marketplace.
   See [`docs/skills-and-plugins.md`](docs/skills-and-plugins.md) for authoring skills and plugins.
+  Claude-format plugins (`.claude-plugin/plugin.json`) load in place from `~/.coda/plugins/`,
+  `<project>/.coda/plugins/`, settings `plugins.paths` and directory/git marketplaces; manage them
+  with `coda plugin list | install | enable | disable | update | remove | approve | marketplace`.
 - **Programmatic access** — Rust `coda serve` exposes the agent over bidirectional
   JSON-RPC on stdio, streaming progress and requesting permission or clarification.
   The .NET [`Coda.Client`](src/Coda.Client) SDK drives it out-of-process.

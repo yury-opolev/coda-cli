@@ -114,6 +114,7 @@ mod tests {
             enabled: true,
             scope: HookScope::Project,
             plugin_origin: None,
+            env: Default::default(),
         }
     }
 

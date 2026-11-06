@@ -1078,6 +1078,9 @@ pub struct WireSkill {
     pub source_path: Option<String>,
     #[serde(default)]
     pub argument_hint: Option<String>,
+    /// The contributing plugin; the skill's `name` is then `<plugin>:<skill>`.
+    #[serde(default)]
+    pub plugin: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -1085,6 +1088,29 @@ pub struct WireSkill {
 pub struct PluginsListResult {
     #[serde(default)]
     pub plugins: Vec<WirePlugin>,
+    /// Problems not attributable to one plugin (settings shape, missing paths).
+    #[serde(default)]
+    pub errors: Vec<String>,
+}
+
+/// The components a plugin contributes, by qualified name.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct WirePluginComponents {
+    #[serde(default)]
+    pub skills: Vec<String>,
+    #[serde(default)]
+    pub commands: Vec<String>,
+    #[serde(default)]
+    pub agents: Vec<String>,
+    #[serde(default)]
+    pub mcp_servers: Vec<String>,
+    /// Hook event names.
+    #[serde(default)]
+    pub hooks: Vec<String>,
+    #[serde(default)]
+    pub lsp_servers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1096,10 +1122,32 @@ pub struct WirePlugin {
     pub version: Option<String>,
     #[serde(default)]
     pub enabled: bool,
+    /// `true` when no executable component is waiting for approval.
     #[serde(default)]
     pub trusted: bool,
     #[serde(default)]
     pub is_external: bool,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// `user`, `project`, `path` or `marketplace:<id>`.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// The plugin directory.
+    #[serde(default)]
+    pub root: Option<String>,
+    /// `notRequired`, `approved`, `partial` or `pending`.
+    #[serde(default)]
+    pub trust: Option<String>,
+    #[serde(default)]
+    pub components: WirePluginComponents,
+    /// Executable components not yet approved, as `kind:name`.
+    #[serde(default)]
+    pub pending_approval: Vec<String>,
+    #[serde(default)]
+    pub notes: Vec<String>,
+    /// Per-plugin load errors.
+    #[serde(default)]
+    pub errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

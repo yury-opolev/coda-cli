@@ -292,6 +292,10 @@ pub struct ToolContext {
     /// Additional roots (e.g. skill directories the user consented to) that
     /// file tools may access beyond `working_directory`.
     pub granted_directories: Option<HashSet<String>>,
+    /// Roots the **read-only** file tools may read beyond the above (plugin
+    /// directories, user skill directories). Never writable: a writable
+    /// plugin root would let the model rewrite an approved hook script.
+    pub readable_directories: Option<HashSet<String>>,
 
     // ── Service handles: directly typed (coda-tool knows these types) ─────────
     pub todos: Option<Arc<TodoStore>>,
@@ -325,6 +329,7 @@ impl std::fmt::Debug for ToolContext {
             .field("working_directory", &self.working_directory)
             .field("allow_outside_working_directory", &self.allow_outside_working_directory)
             .field("granted_directories", &self.granted_directories)
+            .field("readable_directories", &self.readable_directories)
             .field("todos", &self.todos.is_some())
             .field("user_question", &self.user_question.is_some())
             .field("plan_approver", &self.plan_approver.is_some())
@@ -347,6 +352,7 @@ impl ToolContext {
             working_directory: working_directory.into(),
             allow_outside_working_directory: false,
             granted_directories: None,
+            readable_directories: None,
             todos: None,
             user_question: None,
             plan_approver: None,
@@ -359,6 +365,15 @@ impl ToolContext {
             schedule_store: None,
             subagent_factory: None,
             message_bus: None,
+        }
+    }
+
+    /// The roots a read-only tool may access beyond the working directory:
+    /// the granted directories plus the readable ones.
+    pub fn read_roots(&self) -> Option<HashSet<String>> {
+        match (&self.granted_directories, &self.readable_directories) {
+            (None, None) => None,
+            (a, b) => Some(a.iter().chain(b.iter()).flatten().cloned().collect()),
         }
     }
 

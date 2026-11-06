@@ -45,6 +45,7 @@ pub(crate) struct BatchContext<'a> {
     pub steering: Option<&'a SteeringInbox>,
     pub working_directory: &'a str,
     pub granted_directories: Option<&'a std::collections::HashSet<String>>,
+    pub readable_directories: Option<&'a std::collections::HashSet<String>>,
     pub tool_max_duration: Option<Duration>,
     /// Seam for the tool heartbeat (later phase).
     #[allow(dead_code)]
@@ -101,6 +102,7 @@ impl<'a> BatchContext<'a> {
             working_directory: self.working_directory.to_owned(),
             allow_outside_working_directory: self.allow_outside_working_directory(),
             granted_directories: self.granted_directories.cloned(),
+            readable_directories: self.readable_directories.cloned(),
             todos: self.todos.clone(),
             user_question: self.tool_user_question.clone(),
             plan_approver: self.plan_approver.clone(),
@@ -963,6 +965,7 @@ mod tests {
             steering: None,
             working_directory: ".",
             granted_directories: None,
+            readable_directories: None,
             tool_max_duration: None,
             tool_progress_interval: Duration::from_secs(30),
             todos: None,
@@ -1005,6 +1008,7 @@ mod tests {
             steering: None,
             working_directory: ".",
             granted_directories: None,
+            readable_directories: None,
             tool_max_duration: None,
             tool_progress_interval: Duration::from_secs(30),
             todos: None,

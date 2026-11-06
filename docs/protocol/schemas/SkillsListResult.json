@@ -52,6 +52,14 @@
             "null"
           ],
           "default": null
+        },
+        "plugin": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The contributing plugin; the skill's `name` is then `<plugin>:<skill>`.",
+          "default": null
         }
       },
       "required": [

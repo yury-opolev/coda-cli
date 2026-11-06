@@ -35,7 +35,7 @@ pub use content_hash::HookContentHash;
 pub use matcher::HookMatcher;
 pub use output::{
     AgentResponseResult, HookOutput, PermissionRequestResult, PostToolUseResult,
-    PreCompactResult, PostCompactResult, SubagentStartResult, SubagentStopResult,
+    PreCompactResult, PostCompactResult, SessionStartResult, SubagentStartResult, SubagentStopResult,
     UserHookResult, UserPromptSubmitResult, UserPromptSubmitShape,
 };
 pub use policy::HookEventPolicy;
@@ -127,6 +127,12 @@ pub struct UserHook {
 
     /// Plugin origin (name + version).  `None` for user-authored hooks.
     pub plugin_origin: Option<(String, String)>,
+
+    /// Extra environment for `command` hooks (a plugin hook gets
+    /// `CLAUDE_PLUGIN_ROOT` / `CODA_PLUGIN_ROOT`). Set by the loader, never
+    /// read from JSON.
+    #[serde(skip)]
+    pub env: std::collections::HashMap<String, String>,
 }
 
 fn default_true() -> bool {

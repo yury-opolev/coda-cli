@@ -245,6 +245,18 @@ impl PostCompactResult {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// SessionStart result
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Merged output of `SessionStart` hooks.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SessionStartResult {
+    /// Every hook's `hookSpecificOutput.additionalContext`, in hook order,
+    /// joined by a blank line. `None` when no hook supplied any.
+    pub additional_context: Option<String>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // UserPromptSubmit result
 // ─────────────────────────────────────────────────────────────────────────────
 

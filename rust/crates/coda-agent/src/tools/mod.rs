@@ -23,6 +23,7 @@ mod run_command;
 mod schedule_cancel_self;
 mod schedule_create;
 mod schedule_tools;
+pub mod skill;
 mod sleep_tool;
 mod source;
 pub mod task;
@@ -71,7 +72,8 @@ pub use schedule_cancel_self::ScheduleCancelSelfTool;
 pub use schedule_create::ScheduleCreateTool;
 pub use schedule_tools::{ScheduleDeleteTool, ScheduleListTool};
 pub use sleep_tool::{SleepTool, MAX_DURATION_MS};
-pub use task::TaskTool;
+pub use skill::{SkillEntry, SkillTool};
+pub use task::{PluginAwareTaskTool, TaskTool};
 pub use task_get::TaskGetTool;
 pub use task_list::TaskListTool;
 pub use task_peek::TaskPeekTool;
@@ -193,6 +195,29 @@ pub(crate) fn glob_to_regex(glob: &str) -> Result<Regex, regex::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Plugin roots are readable but never writable: a writable root would
+    /// let the model rewrite a script an approved plugin hook runs.
+    #[tokio::test]
+    async fn readable_directories_allow_reads_but_not_writes() {
+        let ws = tempfile::tempdir().unwrap();
+        let plugin = tempfile::tempdir().unwrap();
+        std::fs::write(plugin.path().join("a.md"), "hello").unwrap();
+        let mut ctx = crate::tool::ToolContext::new(ws.path().to_string_lossy());
+        ctx.readable_directories = Some([plugin.path().to_string_lossy().into_owned()].into());
+        let cancel = tokio_util::sync::CancellationToken::new;
+
+        let read = ReadFileTool
+            .execute(&serde_json::json!({"path": plugin.path().join("a.md")}), &ctx, cancel())
+            .await;
+        assert!(!read.is_error && read.content.contains("hello"), "{}", read.content);
+        let target = plugin.path().join("b.md");
+        let write = WriteFileTool
+            .execute(&serde_json::json!({"path": target, "content": "x"}), &ctx, cancel())
+            .await;
+        assert!(write.is_error, "{}", write.content);
+        assert!(!target.exists());
+    }
 
     #[test]
     fn single_star_matches_within_one_segment() {
