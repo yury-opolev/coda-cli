@@ -63,7 +63,8 @@ fn canonical_json(v: &Value) -> String {
     fn sort(v: &Value) -> Value {
         match v {
             Value::Object(m) => {
-                let sorted: BTreeMap<&String, Value> = m.iter().map(|(k, v)| (k, sort(v))).collect();
+                let sorted: BTreeMap<&String, Value> =
+                    m.iter().map(|(k, v)| (k, sort(v))).collect();
                 let mut out = Map::new();
                 for (k, v) in sorted {
                     out.insert(k.clone(), v);
@@ -122,7 +123,12 @@ impl PluginTrustStore {
                     .map(|(k, v)| {
                         let kinds = v
                             .as_array()
-                            .map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(Value::as_str)
+                                    .map(str::to_owned)
+                                    .collect()
+                            })
                             .unwrap_or_default();
                         (k.clone(), kinds)
                     })
@@ -147,7 +153,11 @@ impl PluginTrustStore {
 
     /// The components of `plugin` that are not approved yet.
     pub fn pending<'a>(&self, plugin: &'a PluginDescriptor) -> Vec<&'a ExecComponent> {
-        plugin.exec.iter().filter(|c| !self.is_approved(plugin, c)).collect()
+        plugin
+            .exec
+            .iter()
+            .filter(|c| !self.is_approved(plugin, c))
+            .collect()
     }
 
     pub fn state(&self, plugin: &PluginDescriptor) -> TrustState {
@@ -170,7 +180,12 @@ impl PluginTrustStore {
         let approvals: Map<String, Value> = self
             .approvals
             .iter()
-            .map(|(k, kinds)| (k.clone(), Value::Array(kinds.iter().cloned().map(Value::String).collect())))
+            .map(|(k, kinds)| {
+                (
+                    k.clone(),
+                    Value::Array(kinds.iter().cloned().map(Value::String).collect()),
+                )
+            })
             .collect();
         doc.as_object_mut()
             .expect("object")
@@ -192,7 +207,11 @@ fn read_doc(path: &Path) -> Value {
 }
 
 #[cfg(test)]
-pub(crate) fn test_plugin(manifest: &str, source: super::PluginSource, exec: Vec<ExecComponent>) -> PluginDescriptor {
+pub(crate) fn test_plugin(
+    manifest: &str,
+    source: super::PluginSource,
+    exec: Vec<ExecComponent>,
+) -> PluginDescriptor {
     PluginDescriptor {
         name: "p".into(),
         version: None,
@@ -222,7 +241,11 @@ mod tests {
     }
 
     fn server(cmd: &str) -> ExecComponent {
-        ExecComponent { kind: KIND_MCP_SERVER, name: "s".into(), definition: json!({"command": cmd, "args": []}) }
+        ExecComponent {
+            kind: KIND_MCP_SERVER,
+            name: "s".into(),
+            definition: json!({"command": cmd, "args": []}),
+        }
     }
 
     #[test]
@@ -233,8 +256,15 @@ mod tests {
         assert_ne!(key, approval_key(&base, &server("b")), "component change");
         let edited = plugin(r#"{"name":"p","version":"2"}"#, PluginSource::User, vec![]);
         assert_ne!(key, approval_key(&edited, &server("a")), "manifest change");
-        let reordered = ExecComponent { definition: json!({"args": [], "command": "a"}), ..server("a") };
-        assert_eq!(key, approval_key(&base, &reordered), "key order is irrelevant");
+        let reordered = ExecComponent {
+            definition: json!({"args": [], "command": "a"}),
+            ..server("a")
+        };
+        assert_eq!(
+            key,
+            approval_key(&base, &reordered),
+            "key order is irrelevant"
+        );
     }
 
     #[test]
@@ -242,12 +272,18 @@ mod tests {
         let a = plugin("{}", PluginSource::Project, vec![]);
         let mut b = a.clone();
         b.root = PathBuf::from("C:/Other/P");
-        assert_ne!(approval_key(&a, &server("x")), approval_key(&b, &server("x")));
+        assert_ne!(
+            approval_key(&a, &server("x")),
+            approval_key(&b, &server("x"))
+        );
         let mut u = a.clone();
         u.source = PluginSource::User;
         let mut v = u.clone();
         v.root = PathBuf::from("C:/Other/P");
-        assert_eq!(approval_key(&u, &server("x")), approval_key(&v, &server("x")));
+        assert_eq!(
+            approval_key(&u, &server("x")),
+            approval_key(&v, &server("x"))
+        );
     }
 
     #[test]
@@ -268,10 +304,15 @@ mod tests {
         let reloaded = PluginTrustStore::load(dir.path());
         assert!(reloaded.is_approved(&p, &p.exec[0]));
         assert!(!reloaded.is_approved(&p, &p.exec[1]));
-        let doc: Value =
-            serde_json::from_str(&std::fs::read_to_string(dir.path().join("plugin-trust.json")).unwrap()).unwrap();
+        let doc: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("plugin-trust.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(doc["other"], 1);
         assert_eq!(doc["pluginApprovals"]["old"][0], "skill");
-        assert_eq!(reloaded.state(&plugin("{}", PluginSource::User, vec![])), TrustState::NotRequired);
+        assert_eq!(
+            reloaded.state(&plugin("{}", PluginSource::User, vec![])),
+            TrustState::NotRequired
+        );
     }
 }

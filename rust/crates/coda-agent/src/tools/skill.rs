@@ -65,7 +65,11 @@ pub fn resolve<'a>(entries: &'a [SkillEntry], name: &str) -> Result<&'a SkillEnt
         names.sort_unstable();
         return Err(format!(
             "Unknown skill '{name}'. Available skills: {}",
-            if names.is_empty() { "(none)".to_owned() } else { names.join(", ") }
+            if names.is_empty() {
+                "(none)".to_owned()
+            } else {
+                names.join(", ")
+            }
         ));
     };
     let winners: Vec<&SkillEntry> = matches.into_iter().filter(|e| e.rank == top).collect();
@@ -76,7 +80,10 @@ pub fn resolve<'a>(entries: &'a [SkillEntry], name: &str) -> Result<&'a SkillEnt
         [one] => Ok(one),
         many => {
             let names: Vec<&str> = many.iter().map(|e| e.name.as_str()).collect();
-            Err(format!("Skill '{name}' is ambiguous; use one of: {}", names.join(", ")))
+            Err(format!(
+                "Skill '{name}' is ambiguous; use one of: {}",
+                names.join(", ")
+            ))
         }
     }
 }
@@ -99,7 +106,10 @@ impl SkillTool {
         for e in listed {
             description.push_str(&format!("\n- {}: {}", e.name, truncate(&e.description)));
         }
-        Self { entries, description }
+        Self {
+            entries,
+            description,
+        }
     }
 
     pub fn entries(&self) -> &[SkillEntry] {
@@ -108,8 +118,13 @@ impl SkillTool {
 
     /// The text returned for `entry` invoked with `arguments`.
     pub fn render(entry: &SkillEntry, arguments: &[String]) -> Result<String, String> {
-        let text = std::fs::read_to_string(&entry.file)
-            .map_err(|e| format!("Cannot read skill '{}' ({}): {e}", entry.name, entry.file.display()))?;
+        let text = std::fs::read_to_string(&entry.file).map_err(|e| {
+            format!(
+                "Cannot read skill '{}' ({}): {e}",
+                entry.name,
+                entry.file.display()
+            )
+        })?;
         let mut body = strip_front_matter(&text).to_owned();
         if !arguments.is_empty() {
             let args: Vec<&str> = arguments.iter().map(String::as_str).collect();
@@ -120,7 +135,9 @@ impl SkillTool {
         let mut out = format!("Base directory for this skill: {dir}\n");
         if let Some(root) = &entry.plugin_root {
             let root = root.to_string_lossy();
-            body = body.replace("${CLAUDE_PLUGIN_ROOT}", &root).replace("${CODA_PLUGIN_ROOT}", &root);
+            body = body
+                .replace("${CLAUDE_PLUGIN_ROOT}", &root)
+                .replace("${CODA_PLUGIN_ROOT}", &root);
             out.push_str(&format!(
                 "Plugin: {} (root: {root}; also available as ${{CLAUDE_PLUGIN_ROOT}} / ${{CODA_PLUGIN_ROOT}})\n",
                 entry.plugin.as_deref().unwrap_or("?")
@@ -169,8 +186,17 @@ impl Tool for SkillTool {
         true
     }
 
-    async fn execute(&self, input: &Value, _ctx: &ToolContext, _cancel: CancellationToken) -> ToolOutcome {
-        let Some(name) = input.get("name").and_then(Value::as_str).filter(|n| !n.trim().is_empty()) else {
+    async fn execute(
+        &self,
+        input: &Value,
+        _ctx: &ToolContext,
+        _cancel: CancellationToken,
+    ) -> ToolOutcome {
+        let Some(name) = input
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|n| !n.trim().is_empty())
+        else {
             return ToolResult::error("Missing required 'name'.");
         };
         let entry = match resolve(&self.entries, name) {
@@ -185,7 +211,11 @@ impl Tool for SkillTool {
         }
         let arguments: Vec<String> = match input.get("arguments") {
             Some(Value::String(s)) => s.split_whitespace().map(str::to_owned).collect(),
-            Some(Value::Array(items)) => items.iter().filter_map(Value::as_str).map(str::to_owned).collect(),
+            Some(Value::Array(items)) => items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect(),
             _ => Vec::new(),
         };
         match Self::render(entry, &arguments) {
@@ -311,13 +341,26 @@ mod tests {
 
         let all = vec![user.clone(), a.clone(), b.clone(), project.clone()];
         assert_eq!(resolve(&all, "review").unwrap().rank, 4, "project wins");
-        assert_eq!(resolve(&all, "b:review").unwrap().name, "b:review", "qualified is exact");
+        assert_eq!(
+            resolve(&all, "b:review").unwrap().name,
+            "b:review",
+            "qualified is exact"
+        );
 
         let err = resolve(&[user.clone(), a.clone(), b.clone()], "review").unwrap_err();
-        assert!(err.contains("a:review") && err.contains("b:review"), "{err}");
+        assert!(
+            err.contains("a:review") && err.contains("b:review"),
+            "{err}"
+        );
 
-        assert_eq!(resolve(&[user.clone(), a.clone()], "review").unwrap().name, "a:review", "plugin beats user");
-        assert!(resolve(&[user], "nope").unwrap_err().contains("Available skills: review"));
+        assert_eq!(
+            resolve(&[user.clone(), a.clone()], "review").unwrap().name,
+            "a:review",
+            "plugin beats user"
+        );
+        assert!(resolve(&[user], "nope")
+            .unwrap_err()
+            .contains("Available skills: review"));
     }
 
     #[tokio::test]
@@ -337,23 +380,44 @@ mod tests {
         e.plugin_root = Some(root.clone());
         e.plugin_agents = vec!["deep-review:skeptic".into()];
         let tool = SkillTool::new(vec![e]);
-        assert!(tool.description().contains("- deep-review:extreme-review: extreme-review desc"));
+        assert!(tool
+            .description()
+            .contains("- deep-review:extreme-review: extreme-review desc"));
 
         let ctx = ToolContext::new(".");
         let out = tool
-            .execute(&json!({"name": "extreme-review", "arguments": "PR-7"}), &ctx, CancellationToken::new())
+            .execute(
+                &json!({"name": "extreme-review", "arguments": "PR-7"}),
+                &ctx,
+                CancellationToken::new(),
+            )
             .await;
         let text = out.content.clone();
         assert!(!out.is_error, "{text}");
-        assert!(text.starts_with(&format!("Base directory for this skill: {}", skill_dir.display())), "{text}");
+        assert!(
+            text.starts_with(&format!(
+                "Base directory for this skill: {}",
+                skill_dir.display()
+            )),
+            "{text}"
+        );
         assert!(text.contains("deep-review:skeptic"));
-        assert!(text.contains(&format!("{}/scripts/x.ps1 on PR-7", root.display())), "{text}");
+        assert!(
+            text.contains(&format!("{}/scripts/x.ps1 on PR-7", root.display())),
+            "{text}"
+        );
         assert!(text.contains("Costs $5."));
         assert!(!text.contains("description: d"), "front matter is stripped");
 
         // Edits apply on the next call without rebuilding the catalogue.
         std::fs::write(&file, "---\nname: extreme-review\n---\nEdited.").unwrap();
-        let out = tool.execute(&json!({"name": "deep-review:extreme-review"}), &ctx, CancellationToken::new()).await;
+        let out = tool
+            .execute(
+                &json!({"name": "deep-review:extreme-review"}),
+                &ctx,
+                CancellationToken::new(),
+            )
+            .await;
         assert!(out.content.clone().ends_with("Edited."));
     }
 
@@ -366,7 +430,13 @@ mod tests {
         e.model_invocable = false;
         let tool = SkillTool::new(vec![e]);
         assert!(!tool.description().contains("quiet"));
-        let out = tool.execute(&json!({"name": "quiet"}), &ToolContext::new("."), CancellationToken::new()).await;
+        let out = tool
+            .execute(
+                &json!({"name": "quiet"}),
+                &ToolContext::new("."),
+                CancellationToken::new(),
+            )
+            .await;
         assert!(out.is_error);
     }
 
@@ -379,7 +449,10 @@ mod tests {
 
     #[test]
     fn bind_skill_args_rules() {
-        assert_eq!(bind_skill_args("Translate to $1: $ARGUMENTS", &["French", "Hi"]), "Translate to French: French Hi");
+        assert_eq!(
+            bind_skill_args("Translate to $1: $ARGUMENTS", &["French", "Hi"]),
+            "Translate to French: French Hi"
+        );
         assert_eq!(bind_skill_args("Do $1 and $3", &["first"]), "Do first and ");
         assert_eq!(bind_skill_args("$$1", &["x"]), "$1");
         assert_eq!(bind_skill_args("$1", &["$ARGUMENTS"]), "$ARGUMENTS");

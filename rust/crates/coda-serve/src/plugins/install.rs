@@ -16,7 +16,9 @@ pub const RECEIPT_FILE: &str = ".coda-plugin.json";
 /// `true` for strings that name a git repository rather than a local path.
 pub fn looks_like_git_url(source: &str) -> bool {
     let s = source.trim();
-    ["https://", "http://", "git@", "ssh://", "git://", "file://"].iter().any(|p| s.starts_with(p))
+    ["https://", "http://", "git@", "ssh://", "git://", "file://"]
+        .iter()
+        .any(|p| s.starts_with(p))
         || s.split('#').next().is_some_and(|u| u.ends_with(".git"))
 }
 
@@ -42,7 +44,11 @@ pub fn git(dir: Option<&Path>, args: &[&str]) -> Result<String, String> {
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
     } else {
-        Err(format!("git {} failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim()))
+        Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
     }
 }
 
@@ -86,9 +92,22 @@ pub fn fetch_and_reset(dir: &Path, git_ref: Option<&str>) -> Result<String, Stri
         check_arg("ref", r)?;
     }
     if !is_own_checkout(dir) {
-        return Err(format!("{} is not a git checkout of its own; not updating it", dir.display()));
+        return Err(format!(
+            "{} is not a git checkout of its own; not updating it",
+            dir.display()
+        ));
     }
-    git(Some(dir), &["fetch", "--depth", "1", "--quiet", "origin", git_ref.unwrap_or("HEAD")])?;
+    git(
+        Some(dir),
+        &[
+            "fetch",
+            "--depth",
+            "1",
+            "--quiet",
+            "origin",
+            git_ref.unwrap_or("HEAD"),
+        ],
+    )?;
     git(Some(dir), &["reset", "--hard", "--quiet", "FETCH_HEAD"])?;
     head_commit(dir)
 }
@@ -116,7 +135,9 @@ pub fn content_hash(root: &Path) -> String {
 }
 
 fn collect(root: &Path, dir: &Path, out: &mut Vec<String>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let name = entry.file_name();
         if name == ".git" || name == RECEIPT_FILE {
@@ -141,7 +162,12 @@ pub fn read_receipt(root: &Path) -> Option<Value> {
     serde_json::from_str(&text).ok()
 }
 
-pub fn write_receipt(root: &Path, url: &str, git_ref: Option<&str>, commit: &str) -> Result<(), String> {
+pub fn write_receipt(
+    root: &Path,
+    url: &str,
+    git_ref: Option<&str>,
+    commit: &str,
+) -> Result<(), String> {
     let receipt = json!({
         "source": "git",
         "url": url,
@@ -150,8 +176,11 @@ pub fn write_receipt(root: &Path, url: &str, git_ref: Option<&str>, commit: &str
         "installedAt": chrono::Utc::now().to_rfc3339(),
         "contentHash": content_hash(root),
     });
-    std::fs::write(root.join(RECEIPT_FILE), serde_json::to_string_pretty(&receipt).unwrap_or_default())
-        .map_err(|e| format!("cannot write the install receipt: {e}"))
+    std::fs::write(
+        root.join(RECEIPT_FILE),
+        serde_json::to_string_pretty(&receipt).unwrap_or_default(),
+    )
+    .map_err(|e| format!("cannot write the install receipt: {e}"))
 }
 
 /// A unique staging directory under `plugins_dir` (hidden, so discovery
@@ -171,8 +200,14 @@ mod tests {
         assert!(looks_like_git_url("C:/src/repo.git#v1"));
         assert!(!looks_like_git_url("C:/src/plugin"));
         assert!(!looks_like_git_url("review@local"));
-        assert_eq!(split_ref("https://x/r.git#v2"), ("https://x/r.git".to_owned(), Some("v2".to_owned())));
-        assert_eq!(split_ref("https://x/r.git"), ("https://x/r.git".to_owned(), None));
+        assert_eq!(
+            split_ref("https://x/r.git#v2"),
+            ("https://x/r.git".to_owned(), Some("v2".to_owned()))
+        );
+        assert_eq!(
+            split_ref("https://x/r.git"),
+            ("https://x/r.git".to_owned(), None)
+        );
         assert!(check_arg("ref", "--upload-pack=evil").is_err());
         assert!(clone("https://x/r.git", Some("-x"), Path::new("unused")).is_err());
     }
@@ -189,7 +224,9 @@ mod tests {
         let nested = repo.path().join(".coda/plugins/x");
         std::fs::create_dir_all(&nested).unwrap();
         assert!(!is_own_checkout(&nested));
-        assert!(fetch_and_reset(&nested, None).unwrap_err().contains("not a git checkout of its own"));
+        assert!(fetch_and_reset(&nested, None)
+            .unwrap_err()
+            .contains("not a git checkout of its own"));
         assert!(is_own_checkout(repo.path()));
     }
 

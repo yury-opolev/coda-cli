@@ -73,7 +73,9 @@ impl PluginSettings {
                         Some(b) => {
                             out.enabled.insert(name.clone(), b);
                         }
-                        None => errors.push(format!("settings `plugins.enabled.{name}` must be true or false")),
+                        None => errors.push(format!(
+                            "settings `plugins.enabled.{name}` must be true or false"
+                        )),
                     }
                 }
             }
@@ -86,7 +88,8 @@ impl PluginSettings {
                 for item in items {
                     match item.as_str().map(str::trim).filter(|s| !s.is_empty()) {
                         Some(p) => out.paths.push(expand_home(p)),
-                        None => errors.push("settings `plugins.paths` entries must be strings".to_owned()),
+                        None => errors
+                            .push("settings `plugins.paths` entries must be strings".to_owned()),
                     }
                 }
             }
@@ -117,7 +120,12 @@ impl PluginSettings {
                 let names = |key: &str| -> Vec<String> {
                     doc.get(key)
                         .and_then(Value::as_array)
-                        .map(|l| l.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+                        .map(|l| {
+                            l.iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_owned)
+                                .collect()
+                        })
                         .unwrap_or_default()
                 };
                 self.legacy_disabled.extend(names("disabledPlugins"));
@@ -154,12 +162,19 @@ fn parse_marketplace(id: &str, def: &Value, coda_dir: &Path) -> Result<Marketpla
     let obj = def
         .as_object()
         .ok_or_else(|| format!("settings `plugins.marketplaces.{id}` must be an object"))?;
-    let source = obj.get("source").and_then(Value::as_str).unwrap_or("directory");
+    let source = obj
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or("directory");
     let path = obj.get("path").and_then(Value::as_str).map(expand_home);
     match source {
         "directory" => {
             let path = path.ok_or_else(|| format!("marketplace '{id}' needs a `path`"))?;
-            Ok(MarketplaceRef { id: id.to_owned(), kind: MarketplaceKind::Directory, path })
+            Ok(MarketplaceRef {
+                id: id.to_owned(),
+                kind: MarketplaceKind::Directory,
+                path,
+            })
         }
         "git" => {
             let url = obj
@@ -169,11 +184,15 @@ fn parse_marketplace(id: &str, def: &Value, coda_dir: &Path) -> Result<Marketpla
                 .ok_or_else(|| format!("marketplace '{id}' needs a `url`"))?;
             Ok(MarketplaceRef {
                 id: id.to_owned(),
-                kind: MarketplaceKind::Git { url: url.to_owned() },
+                kind: MarketplaceKind::Git {
+                    url: url.to_owned(),
+                },
                 path: path.unwrap_or_else(|| git_marketplace_dir(coda_dir, id)),
             })
         }
-        other => Err(format!("marketplace '{id}' has an unsupported source '{other}'")),
+        other => Err(format!(
+            "marketplace '{id}' has an unsupported source '{other}'"
+        )),
     }
 }
 
@@ -240,13 +259,19 @@ mod tests {
         assert!(s.is_enabled("p", &PluginSource::User));
         assert!(s.is_enabled("p", &PluginSource::Path));
         assert!(s.is_enabled("p", &PluginSource::Project));
-        assert!(!s.is_enabled("p", &market), "marketplace plugins are opt-in");
+        assert!(
+            !s.is_enabled("p", &market),
+            "marketplace plugins are opt-in"
+        );
 
         s.legacy_disabled.insert("p".into());
         assert!(!s.is_enabled("p", &PluginSource::User));
 
         s.enabled.insert("p".into(), true);
-        assert!(s.is_enabled("p", &PluginSource::User), "explicit settings win");
+        assert!(
+            s.is_enabled("p", &PluginSource::User),
+            "explicit settings win"
+        );
         assert!(s.is_enabled("p", &market));
         s.enabled.insert("p".into(), false);
         assert!(!s.is_enabled("p", &PluginSource::Path));
@@ -262,6 +287,9 @@ mod tests {
         .unwrap();
         let s = PluginSettings::default().with_legacy_state(dir.path());
         assert!(!s.is_enabled("old", &PluginSource::User));
-        assert!(s.is_enabled("m", &PluginSource::Marketplace("x".into())), "the TUI's /plugin enable counts");
+        assert!(
+            s.is_enabled("m", &PluginSource::Marketplace("x".into())),
+            "the TUI's /plugin enable counts"
+        );
     }
 }

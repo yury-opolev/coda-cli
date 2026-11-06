@@ -92,7 +92,11 @@ pub fn parse(value: &Value) -> Result<PluginManifest, String> {
     }
     for key in obj.keys() {
         if !KNOWN_KEYS.contains(&key.as_str()) {
-            tracing::debug!(plugin = name, key = key.as_str(), "ignoring unknown plugin.json key");
+            tracing::debug!(
+                plugin = name,
+                key = key.as_str(),
+                "ignoring unknown plugin.json key"
+            );
         }
     }
     let author = match obj.get("author") {
@@ -120,19 +124,25 @@ pub fn is_valid_name(name: &str) -> bool {
     !name.is_empty()
         && name != "."
         && name != ".."
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 fn string_field(v: Option<&Value>) -> Option<String> {
-    v.and_then(Value::as_str).map(str::to_owned).filter(|s| !s.trim().is_empty())
+    v.and_then(Value::as_str)
+        .map(str::to_owned)
+        .filter(|s| !s.trim().is_empty())
 }
 
 fn path_list(v: Option<&Value>) -> Vec<String> {
     match v {
         Some(Value::String(s)) => vec![s.clone()],
-        Some(Value::Array(items)) => {
-            items.iter().filter_map(Value::as_str).map(str::to_owned).collect()
-        }
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -184,7 +194,10 @@ mod tests {
     #[test]
     fn the_claude_layout_is_preferred_over_a_root_manifest() {
         let dir = tempfile::tempdir().unwrap();
-        write(&dir.path().join(".claude-plugin/plugin.json"), r#"{"name":"nested"}"#);
+        write(
+            &dir.path().join(".claude-plugin/plugin.json"),
+            r#"{"name":"nested"}"#,
+        );
         write(&dir.path().join("plugin.json"), r#"{"name":"flat"}"#);
         let (m, _) = load(dir.path()).unwrap().unwrap();
         assert_eq!(m.name, "nested");
@@ -193,7 +206,10 @@ mod tests {
     #[test]
     fn a_root_manifest_is_accepted() {
         let dir = tempfile::tempdir().unwrap();
-        write(&dir.path().join("plugin.json"), r#"{"name":"flat","version":"1.2.3"}"#);
+        write(
+            &dir.path().join("plugin.json"),
+            r#"{"name":"flat","version":"1.2.3"}"#,
+        );
         let (m, bytes) = load(dir.path()).unwrap().unwrap();
         assert_eq!(m.name, "flat");
         assert_eq!(m.version.as_deref(), Some("1.2.3"));
@@ -213,7 +229,9 @@ mod tests {
         let err = load(dir.path()).unwrap().unwrap_err();
         assert!(err.contains("invalid plugin.json"), "{err}");
 
-        assert!(parse(&json!({"version":"1"})).unwrap_err().contains("`name` is required"));
+        assert!(parse(&json!({"version":"1"}))
+            .unwrap_err()
+            .contains("`name` is required"));
         assert!(parse(&json!({"name":"../evil"})).is_err());
     }
 
@@ -232,7 +250,13 @@ mod tests {
         assert_eq!(m.skills, vec!["./extra"]);
         assert_eq!(m.agents, vec!["./a", "./b"]);
         assert_eq!(m.mcp_servers, Some(json!("./servers.json")));
-        assert_eq!(parse(&json!({"name":"p","author":"me"})).unwrap().author.as_deref(), Some("me"));
+        assert_eq!(
+            parse(&json!({"name":"p","author":"me"}))
+                .unwrap()
+                .author
+                .as_deref(),
+            Some("me")
+        );
     }
 
     #[test]
@@ -241,8 +265,12 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("skills")).unwrap();
         assert!(resolve_contained(dir.path(), "./skills").is_ok());
         assert!(resolve_contained(dir.path(), "a/../skills").is_ok());
-        assert!(resolve_contained(dir.path(), "../x").unwrap_err().contains("escapes"));
-        assert!(resolve_contained(dir.path(), "a/../../x").unwrap_err().contains("escapes"));
+        assert!(resolve_contained(dir.path(), "../x")
+            .unwrap_err()
+            .contains("escapes"));
+        assert!(resolve_contained(dir.path(), "a/../../x")
+            .unwrap_err()
+            .contains("escapes"));
         let absolute = dir.path().join("skills").to_string_lossy().into_owned();
         assert!(resolve_contained(dir.path(), &absolute).is_err());
     }

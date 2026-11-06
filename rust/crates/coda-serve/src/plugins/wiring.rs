@@ -40,15 +40,23 @@ impl PluginWiring {
         let mut agents_by_plugin: HashMap<String, Vec<String>> = HashMap::new();
         for a in &agents {
             if let Some((plugin, _)) = a.agent_type.split_once(':') {
-                agents_by_plugin.entry(plugin.to_owned()).or_default().push(a.agent_type.clone());
+                agents_by_plugin
+                    .entry(plugin.to_owned())
+                    .or_default()
+                    .push(a.agent_type.clone());
             }
         }
         let skills = skills::discover(workspace, plugins);
         let catalog = skills::catalog(&skills, &agents_by_plugin);
 
-        let mut readable_directories: HashSet<String> =
-            plugins.active().map(|p| p.root.to_string_lossy().into_owned()).collect();
-        for s in skills.iter().filter(|s| s.plugin.is_none() && s.source_path.is_none()) {
+        let mut readable_directories: HashSet<String> = plugins
+            .active()
+            .map(|p| p.root.to_string_lossy().into_owned())
+            .collect();
+        for s in skills
+            .iter()
+            .filter(|s| s.plugin.is_none() && s.source_path.is_none())
+        {
             if let Some(dir) = s.file.parent() {
                 readable_directories.insert(dir.to_string_lossy().into_owned());
             }
@@ -76,7 +84,10 @@ impl PluginWiring {
 
     /// `(type, description)` pairs for the `task` tool description.
     pub fn agent_summaries(&self) -> Vec<(String, String)> {
-        self.agents.iter().map(|a| (a.agent_type.clone(), a.description.clone())).collect()
+        self.agents
+            .iter()
+            .map(|a| (a.agent_type.clone(), a.description.clone()))
+            .collect()
     }
 }
 
@@ -85,7 +96,12 @@ pub fn plugin_agents(plugins: &PluginSet) -> Vec<SubagentDefinition> {
     let mut out = Vec::new();
     for plugin in plugins.active() {
         for dir in &plugin.agent_dirs {
-            out.extend(PluginAgentLoader::load_for_plugin(dir, &plugin.name, plugin.source.is_project(), &plugin.root));
+            out.extend(PluginAgentLoader::load_for_plugin(
+                dir,
+                &plugin.name,
+                plugin.source.is_project(),
+                &plugin.root,
+            ));
         }
     }
     out
@@ -100,7 +116,10 @@ pub fn inventory(workspace: &Path, plugins: &PluginSet, trust: &PluginTrustStore
         .iter()
         .map(|p| {
             let (mut skill_names, mut command_names) = (Vec::new(), Vec::new());
-            for s in skills.iter().filter(|s| s.plugin.as_deref() == Some(p.name.as_str())) {
+            for s in skills
+                .iter()
+                .filter(|s| s.plugin.as_deref() == Some(p.name.as_str()))
+            {
                 if s.file.file_name().is_some_and(|f| f == "SKILL.md") {
                     skill_names.push(s.name.clone());
                 } else {
@@ -108,16 +127,28 @@ pub fn inventory(workspace: &Path, plugins: &PluginSet, trust: &PluginTrustStore
                 }
             }
             let prefix = format!("{}:", p.name);
-            let agent_names: Vec<String> =
-                agents.iter().filter(|a| a.agent_type.starts_with(&prefix)).map(|a| a.agent_type.clone()).collect();
+            let agent_names: Vec<String> = agents
+                .iter()
+                .filter(|a| a.agent_type.starts_with(&prefix))
+                .map(|a| a.agent_type.clone())
+                .collect();
             let names = |kind: &str| -> Vec<String> {
-                p.exec.iter().filter(|c| c.kind == kind).map(|c| c.name.clone()).collect()
+                p.exec
+                    .iter()
+                    .filter(|c| c.kind == kind)
+                    .map(|c| c.name.clone())
+                    .collect()
             };
             let hook_events: Vec<String> = p
                 .exec
                 .iter()
                 .filter(|c| c.kind == KIND_HOOK)
-                .flat_map(|c| c.definition.as_object().map(|m| m.keys().cloned().collect::<Vec<_>>()).unwrap_or_default())
+                .flat_map(|c| {
+                    c.definition
+                        .as_object()
+                        .map(|m| m.keys().cloned().collect::<Vec<_>>())
+                        .unwrap_or_default()
+                })
                 .collect();
             let components = json!({
                 "skills": skill_names,
@@ -156,9 +187,15 @@ mod tests {
         let wiring = PluginWiring::build(ws.path(), &set, &trust);
         assert_eq!(wiring.agents.len(), 1);
         assert_eq!(wiring.agents[0].agent_type, "deep-review:skeptic");
-        let entry = wiring.catalog.iter().find(|e| e.name == "deep-review:review").unwrap();
+        let entry = wiring
+            .catalog
+            .iter()
+            .find(|e| e.name == "deep-review:review")
+            .unwrap();
         assert_eq!(entry.plugin_agents, vec!["deep-review:skeptic".to_owned()]);
-        assert!(wiring.readable_directories.contains(&*set.plugins[0].root.to_string_lossy()));
+        assert!(wiring
+            .readable_directories
+            .contains(&*set.plugins[0].root.to_string_lossy()));
         assert_eq!(wiring.hooks.len(), 1);
         assert!(!wiring.hooks[0].enabled, "unapproved hooks never run");
         assert!(wiring.trusted_hook_hashes.is_empty());
@@ -179,6 +216,9 @@ mod tests {
         let wiring = PluginWiring::build(ws.path(), &set, &trust);
         assert!(wiring.hooks[0].enabled);
         assert_eq!(wiring.trusted_hook_hashes.len(), 1);
-        assert_eq!(inventory(ws.path(), &set, &trust)["plugins"][0]["trust"], "approved");
+        assert_eq!(
+            inventory(ws.path(), &set, &trust)["plugins"][0]["trust"],
+            "approved"
+        );
     }
 }

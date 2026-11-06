@@ -97,7 +97,8 @@ pub fn run(args: PluginArgs) -> i32 {
         print!("{question} [y/N] ");
         let _ = std::io::stdout().flush();
         let mut line = String::new();
-        std::io::stdin().read_line(&mut line).is_ok() && matches!(line.trim(), "y" | "Y" | "yes" | "YES")
+        std::io::stdin().read_line(&mut line).is_ok()
+            && matches!(line.trim(), "y" | "Y" | "yes" | "YES")
     };
     let coda_dir = coda_auth::coda_dir();
     let mut env = CliEnv {
@@ -145,8 +146,12 @@ fn read_settings(env: &CliEnv) -> Result<Value, String> {
 fn edit_settings(env: &CliEnv, edit: impl FnOnce(&mut Map<String, Value>)) -> Result<(), String> {
     let original = read_settings(env)?;
     let mut edited = original.clone();
-    let root = edited.as_object_mut().ok_or("settings.json is not an object")?;
-    let plugins = root.entry("plugins").or_insert_with(|| Value::Object(Map::new()));
+    let root = edited
+        .as_object_mut()
+        .ok_or("settings.json is not an object")?;
+    let plugins = root
+        .entry("plugins")
+        .or_insert_with(|| Value::Object(Map::new()));
     if !plugins.is_object() {
         return Err("settings `plugins` is not an object".into());
     }
@@ -154,7 +159,8 @@ fn edit_settings(env: &CliEnv, edit: impl FnOnce(&mut Map<String, Value>)) -> Re
     if let Some(dir) = env.settings_path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
-    coda_boot::settings_store::save_changes(&env.settings_path, &original, &edited).map_err(|e| e.to_string())
+    coda_boot::settings_store::save_changes(&env.settings_path, &original, &edited)
+        .map_err(|e| e.to_string())
 }
 
 fn object<'a>(map: &'a mut Map<String, Value>, key: &str) -> &'a mut Map<String, Value> {
@@ -175,11 +181,16 @@ fn array<'a>(map: &'a mut Map<String, Value>, key: &str) -> &'a mut Vec<Value> {
 
 fn discover(env: &CliEnv) -> Result<PluginSet, String> {
     let settings = read_settings(env)?;
-    Ok(discover_from_settings(&env.workspace, &env.coda_dir, &settings))
+    Ok(discover_from_settings(
+        &env.workspace,
+        &env.coda_dir,
+        &settings,
+    ))
 }
 
 fn find<'a>(set: &'a PluginSet, name: &str) -> Result<&'a PluginDescriptor, String> {
-    set.find(name).ok_or_else(|| format!("no plugin named '{name}' (see `coda plugin list`)"))
+    set.find(name)
+        .ok_or_else(|| format!("no plugin named '{name}' (see `coda plugin list`)"))
 }
 
 // ── commands ─────────────────────────────────────────────────────────────────
@@ -189,7 +200,12 @@ fn list(env: &mut CliEnv, as_json: bool) -> Result<(), String> {
     let trust = PluginTrustStore::load(&env.coda_dir);
     let inventory = super::wiring::inventory(&env.workspace, &set, &trust);
     if as_json {
-        writeln!(env.out, "{}", serde_json::to_string_pretty(&inventory).unwrap_or_default()).ok();
+        writeln!(
+            env.out,
+            "{}",
+            serde_json::to_string_pretty(&inventory).unwrap_or_default()
+        )
+        .ok();
         return Ok(());
     }
     if set.plugins.is_empty() {
@@ -237,7 +253,11 @@ fn set_enabled(env: &mut CliEnv, name: &str, enabled: bool) -> Result<(), String
         env.out,
         "{} plugin '{name}'.{} Start a new session to apply.",
         if enabled { "Enabled" } else { "Disabled" },
-        if known { "" } else { " (No such plugin is installed yet.)" }
+        if known {
+            ""
+        } else {
+            " (No such plugin is installed yet.)"
+        }
     )
     .ok();
     Ok(())
@@ -253,7 +273,14 @@ fn install_cmd(env: &mut CliEnv, source: &str, yes: bool) -> Result<(), String> 
     };
     let set = discover(env)?;
     let plugin = find(&set, &name)?;
-    writeln!(env.out, "Installed plugin '{}' from {} ({}).", plugin.name, plugin.source.label(), plugin.root.display()).ok();
+    writeln!(
+        env.out,
+        "Installed plugin '{}' from {} ({}).",
+        plugin.name,
+        plugin.source.label(),
+        plugin.root.display()
+    )
+    .ok();
     for e in &plugin.errors {
         writeln!(env.out, "  warning: {e}").ok();
     }
@@ -264,17 +291,24 @@ fn install_cmd(env: &mut CliEnv, source: &str, yes: bool) -> Result<(), String> 
 fn parse_marketplace_ref(source: &str) -> Option<(&str, &str)> {
     let (plugin, market) = source.split_once('@')?;
     let valid = |s: &str| super::manifest::is_valid_name(s);
-    (valid(plugin) && valid(market) && !source.contains('/') && !source.contains('\\')).then_some((plugin, market))
+    (valid(plugin) && valid(market) && !source.contains('/') && !source.contains('\\'))
+        .then_some((plugin, market))
 }
 
-fn install_from_marketplace(env: &mut CliEnv, plugin: &str, market: &str) -> Result<String, String> {
+fn install_from_marketplace(
+    env: &mut CliEnv,
+    plugin: &str,
+    market: &str,
+) -> Result<String, String> {
     let settings = read_settings(env)?;
     let (parsed, _) = super::PluginSettings::from_settings(&settings, &env.coda_dir);
     let m = parsed
         .marketplaces
         .iter()
         .find(|m| m.id == market)
-        .ok_or_else(|| format!("no marketplace '{market}' (add it with `coda plugin marketplace add`)"))?;
+        .ok_or_else(|| {
+            format!("no marketplace '{market}' (add it with `coda plugin marketplace add`)")
+        })?;
     if let super::MarketplaceKind::Git { url } = &m.kind {
         if !m.path.is_dir() {
             install::clone(url, None, &m.path)?;
@@ -284,7 +318,10 @@ fn install_from_marketplace(env: &mut CliEnv, plugin: &str, market: &str) -> Res
     let found = set
         .plugins
         .iter()
-        .find(|p| p.name.eq_ignore_ascii_case(plugin) && p.source == PluginSource::Marketplace(market.to_owned()))
+        .find(|p| {
+            p.name.eq_ignore_ascii_case(plugin)
+                && p.source == PluginSource::Marketplace(market.to_owned())
+        })
         .ok_or_else(|| format!("marketplace '{market}' offers no plugin '{plugin}'"))?;
     let name = found.name.clone();
     edit_settings(env, |p| {
@@ -304,9 +341,14 @@ fn install_from_git(env: &mut CliEnv, source: &str) -> Result<String, String> {
             .ok_or("the repository root is not a plugin (no plugin.json); for a marketplace use `coda plugin marketplace add --git`")??;
         let dest = plugins_dir.join(&manifest.name);
         if dest.exists() {
-            return Err(format!("plugin '{}' is already installed at {}", manifest.name, dest.display()));
+            return Err(format!(
+                "plugin '{}' is already installed at {}",
+                manifest.name,
+                dest.display()
+            ));
         }
-        std::fs::rename(&staging, &dest).map_err(|e| format!("cannot move the checkout into place: {e}"))?;
+        std::fs::rename(&staging, &dest)
+            .map_err(|e| format!("cannot move the checkout into place: {e}"))?;
         let commit = install::head_commit(&dest)?;
         install::write_receipt(&dest, &url, git_ref.as_deref(), &commit)?;
         Ok(manifest.name)
@@ -328,7 +370,10 @@ fn install_from_path(env: &mut CliEnv, path: &Path) -> Result<String, String> {
     let name = manifest.name.clone();
     edit_settings(env, |p| {
         let paths = array(p, "paths");
-        if !paths.iter().any(|v| v.as_str().is_some_and(|s| super::canonical(Path::new(s)) == root)) {
+        if !paths.iter().any(|v| {
+            v.as_str()
+                .is_some_and(|s| super::canonical(Path::new(s)) == root)
+        }) {
             paths.push(Value::String(entry));
         }
         if let Some(Value::Bool(false)) = p.get("enabled").and_then(|e| e.get(&name)) {
@@ -344,11 +389,22 @@ fn approve(env: &mut CliEnv, plugin: &PluginDescriptor, yes: bool) -> Result<(),
     let pending: Vec<_> = trust.pending(plugin).into_iter().cloned().collect();
     if pending.is_empty() {
         if !plugin.exec.is_empty() {
-            writeln!(env.out, "All executable components of '{}' are approved.", plugin.name).ok();
+            writeln!(
+                env.out,
+                "All executable components of '{}' are approved.",
+                plugin.name
+            )
+            .ok();
         }
         return Ok(());
     }
-    writeln!(env.out, "Plugin '{}' ({}) wants to run:", plugin.name, plugin.source.label()).ok();
+    writeln!(
+        env.out,
+        "Plugin '{}' ({}) wants to run:",
+        plugin.name,
+        plugin.source.label()
+    )
+    .ok();
     for c in &pending {
         writeln!(env.out, "  {}: {}", c.label(), c.definition).ok();
     }
@@ -365,8 +421,15 @@ fn approve(env: &mut CliEnv, plugin: &PluginDescriptor, yes: bool) -> Result<(),
     for c in &pending {
         trust.approve(plugin, c);
     }
-    trust.save().map_err(|e| format!("cannot save plugin approvals: {e}"))?;
-    writeln!(env.out, "Approved {} component(s). Start a new session to apply.", pending.len()).ok();
+    trust
+        .save()
+        .map_err(|e| format!("cannot save plugin approvals: {e}"))?;
+    writeln!(
+        env.out,
+        "Approved {} component(s). Start a new session to apply.",
+        pending.len()
+    )
+    .ok();
     Ok(())
 }
 
@@ -381,7 +444,11 @@ fn update(env: &mut CliEnv, name: Option<&str>, yes: bool) -> Result<(), String>
             }
             if m.path.is_dir() {
                 if !install::is_own_checkout(&m.path) {
-                    return Err(format!("marketplace '{}' at {} is not a git checkout of its own", m.id, m.path.display()));
+                    return Err(format!(
+                        "marketplace '{}' at {} is not a git checkout of its own",
+                        m.id,
+                        m.path.display()
+                    ));
                 }
                 install::git(Some(&m.path), &["pull", "--ff-only", "--quiet"])?;
             } else {
@@ -399,8 +466,13 @@ fn update(env: &mut CliEnv, name: Option<&str>, yes: bool) -> Result<(), String>
         }
         // Only git installs this command made: a receipt in a project or
         // referenced directory is just a file someone shipped.
-        let installed_here = plugin.source == PluginSource::User && plugin.root.starts_with(&user_dir);
-        let receipt = if installed_here { install::read_receipt(&plugin.root) } else { None };
+        let installed_here =
+            plugin.source == PluginSource::User && plugin.root.starts_with(&user_dir);
+        let receipt = if installed_here {
+            install::read_receipt(&plugin.root)
+        } else {
+            None
+        };
         if let Some(receipt) = receipt {
             let url = receipt["url"].as_str().unwrap_or_default().to_owned();
             let git_ref = receipt["ref"].as_str().map(str::to_owned);
@@ -417,16 +489,30 @@ fn update(env: &mut CliEnv, name: Option<&str>, yes: bool) -> Result<(), String>
             .ok();
             updated += 1;
         } else if name.is_some() {
-            writeln!(env.out, "'{}' is loaded in place from {}; nothing to update.", plugin.name, plugin.root.display()).ok();
+            writeln!(
+                env.out,
+                "'{}' is loaded in place from {}; nothing to update.",
+                plugin.name,
+                plugin.root.display()
+            )
+            .ok();
         }
     }
     if updated == 0 && name.is_none() {
-        writeln!(env.out, "Nothing to update (no git installs or git marketplaces).").ok();
+        writeln!(
+            env.out,
+            "Nothing to update (no git installs or git marketplaces)."
+        )
+        .ok();
     }
     // Any executable component whose definition or manifest changed now has
     // a new approval key, so it shows up as pending again.
     let set = discover(env)?;
-    for plugin in set.plugins.iter().filter(|p| name.is_none_or(|n| n.eq_ignore_ascii_case(&p.name))) {
+    for plugin in set
+        .plugins
+        .iter()
+        .filter(|p| name.is_none_or(|n| n.eq_ignore_ascii_case(&p.name)))
+    {
         approve(env, plugin, yes)?;
     }
     Ok(())
@@ -438,11 +524,18 @@ fn remove(env: &mut CliEnv, name: &str) -> Result<(), String> {
     let user_dir = super::canonical(&env.coda_dir.join("plugins"));
     match &plugin.source {
         PluginSource::User if plugin.root.starts_with(&user_dir) => {
-            std::fs::remove_dir_all(&plugin.root).map_err(|e| format!("cannot delete {}: {e}", plugin.root.display()))?;
+            std::fs::remove_dir_all(&plugin.root)
+                .map_err(|e| format!("cannot delete {}: {e}", plugin.root.display()))?;
             edit_settings(env, |p| {
                 object(p, "enabled").remove(&plugin.name);
             })?;
-            writeln!(env.out, "Removed '{}' ({}).", plugin.name, plugin.root.display()).ok();
+            writeln!(
+                env.out,
+                "Removed '{}' ({}).",
+                plugin.name,
+                plugin.root.display()
+            )
+            .ok();
         }
         PluginSource::Path => {
             let root = plugin.root.clone();
@@ -450,7 +543,10 @@ fn remove(env: &mut CliEnv, name: &str) -> Result<(), String> {
             edit_settings(env, |p| {
                 let paths = array(p, "paths");
                 let before = paths.len();
-                paths.retain(|v| !v.as_str().is_some_and(|s| super::canonical(Path::new(s)) == root));
+                paths.retain(|v| {
+                    !v.as_str()
+                        .is_some_and(|s| super::canonical(Path::new(s)) == root)
+                });
                 dropped = paths.len() != before;
                 if !dropped {
                     // Referenced through a containing directory: disable instead.
@@ -458,9 +554,19 @@ fn remove(env: &mut CliEnv, name: &str) -> Result<(), String> {
                 }
             })?;
             if dropped {
-                writeln!(env.out, "Removed the path reference to '{}'; its files were not touched.", plugin.name).ok();
+                writeln!(
+                    env.out,
+                    "Removed the path reference to '{}'; its files were not touched.",
+                    plugin.name
+                )
+                .ok();
             } else {
-                writeln!(env.out, "'{}' comes from a referenced directory; it is now disabled.", plugin.name).ok();
+                writeln!(
+                    env.out,
+                    "'{}' comes from a referenced directory; it is now disabled.",
+                    plugin.name
+                )
+                .ok();
             }
         }
         PluginSource::Marketplace(_) => {
@@ -544,7 +650,16 @@ fn marketplace(env: &mut CliEnv, command: MarketplaceCommand) -> Result<(), Stri
             if clone.is_dir() {
                 let _ = std::fs::remove_dir_all(&clone);
             }
-            writeln!(env.out, "{}", if existed { format!("Removed marketplace '{id}'.") } else { format!("No marketplace '{id}'.") }).ok();
+            writeln!(
+                env.out,
+                "{}",
+                if existed {
+                    format!("Removed marketplace '{id}'.")
+                } else {
+                    format!("No marketplace '{id}'.")
+                }
+            )
+            .ok();
             Ok(())
         }
         MarketplaceCommand::Update { id } => update(env, id.as_deref(), false),
@@ -604,7 +719,8 @@ mod tests {
         }
 
         fn settings(&self) -> Value {
-            serde_json::from_str(&std::fs::read_to_string(self.coda.join("settings.json")).unwrap()).unwrap()
+            serde_json::from_str(&std::fs::read_to_string(self.coda.join("settings.json")).unwrap())
+                .unwrap()
         }
     }
 
@@ -613,20 +729,37 @@ mod tests {
         let mut h = Harness::new();
         let src = tempfile::tempdir().unwrap();
         plugin(&src.path().join("p"), "local-one");
-        let out = h.run(&["install", &src.path().join("p").to_string_lossy()]).unwrap();
-        assert!(out.contains("Installed plugin 'local-one' from path"), "{out}");
-        assert_eq!(h.settings()["plugins"]["paths"].as_array().unwrap().len(), 1);
+        let out = h
+            .run(&["install", &src.path().join("p").to_string_lossy()])
+            .unwrap();
+        assert!(
+            out.contains("Installed plugin 'local-one' from path"),
+            "{out}"
+        );
+        assert_eq!(
+            h.settings()["plugins"]["paths"].as_array().unwrap().len(),
+            1
+        );
 
         h.run(&["disable", "local-one"]).unwrap();
         assert_eq!(h.settings()["plugins"]["enabled"]["local-one"], false);
         let listed = h.run(&["list"]).unwrap();
-        assert!(listed.contains("local-one 1.0.0  [path]  disabled"), "{listed}");
+        assert!(
+            listed.contains("local-one 1.0.0  [path]  disabled"),
+            "{listed}"
+        );
         h.run(&["enable", "local-one"]).unwrap();
         assert_eq!(h.settings()["plugins"]["enabled"]["local-one"], true);
 
         h.run(&["remove", "local-one"]).unwrap();
-        assert!(h.settings()["plugins"]["paths"].as_array().unwrap().is_empty());
-        assert!(src.path().join("p/.claude-plugin/plugin.json").exists(), "files untouched");
+        assert!(h.settings()["plugins"]["paths"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(
+            src.path().join("p/.claude-plugin/plugin.json").exists(),
+            "files untouched"
+        );
     }
 
     #[test]
@@ -635,20 +768,38 @@ mod tests {
         let src = tempfile::tempdir().unwrap();
         let root = src.path().join("p");
         plugin(&root, "exec");
-        write(&root.join(".mcp.json"), r#"{"mcpServers":{"srv":{"command":"x"}}}"#);
+        write(
+            &root.join(".mcp.json"),
+            r#"{"mcpServers":{"srv":{"command":"x"}}}"#,
+        );
         let out = h.run(&["install", &root.to_string_lossy()]).unwrap();
-        assert!(out.contains("mcpServer:srv") && out.contains("Not approved"), "{out}");
-        assert!(h.run(&["list"]).unwrap().contains("needs approval: mcpServer:srv"));
+        assert!(
+            out.contains("mcpServer:srv") && out.contains("Not approved"),
+            "{out}"
+        );
+        assert!(h
+            .run(&["list"])
+            .unwrap()
+            .contains("needs approval: mcpServer:srv"));
 
         let out = h.run(&["approve", "exec", "--yes"]).unwrap();
         assert!(out.contains("Approved 1 component"), "{out}");
         assert!(h.run(&["list"]).unwrap().contains("trust: approved"));
 
         // A changed definition asks again.
-        write(&root.join(".mcp.json"), r#"{"mcpServers":{"srv":{"command":"y"}}}"#);
-        assert!(h.run(&["list"]).unwrap().contains("needs approval: mcpServer:srv"));
+        write(
+            &root.join(".mcp.json"),
+            r#"{"mcpServers":{"srv":{"command":"y"}}}"#,
+        );
+        assert!(h
+            .run(&["list"])
+            .unwrap()
+            .contains("needs approval: mcpServer:srv"));
         h.answer = true;
-        assert!(h.run(&["approve", "exec"]).unwrap().contains("Approved 1 component"));
+        assert!(h
+            .run(&["approve", "exec"])
+            .unwrap()
+            .contains("Approved 1 component"));
     }
 
     #[test]
@@ -656,15 +807,35 @@ mod tests {
         let mut h = Harness::new();
         let m = tempfile::tempdir().unwrap();
         plugin(&m.path().join("plugins/a"), "alpha");
-        let out = h.run(&["marketplace", "add", "local", "--path", &m.path().to_string_lossy()]).unwrap();
+        let out = h
+            .run(&[
+                "marketplace",
+                "add",
+                "local",
+                "--path",
+                &m.path().to_string_lossy(),
+            ])
+            .unwrap();
         assert!(out.contains("offering: alpha"), "{out}");
-        assert!(h.run(&["list"]).unwrap().contains("[marketplace:local]  disabled"));
+        assert!(h
+            .run(&["list"])
+            .unwrap()
+            .contains("[marketplace:local]  disabled"));
         h.run(&["install", "alpha@local"]).unwrap();
         assert_eq!(h.settings()["plugins"]["enabled"]["alpha"], true);
-        assert!(h.run(&["marketplace", "list"]).unwrap().contains("local  directory"));
+        assert!(h
+            .run(&["marketplace", "list"])
+            .unwrap()
+            .contains("local  directory"));
         h.run(&["marketplace", "remove", "local"]).unwrap();
-        assert!(h.settings()["plugins"]["marketplaces"].as_object().unwrap().is_empty());
-        assert!(h.run(&["install", "alpha@nope"]).unwrap_err().contains("no marketplace 'nope'"));
+        assert!(h.settings()["plugins"]["marketplaces"]
+            .as_object()
+            .unwrap()
+            .is_empty());
+        assert!(h
+            .run(&["install", "alpha@nope"])
+            .unwrap_err()
+            .contains("no marketplace 'nope'"));
     }
 
     #[test]
@@ -672,7 +843,10 @@ mod tests {
         let mut h = Harness::new();
         let root = h.ws.join(".coda/plugins/p");
         plugin(&root, "shipped");
-        write(&root.join(install::RECEIPT_FILE), r#"{"source":"git","url":"https://x/r.git","ref":"--upload-pack=evil"}"#);
+        write(
+            &root.join(install::RECEIPT_FILE),
+            r#"{"source":"git","url":"https://x/r.git","ref":"--upload-pack=evil"}"#,
+        );
         let out = h.run(&["update"]).unwrap();
         assert!(out.contains("Nothing to update"), "{out}");
         assert!(root.join(".claude-plugin/plugin.json").exists());
@@ -689,24 +863,62 @@ mod tests {
         let g = |args: &[&str]| install::git(Some(repo.path()), args).unwrap();
         g(&["init", "--quiet"]);
         g(&["-c", "user.email=t@t", "-c", "user.name=t", "add", "."]);
-        g(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--quiet", "-m", "one"]);
-        let url = format!("file://{}", repo.path().to_string_lossy().replace('\\', "/"));
+        g(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--quiet",
+            "-m",
+            "one",
+        ]);
+        let url = format!(
+            "file://{}",
+            repo.path().to_string_lossy().replace('\\', "/")
+        );
 
         let out = h.run(&["install", &url]).unwrap();
-        assert!(out.contains("Installed plugin 'from-git' from user"), "{out}");
+        assert!(
+            out.contains("Installed plugin 'from-git' from user"),
+            "{out}"
+        );
         let root = h.coda.join("plugins/from-git");
         let receipt = install::read_receipt(&root).unwrap();
         assert_eq!(receipt["source"], "git");
         assert_eq!(receipt["commit"], g(&["rev-parse", "HEAD"]));
         assert!(receipt["contentHash"].as_str().unwrap().len() == 64);
-        assert!(!h.coda.join("plugins").read_dir().unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with(".staging")));
+        assert!(!h
+            .coda
+            .join("plugins")
+            .read_dir()
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with(".staging")));
 
-        write(&repo.path().join("skills/review/SKILL.md"), "---\nname: review\n---\nv2");
-        g(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--quiet", "-am", "two"]);
+        write(
+            &repo.path().join("skills/review/SKILL.md"),
+            "---\nname: review\n---\nv2",
+        );
+        g(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--quiet",
+            "-am",
+            "two",
+        ]);
         let out = h.run(&["update", "from-git"]).unwrap();
         assert!(out.contains("Updated 'from-git'"), "{out}");
-        assert_eq!(install::read_receipt(&root).unwrap()["commit"], g(&["rev-parse", "HEAD"]));
-        assert!(std::fs::read_to_string(root.join("skills/review/SKILL.md")).unwrap().ends_with("v2"));
+        assert_eq!(
+            install::read_receipt(&root).unwrap()["commit"],
+            g(&["rev-parse", "HEAD"])
+        );
+        assert!(std::fs::read_to_string(root.join("skills/review/SKILL.md"))
+            .unwrap()
+            .ends_with("v2"));
 
         h.run(&["remove", "from-git"]).unwrap();
         assert!(!root.exists());

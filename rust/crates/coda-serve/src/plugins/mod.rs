@@ -115,7 +115,9 @@ impl PluginSet {
     }
 
     pub fn find(&self, name: &str) -> Option<&PluginDescriptor> {
-        self.plugins.iter().find(|p| p.name.eq_ignore_ascii_case(name))
+        self.plugins
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case(name))
     }
 }
 
@@ -197,7 +199,10 @@ pub fn discover_plugins(workspace: &Path, coda_dir: &Path, settings: &PluginSett
         by_name.insert(key, descriptor);
     }
 
-    PluginSet { plugins: by_name.into_values().collect(), errors }
+    PluginSet {
+        plugins: by_name.into_values().collect(),
+        errors,
+    }
 }
 
 /// Immediate subdirectories of `dir` that are plugin directories. Hidden
@@ -224,7 +229,11 @@ fn marketplace_plugins(market: &MarketplaceRef) -> Result<(Vec<PathBuf>, Vec<Str
     if !market.path.is_dir() {
         return Err(match &market.kind {
             MarketplaceKind::Directory => {
-                format!("marketplace '{}' not found at {}", market.id, market.path.display())
+                format!(
+                    "marketplace '{}' not found at {}",
+                    market.id,
+                    market.path.display()
+                )
             }
             MarketplaceKind::Git { .. } => format!(
                 "marketplace '{}' is not cloned yet; run `coda plugin marketplace update {}`",
@@ -240,13 +249,22 @@ fn marketplace_plugins(market: &MarketplaceRef) -> Result<(Vec<PathBuf>, Vec<Str
         }
         return Ok((roots, Vec::new()));
     }
-    let text = std::fs::read_to_string(&catalogue)
-        .map_err(|e| format!("marketplace '{}': cannot read marketplace.json: {e}", market.id))?;
+    let text = std::fs::read_to_string(&catalogue).map_err(|e| {
+        format!(
+            "marketplace '{}': cannot read marketplace.json: {e}",
+            market.id
+        )
+    })?;
     let doc: Value = serde_json::from_str(text.trim_start_matches('\u{feff}'))
         .map_err(|e| format!("marketplace '{}': invalid marketplace.json: {e}", market.id))?;
     let mut roots = Vec::new();
     let mut problems = Vec::new();
-    for entry in doc.get("plugins").and_then(Value::as_array).into_iter().flatten() {
+    for entry in doc
+        .get("plugins")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
         let name = entry.get("name").and_then(Value::as_str).unwrap_or("?");
         match entry.get("source") {
             Some(Value::String(rel)) => match manifest::resolve_contained(&market.path, rel) {
@@ -267,9 +285,16 @@ fn marketplace_plugins(market: &MarketplaceRef) -> Result<(Vec<PathBuf>, Vec<Str
     Ok((roots, problems))
 }
 
-fn load_descriptor(root: &Path, source: PluginSource, settings: &PluginSettings) -> PluginDescriptor {
+fn load_descriptor(
+    root: &Path,
+    source: PluginSource,
+    settings: &PluginSettings,
+) -> PluginDescriptor {
     let root = canonical(root);
-    let dir_name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let dir_name = root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let mut descriptor = PluginDescriptor {
         name: dir_name,
         version: None,
@@ -291,10 +316,12 @@ fn load_descriptor(root: &Path, source: PluginSource, settings: &PluginSettings)
             descriptor.name = m.name.clone();
             descriptor.version = m.version.clone();
             descriptor.description = m.description.clone();
-            descriptor.skill_dirs = component_dirs(&root, "skills", &m.skills, &mut descriptor.errors);
+            descriptor.skill_dirs =
+                component_dirs(&root, "skills", &m.skills, &mut descriptor.errors);
             descriptor.command_dirs =
                 component_dirs(&root, "commands", &m.commands, &mut descriptor.errors);
-            descriptor.agent_dirs = component_dirs(&root, "agents", &m.agents, &mut descriptor.errors);
+            descriptor.agent_dirs =
+                component_dirs(&root, "agents", &m.agents, &mut descriptor.errors);
             descriptor.exec = components::exec_components(&root, &m, &mut descriptor.errors);
             descriptor.manifest = Some(m);
             descriptor.manifest_bytes = bytes;
@@ -307,7 +334,12 @@ fn load_descriptor(root: &Path, source: PluginSource, settings: &PluginSettings)
 }
 
 /// The default directory plus the declared ones, existing and contained only.
-fn component_dirs(root: &Path, default: &str, declared: &[String], errors: &mut Vec<String>) -> Vec<PathBuf> {
+fn component_dirs(
+    root: &Path,
+    default: &str,
+    declared: &[String],
+    errors: &mut Vec<String>,
+) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     let default_dir = root.join(default);
     if default_dir.is_dir() {
@@ -345,7 +377,8 @@ pub fn canonical(path: &Path) -> PathBuf {
 /// Expands `${CLAUDE_PLUGIN_ROOT}` and `${CODA_PLUGIN_ROOT}`.
 pub fn expand_root(text: &str, root: &Path) -> String {
     let root = root.to_string_lossy();
-    text.replace("${CLAUDE_PLUGIN_ROOT}", &root).replace("${CODA_PLUGIN_ROOT}", &root)
+    text.replace("${CLAUDE_PLUGIN_ROOT}", &root)
+        .replace("${CODA_PLUGIN_ROOT}", &root)
 }
 
 /// The `plugins/list` item for one plugin.
@@ -383,12 +416,18 @@ pub(crate) mod test_support {
 
     /// A Claude-layout plugin with one skill and one agent.
     pub fn plugin(dir: &Path, name: &str) {
-        write(&dir.join(".claude-plugin/plugin.json"), &format!(r#"{{"name":"{name}","version":"1.0.0"}}"#));
+        write(
+            &dir.join(".claude-plugin/plugin.json"),
+            &format!(r#"{{"name":"{name}","version":"1.0.0"}}"#),
+        );
         write(
             &dir.join("skills/review/SKILL.md"),
             &format!("---\nname: review\ndescription: review from {name}\n---\nBody of {name}\n"),
         );
-        write(&dir.join("agents/skeptic.md"), "---\nname: skeptic\ndescription: doubts\n---\nYou doubt.\n");
+        write(
+            &dir.join("agents/skeptic.md"),
+            "---\nname: skeptic\ndescription: doubts\n---\nYou doubt.\n",
+        );
     }
 }
 
@@ -422,15 +461,21 @@ mod tests {
         plugin(&elsewhere.path().join("market/plugins/m"), "market-one");
 
         let mut s = settings();
-        s.paths = vec![elsewhere.path().join("direct"), elsewhere.path().join("bundle")];
+        s.paths = vec![
+            elsewhere.path().join("direct"),
+            elsewhere.path().join("bundle"),
+        ];
         s.marketplaces = vec![MarketplaceRef {
             id: "local".into(),
             kind: MarketplaceKind::Directory,
             path: elsewhere.path().join("market"),
         }];
         let set = discover_plugins(ws.path(), home.path(), &s);
-        let labels: Vec<(String, String, bool)> =
-            set.plugins.iter().map(|p| (p.name.clone(), p.source.label(), p.enabled)).collect();
+        let labels: Vec<(String, String, bool)> = set
+            .plugins
+            .iter()
+            .map(|p| (p.name.clone(), p.source.label(), p.enabled))
+            .collect();
         assert_eq!(
             labels,
             vec![
@@ -463,7 +508,11 @@ mod tests {
         );
         let mut s = settings();
         s.enabled.insert("security-review".into(), true);
-        s.marketplaces = vec![MarketplaceRef { id: "m".into(), kind: MarketplaceKind::Directory, path: m.path().into() }];
+        s.marketplaces = vec![MarketplaceRef {
+            id: "m".into(),
+            kind: MarketplaceKind::Directory,
+            path: m.path().into(),
+        }];
         let set = discover_plugins(ws.path(), home.path(), &s);
         assert_eq!(set.plugins.len(), 1);
         assert!(set.plugins[0].enabled);
@@ -487,7 +536,10 @@ mod tests {
         let ws = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         plugin(&home.path().join("plugins/good"), "good");
-        write(&home.path().join("plugins/bad/.claude-plugin/plugin.json"), "{ nope");
+        write(
+            &home.path().join("plugins/bad/.claude-plugin/plugin.json"),
+            "{ nope",
+        );
         let set = discover_plugins(ws.path(), home.path(), &settings());
         assert_eq!(set.plugins.len(), 2);
         let bad = set.find("bad").unwrap();
@@ -502,10 +554,17 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("plugins/t");
         plugin(&root, "t");
-        write(&root.join(".claude-plugin/plugin.json"), r#"{"name":"t","skills":["../../x"]}"#);
+        write(
+            &root.join(".claude-plugin/plugin.json"),
+            r#"{"name":"t","skills":["../../x"]}"#,
+        );
         let set = discover_plugins(ws.path(), home.path(), &settings());
         let t = set.find("t").unwrap();
-        assert!(t.errors.iter().any(|e| e.contains("escapes")), "{:?}", t.errors);
+        assert!(
+            t.errors.iter().any(|e| e.contains("escapes")),
+            "{:?}",
+            t.errors
+        );
         assert_eq!(t.skill_dirs.len(), 1, "the default skills dir still loads");
     }
 
@@ -522,6 +581,9 @@ mod tests {
     #[test]
     fn root_variables_are_expanded() {
         let root = Path::new("C:/p");
-        assert_eq!(expand_root("${CLAUDE_PLUGIN_ROOT}/a ${CODA_PLUGIN_ROOT}", root), "C:/p/a C:/p");
+        assert_eq!(
+            expand_root("${CLAUDE_PLUGIN_ROOT}/a ${CODA_PLUGIN_ROOT}", root),
+            "C:/p/a C:/p"
+        );
     }
 }

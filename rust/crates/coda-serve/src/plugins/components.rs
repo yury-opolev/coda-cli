@@ -20,7 +20,11 @@ use super::{PluginDescriptor, PluginSet};
 
 /// Reads every executable component a manifest declares (or the plugin
 /// ships in the default locations). Problems are pushed to `errors`.
-pub fn exec_components(root: &Path, m: &PluginManifest, errors: &mut Vec<String>) -> Vec<ExecComponent> {
+pub fn exec_components(
+    root: &Path,
+    m: &PluginManifest,
+    errors: &mut Vec<String>,
+) -> Vec<ExecComponent> {
     let mut out = Vec::new();
 
     let mcp = match &m.mcp_servers {
@@ -28,7 +32,11 @@ pub fn exec_components(root: &Path, m: &PluginManifest, errors: &mut Vec<String>
         None => default_file(root, ".mcp.json", "mcpServers", errors),
     };
     for (name, definition) in mcp {
-        out.push(ExecComponent { kind: KIND_MCP_SERVER, name, definition });
+        out.push(ExecComponent {
+            kind: KIND_MCP_SERVER,
+            name,
+            definition,
+        });
     }
 
     let hooks = match &m.hooks {
@@ -36,7 +44,11 @@ pub fn exec_components(root: &Path, m: &PluginManifest, errors: &mut Vec<String>
         None => default_file(root, "hooks/hooks.json", "hooks", errors),
     };
     if !hooks.is_empty() {
-        out.push(ExecComponent { kind: KIND_HOOK, name: "hooks".into(), definition: Value::Object(hooks) });
+        out.push(ExecComponent {
+            kind: KIND_HOOK,
+            name: "hooks".into(),
+            definition: Value::Object(hooks),
+        });
     }
 
     let mut lsp = default_file(root, ".lsp.json", "lspServers", errors);
@@ -50,14 +62,23 @@ pub fn exec_components(root: &Path, m: &PluginManifest, errors: &mut Vec<String>
         }
     }
     for (name, definition) in lsp {
-        out.push(ExecComponent { kind: KIND_LSP_SERVER, name, definition });
+        out.push(ExecComponent {
+            kind: KIND_LSP_SERVER,
+            name,
+            definition,
+        });
     }
     out
 }
 
 /// An inline object, or a contained relative path to a JSON file holding
 /// either `{ "<key>": {…} }` or the bare map.
-fn declared_map(root: &Path, decl: &Value, key: &str, errors: &mut Vec<String>) -> Map<String, Value> {
+fn declared_map(
+    root: &Path,
+    decl: &Value,
+    key: &str,
+    errors: &mut Vec<String>,
+) -> Map<String, Value> {
     match decl {
         Value::Object(obj) => unwrap_key(obj, key),
         Value::String(rel) => match manifest::resolve_contained(root, rel) {
@@ -86,11 +107,17 @@ fn default_file(root: &Path, rel: &str, key: &str, errors: &mut Vec<String>) -> 
 fn read_map(path: &Path, key: &str, errors: &mut Vec<String>) -> Map<String, Value> {
     let parsed = std::fs::read_to_string(path)
         .map_err(|e| e.to_string())
-        .and_then(|t| serde_json::from_str::<Value>(t.trim_start_matches('\u{feff}')).map_err(|e| e.to_string()));
+        .and_then(|t| {
+            serde_json::from_str::<Value>(t.trim_start_matches('\u{feff}'))
+                .map_err(|e| e.to_string())
+        });
     match parsed {
         Ok(Value::Object(obj)) => unwrap_key(&obj, key),
         Ok(_) => {
-            errors.push(format!("{key}: {} must contain a JSON object", path.display()));
+            errors.push(format!(
+                "{key}: {} must contain a JSON object",
+                path.display()
+            ));
             Map::new()
         }
         Err(e) => {
@@ -112,14 +139,21 @@ fn expand_value(v: &Value, root: &Path) -> Value {
     match v {
         Value::String(s) => Value::String(super::expand_root(s, root)),
         Value::Array(a) => Value::Array(a.iter().map(|x| expand_value(x, root)).collect()),
-        Value::Object(m) => Value::Object(m.iter().map(|(k, x)| (k.clone(), expand_value(x, root))).collect()),
+        Value::Object(m) => Value::Object(
+            m.iter()
+                .map(|(k, x)| (k.clone(), expand_value(x, root)))
+                .collect(),
+        ),
         other => other.clone(),
     }
 }
 
 fn root_env(root: &Path) -> HashMap<String, String> {
     let root = root.to_string_lossy().into_owned();
-    HashMap::from([("CLAUDE_PLUGIN_ROOT".to_owned(), root.clone()), ("CODA_PLUGIN_ROOT".to_owned(), root)])
+    HashMap::from([
+        ("CLAUDE_PLUGIN_ROOT".to_owned(), root.clone()),
+        ("CODA_PLUGIN_ROOT".to_owned(), root),
+    ])
 }
 
 /// The MCP server name a plugin server is registered under. Tool names
@@ -139,7 +173,10 @@ pub fn approved_mcp_servers(
         let mut map = Map::new();
         for c in plugin.exec.iter().filter(|c| c.kind == KIND_MCP_SERVER) {
             if trust.is_approved(plugin, c) {
-                map.insert(mcp_server_name(&plugin.name, &c.name), expand_value(&c.definition, &plugin.root));
+                map.insert(
+                    mcp_server_name(&plugin.name, &c.name),
+                    expand_value(&c.definition, &plugin.root),
+                );
             }
         }
         let (mut s, h) = coda_mcp::config::connectables_from_map(&Value::Object(map));
@@ -176,7 +213,9 @@ pub fn plugin_hooks(plugins: &PluginSet, trust: &PluginTrustStore) -> Vec<(UserH
 /// `{ "<Event>": [ { "matcher"?, "hooks": [ { "type": "command", "command", "timeout"? } ] } ] }`.
 fn hooks_from_definition(plugin: &PluginDescriptor, events: &Value) -> Vec<UserHook> {
     let mut out = Vec::new();
-    let Some(events) = events.as_object() else { return out };
+    let Some(events) = events.as_object() else {
+        return out;
+    };
     for (event, groups) in events {
         for group in groups.as_array().into_iter().flatten() {
             let matcher = group
@@ -184,13 +223,27 @@ fn hooks_from_definition(plugin: &PluginDescriptor, events: &Value) -> Vec<UserH
                 .and_then(Value::as_str)
                 .filter(|m| !m.is_empty() && *m != "*")
                 .map(str::to_owned);
-            for handler in group.get("hooks").and_then(Value::as_array).into_iter().flatten() {
-                let kind = handler.get("type").and_then(Value::as_str).unwrap_or("command");
+            for handler in group
+                .get("hooks")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let kind = handler
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("command");
                 if kind != "command" {
-                    tracing::debug!(plugin = plugin.name.as_str(), kind, "skipping unsupported plugin hook type");
+                    tracing::debug!(
+                        plugin = plugin.name.as_str(),
+                        kind,
+                        "skipping unsupported plugin hook type"
+                    );
                     continue;
                 }
-                let Some(command) = handler.get("command").and_then(Value::as_str) else { continue };
+                let Some(command) = handler.get("command").and_then(Value::as_str) else {
+                    continue;
+                };
                 out.push(UserHook {
                     event: event.clone(),
                     command: Some(super::expand_root(command, &plugin.root)),
@@ -205,8 +258,15 @@ fn hooks_from_definition(plugin: &PluginDescriptor, events: &Value) -> Vec<UserH
                     hook_prompt: None,
                     agent_type: None,
                     enabled: true,
-                    scope: if plugin.source.is_project() { HookScope::Project } else { HookScope::User },
-                    plugin_origin: Some((plugin.name.clone(), plugin.version.clone().unwrap_or_default())),
+                    scope: if plugin.source.is_project() {
+                        HookScope::Project
+                    } else {
+                        HookScope::User
+                    },
+                    plugin_origin: Some((
+                        plugin.name.clone(),
+                        plugin.version.clone().unwrap_or_default(),
+                    )),
                     env: root_env(&plugin.root),
                 });
             }
@@ -216,7 +276,10 @@ fn hooks_from_definition(plugin: &PluginDescriptor, events: &Value) -> Vec<UserH
 }
 
 /// Approved LSP servers of every active plugin, scoped `plugin:<p>:<s>`.
-pub fn approved_lsp_servers(plugins: &PluginSet, trust: &PluginTrustStore) -> HashMap<String, LspServerConfig> {
+pub fn approved_lsp_servers(
+    plugins: &PluginSet,
+    trust: &PluginTrustStore,
+) -> HashMap<String, LspServerConfig> {
     let mut out = HashMap::new();
     for plugin in plugins.active() {
         let mut map = Map::new();
@@ -226,7 +289,11 @@ pub fn approved_lsp_servers(plugins: &PluginSet, trust: &PluginTrustStore) -> Ha
             }
         }
         if !map.is_empty() {
-            out.extend(PluginLspServerLoader::configs_for_plugin(&Value::Object(map), &plugin.root, &plugin.name));
+            out.extend(PluginLspServerLoader::configs_for_plugin(
+                &Value::Object(map),
+                &plugin.root,
+                &plugin.name,
+            ));
         }
     }
     out
@@ -249,19 +316,31 @@ mod tests {
     fn inline_file_and_default_declarations_are_read() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        write(&root.join("servers.json"), r#"{"mcpServers":{"b":{"command":"b"}}}"#);
+        write(
+            &root.join("servers.json"),
+            r#"{"mcpServers":{"b":{"command":"b"}}}"#,
+        );
         write(&root.join("bare.json"), r#"{"c":{"command":"c"}}"#);
         let (exec, errors) = exec_of(root, r#"{"name":"p","mcpServers":{"a":{"command":"a"}}}"#);
         assert!(errors.is_empty());
-        assert_eq!(exec.iter().map(|c| c.label()).collect::<Vec<_>>(), vec!["mcpServer:a"]);
+        assert_eq!(
+            exec.iter().map(|c| c.label()).collect::<Vec<_>>(),
+            vec!["mcpServer:a"]
+        );
 
         let (exec, _) = exec_of(root, r#"{"name":"p","mcpServers":"./servers.json"}"#);
         assert_eq!(exec[0].name, "b");
         let (exec, _) = exec_of(root, r#"{"name":"p","mcpServers":"bare.json"}"#);
         assert_eq!(exec[0].name, "c");
 
-        write(&root.join(".mcp.json"), r#"{"mcpServers":{"d":{"command":"d"}}}"#);
-        write(&root.join("hooks/hooks.json"), r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"x"}]}]}}"#);
+        write(
+            &root.join(".mcp.json"),
+            r#"{"mcpServers":{"d":{"command":"d"}}}"#,
+        );
+        write(
+            &root.join("hooks/hooks.json"),
+            r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"x"}]}]}}"#,
+        );
         let (exec, _) = exec_of(root, r#"{"name":"p"}"#);
         let labels: Vec<String> = exec.iter().map(|c| c.label()).collect();
         assert_eq!(labels, vec!["mcpServer:d", "hook:hooks"]);
@@ -290,7 +369,10 @@ mod tests {
         );
         let mut trust = PluginTrustStore::load(home.path());
         let (stdio, http) = approved_mcp_servers(&set, &trust);
-        assert!(stdio.is_empty() && http.is_empty(), "nothing starts before approval");
+        assert!(
+            stdio.is_empty() && http.is_empty(),
+            "nothing starts before approval"
+        );
         let p = &set.plugins[0];
         for c in &p.exec {
             trust.approve(p, c);
@@ -317,7 +399,10 @@ mod tests {
         let (h, approved) = &hooks[0];
         assert!(!approved && !h.enabled);
         let root = set.plugins[0].root.to_string_lossy().into_owned();
-        assert_eq!(h.command.as_deref(), Some(format!("{root}/start.ps1").as_str()));
+        assert_eq!(
+            h.command.as_deref(),
+            Some(format!("{root}/start.ps1").as_str())
+        );
         assert_eq!(h.matcher.as_deref(), Some("startup"));
         assert_eq!(h.timeout_seconds, Some(5));
         assert_eq!(h.plugin_origin, Some(("p".into(), "2".into())));
