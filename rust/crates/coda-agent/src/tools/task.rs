@@ -77,6 +77,53 @@ impl Tool for TaskTool {
     }
 }
 
+/// The `task` tool with the plugin agent types appended to its description,
+/// so the model knows which `subagentType` values exist. Registered by the
+/// host in place of [`TaskTool`] when plugins contribute agents; behaviour is
+/// identical.
+pub struct PluginAwareTaskTool {
+    description: String,
+}
+
+impl PluginAwareTaskTool {
+    /// `agents` are `(type, description)` pairs.
+    pub fn new(agents: &[(String, String)]) -> Self {
+        let mut description = TaskTool.description().to_owned();
+        description.push_str(
+            "\n\nAgent types contributed by plugins (pass as subagentType; the part after ':' \
+             is accepted alone when unique):",
+        );
+        for (agent_type, about) in agents {
+            let about: String = about.trim().chars().take(200).collect();
+            description.push_str(&format!("\n- {agent_type}: {about}"));
+        }
+        Self { description }
+    }
+}
+
+#[async_trait]
+impl Tool for PluginAwareTaskTool {
+    fn name(&self) -> &str {
+        "task"
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn input_schema_json(&self) -> &str {
+        TaskTool.input_schema_json()
+    }
+
+    fn is_read_only(&self) -> bool {
+        false
+    }
+
+    async fn execute(&self, input: &Value, ctx: &ToolContext, cancel: CancellationToken) -> ToolOutcome {
+        start_subagent(input, ctx, cancel).await
+    }
+}
+
 /// The text the model receives for a subagent that is now running.
 pub(crate) fn started_handle(task_id: &str) -> String {
     format!(
