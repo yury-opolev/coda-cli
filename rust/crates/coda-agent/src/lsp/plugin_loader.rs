@@ -43,6 +43,27 @@ impl PluginLspServerLoader {
         result
     }
 
+    /// Builds the scoped configs (`plugin:<pluginName>:<serverName>`) for an
+    /// already-collected server map, resolving `${CLAUDE_PLUGIN_ROOT}`,
+    /// `${CODA_PLUGIN_ROOT}` and `${VAR}` against `plugin_dir`.
+    ///
+    /// Used by the plugin composition root, which reads either manifest
+    /// layout and passes only servers the user approved.
+    pub fn configs_for_plugin(
+        servers: &Value,
+        plugin_dir: &Path,
+        plugin_name: &str,
+    ) -> HashMap<String, LspServerConfig> {
+        let mut parsed = HashMap::new();
+        merge_server_map(servers, &mut parsed);
+        parsed
+            .into_iter()
+            .map(|(name, cfg)| {
+                (format!("plugin:{plugin_name}:{name}"), resolve_plugin_environment(cfg, plugin_dir))
+            })
+            .collect()
+    }
+
     /// Loads and scopes all LSP servers discovered by scanning the given base directories.
     ///
     /// Each entry under `base_dirs` is treated as a plugins base directory; subdirectories
@@ -179,7 +200,9 @@ fn resolve_variables(value: &str, plugin_root: &Path) -> String {
     let plugin_root_str = plugin_root.to_string_lossy();
 
     // Replace ${CLAUDE_PLUGIN_ROOT} literally first.
-    let result = value.replace("${CLAUDE_PLUGIN_ROOT}", plugin_root_str.as_ref());
+    let result = value
+        .replace("${CLAUDE_PLUGIN_ROOT}", plugin_root_str.as_ref())
+        .replace("${CODA_PLUGIN_ROOT}", plugin_root_str.as_ref());
 
     // Then replace remaining ${VAR} from environment.
     let mut out = String::with_capacity(result.len());
@@ -226,6 +249,7 @@ fn resolve_plugin_environment(config: LspServerConfig, plugin_dir: &Path) -> Lsp
         "CLAUDE_PLUGIN_ROOT".to_owned(),
         plugin_dir.to_string_lossy().into_owned(),
     );
+    resolved_env.insert("CODA_PLUGIN_ROOT".to_owned(), plugin_dir.to_string_lossy().into_owned());
 
     LspServerConfig {
         command: resolved_command,
@@ -490,5 +514,19 @@ mod tests {
 
         assert!(result.contains_key("plugin:arrayplugin:a"), "expected a from inline");
         assert!(result.contains_key("plugin:arrayplugin:b"), "expected b from more.json");
+    }
+
+    #[test]
+    fn configs_for_plugin_scopes_and_expands_both_root_variables() {
+        let servers: Value = serde_json::from_str(
+            r#"{"x":{"command":"${CODA_PLUGIN_ROOT}/bin/ls","args":["${CLAUDE_PLUGIN_ROOT}"],"extensionToLanguage":{".x":"x"}}}"#,
+        )
+        .unwrap();
+        let root = Path::new("R:/plug");
+        let result = PluginLspServerLoader::configs_for_plugin(&servers, root, "p");
+        let cfg = &result["plugin:p:x"];
+        assert_eq!(cfg.command, "R:/plug/bin/ls");
+        assert_eq!(cfg.args, vec!["R:/plug".to_owned()]);
+        assert_eq!(cfg.env["CODA_PLUGIN_ROOT"], "R:/plug");
     }
 }

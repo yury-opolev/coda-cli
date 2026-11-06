@@ -4679,7 +4679,7 @@ impl ServeBackend for ServeHost {
     }
 
     async fn skills_list(&self) -> Result<Value, RpcError> {
-        let found = crate::skills::discover(std::path::Path::new(&self.working_dir));
+        let found = crate::skills::discover(std::path::Path::new(&self.working_dir), &self.plugins);
         serde_json::to_value(serde_json::json!({ "skills": found }))
             .map_err(|e| RpcError::internal(e.to_string()))
     }

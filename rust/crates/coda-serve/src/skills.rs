@@ -21,10 +21,11 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 /// Where a skill came from. Ordered by precedence, lowest first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum SkillOrigin {
     /// Another ecosystem's layout (`.agents/skills`, `~/.claude/agents`,
     /// `~/.claude/commands`). Read-only.
+    #[default]
     Foreign,
     /// The Claude CLI's skill directory (`~/.claude/skills`). Read-only.
     Claude,
@@ -62,6 +63,20 @@ pub struct SkillInfo {
     pub source_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub argument_hint: Option<String>,
+    /// The contributing plugin, for plugin skills (whose `name` is then
+    /// `<plugin>:<skill>`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<String>,
+    /// The skill file, read again at invocation time.
+    #[serde(skip)]
+    pub file: PathBuf,
+    /// `name` without the plugin prefix.
+    #[serde(skip)]
+    pub short_name: String,
+    #[serde(skip)]
+    pub plugin_root: Option<PathBuf>,
+    #[serde(skip)]
+    pub origin_kind: SkillOrigin,
 }
 
 /// Parsed YAML front matter. Only the fields the wire shape needs.
@@ -121,15 +136,30 @@ fn parse_front_matter(text: &str) -> FrontMatter {
 
 /// Reads one skill directory, or `None` when it holds no readable `SKILL.md`.
 fn load_one(dir: &Path, origin: SkillOrigin, workspace: &Path) -> Option<SkillInfo> {
-    let file = dir.join("SKILL.md");
-    let text = std::fs::read_to_string(&file).ok()?;
-    let fm = parse_front_matter(&text);
-
     // A skill with no `name` falls back to its directory name, matching C#.
+    load_file(&dir.join("SKILL.md"), dir.file_name()?, origin, workspace)
+}
+
+/// Reads one command file (`commands/<name>.md`), treated like a skill whose
+/// fallback name is the file stem.
+fn load_command(file: &Path, origin: SkillOrigin, workspace: &Path) -> Option<SkillInfo> {
+    load_file(file, file.file_stem()?, origin, workspace)
+}
+
+fn load_file(
+    file: &Path,
+    fallback_name: &std::ffi::OsStr,
+    origin: SkillOrigin,
+    workspace: &Path,
+) -> Option<SkillInfo> {
+    let text = std::fs::read_to_string(file).ok()?;
+    let fm = parse_front_matter(&text);
     let name = fm
         .name
         .filter(|n| !n.trim().is_empty())
-        .or_else(|| dir.file_name().map(|n| n.to_string_lossy().into_owned()))?;
+        .unwrap_or_else(|| fallback_name.to_string_lossy().into_owned());
+    let file = file.to_path_buf();
+    let short_name = name.clone();
 
     Some(SkillInfo {
         name,
@@ -140,6 +170,11 @@ fn load_one(dir: &Path, origin: SkillOrigin, workspace: &Path) -> Option<SkillIn
         user_invocable: fm.user_invocable.unwrap_or(true),
         source_path: workspace_relative(&file, workspace),
         argument_hint: fm.argument_hint,
+        plugin: None,
+        short_name,
+        file,
+        plugin_root: None,
+        origin_kind: origin,
     })
 }
 
@@ -180,7 +215,7 @@ fn search_paths(workspace: &Path) -> Vec<(PathBuf, SkillOrigin)> {
 ///
 /// Results are sorted by name so the listing is stable between calls; an
 /// unstable order would make the differential parity suite flap.
-pub fn discover(workspace: &Path) -> Vec<SkillInfo> {
+pub fn discover(workspace: &Path, plugins: &crate::plugins::PluginSet) -> Vec<SkillInfo> {
     // Keyed by name so a higher-precedence origin replaces a lower one, and
     // BTreeMap gives the stable ordering for free.
     let mut by_name: BTreeMap<String, SkillInfo> = BTreeMap::new();
@@ -199,7 +234,64 @@ pub fn discover(workspace: &Path) -> Vec<SkillInfo> {
         }
     }
 
+    // Plugin skills and commands are keyed by `<plugin>:<name>`, so two
+    // plugins (or a plugin and a user skill) sharing a name are both listed
+    // instead of one silently hiding the other.
+    for plugin in plugins.active() {
+        let mut found = Vec::new();
+        for root in &plugin.skill_dirs {
+            let Ok(entries) = std::fs::read_dir(root) else { continue };
+            for entry in entries.flatten() {
+                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    found.extend(load_one(&entry.path(), SkillOrigin::Plugin, workspace));
+                }
+            }
+        }
+        for root in &plugin.command_dirs {
+            let Ok(entries) = std::fs::read_dir(root) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("md")) {
+                    found.extend(load_command(&path, SkillOrigin::Plugin, workspace));
+                }
+            }
+        }
+        for mut skill in found {
+            skill.name = format!("{}:{}", plugin.name, skill.short_name);
+            skill.plugin = Some(plugin.name.clone());
+            skill.plugin_root = Some(plugin.root.clone());
+            by_name.entry(skill.name.clone()).or_insert(skill);
+        }
+    }
+
     by_name.into_values().collect()
+}
+
+/// The catalogue the `skill` tool resolves against. `plugin_agents` maps a
+/// plugin name to the agent types it contributes.
+pub fn catalog(
+    skills: &[SkillInfo],
+    plugin_agents: &std::collections::HashMap<String, Vec<String>>,
+) -> Vec<coda_agent::tools::SkillEntry> {
+    skills
+        .iter()
+        .map(|s| coda_agent::tools::SkillEntry {
+            name: s.name.clone(),
+            short_name: s.short_name.clone(),
+            description: s.description.clone(),
+            file: s.file.clone(),
+            plugin: s.plugin.clone(),
+            plugin_root: s.plugin_root.clone(),
+            model_invocable: s.enabled,
+            rank: s.origin_kind as u8,
+            plugin_agents: s
+                .plugin
+                .as_ref()
+                .and_then(|p| plugin_agents.get(p))
+                .cloned()
+                .unwrap_or_default(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -300,7 +392,7 @@ mod tests {
         write_skill(&project, "good", "---\nname: good\ndescription: fine\n---\n");
         write_skill(&project, "bad", "not front matter at all");
 
-        let found = discover(dir.path());
+        let found = discover(dir.path(), &crate::plugins::PluginSet::empty());
         assert!(
             found.iter().any(|s| s.name == "good"),
             "the valid skill must still be listed: {found:?}"
@@ -321,7 +413,7 @@ mod tests {
         std::fs::create_dir_all(&project).expect("dirs");
         write_skill(&project, "shared", "---\nname: shared\ndescription: from project\n---\n");
 
-        let found = discover(dir.path());
+        let found = discover(dir.path(), &crate::plugins::PluginSet::empty());
         let shared: Vec<_> = found.iter().filter(|s| s.name == "shared").collect();
         assert_eq!(shared.len(), 1, "the name must appear once, not twice");
         assert_eq!(shared[0].origin, "project");
@@ -337,7 +429,7 @@ mod tests {
         std::fs::create_dir_all(&project).expect("dirs");
         write_skill(&project, "local", "---\nname: local\ndescription: d\n---\n");
 
-        let found = discover(dir.path());
+        let found = discover(dir.path(), &crate::plugins::PluginSet::empty());
         let local = found.iter().find(|s| s.name == "local").expect("found");
         let path = local.source_path.as_deref().expect("in-workspace skill has a path");
         assert!(!path.contains(".."), "path must be relative and contained: {path}");
@@ -360,10 +452,50 @@ mod tests {
             write_skill(&project, name, &format!("---\nname: {name}\ndescription: d\n---\n"));
         }
         let names: Vec<String> =
-            discover(dir.path()).into_iter().map(|s| s.name).collect();
+            discover(dir.path(), &crate::plugins::PluginSet::empty()).into_iter().map(|s| s.name).collect();
         let mut sorted = names.clone();
         sorted.sort();
         assert_eq!(names, sorted, "listing must be stable, or parity tests flap");
+    }
+
+    #[test]
+    fn plugin_skills_and_commands_are_namespaced_and_never_shadowed() {
+        use crate::plugins::{discover_plugins, test_support, PluginSettings};
+        let ws = TempDir::new();
+        let home = TempDir::new();
+        test_support::plugin(&home.path().join("plugins/a"), "deep-review");
+        test_support::plugin(&home.path().join("plugins/b"), "other");
+        test_support::write(
+            &home.path().join("plugins/b/commands/fix.md"),
+            "---\ndescription: fixes\n---\nFix it.",
+        );
+        let project = ws.path().join(".coda").join("skills");
+        std::fs::create_dir_all(&project).expect("dirs");
+        write_skill(&project, "review", "---\nname: review\ndescription: project\n---\n");
+
+        let mut settings = PluginSettings::default();
+        let plugins = discover_plugins(ws.path(), home.path(), &settings);
+        let found = discover(ws.path(), &plugins);
+        let names: Vec<&str> = found.iter().map(|s| s.name.as_str()).collect();
+        for expected in ["deep-review:review", "other:review", "other:fix", "review"] {
+            assert!(names.contains(&expected), "{expected} missing from {names:?}");
+        }
+        let plugin_skill = found.iter().find(|s| s.name == "deep-review:review").unwrap();
+        assert_eq!(plugin_skill.origin, "plugin");
+        assert_eq!(plugin_skill.plugin.as_deref(), Some("deep-review"));
+        let json = serde_json::to_value(plugin_skill).unwrap();
+        assert_eq!(json["plugin"], "deep-review");
+        assert!(json.get("file").is_none(), "internal fields stay off the wire");
+
+        // The catalogue resolves the short name to the project skill.
+        let entries = catalog(&found, &Default::default());
+        assert_eq!(coda_agent::tools::skill::resolve(&entries, "review").unwrap().name, "review");
+
+        // A disabled plugin contributes nothing.
+        settings.enabled.insert("other".into(), false);
+        let plugins = discover_plugins(ws.path(), home.path(), &settings);
+        let found = discover(ws.path(), &plugins);
+        assert!(!found.iter().any(|s| s.plugin.as_deref() == Some("other")));
     }
 
     #[test]

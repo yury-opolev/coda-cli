@@ -3770,6 +3770,7 @@ mod tests {
             enabled: true,
             scope: HookScope::User,
             plugin_origin: None,
+            env: Default::default(),
         };
         Arc::new(crate::hooks::HookRunner::with_executor(
             vec![h],

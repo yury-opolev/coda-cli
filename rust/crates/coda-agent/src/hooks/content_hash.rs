@@ -86,6 +86,7 @@ mod tests {
             enabled: true,
             scope: HookScope::User,
             plugin_origin: None,
+            env: Default::default(),
         }
     }
 
