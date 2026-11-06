@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "echo {\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"DEEP-REVIEW-HOOK-RAN\"}}",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/session-start.cmd",
             "timeout": 10
           }
         ]

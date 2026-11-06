@@ -19,16 +19,18 @@ serve-protocol surface, and worked examples.
   - [Discovery and precedence](#discovery-and-precedence)
   - [Foreign skill sources](#foreign-skill-sources)
 - [Plugins](#plugins)
+  - [Discovery](#discovery)
+  - [Settings](#settings)
   - [Manifest reference](#manifest-reference)
-  - [Component directories](#component-directories)
-  - [User configuration](#user-configuration)
+  - [Components](#components)
+  - [The model's view](#the-models-view)
   - [Variable interpolation](#variable-interpolation)
-  - [Foreign plugin sources](#foreign-plugin-sources)
 - [Marketplaces](#marketplaces)
 - [Trust model](#trust-model)
 - [Commands](#commands)
   - [`/skills`](#skills-command)
   - [`/plugin`](#plugin-command)
+  - [`coda plugin`](#coda-plugin-cli)
   - [`/marketplace`](#marketplace-command)
   - [Interactive browsers](#interactive-browsers)
 - [Serve protocol](#serve-protocol)
@@ -135,138 +137,161 @@ is overridable with `CODA_USER_SKILLS_DIR`.
 
 ## Plugins
 
-A plugin is a directory containing a `plugin.json` manifest plus the component files it references.
-Coda-native plugins live under `.coda/plugins/<name>/` (project) or `~/.coda/plugins/<name>/`
-(user).
+A plugin is a directory in the Claude plugin format: a manifest at `.claude-plugin/plugin.json`
+(a root `plugin.json` is accepted too) plus component folders. The same directory works in other
+Claude-format CLIs and in Coda, and it is **read in place** — nothing is copied, so a skill can
+reference sibling files by relative path and a local checkout can be edited and tested directly.
+
+```
+deep-review/
+  .claude-plugin/plugin.json
+  skills/review/SKILL.md
+  skills/extreme-review/SKILL.md      # may read ../review/SKILL.md
+  agents/advocate.md  agents/skeptic.md  agents/architect.md
+  commands/*.md                       # optional, loaded like skills
+  hooks/hooks.json                    # optional, needs approval
+  .mcp.json                           # optional, needs approval
+```
+
+### Discovery
+
+Plugins are discovered once per engine instance (no hot reload: start a new session to apply
+changes), in this order — a later plugin with the same name replaces an earlier one, and the
+replacement is reported in `plugins/list` `notes`:
+
+1. **User:** `~/.coda/plugins/<dir>/` (honours `CODA_HOME`). Git installs land here.
+2. **Settings paths:** each `plugins.paths` entry is a plugin directory, or a directory whose
+   children are plugin directories.
+3. **Marketplaces:** each `plugins.marketplaces.<id>` — a local directory (`source: "directory"`)
+   or a git repository (`source: "git"`, cloned to `~/.coda/marketplaces/<id>`). The plugins it
+   offers are the relative `source` entries of `.claude-plugin/marketplace.json`, or every plugin
+   under `<path>/plugins/` when there is no catalogue file. Remote (`github`, `url`) entries in a
+   catalogue are reported as errors.
+4. **Project:** `<project>/.coda/plugins/<dir>/` — untrusted, like project skills.
+
+One malformed plugin never hides the others: it is listed with its `errors` and contributes
+nothing.
+
+### Settings
+
+Only the **user** settings file (`~/.coda/settings.json`) is read, so a project cannot point Coda
+at arbitrary directories:
+
+```jsonc
+"plugins": {
+  "enabled": { "deep-review": true, "owasp-pr-review": false },
+  "paths": [ "D:/src/my-marketplace/plugins/owasp-pr-review" ],
+  "marketplaces": {
+    "local-dev": { "source": "directory", "path": "D:/src/my-marketplace" },
+    "team":      { "source": "git", "url": "https://github.com/org/plugins.git" }
+  }
+}
+```
+
+Enablement: an explicit `enabled` entry wins. Otherwise marketplace plugins are **off** until
+enabled (a marketplace is a catalogue — `coda plugin install <name>@<id>` enables one) and every
+other source is on. The legacy `~/.coda/plugin-state.json` lists written by the TUI's
+`/plugin enable|disable` are honoured when `enabled` has no entry. A disabled plugin is listed
+but contributes no component.
 
 ### Manifest reference
 
-`plugin.json` is a component-map manifest. **Unrecognised top-level fields are ignored by design**,
-so one `plugin.json` can double as a `package.json` or another ecosystem's descriptor.
-
-| Field | Type | Default | Meaning |
-| --- | --- | --- | --- |
-| `name` | string | — | Unique kebab-case identifier. **Required.** |
-| `version` | string | `0.0.0` | Semantic version. |
-| `description` | string | empty | One-line summary. |
-| `displayName` | string | none | Human-friendly name for listings. |
-| `author` | string | none | Author name or handle. |
-| `homepage` | string | none | Project or documentation URL. |
-| `repository` | string | none | Source repository URL. |
-| `license` | string | none | SPDX license identifier. |
-| `keywords` | list | empty | Search keywords for marketplace listings. |
-| `defaultEnabled` | bool | `true` | When `false`, the plugin installs disabled until the user enables it. |
-
-### Component directories
-
-Component paths are relative to the plugin directory. The `skills` array is **additive** — its
-entries are scanned in addition to the default `skills/` subdirectory. The other component fields
-are **exclusive** — a declared path *replaces* the default directory for that component.
-
-| Field | Type | Behaviour | Default directory |
-| --- | --- | --- | --- |
-| `skills` | list | Additive extra skill directories. | `skills/` |
-| `commands` | string | Replaces the commands directory. | `commands/` |
-| `agents` | string | Replaces the sub-agent directory. | `agents/` |
-| `outputStyles` | string | Replaces the output-style directory. | `output-styles/` |
-| `themes` | string | Replaces the theme directory. | `themes/` |
-| `hooks` | list | Inline or path-based hook configurations. | — |
-| `mcpServers` | list | MCP server configurations. | — |
-| `lspServers` | list | LSP server configurations. | — |
-
-#### Plugin commands
-
-Each `.md` file in the commands directory is parsed identically to a user skill file (same
-YAML-subset frontmatter, same argument-substitution semantics). The file stem is the fallback
-command name when no `name` field is present in the frontmatter.
-
-**Trust requirement.** Commands expand into a prompt the model acts on, so they are executable
-content. A plugin must have the `SlashCommand` component class approved (or have no approval
-record at all, which grants all-approved for backward compatibility) for its commands to register.
-A project-scoped plugin in an untrusted workspace contributes no commands.
-
-**Collision rule.** A plugin command whose name matches any built-in or skill-derived command is
-silently skipped with a diagnostic warning visible in the TUI. The built-in name always wins.
-Plugin commands from different plugins that share the same name are resolved first-wins (earlier
-in the enabled-plugin list wins). No namespace prefix is added — the author is responsible for
-choosing a name that does not conflict.
-
-**`/plugin validate`** counts the `*.md` files in the declared commands directory and reports
-the total in the component inventory.
-
-### User configuration
-
-`userConfig` declares install-time prompts. Each entry is an object:
+Only `name` is required; unknown keys are ignored (logged at debug level).
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `key` | string | Settings key the answer is stored under. |
-| `type` | enum | `string`, `boolean`, `number`, `choice`, or `secret`. |
-| `label` | string | Prompt text. |
-| `required` | bool | Whether an answer is mandatory. |
-| `default` | string | Default value when the user accepts. |
-| `options` | list | Allowed values for `choice`. |
+| `name` | string | Plugin name: letters, digits, `-`, `_`, `.`. Prefixes its skills and agents. |
+| `version` | string | Shown in listings and stamped on hooks. |
+| `description` | string | One-line summary. |
+| `author` | string or `{ name }` | Author. |
+| `skills` | path or paths | Extra skill directories, **in addition to** `./skills/`. |
+| `commands` | path or paths | Extra command directories, in addition to `./commands/`. |
+| `agents` | path or paths | Extra agent directories, in addition to `./agents/`. |
+| `mcpServers` | object or path | Inline `{ name: server }` map, or a JSON file holding `{ "mcpServers": {…} }` or the bare map. Default: `./.mcp.json` if present. |
+| `hooks` | object or path | Claude hooks block (`{ "hooks": { "<Event>": [ … ] } }` or the bare event map), or a path to one. Default: `./hooks/hooks.json` if present. |
+| `lspServers` | object, path or array | LSP servers (also `./.lsp.json`). |
 
-`secret` values are stored in the OS credential store and never written to `settings.json` or any
-other plaintext file.
+Every path must stay inside the plugin directory: absolute paths and `..` escapes are rejected
+with a per-plugin error, and the rest of the plugin still loads.
 
-`dependencies` declares required plugins, each with a `pluginName` and an optional semver range.
+### Components
+
+- **Skills and commands** are listed by `skills/list` as `<plugin>:<name>` with `origin: "plugin"`
+  and `plugin: "<plugin>"`, so two plugins shipping `review` never shadow each other. A short
+  name resolves by precedence — project > plugin > user > claude > foreign — and when two plugin
+  skills share the winning short name the call fails and names both.
+- **Agents** (`agents/*.md`, Claude format: `name`, `description`, body = system prompt; Coda's
+  `type` key is also accepted, the file stem is the fallback) register as `<plugin>:<agent>`
+  subagent types for the `task` tool, whose description lists them. A unique short name
+  (`skeptic`) is accepted; an ambiguous one is refused. Built-in types always win. `hooks`,
+  `mcpServers`, `permissions` and `permissionMode` keys in an agent file are ignored. An agent's
+  `model` is never applied (Claude aliases such as `sonnet` are not provider model ids); `tools`
+  is not mapped.
+- **MCP servers** start as `plugin_<plugin>_<server>` (tools `mcp__plugin_<plugin>_<server>__*`)
+  once approved. A user or project server of the same name wins.
+- **Hooks** use the Claude format; `command` handlers are converted into Coda hooks that carry
+  their plugin as `plugin_origin` and appear in `hooks/list` with `plugin`. `SessionStart` fires
+  once per engine instance, at the first prompt (`source: "startup"`, fail-open); each hook's
+  `hookSpecificOutput.additionalContext` is prepended to that prompt. Other events go through
+  the same pipeline as user hooks.
+- **LSP servers** are merged into the LSP configuration as `plugin:<plugin>:<server>` once approved.
+
+### The model's view
+
+The `skill` tool lists every model-invocable skill (`name: description`) and loads one on demand.
+It re-reads the file at call time (edits apply on the next call) and returns:
+
+```
+Base directory for this skill: C:\src\deep-review\skills\extreme-review
+Plugin: deep-review (root: C:\src\deep-review; also available as ${CLAUDE_PLUGIN_ROOT} / ${CODA_PLUGIN_ROOT})
+Subagent types from this plugin (use with the `task` tool's subagentType): deep-review:advocate, …
+
+<skill body>
+```
+
+Plugin roots (and the directories of user-level skills) are added to the file tools' granted
+directories, so `read_file ../review/SKILL.md` or reading `scripts/helper.ps1` works without
+leaving default permission mode. Running a script still goes through the normal `run_command`
+permission prompt. The TUI's `/skill <name>` runs local project/user skills directly and hands any
+other name (for example `deep-review:review`) to the model's `skill` tool.
 
 ### Variable interpolation
 
-Manifest string values are interpolated at load time:
-
-| Placeholder | Expands to |
-| --- | --- |
-| `${CODA_PLUGIN_ROOT}` | Absolute path of the plugin directory. |
-| `${CODA_PLUGIN_DATA}` | Per-plugin writable data directory. |
-| `${CLAUDE_PLUGIN_ROOT}` | Alias for `${CODA_PLUGIN_ROOT}` — accepted for Claude Code compatibility. |
-| `${CLAUDE_PLUGIN_DATA}` | Alias for `${CODA_PLUGIN_DATA}`. |
-
-The `CLAUDE_*` aliases let a manifest written for Claude Code interpolate correctly under Coda
-without edits.
-
-### Foreign plugin sources
-
-Coda discovers a single foreign plugin per directory from a `.claude-plugin/plugin.json` manifest.
-The plugin directory *is* the `.claude-plugin/` directory. Foreign plugins load at lower
-precedence than Coda-native plugins (a native plugin of the same name wins) and are marked
-`isExternal`. The project location scanned is `<project>/.claude-plugin/plugin.json`.
+`${CLAUDE_PLUGIN_ROOT}` and `${CODA_PLUGIN_ROOT}` expand to the plugin directory in skill and
+agent bodies and in every string of MCP server, hook and LSP definitions; both are also exported
+to the processes those start. `${CLAUDE_SKILL_DIR}` expands to the skill's directory in a skill body.
 
 ---
 
 ## Marketplaces
 
-A marketplace is a source (git URL or local path) that lists installable plugins. Manage them with
-`/marketplace`:
-
-| Subcommand | Effect |
-| --- | --- |
-| `add <source>` | Register a marketplace by git URL or local path. |
-| `list` | List registered marketplaces. |
-| `remove <name> [--force]` | Unregister a marketplace. |
-| `browse <name>` | List the plugins a marketplace offers. |
-| `search <query>` | Search across registered marketplaces. |
-| `install <plugin> <marketplace>` | Install a plugin from a named marketplace. |
-| `refresh [<name>]` | Re-fetch marketplace manifests. |
+A marketplace is a directory (or git repository) that offers plugins. Register one with
+`coda plugin marketplace add <id> --path <dir>` or `--git <url>`, then enable a plugin from it with
+`coda plugin install <name>@<id>`. `coda plugin update` pulls git marketplaces. The TUI's
+`/marketplace` command manages the older `marketplaces` settings key and is unrelated to plugin
+loading.
 
 ---
 
 ## Trust model
 
-Coda never silently runs third-party code. Two independent gates apply:
+Coda never silently runs third-party code:
 
-**Plugins** — installing or updating a plugin that contributes executable components (hooks, MCP
-servers, commands) triggers a per-class approval prompt. Approvals are keyed by a content hash of
-the plugin's name and version and persisted, so a re-install of the same version is not re-prompted,
-but an updated version is. `/plugin approve <name>` re-runs the prompt for a plugin installed with
-withheld components.
-
-**Skills** — a foreign or otherwise untrusted skill is gated before the model may invoke it. In an
-interactive session the user is prompted. In an unattended session (for example `coda serve`) there
-is no interactive callback, so the gate **refuses** rather than silently granting: the skill still
-appears in listings, but model invocation is blocked. Trust is answered over the protocol only when
-the client provides a callback — never assumed.
+- **Prompt content** — skills, commands and agents — loads like user skills (project plugins like
+  project skills). It cannot execute anything by itself; tools it asks for go through the normal
+  permission checks.
+- **Executable components** — each MCP server, each LSP server and a plugin's hooks block — need
+  **approval**. An approval is keyed by SHA-256 of the plugin manifest bytes plus the component's
+  kind, name and definition (and, for project plugins, the plugin directory, binding it to one
+  checkout). Any change to the manifest or the definition yields a new key, so it must be
+  approved again. Approvals live in `~/.coda/plugin-trust.json` under
+  `pluginApprovals: { "<hash>": ["mcpServer" | "lspServer" | "hook"] }`.
+- The engine never prompts: unapproved components are not started (`plugins/list` reports them in
+  `pendingApproval`; their hooks are listed by `hooks/list` disabled and untrusted). Approve with
+  `coda plugin approve <name>` (asks y/N on a terminal; `--yes` for scripts); `install` and
+  `update` run the same step.
+- Hook trust for ordinary project hooks (`hooks/trust`) and skill trust (`skills/trust`) are
+  unchanged.
 
 ---
 
@@ -291,23 +316,30 @@ the client provides a callback — never assumed.
 ### `/plugin` command {#plugin-command}
 
 ```
-/plugin [list | info <name> | install <source> | remove <name> | enable <name> |
-         disable <name> | update <name> | prune | approve <name> | validate <path> | new <name>]
+/plugin [list | info <name> | enable <name> | disable <name>]
 ```
 
-| Subcommand | Effect |
+`list` shows each plugin's version, source, state, component counts and pending approvals (from
+`plugins/list`); `enable`/`disable` write `~/.coda/plugin-state.json` and apply to the next
+engine instance. Everything else is the `coda plugin` command line:
+
+### `coda plugin` command line {#coda-plugin-cli}
+
+| Command | Effect |
 | --- | --- |
-| _(none)_ / `list` | List installed plugins. |
-| `info <name>` | Show components, config, and trust state for a plugin. |
-| `install <source>` | Install from a local directory path or a git URL. |
-| `remove <name>` | Uninstall a plugin. |
-| `enable <name>` | Enable a plugin. |
-| `disable <name>` | Disable a plugin without removing it. |
-| `update <name>` | Update a git-installed plugin to the latest version. |
-| `prune` | List dependency-only plugins no longer required by anything. |
-| `approve <name>` | Re-run the per-class approval prompt for a plugin. |
-| `validate <path>` | Parse and validate the `plugin.json` at `<path>` (or `<path>/.claude-plugin/plugin.json`). |
-| `new <name>` | Scaffold `<cwd>/.coda/plugins/<name>/plugin.json`. |
+| `coda plugin list [--json]` | Discovered plugins with source, root, state, trust, components and errors (`--json` prints the `plugins/list` result). |
+| `coda plugin install <path>` | Adds the directory to `plugins.paths` (loaded in place). |
+| `coda plugin install <git-url>[#ref]` | Clones into `~/.coda/plugins/<name>/` and writes `.coda-plugin.json` (`source`, `url`, `ref`, `commit`, `installedAt`, `contentHash`). |
+| `coda plugin install <name>@<marketplace>` | Enables a plugin a registered marketplace offers. |
+| `coda plugin enable|disable <name>` | Sets `plugins.enabled.<name>`. |
+| `coda plugin update [<name>] [--yes]` | Fetches git installs to their ref's latest commit (updating the receipt) and pulls git marketplaces, then asks again for any executable component whose approval no longer matches. |
+| `coda plugin remove <name>` | Deletes a `~/.coda/plugins/` install, drops a `plugins.paths` reference, or disables a marketplace plugin. Project plugins are removed by deleting their directory. |
+| `coda plugin approve <name> [--yes]` | Shows and approves pending executable components. |
+| `coda plugin marketplace add <id> --path <dir> \| --git <url>` | Registers a marketplace (a git one is cloned). |
+| `coda plugin marketplace list \| remove <id> \| update [<id>]` | Lists, unregisters (deleting a clone) or pulls marketplaces. |
+
+All commands edit `~/.coda/settings.json` with locked delta writes and take effect in the next
+session.
 
 ### `/marketplace` command {#marketplace-command}
 
@@ -343,16 +375,17 @@ command path.
 
 ## Serve protocol
 
-`coda serve` exposes read-only skill and plugin surfaces to an orchestrator over JSON-RPC:
-
 | Method | Result |
 | --- | --- |
-| `skills/list` | `{ skills: [{ name, description, origin, enabled, userInvocable, sourcePath, argumentHint }] }` |
-| `plugins/list` | `{ plugins: [{ name, version, enabled, trusted, isExternal }] }` |
-| `skills/trust` | Refused in an unattended serve session (no interactive callback); trust must be granted through the interactive gate. |
+| `skills/list` | `{ skills: [{ name, description, origin, enabled, userInvocable, sourcePath?, argumentHint?, plugin? }] }` |
+| `plugins/list` | `{ plugins: [ { name, version?, description?, source, root, enabled, trusted, trust, isExternal, components: { skills, commands, agents, mcpServers, hooks, lspServers }, pendingApproval, notes, errors } ], errors }` |
+| `hooks/list` | Plugin hooks carry `plugin`; `trusted` is `false` until approved. |
+| `skills/trust` | Refused in an unattended serve session (no interactive callback). |
 
-`skills/list` includes foreign skills, but an untrusted skill's model invocation remains blocked by
-the unattended gate. See [`docs/serve-protocol.md`](serve-protocol.md) for the wire-level details.
+`source` is `user`, `project`, `path` or `marketplace:<id>`; `trust` is `notRequired`, `approved`,
+`partial` or `pending`; `trusted` is `true` when nothing is pending. Components are qualified
+names (`deep-review:review`), hook event names, and server names. See
+[`docs/serve-protocol.md`](serve-protocol.md) for the wire-level details.
 
 ---
 
@@ -396,30 +429,18 @@ Review the pending change and report exploitable risks with severity and confide
 This skill never appears in `/skills` and cannot be run with `/skill`, but the model may route to it
 via the `skill` tool.
 
-### A plugin bundling a skill and a command
+### Loading two review plugins from a local checkout
 
-`.coda/plugins/release-tools/plugin.json`:
-
-```json
-{
-  "name": "release-tools",
-  "version": "1.0.0",
-  "description": "Release automation helpers.",
-  "author": "example",
-  "license": "MIT",
-  "commands": "commands",
-  "skills": ["extra-skills"],
-  "userConfig": [
-    { "key": "release.channel", "type": "choice", "label": "Release channel",
-      "required": true, "default": "stable", "options": ["stable", "beta"] }
-  ]
+```jsonc
+// ~/.coda/settings.json
+"plugins": {
+  "paths": [ "D:/src/reviews/plugins/deep-review", "D:/src/reviews/plugins/owasp-pr-review" ]
 }
 ```
 
-`skills` is additive, so both `skills/` and `extra-skills/` are scanned. `commands` replaces the
-default command directory. Install it and approve its executable components:
-
-```
-/plugin install .coda/plugins/release-tools
-/plugin info release-tools
-```
+A new session lists both in `plugins/list`; `deep-review:review` can start the
+`deep-review:advocate`, `deep-review:skeptic` and `deep-review:architect` agents in parallel, and
+the OWASP skill reads `../teams-owasp-pr-review-monitor/reviewer-contract.md` from the plugin
+directory. Editing a file under `D:/src/reviews` takes effect in the next session (skill bodies
+are even re-read on each `skill` call); `coda plugin disable deep-review` removes all of its
+components from the next session.
