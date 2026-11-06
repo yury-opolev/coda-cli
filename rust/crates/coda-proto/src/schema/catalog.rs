@@ -17,7 +17,7 @@ fn path(name: &str) -> String {
 fn rpc(method: &str, params: Option<&str>, result: Option<&str>, input: Shape, output: Shape) -> Value {
     let availability = match method {
         m::SKILLS_TRUST => "unsupported",
-        m::PLUGINS_LIST | m::HISTORY | m::MESSAGES => "limited",
+        m::HISTORY | m::MESSAGES => "limited",
         _ => "reusable",
     };
     json!({

@@ -6,6 +6,14 @@
       "items": {
         "$ref": "#/$defs/WirePlugin"
       }
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Problems not attributable to one plugin (settings shape, missing paths).",
+      "default": []
     }
   },
   "title": "PluginsListResult",
@@ -30,16 +38,123 @@
         },
         "trusted": {
           "type": "boolean",
+          "description": "`true` when no executable component is waiting for approval.",
           "default": false
         },
         "isExternal": {
           "type": "boolean",
           "default": false
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "source": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "`user`, `project`, `path` or `marketplace:<id>`.",
+          "default": null
+        },
+        "root": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The plugin directory.",
+          "default": null
+        },
+        "trust": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "`notRequired`, `approved`, `partial` or `pending`.",
+          "default": null
+        },
+        "components": {
+          "$ref": "#/$defs/WirePluginComponents"
+        },
+        "pendingApproval": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Executable components not yet approved, as `kind:name`.",
+          "default": []
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "errors": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Per-plugin load errors.",
+          "default": []
         }
       },
       "required": [
         "name"
       ]
+    },
+    "WirePluginComponents": {
+      "type": "object",
+      "properties": {
+        "skills": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "commands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "agents": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "mcpServers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "hooks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Hook event names.",
+          "default": []
+        },
+        "lspServers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        }
+      },
+      "description": "The components a plugin contributes, by qualified name."
     }
   }
 }
