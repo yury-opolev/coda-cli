@@ -168,7 +168,7 @@ impl App {
 
         if let PluginOp::Unsupported(sub) = op {
             self.notice(
-                format!("plugin {sub} is not yet available in the Rust front-end. Use the C# coda tool or /plugins browser."),
+                format!("Run `coda plugin {sub} …` in a terminal; restart the engine afterwards."),
                 NoticeLevel::Warning,
             );
             return;
@@ -190,11 +190,10 @@ impl App {
                         } else {
                             let mut out = String::from("Plugins\n");
                             for p in &result.plugins {
-                                out.push_str(&format!(
-                                    "  {} {}\n",
-                                    p.name,
-                                    p.version.as_deref().unwrap_or("")
-                                ));
+                                out.push_str(&plugin_line(p));
+                            }
+                            for e in &result.errors {
+                                out.push_str(&format!("  ! {e}\n"));
                             }
                             out.trim_end().to_string()
                         };
@@ -294,20 +293,38 @@ impl App {
                 self.submit_programmatic(text).await;
             }
             None => {
-                // Report what IS available to help the user.
-                let available = list_local_skill_names(&self.paths);
-                let list = if available.is_empty() {
-                    "(none found locally)".to_string()
-                } else {
-                    available.join(", ")
-                };
-                self.notice(
-                    format!("Skill '{name}' not found. Available locally: {list}"),
-                    NoticeLevel::Warning,
-                );
+                // Plugin skills (`plugin:skill`) and skills on a remote engine
+                // are not on this machine's disk: the engine's `skill` tool
+                // resolves them, and reports what exists when it cannot.
+                self.notice(format!("Running skill '{name}' via the engine…"), NoticeLevel::Info);
+                self.submit_programmatic(skill_tool_prompt(name, &args)).await;
             }
         }
     }
+}
+
+/// One `/plugin list` row: name, version, source, state and problems.
+fn plugin_line(p: &messages::WirePlugin) -> String {
+    let c = &p.components;
+    let mut line = format!(
+        "  {} {}  [{}]  {}  skills:{} agents:{} mcp:{} hooks:{}",
+        p.name,
+        p.version.as_deref().unwrap_or(""),
+        p.source.as_deref().unwrap_or("?"),
+        if p.enabled { "enabled" } else { "disabled" },
+        c.skills.len() + c.commands.len(),
+        c.agents.len(),
+        c.mcp_servers.len(),
+        c.hooks.len(),
+    );
+    if !p.pending_approval.is_empty() {
+        line.push_str(&format!("  needs approval: {} (coda plugin approve {})", p.pending_approval.join(", "), p.name));
+    }
+    line.push('\n');
+    for e in &p.errors {
+        line.push_str(&format!("    ! {e}\n"));
+    }
+    line
 }
 
 /// Derives a marketplace name from a source URL or path.
@@ -337,25 +354,16 @@ fn find_local_skill_body(paths: &config::Paths, name: &str, args: &[&str]) -> Op
     None
 }
 
-/// Lists the names of locally available skills.
-fn list_local_skill_names(paths: &config::Paths) -> Vec<String> {
-    let mut names = Vec::new();
-    for dir in [paths.skills_project(), paths.skills_user()] {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            if entry.path().join("SKILL.md").is_file() {
-                if let Some(n) = entry.file_name().to_str() {
-                    if !names.iter().any(|e: &String| e.eq_ignore_ascii_case(n)) {
-                        names.push(n.to_string());
-                    }
-                }
-            }
-        }
+/// The prompt that asks the model to run a skill through the `skill` tool.
+fn skill_tool_prompt(name: &str, args: &[&str]) -> String {
+    if args.is_empty() {
+        format!("Use the `skill` tool to load the skill `{name}`, then follow its instructions.")
+    } else {
+        format!(
+            "Use the `skill` tool to load the skill `{name}` with arguments `{}`, then follow its instructions.",
+            args.join(" ")
+        )
     }
-    names.sort();
-    names
 }
 
 /// Substitutes skill argument placeholders in a single pass, preventing
@@ -487,5 +495,13 @@ mod tests {
         // $arguments (lowercase) is NOT the special $ARGUMENTS token → empty.
         assert_eq!(bind_skill_args("$arguments", &["val"]), "");
     }
-}
 
+    #[test]
+    fn unknown_local_skills_are_delegated_to_the_skill_tool() {
+        assert_eq!(
+            skill_tool_prompt("deep-review:review", &[]),
+            "Use the `skill` tool to load the skill `deep-review:review`, then follow its instructions."
+        );
+        assert!(skill_tool_prompt("x", &["a", "b"]).contains("with arguments `a b`"));
+    }
+}

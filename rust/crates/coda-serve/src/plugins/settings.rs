@@ -47,6 +47,8 @@ pub struct PluginSettings {
     pub marketplaces: Vec<MarketplaceRef>,
     /// `disabledPlugins` from `~/.coda/plugin-state.json` (written by the TUI).
     pub legacy_disabled: BTreeSet<String>,
+    /// `explicitlyEnabled` from the same file.
+    pub legacy_enabled: BTreeSet<String>,
 }
 
 impl PluginSettings {
@@ -112,10 +114,14 @@ impl PluginSettings {
         let path = coda_dir.join("plugin-state.json");
         if let Ok(text) = std::fs::read_to_string(path) {
             if let Ok(doc) = serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')) {
-                if let Some(list) = doc.get("disabledPlugins").and_then(Value::as_array) {
-                    self.legacy_disabled
-                        .extend(list.iter().filter_map(Value::as_str).map(str::to_owned));
-                }
+                let names = |key: &str| -> Vec<String> {
+                    doc.get(key)
+                        .and_then(Value::as_array)
+                        .map(|l| l.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+                        .unwrap_or_default()
+                };
+                self.legacy_disabled.extend(names("disabledPlugins"));
+                self.legacy_enabled.extend(names("explicitlyEnabled"));
             }
         }
         self
@@ -133,6 +139,9 @@ impl PluginSettings {
         }
         if self.legacy_disabled.contains(name) {
             return false;
+        }
+        if self.legacy_enabled.contains(name) {
+            return true;
         }
         !matches!(source, PluginSource::Marketplace(_))
     }
@@ -246,8 +255,13 @@ mod tests {
     #[test]
     fn the_legacy_disable_list_is_read() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("plugin-state.json"), r#"{"disabledPlugins":["old"]}"#).unwrap();
+        std::fs::write(
+            dir.path().join("plugin-state.json"),
+            r#"{"disabledPlugins":["old"],"explicitlyEnabled":["m"]}"#,
+        )
+        .unwrap();
         let s = PluginSettings::default().with_legacy_state(dir.path());
-        assert!(s.legacy_disabled.contains("old"));
+        assert!(!s.is_enabled("old", &PluginSource::User));
+        assert!(s.is_enabled("m", &PluginSource::Marketplace("x".into())), "the TUI's /plugin enable counts");
     }
 }
