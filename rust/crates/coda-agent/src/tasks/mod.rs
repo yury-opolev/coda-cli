@@ -8,6 +8,7 @@
 //! - [`managed_task`]: One live unit of work with lifecycle, ring, and cursors.
 //! - [`task_subscription`]: Change subscription with initial snapshot.
 //! - [`task_manager`]: Central registry owning all tasks in a session.
+//! - `title`: Task title validation and derivation.
 
 pub mod completion_push;
 pub mod live_brief;
@@ -18,6 +19,7 @@ pub mod output_ring;
 pub mod streaming_secret_redactor;
 pub mod task_manager;
 pub mod task_subscription;
+mod title;
 
 pub use log_writer::TaskOutputChannel;
 pub use managed_task::{
@@ -30,6 +32,7 @@ pub use task_manager::{
     DEFAULT_MAX_LIVE_SHELL_TASKS, DEFAULT_MAX_RETAINED_TERMINAL_TASKS, DEFAULT_SHUTDOWN_BUDGET,
 };
 pub use task_subscription::{TaskChange, TaskChangeKind, TaskSubscription};
+pub use title::{derive_task_title, validate_task_title, MAX_TASK_TITLE_CHARS};
 
 // ── Shared byte-cap utility ────────────────────────────────────────────────────
 
