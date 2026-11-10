@@ -491,7 +491,7 @@ fn task_card_header(
         Some(title) => {
             let lead = format!("Task {status}: ");
             let fixed = text::width(&lead) + 2 + text::width(&tag);
-            (budget >= fixed + 4).then(|| {
+            (budget >= fixed + text::width(title).min(4)).then(|| {
                 format!("{lead}{}  {tag}", text::truncate_with_ellipsis(title, budget - fixed))
             })
         }
@@ -2456,6 +2456,13 @@ mod tests {
             assert!(!short[1].text.contains('…'));
             assert!(card(None, &long).render_card(40, true).len() > 3);
             assert_eq!(card(None, "  ").render_card(40, false).len(), 1);
+        }
+
+        #[test]
+        fn a_short_title_is_kept_whenever_the_full_header_fits() {
+            // " ▸ " + "Task completed: T  [task-00000007]" = 3 + 34 cells.
+            let row = &card(Some("T"), "p").render_card(37, false)[0].text;
+            assert!(row.contains("Task completed: T  [task-00000007]"), "{row}");
         }
 
         #[test]
