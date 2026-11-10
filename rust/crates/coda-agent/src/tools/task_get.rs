@@ -117,7 +117,7 @@ mod tests {
     async fn get_existing_task() {
         let m = TaskManager::with_defaults("session");
         let t = m
-            .register(TaskKind::Subagent, "hello task", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "hello task", "hello task", None, TaskExecutionMode::Background)
             .unwrap();
         let result = TaskGetTool
             .execute(

@@ -85,6 +85,8 @@ pub struct SubagentCheckpoint {
     /// `"main"` or the owner's task id.
     pub reports_to: String,
     pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub description: String,
     pub mode: String,
     pub spec: SubagentSpec,
@@ -122,6 +124,7 @@ impl SubagentCheckpoint {
             owner_task_id: task.parent_id.clone(),
             reports_to: task.parent_id.clone().unwrap_or_else(|| "main".to_owned()),
             kind: task.kind.as_str().to_owned(),
+            title: task.title.clone(),
             description: task.description.clone(),
             mode: task.mode().as_str().to_owned(),
             spec,

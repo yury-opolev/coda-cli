@@ -199,6 +199,7 @@ mod tests {
             parent_id: None,
             depth: 1,
             kind: TaskKind::Subagent,
+            title: Some("test".to_owned()),
             description: "test".to_owned(),
             status: TaskRunStatus::Running,
             mode: TaskExecutionMode::Background,

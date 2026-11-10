@@ -195,7 +195,7 @@ mod tests {
         let bus = Arc::new(MessageBus::new());
         let manager = TaskManager::with_defaults("session");
         let task = manager
-            .register(TaskKind::Scheduled, "nightly audit run", None, TaskExecutionMode::Background)
+            .register(TaskKind::Scheduled, "nightly audit run", "nightly audit run", None, TaskExecutionMode::Background)
             .unwrap();
         let ctx = ToolContext::new(".")
             .with_message_bus(bus.clone())
@@ -218,10 +218,10 @@ mod tests {
         let bus = Arc::new(MessageBus::new());
         let manager = TaskManager::with_defaults("session");
         let root = manager
-            .register(TaskKind::Scheduled, "nightly audit run", None, TaskExecutionMode::Background)
+            .register(TaskKind::Scheduled, "nightly audit run", "nightly audit run", None, TaskExecutionMode::Background)
             .unwrap();
         let child = manager
-            .register(TaskKind::Subagent, "nested audit worker", Some(&root.id), TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "nested audit worker", "nested audit worker", Some(&root.id), TaskExecutionMode::Background)
             .unwrap();
 
         let ctx = ToolContext::new(".")
@@ -242,10 +242,10 @@ mod tests {
         let bus = Arc::new(MessageBus::new());
         let manager = TaskManager::with_defaults("session");
         let root = manager
-            .register(TaskKind::Subagent, "root task", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "root task", "root task", None, TaskExecutionMode::Background)
             .unwrap();
         let child = manager
-            .register(TaskKind::Subagent, "nested child work", Some(&root.id), TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "nested child work", "nested child work", Some(&root.id), TaskExecutionMode::Background)
             .unwrap();
 
         let ctx = ToolContext::new(".")
@@ -265,7 +265,7 @@ mod tests {
         let bus = Arc::new(MessageBus::new());
         let manager = TaskManager::with_defaults("session");
         let task = manager
-            .register(TaskKind::Subagent, "worker", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "worker", "worker", None, TaskExecutionMode::Background)
             .unwrap();
         let ctx = ToolContext::new(".")
             .with_message_bus(bus.clone())
@@ -292,7 +292,7 @@ mod tests {
         let manager = TaskManager::with_defaults("session");
         for i in 0..MAIN_QUEUE_CAPACITY {
             let task = manager
-                .register(TaskKind::Subagent, format!("worker {i}"), None, TaskExecutionMode::Background)
+                .register(TaskKind::Subagent, &format!("worker {i}"), format!("worker {i}"), None, TaskExecutionMode::Background)
                 .unwrap();
             bus.publish_main(
                 &crate::message::MessageSource::Subagent { task_id: task.id.clone(), label: format!("worker {i}") },
@@ -305,7 +305,7 @@ mod tests {
         assert_eq!(bus.pending_main_len(), MAIN_QUEUE_CAPACITY);
 
         let task = manager
-            .register(TaskKind::Subagent, "overflow worker", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "overflow worker", "overflow worker", None, TaskExecutionMode::Background)
             .unwrap();
         let ctx = ToolContext::new(".")
             .with_message_bus(bus.clone())

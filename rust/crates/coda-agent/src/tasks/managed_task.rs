@@ -114,6 +114,8 @@ pub struct TaskSnapshot {
     pub parent_id: Option<String>,
     pub depth: u32,
     pub kind: TaskKind,
+    /// Short single-line label; `None` for a legacy task restored without one.
+    pub title: Option<String>,
     pub description: String,
     pub status: TaskRunStatus,
     pub mode: TaskExecutionMode,
@@ -163,6 +165,8 @@ pub struct ManagedTask {
     pub parent_id: Option<String>,
     pub depth: u32,
     pub kind: TaskKind,
+    /// Short single-line label; `None` for a legacy task restored without one.
+    pub title: Option<String>,
     pub description: String,
     pub log_path: PathBuf,
     pub started_at: SystemTime,
@@ -224,11 +228,13 @@ pub struct ManagedTask {
 pub const MAIN_CONSUMER_ID: &str = "\u{0000}main";
 
 impl ManagedTask {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: String,
         parent_id: Option<String>,
         depth: u32,
         kind: TaskKind,
+        title: Option<String>,
         description: String,
         log_path: PathBuf,
         output_ring_bytes: u64,
@@ -239,6 +245,7 @@ impl ManagedTask {
             parent_id,
             depth,
             kind,
+            title,
             description,
             log_path,
             output_ring_bytes,
@@ -255,6 +262,7 @@ impl ManagedTask {
         parent_id: Option<String>,
         depth: u32,
         kind: TaskKind,
+        title: Option<String>,
         description: String,
         log_path: PathBuf,
         output_ring_bytes: u64,
@@ -266,6 +274,7 @@ impl ManagedTask {
             parent_id,
             depth,
             kind,
+            title,
             description,
             log_path,
             started_at,
@@ -642,6 +651,7 @@ impl ManagedTask {
             parent_id: self.parent_id.clone(),
             depth: self.depth,
             kind: self.kind,
+            title: self.title.clone(),
             description: self.description.clone(),
             status: s.status,
             mode: s.mode,
@@ -670,6 +680,7 @@ mod tests {
             None,
             1,
             TaskKind::Subagent,
+            Some("test task".to_owned()),
             "test task".to_owned(),
             PathBuf::from("/tmp/task.log"),
             1024,

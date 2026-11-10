@@ -180,7 +180,7 @@ mod tests {
     async fn task_output_reads_new_text_then_no_new_output_running() {
         let m = TaskManager::with_defaults("s");
         let t = m
-            .register(TaskKind::Subagent, "d", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "d", "d", None, TaskExecutionMode::Background)
             .unwrap();
         m.append_output(&t.id, "hello world");
         let input = serde_json::json!({"task_id": t.id});
@@ -201,7 +201,7 @@ mod tests {
     async fn task_output_no_new_output_on_finished_task() {
         let m = TaskManager::with_defaults("s");
         let t = m
-            .register(TaskKind::Subagent, "d", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "d", "d", None, TaskExecutionMode::Background)
             .unwrap();
         m.append_output(&t.id, "partial");
         let input = serde_json::json!({"task_id": t.id});
@@ -228,7 +228,7 @@ mod tests {
             10,
         );
         let t = m
-            .register(TaskKind::Subagent, "d", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "d", "d", None, TaskExecutionMode::Background)
             .unwrap();
         m.append_output(&t.id, "AAAA");
         let input = serde_json::json!({"task_id": t.id});
@@ -260,7 +260,7 @@ mod tests {
         for (status, label) in &cases {
             let m = TaskManager::with_defaults("s");
             let t = m
-                .register(TaskKind::Subagent, "d", None, TaskExecutionMode::Background)
+                .register(TaskKind::Subagent, "d", "d", None, TaskExecutionMode::Background)
                 .unwrap();
             match status {
                 TaskRunStatus::Completed => { m.complete(&t.id, Some("done".into())); }
@@ -285,10 +285,10 @@ mod tests {
     async fn task_output_denied_for_sibling_looks_like_not_found() {
         let m = TaskManager::with_defaults("s");
         let a = m
-            .register(TaskKind::Subagent, "a", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "a", "a", None, TaskExecutionMode::Background)
             .unwrap();
         let b = m
-            .register(TaskKind::Subagent, "b", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "b", "b", None, TaskExecutionMode::Background)
             .unwrap();
         m.append_output(&b.id, "secret");
 
@@ -306,10 +306,10 @@ mod tests {
     async fn task_output_allowed_for_callers_own_descendant() {
         let m = TaskManager::with_defaults("s");
         let parent = m
-            .register(TaskKind::Subagent, "p", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "p", "p", None, TaskExecutionMode::Background)
             .unwrap();
         let child = m
-            .register(TaskKind::Subagent, "c", Some(&parent.id), TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "c", "c", Some(&parent.id), TaskExecutionMode::Background)
             .unwrap();
         m.append_output(&child.id, "child progress");
 

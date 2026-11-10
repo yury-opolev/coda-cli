@@ -192,8 +192,14 @@ pub(crate) async fn start_subagent(
     // cannot choose its own caller identity, depth, task id, or claim that
     // its work belongs to somebody else's scheduled job.
     let background = ctx.get_task_manager().is_some();
+    let title = input
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
     let request = SubagentRequest {
         agent_type,
+        title,
         prompt,
         // Background: the host registers the task and assigns the id.
         task_id: if background { String::new() } else { uuid::Uuid::new_v4().to_string() },
@@ -426,6 +432,7 @@ mod tests {
         let parent = mgr
             .register(
                 crate::tasks::TaskKind::Subagent,
+                "parent",
                 "parent",
                 None,
                 crate::tasks::TaskExecutionMode::Foreground,

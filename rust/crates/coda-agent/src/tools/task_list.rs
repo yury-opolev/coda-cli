@@ -155,7 +155,7 @@ mod tests {
     #[tokio::test]
     async fn lists_registered_task() {
         let m = TaskManager::with_defaults("session");
-        m.register(TaskKind::Subagent, "my-task", None, TaskExecutionMode::Background)
+        m.register(TaskKind::Subagent, "my-task", "my-task", None, TaskExecutionMode::Background)
             .unwrap();
         let result = TaskListTool
             .execute(&Value::Object(Default::default()), &ctx(m), CancellationToken::new())
@@ -173,9 +173,9 @@ mod tests {
     #[tokio::test]
     async fn the_status_filter_selects_active_or_finished_tasks_and_defaults_to_all() {
         let m = TaskManager::with_defaults("session");
-        let live = m.register(TaskKind::Shell, "live-one", None, TaskExecutionMode::Background).unwrap();
-        let done = m.register(TaskKind::Shell, "done-one", None, TaskExecutionMode::Background).unwrap();
-        let stopped = m.register(TaskKind::Shell, "stopped-one", None, TaskExecutionMode::Background).unwrap();
+        let live = m.register(TaskKind::Shell, "live-one", "live-one", None, TaskExecutionMode::Background).unwrap();
+        let done = m.register(TaskKind::Shell, "done-one", "done-one", None, TaskExecutionMode::Background).unwrap();
+        let stopped = m.register(TaskKind::Shell, "stopped-one", "stopped-one", None, TaskExecutionMode::Background).unwrap();
         m.complete(&done.id, None);
         m.stop(&stopped.id);
 
@@ -206,9 +206,9 @@ mod tests {
     #[tokio::test]
     async fn a_subagent_still_sees_only_its_own_tasks_under_a_filter() {
         let m = TaskManager::with_defaults("session");
-        let agent = m.register(TaskKind::Subagent, "agent", None, TaskExecutionMode::Background).unwrap();
-        let mine = m.register(TaskKind::Shell, "mine", Some(&agent.id), TaskExecutionMode::Background).unwrap();
-        m.register(TaskKind::Shell, "other", None, TaskExecutionMode::Background).unwrap();
+        let agent = m.register(TaskKind::Subagent, "agent", "agent", None, TaskExecutionMode::Background).unwrap();
+        let mine = m.register(TaskKind::Shell, "mine", "mine", Some(&agent.id), TaskExecutionMode::Background).unwrap();
+        m.register(TaskKind::Shell, "other", "other", None, TaskExecutionMode::Background).unwrap();
         let ctx = ToolContext::new(".").with_task_manager(m.clone()).with_caller_task_id(agent.id.clone());
         let result = TaskListTool
             .execute(&serde_json::json!({ "statusFilter": "active" }), &ctx, CancellationToken::new())

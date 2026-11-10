@@ -81,7 +81,7 @@ mod tests {
     async fn recall_returns_completions() {
         let m = TaskManager::with_defaults("session");
         let t = m
-            .register(TaskKind::Subagent, "my-task", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "my-task", "my-task", None, TaskExecutionMode::Background)
             .unwrap();
         m.complete(&t.id, Some("done!".into()));
         let result = TaskRecallTool
@@ -97,7 +97,7 @@ mod tests {
     async fn recall_is_exactly_once() {
         let m = TaskManager::with_defaults("session");
         let t = m
-            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "t", "t", None, TaskExecutionMode::Background)
             .unwrap();
         m.complete(&t.id, None);
         TaskRecallTool
@@ -114,7 +114,7 @@ mod tests {
     async fn a_completion_already_pushed_is_not_returned_again() {
         let m = TaskManager::with_defaults("session");
         let t = m
-            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "t", "t", None, TaskExecutionMode::Background)
             .unwrap();
         m.complete(&t.id, Some("pushed".into()));
         t.mark_completion_pushed();

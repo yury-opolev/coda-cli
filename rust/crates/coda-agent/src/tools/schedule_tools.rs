@@ -511,7 +511,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mgr = TaskManager::new("sched-list-no-origin", Some(dir.path().to_owned()), 4096, 16);
         let caller = mgr
-            .register(TaskKind::Subagent, "child", None, TaskExecutionMode::Foreground)
+            .register(TaskKind::Subagent, "child", "child", None, TaskExecutionMode::Foreground)
             .unwrap();
 
         let s = ScheduledTaskStore::new();
@@ -541,7 +541,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mgr = TaskManager::new("sched-list-own-origin", Some(dir.path().to_owned()), 4096, 16);
         let caller = mgr
-            .register(TaskKind::Subagent, "child", None, TaskExecutionMode::Foreground)
+            .register(TaskKind::Subagent, "child", "child", None, TaskExecutionMode::Foreground)
             .unwrap();
 
         let s = ScheduledTaskStore::new();
@@ -624,7 +624,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mgr = TaskManager::new("sched-list-malicious-json", Some(dir.path().to_owned()), 4096, 16);
         let caller = mgr
-            .register(TaskKind::Subagent, "child", None, TaskExecutionMode::Foreground)
+            .register(TaskKind::Subagent, "child", "child", None, TaskExecutionMode::Foreground)
             .unwrap();
 
         let s = ScheduledTaskStore::new();

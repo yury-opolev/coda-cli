@@ -91,7 +91,7 @@ mod tests {
     async fn remove_terminal_task() {
         let m = TaskManager::with_defaults("session");
         let t = m
-            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "t", "t", None, TaskExecutionMode::Background)
             .unwrap();
         m.complete(&t.id, None);
         let result = TaskRemoveTool
@@ -105,7 +105,7 @@ mod tests {
     async fn remove_running_task_returns_error() {
         let m = TaskManager::with_defaults("session");
         let t = m
-            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "t", "t", None, TaskExecutionMode::Background)
             .unwrap();
         let result = TaskRemoveTool
             .execute(&serde_json::json!({"taskId": t.id}), &ctx(m), CancellationToken::new())
@@ -123,10 +123,10 @@ mod tests {
     async fn remove_denied_for_sibling_looks_like_not_found_and_state_unchanged() {
         let m = TaskManager::with_defaults("session");
         let a = m
-            .register(TaskKind::Subagent, "a", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "a", "a", None, TaskExecutionMode::Background)
             .unwrap();
         let b = m
-            .register(TaskKind::Subagent, "b", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "b", "b", None, TaskExecutionMode::Background)
             .unwrap();
         m.complete(&b.id, Some(SIBLING_CANARY.into()));
 
@@ -152,11 +152,11 @@ mod tests {
     async fn remove_denied_for_ancestor_looks_like_not_found() {
         let m = TaskManager::with_defaults("session");
         let parent = m
-            .register(TaskKind::Subagent, "parent", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "parent", "parent", None, TaskExecutionMode::Background)
             .unwrap();
         m.complete(&parent.id, None);
         let child = m
-            .register(TaskKind::Subagent, "child", Some(&parent.id), TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "child", "child", Some(&parent.id), TaskExecutionMode::Background)
             .unwrap();
 
         let result = TaskRemoveTool
@@ -177,7 +177,7 @@ mod tests {
     async fn remove_denied_for_self_looks_like_not_found() {
         let m = TaskManager::with_defaults("session");
         let t = m
-            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "t", "t", None, TaskExecutionMode::Background)
             .unwrap();
         m.complete(&t.id, None);
 
@@ -199,7 +199,7 @@ mod tests {
     async fn remove_denied_for_unknown_caller_looks_like_not_found() {
         let m = TaskManager::with_defaults("session");
         let t = m
-            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "t", "t", None, TaskExecutionMode::Background)
             .unwrap();
         m.complete(&t.id, None);
 
@@ -221,10 +221,10 @@ mod tests {
     async fn remove_allowed_for_own_descendant() {
         let m = TaskManager::with_defaults("session");
         let parent = m
-            .register(TaskKind::Subagent, "parent", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "parent", "parent", None, TaskExecutionMode::Background)
             .unwrap();
         let child = m
-            .register(TaskKind::Subagent, "child", Some(&parent.id), TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "child", "child", Some(&parent.id), TaskExecutionMode::Background)
             .unwrap();
         m.complete(&child.id, None);
 

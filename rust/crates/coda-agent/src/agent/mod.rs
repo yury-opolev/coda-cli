@@ -4026,7 +4026,7 @@ mod tests {
         let bus = Arc::new(crate::message::MessageBus::new());
         let task_mgr = TaskManager::with_defaults("session");
         let caller_task =
-            task_mgr.register(TaskKind::Subagent, "caller worker", None, TaskExecutionMode::Background).unwrap();
+            task_mgr.register(TaskKind::Subagent, "caller worker", "caller worker", None, TaskExecutionMode::Background).unwrap();
 
         let log = Arc::new(Mutex::new(Vec::new()));
 
@@ -4234,6 +4234,7 @@ mod tests {
             let task = manager
                 .register(
                     crate::tasks::TaskKind::Shell,
+                    self.tool_name,
                     self.tool_name,
                     None,
                     crate::tasks::TaskExecutionMode::Foreground,
@@ -4485,7 +4486,7 @@ mod tests {
         let started = Arc::new(Mutex::new(Vec::new()));
         let manager = task_manager_for_test();
         let earlier = manager
-            .register(crate::tasks::TaskKind::Shell, "earlier", None, crate::tasks::TaskExecutionMode::Foreground)
+            .register(crate::tasks::TaskKind::Shell, "earlier", "earlier", None, crate::tasks::TaskExecutionMode::Foreground)
             .unwrap();
         earlier.try_promote_to_background().unwrap();
 
@@ -4551,7 +4552,7 @@ mod tests {
     async fn steering_delivered_while_tasks_run_is_prefixed_with_the_live_task_list() {
         let manager = task_manager_for_test();
         let review = manager
-            .register(crate::tasks::TaskKind::Shell, "review.ps1 -Post", None, crate::tasks::TaskExecutionMode::Background)
+            .register(crate::tasks::TaskKind::Shell, "review.ps1 -Post", "review.ps1 -Post", None, crate::tasks::TaskExecutionMode::Background)
             .unwrap();
         let inbox = Arc::new(crate::SteeringInbox::new());
         inbox.enqueue("make it a dry run").unwrap();
@@ -4571,7 +4572,7 @@ mod tests {
     async fn steering_with_nothing_running_is_delivered_unchanged() {
         let manager = task_manager_for_test();
         let done_task = manager
-            .register(crate::tasks::TaskKind::Shell, "cargo build", None, crate::tasks::TaskExecutionMode::Background)
+            .register(crate::tasks::TaskKind::Shell, "cargo build", "cargo build", None, crate::tasks::TaskExecutionMode::Background)
             .unwrap();
         manager.complete(&done_task.id, Some("exit code: 0".into()));
         let inbox = Arc::new(crate::SteeringInbox::new());
@@ -4589,7 +4590,7 @@ mod tests {
     async fn a_pushed_completion_alone_is_not_prefixed() {
         let manager = task_manager_for_test();
         let live = manager
-            .register(crate::tasks::TaskKind::Shell, "server", None, crate::tasks::TaskExecutionMode::Background)
+            .register(crate::tasks::TaskKind::Shell, "server", "server", None, crate::tasks::TaskExecutionMode::Background)
             .unwrap();
         let inbox = Arc::new(crate::SteeringInbox::new());
         inbox.push_item(crate::steering::InboxItemKind::TaskCompleted, "[task-completed] taskId=task-9");
@@ -4714,6 +4715,7 @@ mod tests {
             .register(
                 crate::tasks::TaskKind::Subagent,
                 "worker",
+                "worker",
                 parent,
                 crate::tasks::TaskExecutionMode::Background,
             )
@@ -4724,6 +4726,7 @@ mod tests {
         manager
             .register(
                 crate::tasks::TaskKind::Shell,
+                "job",
                 "job",
                 Some(owner),
                 crate::tasks::TaskExecutionMode::Background,
@@ -4821,6 +4824,7 @@ mod tests {
         let tool_task = manager
             .register(
                 crate::tasks::TaskKind::Tool,
+                "call",
                 "call",
                 Some(&parent.id),
                 crate::tasks::TaskExecutionMode::Foreground,

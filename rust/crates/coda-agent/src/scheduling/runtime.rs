@@ -191,6 +191,7 @@ impl ScheduledAgentRunner for TaskManagerRunner {
     ) -> Result<String, String> {
         let task = self.task_manager.register(
             TaskKind::Scheduled,
+            &crate::tasks::derive_task_title(&run.description),
             &run.description,
             None,
             TaskExecutionMode::Background,
@@ -1230,6 +1231,7 @@ pub(crate) mod tests {
             parent_id: None,
             depth: 1,
             kind: TaskKind::Scheduled,
+            title: Some("test".into()),
             description: "test".into(),
             status,
             mode: TaskExecutionMode::Background,

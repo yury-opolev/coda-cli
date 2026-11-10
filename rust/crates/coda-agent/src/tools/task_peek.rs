@@ -97,7 +97,7 @@ mod tests {
     async fn peek_returns_output_tail() {
         let m = TaskManager::with_defaults("session");
         let t = m
-            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "t", "t", None, TaskExecutionMode::Background)
             .unwrap();
         m.append_output(&t.id, "hello world output");
         let result = TaskPeekTool
@@ -111,7 +111,7 @@ mod tests {
     async fn peek_empty_returns_placeholder() {
         let m = TaskManager::with_defaults("session");
         let t = m
-            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "t", "t", None, TaskExecutionMode::Background)
             .unwrap();
         let result = TaskPeekTool
             .execute(&serde_json::json!({"taskId": t.id}), &ctx(m), CancellationToken::new())
@@ -129,10 +129,10 @@ mod tests {
     async fn peek_denied_for_sibling_looks_like_not_found_and_leaks_no_output() {
         let m = TaskManager::with_defaults("session");
         let a = m
-            .register(TaskKind::Subagent, "a", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "a", "a", None, TaskExecutionMode::Background)
             .unwrap();
         let b = m
-            .register(TaskKind::Subagent, "b", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "b", "b", None, TaskExecutionMode::Background)
             .unwrap();
         m.append_output(&b.id, SIBLING_CANARY);
 
@@ -158,11 +158,11 @@ mod tests {
     async fn peek_denied_for_ancestor_looks_like_not_found() {
         let m = TaskManager::with_defaults("session");
         let parent = m
-            .register(TaskKind::Subagent, "parent", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "parent", "parent", None, TaskExecutionMode::Background)
             .unwrap();
         m.append_output(&parent.id, SIBLING_CANARY);
         let child = m
-            .register(TaskKind::Subagent, "child", Some(&parent.id), TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "child", "child", Some(&parent.id), TaskExecutionMode::Background)
             .unwrap();
 
         let result = TaskPeekTool
@@ -183,7 +183,7 @@ mod tests {
     async fn peek_denied_for_self_looks_like_not_found() {
         let m = TaskManager::with_defaults("session");
         let t = m
-            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "t", "t", None, TaskExecutionMode::Background)
             .unwrap();
         m.append_output(&t.id, SIBLING_CANARY);
 
@@ -205,7 +205,7 @@ mod tests {
     async fn peek_denied_for_unknown_caller_looks_like_not_found() {
         let m = TaskManager::with_defaults("session");
         let t = m
-            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "t", "t", None, TaskExecutionMode::Background)
             .unwrap();
         m.append_output(&t.id, SIBLING_CANARY);
 
@@ -228,10 +228,10 @@ mod tests {
     async fn peek_allowed_for_own_descendant() {
         let m = TaskManager::with_defaults("session");
         let parent = m
-            .register(TaskKind::Subagent, "parent", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "parent", "parent", None, TaskExecutionMode::Background)
             .unwrap();
         let child = m
-            .register(TaskKind::Subagent, "child", Some(&parent.id), TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "child", "child", Some(&parent.id), TaskExecutionMode::Background)
             .unwrap();
         m.append_output(&child.id, "child output");
 

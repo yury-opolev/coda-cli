@@ -286,11 +286,11 @@ mod tests {
         let mut f = fixture();
         let agent = f
             .manager
-            .register(TaskKind::Subagent, "deep review", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "deep review", "deep review", None, TaskExecutionMode::Background)
             .unwrap();
         let shell = f
             .manager
-            .register(TaskKind::Shell, "cargo test", Some(&agent.id), TaskExecutionMode::Foreground)
+            .register(TaskKind::Shell, "cargo test", "cargo test", Some(&agent.id), TaskExecutionMode::Foreground)
             .unwrap();
         f.manager.fail(&shell.id, Some("exit code: 101".into()));
         f.manager.complete(&agent.id, Some("all good".into()));
@@ -321,7 +321,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn output_is_throttled_per_task_and_bounded_per_frame() {
         let mut f = fixture();
-        let task = f.manager.register(TaskKind::Shell, "noisy", None, TaskExecutionMode::Background).unwrap();
+        let task = f.manager.register(TaskKind::Shell, "noisy", "noisy", None, TaskExecutionMode::Background).unwrap();
         frames(&mut f.rx);
 
         // 2 s of output, one line every 10 ms.
@@ -354,7 +354,7 @@ mod tests {
     async fn a_client_that_never_reads_gets_no_output_and_costs_no_memory() {
         let mut f = fixture();
         f.bus.outbound_health().force_congested(true);
-        let task = f.manager.register(TaskKind::Shell, "flood", None, TaskExecutionMode::Background).unwrap();
+        let task = f.manager.register(TaskKind::Shell, "flood", "flood", None, TaskExecutionMode::Background).unwrap();
         for _ in 0..500 {
             f.manager.append_output(&task.id, &"y".repeat(1_000));
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -386,7 +386,7 @@ mod tests {
     #[tokio::test]
     async fn the_last_output_precedes_the_completion() {
         let mut f = fixture();
-        let task = f.manager.register(TaskKind::Shell, "build", None, TaskExecutionMode::Foreground).unwrap();
+        let task = f.manager.register(TaskKind::Shell, "build", "build", None, TaskExecutionMode::Foreground).unwrap();
         f.manager.append_output(&task.id, "Finished\n");
         f.manager.complete(&task.id, Some("exit code: 0".into()));
         let methods: Vec<String> = frames(&mut f.rx).into_iter().map(|(m, _)| m).collect();
@@ -398,10 +398,10 @@ mod tests {
     #[tokio::test]
     async fn suspension_publishes_suspended_and_resumed_after_pending_output() {
         let mut f = fixture();
-        let owner = f.manager.register(TaskKind::Subagent, "lead", None, TaskExecutionMode::Background).unwrap();
+        let owner = f.manager.register(TaskKind::Subagent, "lead", "lead", None, TaskExecutionMode::Background).unwrap();
         let task = f
             .manager
-            .register(TaskKind::Subagent, "worker", Some(&owner.id), TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "worker", "worker", Some(&owner.id), TaskExecutionMode::Background)
             .unwrap();
         frames(&mut f.rx);
         f.manager.append_output(&task.id, "halfway\n");
@@ -434,12 +434,13 @@ mod tests {
     #[tokio::test]
     async fn only_a_restored_task_start_is_marked_resumed() {
         let mut f = fixture();
-        f.manager.register(TaskKind::Subagent, "fresh", None, TaskExecutionMode::Background).unwrap();
+        f.manager.register(TaskKind::Subagent, "fresh", "fresh", None, TaskExecutionMode::Background).unwrap();
         let restored = f
             .manager
             .register_restored(
                 "task-00000042",
                 TaskKind::Subagent,
+                Some("restored"),
                 "restored",
                 None,
                 TaskExecutionMode::Background,

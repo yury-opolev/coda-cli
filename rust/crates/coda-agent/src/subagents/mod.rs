@@ -145,12 +145,15 @@ impl BuiltInAgents {
 /// # Trust boundary
 /// Every field is set by Rust callers inside the engine (the `task` tool, the
 /// subagent host's background path, the schedule runner).  Tool *arguments*
-/// are untrusted and only ever contribute `prompt`, `agent_type` and `model`;
+/// are untrusted and only ever contribute `title`, `prompt`, `agent_type` and `model`;
 /// `task_id`, `depth`, `caller_task_id` and `schedule_origin` are derived from
 /// the trusted `ToolContext` and the `TaskManager`, never from model output.
 #[derive(Debug, Clone)]
 pub struct SubagentRequest {
     pub agent_type: String,
+    /// Short task label; required for a background spawn, validated by the
+    /// task manager.
+    pub title: String,
     pub prompt: String,
     pub task_id: String,
     pub depth: u32,
@@ -171,6 +174,7 @@ impl SubagentRequest {
     pub fn foreground(agent_type: impl Into<String>, prompt: impl Into<String>, task_id: impl Into<String>, depth: u32) -> Self {
         Self {
             agent_type: agent_type.into(),
+            title: String::new(),
             prompt: prompt.into(),
             task_id: task_id.into(),
             depth,
@@ -179,6 +183,12 @@ impl SubagentRequest {
             caller_task_id: None,
             schedule_origin: None,
         }
+    }
+
+    /// Set the task's short label (required for a background spawn).
+    pub fn with_title(mut self, title: impl Into<String>) -> Self {
+        self.title = title.into();
+        self
     }
 
     /// Stamp the scheduled provenance of this request (trusted callers only).

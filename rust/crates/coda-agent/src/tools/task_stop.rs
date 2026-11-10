@@ -116,7 +116,7 @@ mod tests {
     async fn stop_running_task_reports_stopped_and_cancels_token() {
         let m = TaskManager::with_defaults("s");
         let t = m
-            .register(TaskKind::Subagent, "d", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "d", "d", None, TaskExecutionMode::Background)
             .unwrap();
         let cancel_token = t.cancel.clone();
 
@@ -133,7 +133,7 @@ mod tests {
     async fn stop_finished_task_reports_already_finished() {
         let m = TaskManager::with_defaults("s");
         let t = m
-            .register(TaskKind::Subagent, "d", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "d", "d", None, TaskExecutionMode::Background)
             .unwrap();
         m.complete(&t.id, Some("done".into()));
 
@@ -153,10 +153,10 @@ mod tests {
     async fn stop_denied_for_sibling_looks_like_not_found() {
         let m = TaskManager::with_defaults("s");
         let a = m
-            .register(TaskKind::Subagent, "a", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "a", "a", None, TaskExecutionMode::Background)
             .unwrap();
         let b = m
-            .register(TaskKind::Subagent, "b", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "b", "b", None, TaskExecutionMode::Background)
             .unwrap();
 
         let result = TaskStopTool
