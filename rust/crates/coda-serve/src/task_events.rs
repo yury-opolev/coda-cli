@@ -170,6 +170,7 @@ impl TaskEventObserver for TaskEventPublisher {
         self.publish(Event::TaskStarted {
             task_id: task.id.clone(),
             kind: task.kind.as_str().to_owned(),
+            title: task.title.clone(),
             description: task.description.clone(),
             owner_task_id: task.parent_id.clone(),
             mode: task.mode().as_str().to_owned(),
@@ -209,6 +210,7 @@ impl TaskEventObserver for TaskEventPublisher {
         self.publish(Event::TaskCompleted {
             task_id: task.id.clone(),
             status: status.as_str().to_owned(),
+            title: task.title.clone(),
             description: task.description.clone(),
             report,
             owner_task_id: task.parent_id.clone(),
@@ -454,5 +456,47 @@ mod tests {
         assert_eq!(seen[1].1["taskId"], restored.id.as_str());
         assert_eq!(seen[1].1["resumed"], true);
         f.manager.stop(&restored.id);
+    }
+
+    #[tokio::test]
+    async fn task_events_carry_the_title_when_the_task_has_one() {
+        let mut f = fixture();
+        let titled = f
+            .manager
+            .register(
+                TaskKind::Subagent,
+                "deep review",
+                "Review the auth module in depth and report findings",
+                None,
+                TaskExecutionMode::Background,
+            )
+            .unwrap();
+        f.manager.complete(&titled.id, Some("done".into()));
+        let legacy = f
+            .manager
+            .register_restored(
+                "task-00000077",
+                TaskKind::Subagent,
+                None,
+                "an old prompt",
+                None,
+                TaskExecutionMode::Background,
+                std::time::SystemTime::now(),
+                false,
+            )
+            .unwrap();
+        f.manager.complete(&legacy.id, None);
+
+        let seen = frames(&mut f.rx);
+        let methods: Vec<&str> = seen.iter().map(|(m, _)| m.as_str()).collect();
+        assert_eq!(methods, [
+            "event/taskStarted", "event/taskCompleted", "event/taskStarted", "event/taskCompleted",
+        ]);
+        assert_eq!(seen[0].1["title"], "deep review");
+        assert_eq!(seen[1].1["title"], "deep review");
+        assert_eq!(seen[1].1["description"], "Review the auth module in depth and report findings");
+        assert!(seen[2].1.get("title").is_none(), "{:?}", seen[2].1);
+        assert!(seen[3].1.get("title").is_none(), "{:?}", seen[3].1);
+        assert_eq!(seen[3].1["description"], "an old prompt");
     }
 }

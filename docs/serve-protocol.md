@@ -164,7 +164,7 @@ re-fetches the catalog from models.dev first.
 |---|---|---|
 | `session/getHistory` | `{ sessionId?, historyEpoch?, expectedHistoryLength?, engineInstanceId?, sinceIndex?, limit?, includeLive? }` | `{ sessionId, engineInstanceId, isLiveSession, historyEpoch?, cursor?, historyLength, entries[], nextIndex, totalKnown, truncated, liveEntries?, liveTruncated?, liveOmittedBytes? }` |
 | `session/listSessions` | `{ limit? }` | `{ sessions: [{ sessionId, createdUtc, messageCount, preview, previewTruncated, isCurrent }], totalKnown, truncated }` |
-| `session/listTasks` | `{ statusFilter? }` | `{ sessionId, tasks: [{ id, parentId, kind, description, status, mode, outputTail, report, suspendRequested? }] }` |
+| `session/listTasks` | `{ statusFilter? }` | `{ sessionId, tasks: [{ id, parentId, kind, title?, description, status, mode, outputTail, report, suspendRequested? }] }` |
 | `session/getPendingRequests` | `{}` | `{ requests: PendingRequest[], engineInstanceId }` |
 | `session/resolveRequest` | `{ requestId, outcome }` | `{ ok, state, requestId, outcome }` |
 | `session/cancelRequest` | `{ requestId, reason? }` | `{ ok, requestId, appliedDefault, outcome }` |
@@ -768,7 +768,8 @@ new **secret-redacted** output.
 event/taskStarted {
   "taskId":      "task-00000003",
   "kind":        "shell",        // "shell" | "subagent" | "scheduled" | "tool"
-  "description": "cargo test",
+  "title":       "cargo test",   // short label; absent only for legacy tasks
+  "description": "cargo test",   // the full, unchanged prompt / command
   "ownerTaskId": "task-00000001", // the agent that started it; absent for the main agent
   "mode":        "foreground"    // "foreground" (an agent waits on it) | "background"
 }
@@ -780,7 +781,8 @@ event/taskOutput {
 event/taskCompleted {
   "taskId":      "task-00000003",
   "status":      "failed",       // "completed" | "failed" | "stopped"
-  "description": "cargo test",
+  "title":       "cargo test",   // absent only for legacy tasks
+  "description": "cargo test",   // full description: a recorded completion is self-contained
   "report":      "exit code: 101", // result or error, ≤ 4 000 chars; absent when none
   "ownerTaskId": "task-00000001", // absent for the main agent
   "kind":        "shell",
@@ -818,6 +820,22 @@ event/taskResumed {
   "kind":        "subagent"
 }
 ```
+
+#### Task titles
+
+Every new task has a required **title**: a short label naming the task, distinct from its
+`description`. A valid title is a single line of 1–80 characters (Unicode scalar values) after
+trimming, with no control characters, line/paragraph separators (U+2028, U+2029) or bidi
+controls (U+202A–U+202E, U+2066–U+2069). The `task` tool and its deprecated alias
+`task_start` require `title`; internal producers derive one deterministically — shell commands
+and detachable tool calls from the command / tool name, scheduled runs from the schedule name
+(first non-empty line, whitespace collapsed, elided with `…` past 80 characters). A missing,
+blank or invalid title is rejected with an actionable error **before** anything is registered or
+started. `description` stays the full, unchanged prompt or command.
+
+`title` is optional on the wire (`event/taskStarted`, `event/taskCompleted`, and
+`session/listTasks` rows) and omitted when absent: only tasks restored from older checkpoints
+may lack one. Clients must handle its absence by falling back to `description`.
 
 ### `session/askAside` — side questions (`/btw`)
 

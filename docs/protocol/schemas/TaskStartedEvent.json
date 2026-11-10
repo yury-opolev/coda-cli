@@ -16,6 +16,14 @@
       "type": "string",
       "default": ""
     },
+    "title": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Short task label; absent for legacy tasks and older senders.",
+      "default": null
+    },
     "description": {
       "type": "string",
       "default": ""

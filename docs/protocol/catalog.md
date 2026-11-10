@@ -140,7 +140,7 @@ the same structured projection regardless of that hint.
 | `event/usage`, `event/streamProgress` | Reported response usage (uncached `inputTokens` plus additive cache categories and `totalInputTokens`) and streaming progress; do not silently interpret last-response usage as cumulative. |
 | `event/error`, `event/limitReached` | Execution errors and enforced limits. |
 | `event/steeringDelivered` | Inbox entries injected at a safe boundary, not proof of provider receipt or execution. |
-| `event/taskStarted`, `event/taskOutput`, `event/taskCompleted` | Task lifecycle: one start and one completion per task (kind, owning agent, mode) and throttled, bounded, secret-redacted output (≤ 4 frames/s per task, ≤ 2 000 chars, withheld while the client is not reading). A subagent re-created by a planned-restart restore starts again with `resumed: true`. `session/listTasks` stays authoritative. |
+| `event/taskStarted`, `event/taskOutput`, `event/taskCompleted` | Task lifecycle: one start and one completion per task (kind, title — absent only for legacy restored tasks, owning agent, mode) and throttled, bounded, secret-redacted output (≤ 4 frames/s per task, ≤ 2 000 chars, withheld while the client is not reading). A subagent re-created by a planned-restart restore starts again with `resumed: true`. `session/listTasks` stays authoritative. |
 | `event/taskSuspended`, `event/taskResumed` | A subagent paused at a safe point (`reason`: `requested`, `parent` or `restart`; status `suspended`, not finished) and continued. |
 | `event/scheduleLifecycle` | Existing background lifecycle vocabulary. Do not infer complete fleet or background counters from availability of this name. |
 | `event/promptRewritten`, `event/responseRewritten` | Hook rewrite notifications. |

@@ -17,6 +17,10 @@ pub struct TaskSummaryDto {
     pub id: String,
     pub parent_id: Option<String>,
     pub kind: String,
+    /// Short task label; absent only for tasks restored from older
+    /// checkpoints (clients fall back to `description`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub description: String,
     pub status: String,
     pub mode: String,

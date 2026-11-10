@@ -5250,6 +5250,7 @@ impl ServeBackend for ServeHost {
                     id: task.id,
                     parent_id: task.parent_id,
                     kind: task.kind.as_str().into(),
+                    title: task.title,
                     description: task.description,
                     status: task.status.as_str().into(),
                     mode: task.mode.as_str().into(),
@@ -12509,13 +12510,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (host, _rx) = host_with_events(dir.path());
         let task = host.task_manager.register(
-            TaskKind::Subagent, "waiting for the model", "waiting for the model", None, TaskExecutionMode::Background,
+            TaskKind::Subagent, "waiting", "waiting for the model", None, TaskExecutionMode::Background,
         ).unwrap();
         assert!(!task.log_path.exists(), "the task has not produced a log");
         let listing = crate::dispatch::dispatch("session/listTasks", None, host.as_ref())
             .await.unwrap();
         assert_eq!(listing["tasks"][0]["id"], task.id);
         assert_eq!(listing["tasks"][0]["status"], "running");
+        assert_eq!(listing["tasks"][0]["title"], "waiting");
         assert_eq!(listing["tasks"][0]["description"], "waiting for the model");
         assert_eq!(listing["tasks"][0]["outputTail"], "");
 
@@ -12531,6 +12533,18 @@ mod tests {
         let (found, output, _, _) = host.task_manager.read_output(&task.id, None);
         assert!(found);
         assert_eq!(output, "progress\n", "browsing must not steal the agent's output");
+
+        let legacy = host.task_manager.register_restored(
+            "task-00000099", TaskKind::Subagent, None, "an old prompt", None,
+            TaskExecutionMode::Background, std::time::SystemTime::now(), false,
+        ).unwrap();
+        let listing = crate::dispatch::dispatch("session/listTasks", None, host.as_ref())
+            .await.unwrap();
+        let row = listing["tasks"].as_array().unwrap().iter()
+            .find(|t| t["id"] == legacy.id.as_str()).unwrap();
+        assert!(row.get("title").is_none(), "a legacy task has no title: {row}");
+        assert_eq!(row["description"], "an old prompt");
+        host.task_manager.stop(&legacy.id);
     }
 
     #[tokio::test]

@@ -1774,6 +1774,7 @@ mod tests {
         let completed = |id: &str, mode: &str| Event::TaskCompleted {
             task_id: id.into(),
             status: "completed".into(),
+            title: None,
             description: "build".into(),
             report: None,
             owner_task_id: None,
@@ -1805,6 +1806,7 @@ mod tests {
         state.apply(crate::state::UiEvent::Engine(Event::TaskCompleted {
             task_id: "task-0004".into(),
             status: "failed".into(),
+            title: None,
             description: "child lint".into(),
             report: None,
             owner_task_id: Some("task-0002".into()),
