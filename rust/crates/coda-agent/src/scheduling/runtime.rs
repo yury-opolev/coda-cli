@@ -183,6 +183,16 @@ impl TaskManagerRunner {
     }
 }
 
+/// `Scheduled: <name or prompt>`, labelled from the name or prompt alone so a
+/// prompt that starts with a blank line still yields a meaningful title.
+fn scheduled_title(run: &ScheduledRun) -> String {
+    let source = run.definition_name.as_deref().unwrap_or(&run.prompt);
+    crate::tasks::derive_task_title(&format!(
+        "Scheduled: {}",
+        crate::tasks::derive_task_title(source)
+    ))
+}
+
 impl ScheduledAgentRunner for TaskManagerRunner {
     fn start(
         &self,
@@ -191,7 +201,7 @@ impl ScheduledAgentRunner for TaskManagerRunner {
     ) -> Result<String, String> {
         let task = self.task_manager.register(
             TaskKind::Scheduled,
-            &crate::tasks::derive_task_title(&run.description),
+            &scheduled_title(&run),
             &run.description,
             None,
             TaskExecutionMode::Background,
@@ -1160,6 +1170,20 @@ pub(crate) mod tests {
     use super::*;
     use crate::scheduling::scheduled_task::ScheduleDefinitionDraft;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn scheduled_title_uses_the_name_or_the_first_prompt_line() {
+        let run = |name: Option<&str>, prompt: &str| ScheduledRun {
+            definition_id: "d".into(),
+            definition_name: name.map(str::to_owned),
+            prompt: prompt.into(),
+            description: String::new(),
+        };
+        assert_eq!(scheduled_title(&run(None, "\nCheck CI status\nmore")), "Scheduled: Check CI status");
+        assert_eq!(scheduled_title(&run(Some("nightly audit"), "x")), "Scheduled: nightly audit");
+        let long = scheduled_title(&run(None, &"z".repeat(200)));
+        assert!(crate::tasks::validate_task_title(&long).is_ok());
+    }
 
     // ── Mock runner ───────────────────────────────────────────────────────────
 
