@@ -558,11 +558,11 @@ pub fn tasks(result: &TaskListResult, view: TaskView) -> Browser {
             Column::new("id", 16),
             Column::new("status", 10),
             Column::new("kind", 10),
-            Column::new("description", 44),
+            Column::new("title", 44),
         ],
     )
     .with_footer(format!(
-        "↑/↓ k/j move · Enter output · m message · b background · x stop · {toggle} · r reload · / filter · Esc q close"
+        "↑/↓ k/j move · Enter details · m message · b background · x stop · {toggle} · r reload · / filter · Esc q close"
     ))
     .with_empty_message(empty);
 
@@ -582,10 +582,17 @@ pub fn tasks(result: &TaskListResult, view: TaskView) -> Browser {
                     format!("status      {status}"),
                     format!("kind        {}", task.kind),
                     format!("mode        {}", task.mode),
-                    format!("description {}", task.description),
+                    format!("title       {}", task.title.as_deref().unwrap_or("(none)")),
                 ];
                 if let Some(parent) = &task.parent_id {
                     detail.push(format!("parent      {parent}"));
+                }
+                detail.push(String::new());
+                detail.push("Instructions".to_string());
+                if task.description.is_empty() {
+                    detail.push("(none recorded)".into());
+                } else {
+                    detail.extend(task.description.lines().map(str::to_string));
                 }
                 if let Some(report) = &task.report {
                     detail.push(String::new());
@@ -609,7 +616,15 @@ pub fn tasks(result: &TaskListResult, view: TaskView) -> Browser {
                         task.id.clone(),
                         status.to_string(),
                         task.kind.clone(),
-                        task.description.clone(),
+                        task.title.clone().unwrap_or_else(|| {
+                            // Tasks restored from older checkpoints carry no title.
+                            task.description
+                                .lines()
+                                .map(str::trim)
+                                .find(|line| !line.is_empty())
+                                .unwrap_or_default()
+                                .to_string()
+                        }),
                     ],
                 )
                 .with_detail(detail)
@@ -1246,6 +1261,50 @@ mod tests {
         assert_eq!(browser.empty_message(), Some("No active tasks"));
         assert_eq!(tasks(&finished, TaskView::History).visible_items().len(), 1);
     }
+
+    #[test]
+    fn a_titled_task_lists_its_title_and_details_its_full_instructions() {
+        let mut result = task_listing("s", "completed");
+        result.tasks[0].title = Some("Review auth".into());
+        result.tasks[0].description = "Check the login flow.\n\nThen the token refresh.".into();
+        result.tasks[0].report = Some("all good".into());
+        let browser = tasks(&result, TaskView::History);
+        let row = &browser.visible_items()[0];
+
+        assert_eq!(row.cells[4], "Review auth");
+        assert!(row.detail.contains(&"title       Review auth".to_string()), "{:?}", row.detail);
+        let start = row.detail.iter().position(|line| line == "Instructions").expect("Instructions section");
+        assert_eq!(
+            row.detail[start + 1..start + 4],
+            ["Check the login flow.", "", "Then the token refresh."]
+        );
+        let report = row.detail.iter().position(|line| line == "report").expect("report section");
+        assert!(report > start + 3);
+        assert!(browser.footer().contains("Enter details"), "{}", browser.footer());
+    }
+
+    #[test]
+    fn a_legacy_untitled_task_previews_its_first_instruction_line() {
+        let mut result = task_listing("s", "completed");
+        result.tasks[0].description = "\n  Build the release  \nwith all features".into();
+        let browser = tasks(&result, TaskView::History);
+        let row = &browser.visible_items()[0];
+
+        assert_eq!(row.cells[4], "Build the release");
+        assert!(row.detail.contains(&"title       (none)".to_string()), "{:?}", row.detail);
+        let start = row.detail.iter().position(|line| line == "Instructions").expect("Instructions section");
+        assert_eq!(row.detail[start + 3], "with all features");
+    }
+
+    #[test]
+    fn a_task_without_instructions_says_none_recorded() {
+        let mut result = task_listing("s", "completed");
+        result.tasks[0].description = String::new();
+        let detail = tasks(&result, TaskView::History).visible_items()[0].detail.clone();
+        let start = detail.iter().position(|line| line == "Instructions").unwrap();
+        assert_eq!(detail[start + 1], "(none recorded)");
+    }
+
     fn task_listing(session: &str, status: &str) -> TaskListResult {
         serde_json::from_value(json!({
             "sessionId": session,

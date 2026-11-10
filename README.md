@@ -349,7 +349,7 @@ Windows, `sh` elsewhere.
 In the full-screen TUI, `/tasks` opens a content-sized browser over the session's
 `TaskManager`, read through the engine's `session/listTasks` (so it works the same in local,
 API-only and serve-backed sessions, and shows tasks that have produced no output yet). Each row
-shows a status glyph, the task id, status, kind (subagent/shell/tool/scheduled) and description.
+shows a status glyph, the task id, status, kind (subagent/shell/tool/scheduled) and title.
 
 By default it shows **active work only** — every task still running, foreground or background,
 including subagents parked waiting for their own tasks — titled `Tasks — active (N)`, or
@@ -360,10 +360,18 @@ the session still retains with its report and output tail, and `h` again switche
 events while it is open (no polling): a task that ends leaves the active view, the selection
 stays on the same task where it is still listed, and otherwise moves to a remaining one.
 
+Every task has a short **title**. The `task` tool requires one (`title`: a single line of at
+most 80 characters, separate from the full `prompt`); shell, scheduled and tool tasks derive
+theirs. A finished background task appears in the transcript as a one-row card,
+`Task completed: <title>  [task-id]` — click its header to expand the full instructions, or
+use `/tasks all` and `Enter` for the details page (title, instructions, report, output).
+Tasks restored from older checkpoints that carry no title show a short preview of their
+instructions instead.
+
 Task ids are `task-00000001`, `task-00000002`, … — unique within the session, never reused,
 and simply wider past `task-99999999`.
 
-- **List:** `Up`/`Down` or `k`/`j` move · `Enter` opens the detail page (mode, parent, report,
+- **List:** `Up`/`Down` or `k`/`j` move · `Enter` opens the detail page (mode, parent, title, full instructions, report,
   secret-redacted output tail) · `b` **backgrounds** the selected task (the agent stops waiting on
   it; it keeps running) · `x` **stops** it (and its process tree) · `m` starts a **message** to
   a running subagent (closes the browser and fills in `/send <task-id> `) · `h` toggles
