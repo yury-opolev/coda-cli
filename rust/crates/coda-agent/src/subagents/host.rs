@@ -2017,6 +2017,36 @@ mod tests {
             assert!(mgr.get(&task_id).is_some());
         }
 
+        #[tokio::test]
+        async fn a_background_spawn_requires_a_title() {
+            let dir = tempfile::tempdir().unwrap();
+            let mgr = manager(&dir);
+            let host = host_with(
+                ScriptedClient::new(vec![text_turn("done")]),
+                vec![],
+                Arc::clone(&mgr),
+                4,
+            );
+
+            let mut untitled = SubagentRequest::foreground("general-purpose", "work", "", 1);
+            untitled.foreground = false;
+            let err = host
+                .spawn(untitled, Arc::new(CollectingSink::new()), CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(err.contains("title"), "{err}");
+            assert!(mgr.list().is_empty(), "nothing may be registered");
+
+            let mut titled = SubagentRequest::foreground("general-purpose", "work", "", 1)
+                .with_title("Do the work");
+            titled.foreground = false;
+            let id = host
+                .spawn(titled, Arc::new(CollectingSink::new()), CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(mgr.get(&id).unwrap().title.as_deref(), Some("Do the work"));
+        }
+
         // ── Test 3: schedule store + scheduled origin ─────────────────────────
 
         /// The child must see the SAME schedule store the session owns — a
@@ -3552,6 +3582,33 @@ mod tests {
                 .unwrap_err();
             assert!(err.contains("Unknown parent"), "{err}");
             assert!(mgr.list().is_empty());
+        }
+
+        #[tokio::test]
+        async fn checkpoints_carry_titles_and_legacy_ones_restore_untitled() {
+            let (parent_cp, child_cp) = suspended_pair().await;
+            assert_eq!(parent_cp.title.as_deref(), Some("Parent work"), "from_task copies it");
+            assert_eq!(child_cp.title.as_deref(), Some("Child work"));
+
+            let json = serde_json::to_value(&parent_cp).unwrap();
+            assert_eq!(json["title"], "Parent work");
+            let back: SubagentCheckpoint = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(back.title.as_deref(), Some("Parent work"));
+
+            let mut legacy = json;
+            legacy.as_object_mut().unwrap().remove("title");
+            let legacy: SubagentCheckpoint = serde_json::from_value(legacy).unwrap();
+            assert_eq!(legacy.title, None);
+
+            let dir = tempfile::tempdir().unwrap();
+            let mgr = manager(&dir);
+            let host = restored_host(&after_restart_client(), &mgr);
+            let id = host
+                .restore(legacy, true, Arc::new(CollectingSink::new()))
+                .await
+                .unwrap();
+            assert_eq!(mgr.get(&id).unwrap().title, None, "a legacy task restores untitled");
+            mgr.stop_all();
         }
     }
 }

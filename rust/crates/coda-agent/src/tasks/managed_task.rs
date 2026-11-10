@@ -134,6 +134,13 @@ pub struct TaskSnapshot {
     pub suspend_requested: bool,
 }
 
+impl TaskSnapshot {
+    /// The task's title, or its description for a legacy untitled task.
+    pub fn label(&self) -> &str {
+        self.title.as_deref().unwrap_or(&self.description)
+    }
+}
+
 /// The conversation state a subagent left at the safe point where it
 /// suspended; what a planned restart serializes for it.
 #[derive(Clone, Debug)]
@@ -228,6 +235,11 @@ pub struct ManagedTask {
 pub const MAIN_CONSUMER_ID: &str = "\u{0000}main";
 
 impl ManagedTask {
+    /// The task's title, or its description for a legacy untitled task.
+    pub fn label(&self) -> &str {
+        self.title.as_deref().unwrap_or(&self.description)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: String,

@@ -90,7 +90,8 @@ impl Tool for TaskListTool {
             let kind = t.kind.as_str();
             lines.push(format!(
                 "{} [{kind}/{mode}] {status} — {}",
-                t.id, t.description
+                t.id,
+                t.label()
             ));
             if let Some(ref r) = t.result {
                 if !r.is_empty() {
@@ -155,7 +156,7 @@ mod tests {
     #[tokio::test]
     async fn lists_registered_task() {
         let m = TaskManager::with_defaults("session");
-        m.register(TaskKind::Subagent, "my-task", "my-task", None, TaskExecutionMode::Background)
+        m.register(TaskKind::Subagent, "my-task", "the full prompt", None, TaskExecutionMode::Background)
             .unwrap();
         let result = TaskListTool
             .execute(&Value::Object(Default::default()), &ctx(m), CancellationToken::new())
@@ -163,6 +164,7 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.content.contains("task-00000001"), "{}", result.content);
         assert!(result.content.contains("my-task"), "{}", result.content);
+        assert!(!result.content.contains("the full prompt"), "rows show the title");
         assert!(result.content.contains("running"), "{}", result.content);
     }
 

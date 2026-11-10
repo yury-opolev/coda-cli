@@ -44,7 +44,8 @@ impl Tool for TaskTool {
          continue with other work, or end your turn. Start several in one response to run them \
          in parallel. Use task_send to give it more instructions, task_peek to look at its \
          progress, task_stop to stop it. Nesting is limited to two levels: a subagent may spawn \
-         one generation of children, but grandchildren cannot spawn further."
+         one generation of children, but grandchildren cannot spawn further. Give every task a \
+         short title."
     }
 
     fn input_schema_json(&self) -> &str {
@@ -55,6 +56,11 @@ impl Tool for TaskTool {
               "type": "string",
               "description": "The task description for the subagent."
             },
+            "title": {
+              "type": "string",
+              "maxLength": 80,
+              "description": "Required. A short single-line label for this task (3-8 words, at most 80 characters), e.g. \"Review authentication flow\". Shown in task lists and completion notices; put the details in prompt."
+            },
             "subagentType": {
               "type": "string",
               "description": "The built-in or registered subagent type. Defaults to 'general-purpose'."
@@ -64,7 +70,7 @@ impl Tool for TaskTool {
               "description": "Optional model override."
             }
           },
-          "required": ["prompt"]
+          "required": ["prompt", "title"]
         }"#
     }
 
@@ -144,6 +150,12 @@ pub(crate) async fn start_subagent(
         Some(p) if !p.trim().is_empty() => p.to_owned(),
         _ => return ToolResult::error("Missing required 'prompt'."),
     };
+    let title = match crate::tasks::validate_task_title(
+        input.get("title").and_then(Value::as_str).unwrap_or(""),
+    ) {
+        Ok(t) => t,
+        Err(e) => return ToolResult::error(e),
+    };
 
     let agent_type = input
         .get("subagentType")
@@ -192,11 +204,6 @@ pub(crate) async fn start_subagent(
     // cannot choose its own caller identity, depth, task id, or claim that
     // its work belongs to somebody else's scheduled job.
     let background = ctx.get_task_manager().is_some();
-    let title = input
-        .get("title")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_owned();
     let request = SubagentRequest {
         agent_type,
         title,
@@ -291,7 +298,7 @@ mod tests {
         let ctx = ctx_with_factory(factory);
         let result = TaskTool
             .execute(
-                &serde_json::json!({"prompt": "list all .rs files"}),
+                &serde_json::json!({"prompt": "list all .rs files", "title": "List Rust files"}),
                 &ctx,
                 CancellationToken::new(),
             )
@@ -306,7 +313,7 @@ mod tests {
         let ctx = ctx_with_factory(factory);
         let result = TaskTool
             .execute(
-                &serde_json::json!({"prompt": "do something"}),
+                &serde_json::json!({"prompt": "do something", "title": "Do something"}),
                 &ctx,
                 CancellationToken::new(),
             )
@@ -320,7 +327,7 @@ mod tests {
         let ctx = ToolContext::new(".");
         let result = TaskTool
             .execute(
-                &serde_json::json!({"prompt": "do something"}),
+                &serde_json::json!({"prompt": "do something", "title": "Do something"}),
                 &ctx,
                 CancellationToken::new(),
             )
@@ -381,7 +388,7 @@ mod tests {
 
         let result = TaskTool
             .execute(
-                &serde_json::json!({"prompt": "do something"}),
+                &serde_json::json!({"prompt": "do something", "title": "Do something"}),
                 &ctx,
                 CancellationToken::new(),
             )
@@ -408,7 +415,7 @@ mod tests {
 
         let result = TaskTool
             .execute(
-                &serde_json::json!({"prompt": "do something"}),
+                &serde_json::json!({"prompt": "do something", "title": "Do something"}),
                 &ctx,
                 CancellationToken::new(),
             )
@@ -447,6 +454,7 @@ mod tests {
             .execute(
                 &serde_json::json!({
                     "prompt": "do something",
+                    "title": "Do something",
                     "callerTaskId": "task-0001",
                     "depth": 0,
                     "taskId": "task-0001",
@@ -469,5 +477,46 @@ mod tests {
             requests[0].task_id, "task-0001",
             "the child's own id is assigned by the task manager"
         );
+    }
+
+    #[tokio::test]
+    async fn task_tool_requires_a_valid_title_before_spawning() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ctx = ToolContext::new(".")
+            .with_subagent_factory(Arc::new(RecordingFactory { seen: Arc::clone(&seen) }));
+        for input in [
+            serde_json::json!({"prompt": "p"}),
+            serde_json::json!({"prompt": "p", "title": "  "}),
+            serde_json::json!({"prompt": "p", "title": "a\nb"}),
+            serde_json::json!({"prompt": "p", "title": "x".repeat(81)}),
+        ] {
+            let r = TaskTool.execute(&input, &ctx, CancellationToken::new()).await;
+            assert!(r.is_error && r.content.contains("title"), "{}", r.content);
+        }
+        assert!(seen.lock().unwrap().is_empty());
+
+        let r = TaskTool
+            .execute(
+                &serde_json::json!({"prompt": "long\nprompt", "title": "Review auth"}),
+                &ctx,
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        let req = seen.lock().unwrap()[0].clone();
+        assert_eq!(req.title, "Review auth");
+        assert_eq!(req.prompt, "long\nprompt", "prompt passes through unchanged");
+    }
+
+    #[test]
+    fn task_schemas_require_title() {
+        for schema in [
+            TaskTool.input_schema_json(),
+            crate::tools::background_task::BackgroundTaskStartTool.input_schema_json(),
+        ] {
+            let v: serde_json::Value = serde_json::from_str(schema).unwrap();
+            assert!(v["required"].as_array().unwrap().iter().any(|r| r == "title"));
+            assert_eq!(v["properties"]["title"]["maxLength"], 80);
+        }
     }
 }

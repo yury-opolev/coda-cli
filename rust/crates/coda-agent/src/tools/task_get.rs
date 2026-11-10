@@ -63,6 +63,7 @@ impl Tool for TaskGetTool {
 
         let mut lines = vec![
             format!("id: {}", snap.id),
+            format!("title: {}", snap.title.as_deref().unwrap_or("(none)")),
             format!("description: {}", snap.description),
             format!("status: {status}"),
             format!("kind: {:?}", snap.kind),

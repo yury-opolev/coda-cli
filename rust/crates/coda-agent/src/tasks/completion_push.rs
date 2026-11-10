@@ -75,7 +75,7 @@ impl TaskCompletionListener for MainInboxCompletionPush {
         let Some(bus) = self.bus.upgrade() else { return };
         let source = MessageSource::TaskCompletion {
             task_id: task.id.clone(),
-            label: task.description.clone(),
+            label: task.label().to_owned(),
         };
         let body = completion_body(task, status);
         match bus.publish_main(&source, body, None, Some(format!("completion:{}", task.id))) {
@@ -103,7 +103,7 @@ pub fn completion_frame(task_id: &str, label: &str, body: &str) -> String {
 
 /// The text posted into a subagent's inbox when a task it started ends.
 pub fn owner_completion_text(task: &ManagedTask, status: TaskRunStatus) -> String {
-    completion_frame(&task.id, &task.description, &completion_body_bounded(task, status, OWNER_BODY_CHARS))
+    completion_frame(&task.id, task.label(), &completion_body_bounded(task, status, OWNER_BODY_CHARS))
 }
 
 /// The data block reported for one finished task, bounded for the main inbox.
@@ -349,6 +349,27 @@ mod tests {
         assert!(items[1].text.contains("status: failed"), "{}", items[1].text);
         assert!(items[2].text.contains("stopped by the user"), "{}", items[2].text);
         assert!(manager.live_children(Some(&parent.id)).is_empty());
+    }
+
+    #[test]
+    fn a_titled_task_is_labelled_by_its_title_not_its_prompt() {
+        let (manager, bus) = setup();
+        let agent = manager
+            .register(
+                TaskKind::Subagent,
+                "Review the PR",
+                "Please review pull request 42 carefully\nand list issues",
+                None,
+                TaskExecutionMode::Background,
+            )
+            .unwrap();
+        manager.complete(&agent.id, Some("done".into()));
+
+        let items = bus.take_main_for_delivery();
+        let text = items[0].injected_text();
+        assert!(text.contains(&format!("taskId={} (Review the PR)", agent.id)), "{text}");
+        assert!(!text.contains("Please review"), "{text}");
+        assert!(owner_completion_text(&agent, TaskRunStatus::Completed).contains("(Review the PR)"));
     }
 
     #[test]

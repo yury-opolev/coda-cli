@@ -32,12 +32,13 @@ impl Tool for BackgroundTaskStartTool {
           "type":"object",
           "properties":{
             "prompt":{"type":"string","description":"The detailed task for the subagent"},
+            "title":{"type":"string","maxLength":80,"description":"Required. A short single-line label for this task (3-8 words, at most 80 characters), e.g. \"Review authentication flow\". Shown in task lists and completion notices; put the details in prompt."},
             "subagent_type":{"type":"string","description":"Subagent type: \"general-purpose\" (default) or \"explore\" (read-only research)."},
             "model":{"type":"string","description":"Model id for this subagent. Omit to inherit the session model."},
             "system_prompt_append":{"type":"string","description":"Extra standing instructions appended to the subagent system prompt."},
             "system_prompt":{"type":"string","description":"Replaces the subagent type's own instructions. Prefer system_prompt_append."}
           },
-          "required":["prompt"]
+          "required":["prompt","title"]
         }"#
     }
 

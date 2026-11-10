@@ -80,7 +80,7 @@ pub fn live_task_brief(manager: &TaskManager, owner: Option<&str>) -> Option<Str
             "- {} {} \"{}\" — {} {}\n",
             s.id,
             s.kind.as_str(),
-            one_line(&s.description, DESCRIPTION_CHARS),
+            one_line(s.label(), DESCRIPTION_CHARS),
             s.status.as_str(),
             format_age(age_of(s, now)),
         ));
@@ -140,7 +140,7 @@ fn push_task(text: &mut String, s: &TaskSnapshot, tail: &str, now: SystemTime) {
         "- {} [{}] \"{}\" — {} {timing}; started by {owner}\n",
         s.id,
         s.kind.as_str(),
-        one_line(&s.description, DESCRIPTION_CHARS),
+        one_line(s.label(), DESCRIPTION_CHARS),
         status_word(s.status),
     ));
     let lines: Vec<&str> = tail.lines().filter(|l| !l.trim().is_empty()).collect();

@@ -59,7 +59,11 @@ impl Tool for TaskRecallTool {
             .map(|e| {
                 let status = e.status.as_str();
                 let report = e.report.as_deref().unwrap_or("(no report)");
-                format!("{} [{status}] {} — {report}", e.task_id, e.description)
+                format!(
+                    "{} [{status}] {} — {report}",
+                    e.task_id,
+                    e.title.as_deref().unwrap_or(&e.description)
+                )
             })
             .collect();
 
