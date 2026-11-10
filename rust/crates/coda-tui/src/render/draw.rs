@@ -1791,16 +1791,16 @@ mod tests {
         assert!(status(&state).contains("1 task running · /tasks"), "{}", status(&state));
         state.apply(crate::state::UiEvent::Engine(completed("task-0002", "background")));
         assert!(!status(&state).contains("task running"), "{}", status(&state));
-        let notices: Vec<String> = state
+        let cards: Vec<String> = state
             .transcript
             .blocks()
             .iter()
             .filter_map(|b| match b {
-                crate::transcript::Block::Notice { text, .. } => Some(text.clone()),
+                crate::transcript::Block::TaskCompletion { task_id, .. } => Some(task_id.clone()),
                 _ => None,
             })
             .collect();
-        assert_eq!(notices, ["Task completed: build"], "only background completions are announced");
+        assert_eq!(cards, ["task-0002"], "only background completions are announced");
 
         state.running_tasks.insert("task-0004".into());
         state.apply(crate::state::UiEvent::Engine(Event::TaskCompleted {
@@ -1817,7 +1817,7 @@ mod tests {
         assert!(
             state.transcript.blocks().iter().all(|b| !matches!(
                 b,
-                crate::transcript::Block::Notice { text, .. } if text.contains("child lint")
+                crate::transcript::Block::TaskCompletion { task_id, .. } if task_id == "task-0004"
             )),
             "a subagent's own tasks are reported to it, not announced"
         );

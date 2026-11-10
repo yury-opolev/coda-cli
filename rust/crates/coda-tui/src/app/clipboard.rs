@@ -325,6 +325,8 @@ impl App {
         };
         let event = if self.state.transcript.is_foldable(index) {
             crate::state::UiEvent::ThinkingFoldToggled { block: index }
+        } else if self.state.transcript.is_task_card(index) {
+            crate::state::UiEvent::TaskCardFoldToggled { block: index }
         } else if self.state.display_mode == coda_render::tool::ToolDisplayMode::Summary
             && self.state.transcript.is_tool_group_foldable(index)
         {
@@ -784,6 +786,34 @@ mod fold_tests {
         assert!(header_block_at(&starts, &rows, 0).is_some());
         assert!(header_block_at(&starts, &rows, 1).is_none());
         assert!(rows.iter().any(|row| row.text.contains("result")));
+    }
+
+    #[test]
+    fn a_task_card_header_toggles_but_its_instructions_rows_do_not() {
+        use crate::transcript::{Block, Transcript};
+        use coda_render::tool::ToolDisplayMode;
+        let mut transcript = Transcript::new();
+        transcript.push(Block::Assistant { text: "before".into(), complete: true });
+        transcript.upsert_task_card(Block::TaskCompletion {
+            session_id: Some("s1".into()),
+            task_id: "task-1".into(),
+            status: "completed".into(),
+            kind: None,
+            title: Some("Review auth".into()),
+            instructions: "step one\nstep two".into(),
+        });
+        let (rows, starts) = transcript.render_with_block_starts(80, ToolDisplayMode::Summary);
+        let header = starts[1];
+        let index = header_block_at(&starts, &rows, header).unwrap();
+        assert_eq!(index, 1);
+        assert!(transcript.is_task_card(index) && !transcript.is_foldable(index));
+        assert!(transcript.toggle_task_card(index));
+        let (rows, starts) = transcript.render_with_block_starts(80, ToolDisplayMode::Summary);
+        assert_eq!(header_block_at(&starts, &rows, header), Some(1));
+        let instructions = rows.iter().position(|r| r.text.trim() == "Instructions").unwrap();
+        assert!(instructions > header);
+        assert_eq!(header_block_at(&starts, &rows, instructions), None);
+        assert_eq!(header_block_at(&starts, &rows, instructions + 1), None);
     }
 
     /// `n` plain (non-chrome) rows, enough for any row index a test asks about.

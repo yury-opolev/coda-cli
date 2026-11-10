@@ -373,6 +373,8 @@ pub enum UiEvent {
     /// click did nothing at all once a turn had finished.
     ThinkingFoldToggled { block: usize },
     ToolGroupFoldToggled { block: usize },
+    /// Fold or unfold the task completion card at this index.
+    TaskCardFoldToggled { block: usize },
     /// The tool display mode changed.
     DisplayModeChanged(ToolDisplayMode),
     /// Activates assistant-text buffering for the current and future turns.
@@ -1356,6 +1358,9 @@ impl UiState {
             UiEvent::ToolGroupFoldToggled { block } => {
                 self.transcript.toggle_tool_group(block);
             }
+            UiEvent::TaskCardFoldToggled { block } => {
+                self.transcript.toggle_task_card(block);
+            }
             UiEvent::DisplayModeChanged(mode) => self.display_mode = mode,
             UiEvent::EnableAssistantBuffering => {
                 // Activate buffering; an empty buffer means "buffering on, no text yet".
@@ -1703,6 +1708,8 @@ impl UiState {
                 task_id,
                 description,
                 status,
+                title,
+                kind,
                 mode,
                 owner_task_id,
                 ..
@@ -1714,12 +1721,14 @@ impl UiState {
                 if mode.as_deref() == Some("foreground") || owner_task_id.is_some() {
                     return;
                 }
-                let level = if status == "failed" {
-                    NoticeLevel::Error
-                } else {
-                    NoticeLevel::Info
-                };
-                self.notice(format!("Task {status}: {description}"), level);
+                self.transcript.upsert_task_card(Block::TaskCompletion {
+                    session_id: self.session_id.clone(),
+                    task_id,
+                    status,
+                    kind,
+                    title: title.filter(|t| !t.trim().is_empty()),
+                    instructions: description,
+                });
             }
             Event::AgentMessage { id, label, text, context, source, task_id, schedule_definition_id, .. } => {
                 self.push_agent_message(id, label, text, context, source, task_id, schedule_definition_id);
@@ -2519,6 +2528,7 @@ pub(crate) fn is_critical_event(event: &UiEvent) -> bool {
         // produces no further frames to carry it.
         | UiEvent::ThinkingFoldToggled { .. }
         | UiEvent::ToolGroupFoldToggled { .. }
+        | UiEvent::TaskCardFoldToggled { .. }
         | UiEvent::Submitted { .. }
         | UiEvent::Queued { .. }
         | UiEvent::SteeringRecalled { .. }
@@ -4301,6 +4311,102 @@ mod tests {
         let mut state = state();
         state.apply(UiEvent::ThinkingFoldToggled { block: 99 });
         assert!(state.transcript.blocks().is_empty());
+    }
+
+    fn task_completed(id: &str, title: Option<&str>, mode: &str, owner: Option<&str>) -> UiEvent {
+        UiEvent::Engine(Event::TaskCompleted {
+            task_id: id.into(),
+            status: "completed".into(),
+            title: title.map(str::to_owned),
+            description: format!("instructions for {id}"),
+            report: Some("the final report".into()),
+            owner_task_id: owner.map(str::to_owned),
+            kind: Some("subagent".into()),
+            mode: Some(mode.into()),
+        })
+    }
+
+    fn task_cards(state: &UiState) -> Vec<(Option<String>, String, Option<String>)> {
+        state
+            .transcript
+            .blocks()
+            .iter()
+            .filter_map(|b| match b {
+                Block::TaskCompletion { session_id, task_id, title, .. } => {
+                    Some((session_id.clone(), task_id.clone(), title.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn rendered(state: &UiState) -> String {
+        state
+            .transcript
+            .render(80, ToolDisplayMode::Summary)
+            .iter()
+            .map(|r| r.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_main_background_completion_is_one_task_card_keyed_by_session() {
+        let mut state = state();
+        state.session_id = Some("s1".into());
+        state.apply(task_completed("task-1", Some("Review auth"), "background", None));
+        assert_eq!(
+            task_cards(&state),
+            [(Some("s1".into()), "task-1".into(), Some("Review auth".into()))]
+        );
+        let text = rendered(&state);
+        assert!(text.contains("Task completed: Review auth  [task-1]"), "{text}");
+        assert!(!text.contains("the final report"), "the report is never in the card");
+        assert!(!state.transcript.blocks().iter().any(|b| matches!(b, Block::Notice { .. })));
+
+        // A blank title is a legacy card.
+        state.apply(task_completed("task-2", Some("  "), "background", None));
+        assert_eq!(task_cards(&state)[1].2, None);
+    }
+
+    #[test]
+    fn foreground_and_child_completions_push_no_card() {
+        let mut state = state();
+        state.apply(task_completed("task-1", Some("T"), "foreground", None));
+        state.apply(task_completed("task-2", Some("T"), "background", Some("task-9")));
+        assert!(state.transcript.blocks().is_empty());
+    }
+
+    #[test]
+    fn a_repeated_completion_updates_the_card_in_place() {
+        let mut state = state();
+        state.apply(task_completed("task-1", Some("First"), "background", None));
+        state.apply(UiEvent::Engine(Event::AssistantText { delta: "hi".into() }));
+        state.apply(task_completed("task-1", Some("Second"), "background", None));
+        assert_eq!(task_cards(&state), [(None, "task-1".into(), Some("Second".into()))]);
+        assert!(matches!(state.transcript.blocks()[0], Block::TaskCompletion { .. }));
+    }
+
+    #[test]
+    fn task_card_folds_are_independent_and_survive_rehydration() {
+        let mut state = state();
+        state.apply(task_completed("task-1", Some("Same"), "background", None));
+        state.apply(task_completed("task-2", Some("Same"), "background", None));
+        state.apply(UiEvent::TaskCardFoldToggled { block: 0 });
+        state.apply(task_completed("task-3", Some("Other"), "background", None));
+        let text = rendered(&state);
+        assert!(text.contains("instructions for task-1"), "{text}");
+        assert!(!text.contains("instructions for task-2") && !text.contains("instructions for task-3"));
+
+        state.apply(UiEvent::Rehydrated {
+            blocks: vec![Block::Assistant { text: "hi".into(), complete: true }],
+            notices: vec![],
+            coverage: None,
+        });
+        assert_eq!(task_cards(&state).len(), 3);
+        let text = rendered(&state);
+        assert!(text.contains("instructions for task-1"), "{text}");
+        assert!(!text.contains("instructions for task-2"));
     }
 
     #[test]
