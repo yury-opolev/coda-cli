@@ -63,6 +63,7 @@ impl Tool for TaskGetTool {
 
         let mut lines = vec![
             format!("id: {}", snap.id),
+            format!("title: {}", snap.title.as_deref().unwrap_or("(none)")),
             format!("description: {}", snap.description),
             format!("status: {status}"),
             format!("kind: {:?}", snap.kind),
@@ -117,7 +118,7 @@ mod tests {
     async fn get_existing_task() {
         let m = TaskManager::with_defaults("session");
         let t = m
-            .register(TaskKind::Subagent, "hello task", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "hello task", "hello task", None, TaskExecutionMode::Background)
             .unwrap();
         let result = TaskGetTool
             .execute(

@@ -34,6 +34,8 @@ pub use super::log_writer::TaskOutputChannel;
 #[derive(Clone, Debug)]
 pub struct TaskCompletionEntry {
     pub task_id: String,
+    /// The task's short label; `None` for a legacy task restored without one.
+    pub title: Option<String>,
     pub description: String,
     pub status: TaskRunStatus,
     pub report: Option<String>,
@@ -571,15 +573,19 @@ impl TaskManager {
 
     /// Register a new task and return it in the Running state.
     ///
+    /// `title` must be a valid short label (see [`super::validate_task_title`]);
+    /// an invalid one is rejected before any id is issued.
     /// Depth is derived from the parent: no parent = depth 1.
     /// Rejects when the manager is shutting down or disposed.
     pub fn register(
         &self,
         kind: TaskKind,
+        title: &str,
         description: impl Into<String>,
         parent_task_id: Option<&str>,
         mode: TaskExecutionMode,
     ) -> Result<Arc<ManagedTask>, String> {
+        let title = super::validate_task_title(title)?;
         let depth = if let Some(pid) = parent_task_id {
             let s = self.state.lock().unwrap();
             if let Some(parent) = s.find(pid) {
@@ -630,6 +636,7 @@ impl TaskManager {
             parent_task_id.map(str::to_owned),
             depth,
             kind,
+            Some(title),
             description.into(),
             log_path,
             self.output_ring_bytes,
@@ -648,17 +655,21 @@ impl TaskManager {
     /// malformed or taken id, a number at or below one [`Self::register`]
     /// already issued, an unknown parent, or while shutting down. Later
     /// [`Self::register`] calls never reuse a number at or below a restored one.
+    /// A stored `title` that is missing or no longer valid restores as `None`
+    /// (a legacy task) rather than failing the restore.
     #[allow(clippy::too_many_arguments)]
     pub fn register_restored(
         &self,
         id: &str,
         kind: TaskKind,
+        title: Option<&str>,
         description: impl Into<String>,
         parent_task_id: Option<&str>,
         mode: TaskExecutionMode,
         started_at: std::time::SystemTime,
         suspended_explicit: bool,
     ) -> Result<Arc<ManagedTask>, String> {
+        let title = title.and_then(|t| super::validate_task_title(t).ok());
         let number = id
             .strip_prefix("task-")
             .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
@@ -691,6 +702,7 @@ impl TaskManager {
             parent_task_id.map(str::to_owned),
             depth,
             kind,
+            title,
             description.into(),
             log_path,
             self.output_ring_bytes,
@@ -1228,6 +1240,7 @@ impl TaskManager {
         }
         let entry = TaskCompletionEntry {
             task_id: task.id.clone(),
+            title: task.title.clone(),
             description: task.description.clone(),
             status,
             report,
@@ -1272,13 +1285,73 @@ mod tests {
     // ── register ──────────────────────────────────────────────────────────────
 
     #[test]
+    fn register_rejects_an_invalid_title_before_issuing_an_id() {
+        let m = mgr();
+        for bad in ["", "  ", "two\nlines"] {
+            assert!(m
+                .register(TaskKind::Subagent, bad, "prompt", None, TaskExecutionMode::Background)
+                .is_err());
+        }
+        assert!(m.list().is_empty());
+        let ok = m
+            .register(
+                TaskKind::Subagent,
+                " Review auth ",
+                "full\nprompt",
+                None,
+                TaskExecutionMode::Background,
+            )
+            .unwrap();
+        assert_eq!(ok.id, "task-00000001", "rejected attempts consumed no id");
+        let snap = m.get(&ok.id).unwrap();
+        assert_eq!(snap.title.as_deref(), Some("Review auth"));
+        assert_eq!(snap.description, "full\nprompt");
+    }
+
+    #[test]
+    fn duplicate_titles_are_distinct_tasks() {
+        let m = mgr();
+        let a = m
+            .register(TaskKind::Shell, "build", "a", None, TaskExecutionMode::Background)
+            .unwrap();
+        let b = m
+            .register(TaskKind::Shell, "build", "b", None, TaskExecutionMode::Background)
+            .unwrap();
+        assert_ne!(a.id, b.id);
+    }
+
+    #[test]
+    fn restored_task_without_title_is_legacy_and_invalid_stored_title_is_ignored() {
+        let m = mgr();
+        let restore = |id: &str, title: Option<&str>| {
+            m.register_restored(
+                id,
+                TaskKind::Subagent,
+                title,
+                "old prompt",
+                None,
+                TaskExecutionMode::Background,
+                std::time::SystemTime::now(),
+                false,
+            )
+            .unwrap()
+        };
+        let t = restore("task-00000005", None);
+        assert_eq!(m.get(&t.id).unwrap().title, None);
+        let u = restore("task-00000006", Some("bad\ntitle"));
+        assert_eq!(m.get(&u.id).unwrap().title, None);
+        let v = restore("task-00000007", Some("Kept title"));
+        assert_eq!(m.get(&v.id).unwrap().title.as_deref(), Some("Kept title"));
+    }
+
+    #[test]
     fn browser_output_is_redacted_bounded_and_survives_log_failure_and_completion() {
         let dir = tempfile::tempdir().unwrap();
         let blocked_root = dir.path().join("not-a-directory");
         std::fs::write(&blocked_root, "file").unwrap();
         let m = TaskManager::new("s", Some(blocked_root), 4096, 10);
         let task = m.register(
-            TaskKind::Shell, "output", None, TaskExecutionMode::Background,
+            TaskKind::Shell, "output", "output", None, TaskExecutionMode::Background,
         ).unwrap();
         m.append_output(&task.id, "sk-ab");
         assert_eq!(m.list_with_output(4000)[0].1, "");
@@ -1299,7 +1372,7 @@ mod tests {
     fn register_creates_task_in_running_state() {
         let m = mgr();
         let t = m
-            .register(TaskKind::Subagent, "hello", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "hello", "hello", None, TaskExecutionMode::Background)
             .unwrap();
         assert_eq!(t.status(), TaskRunStatus::Running);
         assert_eq!(m.list().len(), 1);
@@ -1309,10 +1382,10 @@ mod tests {
     fn register_assigns_sequential_ids() {
         let m = mgr();
         let t1 = m
-            .register(TaskKind::Subagent, "a", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "a", "a", None, TaskExecutionMode::Background)
             .unwrap();
         let t2 = m
-            .register(TaskKind::Subagent, "b", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "b", "b", None, TaskExecutionMode::Background)
             .unwrap();
         assert_eq!(t1.id, "task-00000001");
         assert_eq!(t2.id, "task-00000002");
@@ -1323,7 +1396,7 @@ mod tests {
         let m = mgr();
         m.seed_last_task_number(99_999_998);
         let ids: Vec<_> = (0..2)
-            .map(|_| m.register(TaskKind::Shell, "x", None, TaskExecutionMode::Background).unwrap().id.clone())
+            .map(|_| m.register(TaskKind::Shell, "x", "x", None, TaskExecutionMode::Background).unwrap().id.clone())
             .collect();
         assert_eq!(ids, ["task-99999999", "task-100000000"]);
     }
@@ -1337,7 +1410,7 @@ mod tests {
         let sub = m.subscribe();
         m.seed_last_task_number(u64::MAX - 1);
 
-        let last = m.register(TaskKind::Shell, "last", None, TaskExecutionMode::Background).unwrap();
+        let last = m.register(TaskKind::Shell, "last", "last", None, TaskExecutionMode::Background).unwrap();
         assert_eq!(last.id, format!("task-{}", u64::MAX));
         m.append_output(&last.id, "hello\n");
         let log_files = || std::fs::read_dir(dir.path().join("s")).map(|d| d.count()).unwrap_or(0);
@@ -1345,7 +1418,7 @@ mod tests {
         assert!(!sub.drain().0.is_empty(), "the last task was announced");
 
         let error = m
-            .register(TaskKind::Subagent, "overflow", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "overflow", "overflow", None, TaskExecutionMode::Background)
             .err()
             .expect("allocation past u64::MAX must fail");
         assert!(error.contains("task ids"), "{error}");
@@ -1359,7 +1432,7 @@ mod tests {
             1,
             "no start event for a refused task"
         );
-        assert!(m.register(TaskKind::Shell, "again", None, TaskExecutionMode::Background).is_err());
+        assert!(m.register(TaskKind::Shell, "again", "again", None, TaskExecutionMode::Background).is_err());
         assert_eq!(m.state.lock().unwrap().next_id, u64::MAX);
     }
 
@@ -1371,7 +1444,7 @@ mod tests {
                 let m = m.clone();
                 std::thread::spawn(move || {
                     (0..25)
-                        .map(|_| m.register(TaskKind::Subagent, "c", None, TaskExecutionMode::Background).unwrap().id.clone())
+                        .map(|_| m.register(TaskKind::Subagent, "c", "c", None, TaskExecutionMode::Background).unwrap().id.clone())
                         .collect::<Vec<_>>()
                 })
             })
@@ -1387,10 +1460,10 @@ mod tests {
     fn filtered_listing_returns_exactly_the_requested_statuses_and_keeps_the_rest() {
         use coda_proto::requests::TaskStatusFilter as F;
         let m = mgr();
-        let running = m.register(TaskKind::Shell, "r", None, TaskExecutionMode::Foreground).unwrap();
-        let done = m.register(TaskKind::Shell, "c", None, TaskExecutionMode::Background).unwrap();
-        let failed = m.register(TaskKind::Shell, "f", None, TaskExecutionMode::Background).unwrap();
-        let parked = m.register(TaskKind::Subagent, "p", None, TaskExecutionMode::Background).unwrap();
+        let running = m.register(TaskKind::Shell, "r", "r", None, TaskExecutionMode::Foreground).unwrap();
+        let done = m.register(TaskKind::Shell, "c", "c", None, TaskExecutionMode::Background).unwrap();
+        let failed = m.register(TaskKind::Shell, "f", "f", None, TaskExecutionMode::Background).unwrap();
+        let parked = m.register(TaskKind::Subagent, "p", "p", None, TaskExecutionMode::Background).unwrap();
         m.append_output(&done.id, "done output");
         m.complete(&done.id, Some("report".into()));
         m.fail(&failed.id, Some("boom".into()));
@@ -1412,6 +1485,7 @@ mod tests {
         let result = m.register(
             TaskKind::Subagent,
             "child",
+            "child",
             Some("task-9999"),
             TaskExecutionMode::Background,
         );
@@ -1422,11 +1496,12 @@ mod tests {
     fn register_sets_depth_from_parent() {
         let m = mgr();
         let parent = m
-            .register(TaskKind::Subagent, "parent", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "parent", "parent", None, TaskExecutionMode::Background)
             .unwrap();
         let child = m
             .register(
                 TaskKind::Subagent,
+                "child",
                 "child",
                 Some(&parent.id),
                 TaskExecutionMode::Background,
@@ -1442,7 +1517,7 @@ mod tests {
     fn complete_transitions_task() {
         let m = mgr();
         let t = m
-            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "t", "t", None, TaskExecutionMode::Background)
             .unwrap();
         assert!(m.complete(&t.id, Some("done".into())));
         assert_eq!(m.get(&t.id).unwrap().status, TaskRunStatus::Completed);
@@ -1452,7 +1527,7 @@ mod tests {
     fn fail_transitions_task() {
         let m = mgr();
         let t = m
-            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "t", "t", None, TaskExecutionMode::Background)
             .unwrap();
         assert!(m.fail(&t.id, Some("oops".into())));
         assert_eq!(m.get(&t.id).unwrap().status, TaskRunStatus::Failed);
@@ -1462,7 +1537,7 @@ mod tests {
     fn stop_transitions_task() {
         let m = mgr();
         let t = m
-            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "t", "t", None, TaskExecutionMode::Background)
             .unwrap();
         assert!(m.stop(&t.id));
         assert_eq!(m.get(&t.id).unwrap().status, TaskRunStatus::Stopped);
@@ -1480,7 +1555,7 @@ mod tests {
     fn append_output_is_readable() {
         let m = mgr();
         let t = m
-            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "t", "t", None, TaskExecutionMode::Background)
             .unwrap();
         m.append_output(&t.id, "hello world");
         let (text, _, _) = m.try_read_incremental(&t.id, 0).unwrap();
@@ -1491,7 +1566,7 @@ mod tests {
     fn append_output_after_terminal_is_no_op() {
         let m = mgr();
         let t = m
-            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "t", "t", None, TaskExecutionMode::Background)
             .unwrap();
         m.complete(&t.id, None);
         m.append_output(&t.id, "late");
@@ -1507,7 +1582,7 @@ mod tests {
         // Create and complete 5 tasks.
         for _ in 0..5 {
             let t = m
-                .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+                .register(TaskKind::Subagent, "t", "t", None, TaskExecutionMode::Background)
                 .unwrap();
             m.complete(&t.id, None);
         }
@@ -1520,12 +1595,12 @@ mod tests {
         let m = TaskManager::new("test-session", Some(std::env::temp_dir().join("coda-mgr-prune3")), 512, 1);
         // Ended, but its terminal notification (push, then settle) has not run.
         let unreported = m
-            .register(TaskKind::Shell, "unreported", None, TaskExecutionMode::Background)
+            .register(TaskKind::Shell, "unreported", "unreported", None, TaskExecutionMode::Background)
             .unwrap();
         unreported.try_complete(Some("exit code: 0".into()));
         for _ in 0..3 {
             let t = m
-                .register(TaskKind::Subagent, "done", None, TaskExecutionMode::Background)
+                .register(TaskKind::Subagent, "done", "done", None, TaskExecutionMode::Background)
                 .unwrap();
             m.complete(&t.id, None);
         }
@@ -1540,12 +1615,12 @@ mod tests {
     fn running_tasks_are_never_pruned() {
         let m = TaskManager::new("test-session", Some(std::env::temp_dir().join("coda-mgr-prune2")), 512, 1);
         let _running = m
-            .register(TaskKind::Subagent, "running", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "running", "running", None, TaskExecutionMode::Background)
             .unwrap();
         // Complete enough tasks to trigger pruning.
         for _ in 0..3 {
             let t = m
-                .register(TaskKind::Subagent, "done", None, TaskExecutionMode::Background)
+                .register(TaskKind::Subagent, "done", "done", None, TaskExecutionMode::Background)
                 .unwrap();
             m.complete(&t.id, None);
         }
@@ -1562,7 +1637,7 @@ mod tests {
     fn remove_terminal_task_ok() {
         let m = mgr();
         let t = m
-            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "t", "t", None, TaskExecutionMode::Background)
             .unwrap();
         m.complete(&t.id, None);
         assert_eq!(m.remove(&t.id), TaskActionResult::Ok);
@@ -1573,7 +1648,7 @@ mod tests {
     fn remove_running_task_rejected() {
         let m = mgr();
         let t = m
-            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "t", "t", None, TaskExecutionMode::Background)
             .unwrap();
         assert_eq!(m.remove(&t.id), TaskActionResult::Rejected);
     }
@@ -1589,7 +1664,7 @@ mod tests {
     #[test]
     fn subscription_receives_initial_snapshot() {
         let m = mgr();
-        m.register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+        m.register(TaskKind::Subagent, "t", "t", None, TaskExecutionMode::Background)
             .unwrap();
         let sub = m.subscribe();
         assert_eq!(sub.initial_snapshot.len(), 1);
@@ -1599,7 +1674,7 @@ mod tests {
     fn subscription_receives_created_change() {
         let m = mgr();
         let sub = m.subscribe();
-        m.register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+        m.register(TaskKind::Subagent, "t", "t", None, TaskExecutionMode::Background)
             .unwrap();
         let (changes, _) = sub.drain();
         assert!(
@@ -1616,10 +1691,10 @@ mod tests {
     async fn shutdown_terminates_running_tasks_within_budget() {
         let m = mgr();
         let t1 = m
-            .register(TaskKind::Subagent, "t1", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "t1", "t1", None, TaskExecutionMode::Background)
             .unwrap();
         let t2 = m
-            .register(TaskKind::Subagent, "t2", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "t2", "t2", None, TaskExecutionMode::Background)
             .unwrap();
 
         // Simulate tasks that run until their cancel token fires.
@@ -1651,7 +1726,7 @@ mod tests {
     async fn shutdown_force_stops_uncooperative_tasks() {
         let m = mgr();
         let _t = m
-            .register(TaskKind::Subagent, "stubborn", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "stubborn", "stubborn", None, TaskExecutionMode::Background)
             .unwrap();
         // No cooperation: the task ignores cancellation.
         // Shutdown with a very short budget to force the stop path.
@@ -1674,7 +1749,7 @@ mod tests {
     async fn register_after_shutdown_is_rejected() {
         let m = mgr();
         m.shutdown(Duration::from_millis(10)).await;
-        let result = m.register(TaskKind::Subagent, "late", None, TaskExecutionMode::Background);
+        let result = m.register(TaskKind::Subagent, "late", "late", None, TaskExecutionMode::Background);
         assert!(result.is_err(), "should reject registration after shutdown");
     }
 
@@ -1684,7 +1759,7 @@ mod tests {
     fn background_completion_is_enqueued() {
         let m = mgr();
         let t = m
-            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "t", "t", None, TaskExecutionMode::Background)
             .unwrap();
         m.complete(&t.id, Some("result".into()));
         let entries = m.drain_completions(None); // main agent outbox
@@ -1697,7 +1772,7 @@ mod tests {
     fn foreground_completion_is_not_enqueued() {
         let m = mgr();
         let t = m
-            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Foreground)
+            .register(TaskKind::Subagent, "t", "t", None, TaskExecutionMode::Foreground)
             .unwrap();
         m.complete(&t.id, None);
         let entries = m.drain_completions(None);
@@ -1708,7 +1783,7 @@ mod tests {
     fn drain_completions_is_exactly_once() {
         let m = mgr();
         let t = m
-            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "t", "t", None, TaskExecutionMode::Background)
             .unwrap();
         m.complete(&t.id, None);
         let first = m.drain_completions(None);
@@ -1725,7 +1800,7 @@ mod tests {
         // task's async work but leaves status transitions to the task itself.
         let m = mgr();
         let t = m
-            .register(TaskKind::Subagent, "work", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "work", "work", None, TaskExecutionMode::Background)
             .unwrap();
 
         assert_eq!(t.status(), TaskRunStatus::Running);
@@ -1755,7 +1830,7 @@ mod tests {
     fn main_agent_caller_has_full_authority() {
         let m = mgr();
         let t = m
-            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "t", "t", None, TaskExecutionMode::Background)
             .unwrap();
         assert!(m.is_authorized_caller(&t.id, None), "main agent must have full authority");
     }
@@ -1764,10 +1839,10 @@ mod tests {
     fn parent_is_authorized_over_child() {
         let m = mgr();
         let parent = m
-            .register(TaskKind::Subagent, "parent", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "parent", "parent", None, TaskExecutionMode::Background)
             .unwrap();
         let child = m
-            .register(TaskKind::Subagent, "child", Some(&parent.id), TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "child", "child", Some(&parent.id), TaskExecutionMode::Background)
             .unwrap();
         assert!(
             m.is_authorized_caller(&child.id, Some(&parent.id)),
@@ -1779,10 +1854,10 @@ mod tests {
     fn sibling_is_not_authorized() {
         let m = mgr();
         let a = m
-            .register(TaskKind::Subagent, "a", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "a", "a", None, TaskExecutionMode::Background)
             .unwrap();
         let b = m
-            .register(TaskKind::Subagent, "b", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "b", "b", None, TaskExecutionMode::Background)
             .unwrap();
         assert!(
             !m.is_authorized_caller(&b.id, Some(&a.id)),
@@ -1794,7 +1869,7 @@ mod tests {
     fn task_is_not_authorized_over_itself() {
         let m = mgr();
         let t = m
-            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "t", "t", None, TaskExecutionMode::Background)
             .unwrap();
         assert!(
             !m.is_authorized_caller(&t.id, Some(&t.id)),
@@ -1807,7 +1882,7 @@ mod tests {
         let m = mgr();
         // Caller = main agent always succeeds — test with a subagent caller instead.
         let caller = m
-            .register(TaskKind::Subagent, "caller", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "caller", "caller", None, TaskExecutionMode::Background)
             .unwrap();
         assert!(
             !m.is_authorized_caller("task-9999", Some(&caller.id)),
@@ -1821,7 +1896,7 @@ mod tests {
     fn request_stop_running_task_ok() {
         let m = mgr();
         let t = m
-            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "t", "t", None, TaskExecutionMode::Background)
             .unwrap();
         let result = m.request_stop(&t.id, None);
         assert_eq!(result, TaskActionResult::Ok);
@@ -1832,7 +1907,7 @@ mod tests {
     fn request_stop_terminal_task_invalid_state() {
         let m = mgr();
         let t = m
-            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "t", "t", None, TaskExecutionMode::Background)
             .unwrap();
         m.complete(&t.id, None);
         let result = m.request_stop(&t.id, None);
@@ -1849,10 +1924,10 @@ mod tests {
     fn request_stop_denied_for_unauthorized_caller() {
         let m = mgr();
         let a = m
-            .register(TaskKind::Subagent, "a", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "a", "a", None, TaskExecutionMode::Background)
             .unwrap();
         let b = m
-            .register(TaskKind::Subagent, "b", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "b", "b", None, TaskExecutionMode::Background)
             .unwrap();
         // "a" tries to stop unrelated "b"
         let result = m.request_stop(&b.id, Some(&a.id));
@@ -1866,7 +1941,7 @@ mod tests {
     fn read_output_main_agent_reads_any_task() {
         let m = mgr();
         let t = m
-            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "t", "t", None, TaskExecutionMode::Background)
             .unwrap();
         m.append_output(&t.id, "hello");
         let (found, text, _truncated, _status) = m.read_output(&t.id, None);
@@ -1878,10 +1953,10 @@ mod tests {
     fn read_output_unauthorized_returns_not_found() {
         let m = mgr();
         let a = m
-            .register(TaskKind::Subagent, "a", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "a", "a", None, TaskExecutionMode::Background)
             .unwrap();
         let b = m
-            .register(TaskKind::Subagent, "b", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "b", "b", None, TaskExecutionMode::Background)
             .unwrap();
         m.append_output(&b.id, "secret");
         let (found, text, _, _) = m.read_output(&b.id, Some(&a.id));
@@ -1893,10 +1968,10 @@ mod tests {
     fn read_output_parent_can_read_child() {
         let m = mgr();
         let parent = m
-            .register(TaskKind::Subagent, "p", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "p", "p", None, TaskExecutionMode::Background)
             .unwrap();
         let child = m
-            .register(TaskKind::Subagent, "c", Some(&parent.id), TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "c", "c", Some(&parent.id), TaskExecutionMode::Background)
             .unwrap();
         m.append_output(&child.id, "child output");
         let (found, text, _, _) = m.read_output(&child.id, Some(&parent.id));
@@ -1910,12 +1985,12 @@ mod tests {
     fn shell_commands_beyond_the_cap_are_refused_and_finished_ones_free_a_slot() {
         let m = mgr();
         m.set_max_live_shell_tasks(2);
-        let first = m.register(TaskKind::Shell, "a", None, TaskExecutionMode::Foreground).unwrap();
-        m.register(TaskKind::Shell, "b", None, TaskExecutionMode::Background).unwrap();
+        let first = m.register(TaskKind::Shell, "a", "a", None, TaskExecutionMode::Foreground).unwrap();
+        m.register(TaskKind::Shell, "b", "b", None, TaskExecutionMode::Background).unwrap();
         // Other kinds are bounded elsewhere and never count against the cap.
-        m.register(TaskKind::Subagent, "agent", None, TaskExecutionMode::Background).unwrap();
+        m.register(TaskKind::Subagent, "agent", "agent", None, TaskExecutionMode::Background).unwrap();
 
-        let Err(message) = m.register(TaskKind::Shell, "c", None, TaskExecutionMode::Foreground) else {
+        let Err(message) = m.register(TaskKind::Shell, "c", "c", None, TaskExecutionMode::Foreground) else {
             panic!("a third live shell is refused");
         };
         assert!(message.contains("2 shell commands are already running"), "{message}");
@@ -1924,7 +1999,7 @@ mod tests {
 
         m.complete(&first.id, Some("exit code: 0".into()));
         assert!(
-            m.register(TaskKind::Shell, "c", None, TaskExecutionMode::Foreground).is_ok(),
+            m.register(TaskKind::Shell, "c", "c", None, TaskExecutionMode::Foreground).is_ok(),
             "a finished command no longer counts"
         );
     }
@@ -1933,9 +2008,9 @@ mod tests {
     fn the_default_cap_is_thirty_two_live_shells() {
         let m = mgr();
         for i in 0..DEFAULT_MAX_LIVE_SHELL_TASKS {
-            m.register(TaskKind::Shell, format!("s{i}"), None, TaskExecutionMode::Background).unwrap();
+            m.register(TaskKind::Shell, &format!("s{i}"), format!("s{i}"), None, TaskExecutionMode::Background).unwrap();
         }
-        assert!(m.register(TaskKind::Shell, "one more", None, TaskExecutionMode::Background).is_err());
+        assert!(m.register(TaskKind::Shell, "one more", "one more", None, TaskExecutionMode::Background).is_err());
     }
 
     #[derive(Default)]
@@ -1962,7 +2037,7 @@ mod tests {
     // ── suspension ────────────────────────────────────────────────────────────
 
     fn subagent(m: &TaskManager, parent: Option<&str>) -> Arc<ManagedTask> {
-        m.register(TaskKind::Subagent, "agent", parent, TaskExecutionMode::Background).unwrap()
+        m.register(TaskKind::Subagent, "agent", "agent", parent, TaskExecutionMode::Background).unwrap()
     }
 
     fn checkpoint(steps_used: usize) -> TaskCheckpoint {
@@ -2004,7 +2079,7 @@ mod tests {
     #[test]
     fn suspend_rejects_non_subagent_and_terminal_tasks() {
         let m = mgr();
-        let shell = m.register(TaskKind::Shell, "sh", None, TaskExecutionMode::Background).unwrap();
+        let shell = m.register(TaskKind::Shell, "sh", "sh", None, TaskExecutionMode::Background).unwrap();
         let done = subagent(&m, None);
         m.complete(&done.id, None);
         let live = subagent(&m, None);
@@ -2076,6 +2151,7 @@ mod tests {
             .register_restored(
                 "task-00000007",
                 TaskKind::Subagent,
+                Some("restored"),
                 "restored",
                 None,
                 TaskExecutionMode::Background,
@@ -2098,6 +2174,7 @@ mod tests {
             m.register_restored(
                 id,
                 TaskKind::Subagent,
+                Some("x"),
                 "x",
                 None,
                 TaskExecutionMode::Background,
@@ -2126,6 +2203,7 @@ mod tests {
             m.register_restored(
                 id,
                 TaskKind::Subagent,
+                Some("x"),
                 "x",
                 None,
                 TaskExecutionMode::Background,
@@ -2150,8 +2228,8 @@ mod tests {
     #[test]
     fn background_moves_a_suspended_foreground_task_to_the_background() {
         let m = mgr();
-        let one = m.register(TaskKind::Tool, "a", None, TaskExecutionMode::Foreground).unwrap();
-        let two = m.register(TaskKind::Tool, "b", None, TaskExecutionMode::Foreground).unwrap();
+        let one = m.register(TaskKind::Tool, "a", "a", None, TaskExecutionMode::Foreground).unwrap();
+        let two = m.register(TaskKind::Tool, "b", "b", None, TaskExecutionMode::Foreground).unwrap();
         assert!(m.mark_suspended(&one.id, checkpoint(1)));
         assert!(m.mark_suspended(&two.id, checkpoint(1)));
         assert_eq!(m.background(&one.id), TaskActionResult::Ok);
@@ -2168,7 +2246,7 @@ mod tests {
         let before = subagent(&m, None);
         m.set_suspend_new(true);
         let during = subagent(&m, None);
-        let shell = m.register(TaskKind::Shell, "sh", None, TaskExecutionMode::Background).unwrap();
+        let shell = m.register(TaskKind::Shell, "sh", "sh", None, TaskExecutionMode::Background).unwrap();
         assert!(!m.is_suspension_requested(&before.id));
         assert!(m.is_suspension_requested(&during.id));
         assert!(!m.is_suspension_requested(&shell.id));
@@ -2219,7 +2297,7 @@ mod tests {
     #[test]
     fn stop_with_note_records_note_and_stops() {
         let m = mgr();
-        let shell = m.register(TaskKind::Shell, "sh", None, TaskExecutionMode::Background).unwrap();
+        let shell = m.register(TaskKind::Shell, "sh", "sh", None, TaskExecutionMode::Background).unwrap();
         let killed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = killed.clone();
         shell.attach_shell_kill(move || flag.store(true, std::sync::atomic::Ordering::SeqCst));
@@ -2246,7 +2324,7 @@ mod tests {
         let m = mgr();
         let observer = Arc::new(RecordingObserver::default());
         m.set_event_observer(observer.clone());
-        let t = m.register(TaskKind::Shell, "x", None, TaskExecutionMode::Foreground).unwrap();
+        let t = m.register(TaskKind::Shell, "x", "x", None, TaskExecutionMode::Foreground).unwrap();
         m.append_output(&t.id, "hello\n");
         m.fail(&t.id, Some("exit code: 1".into()));
         m.complete(&t.id, None);

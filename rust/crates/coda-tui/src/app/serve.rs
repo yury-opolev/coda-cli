@@ -4983,7 +4983,10 @@ pub(in crate::app) mod tests {
         let visible = notices(app);
         assert!(visible.iter().any(|text| text.contains("provider unavailable")));
         assert!(visible.iter().any(|text| text.contains("budget exhausted")));
-        assert!(visible.iter().any(|text| text.contains("background work")));
+        assert!(app.state.transcript.blocks().iter().any(|b| matches!(
+            b,
+            crate::transcript::Block::TaskCompletion { instructions, .. } if instructions == "background work"
+        )));
         assert_eq!(app.state.usage.last_input_tokens, 17);
     }
 

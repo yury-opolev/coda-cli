@@ -208,6 +208,22 @@ pub enum Block {
         /// set exactly when `source == "scheduledTask"`.
         schedule_definition_id: Option<String>,
     },
+    /// A main-agent background task that finished, as a foldable card.
+    ///
+    /// Collapsed it is one header row naming the task by title (a legacy task
+    /// without a title previews its instructions instead); expanded it shows
+    /// the full instructions. The task's report is never part of the card.
+    /// Expansion lives in [`Transcript`], keyed by session and task id.
+    TaskCompletion {
+        session_id: Option<String>,
+        task_id: String,
+        /// `completed` | `failed` | `stopped`, shown verbatim.
+        status: String,
+        kind: Option<String>,
+        title: Option<String>,
+        /// The task's full prompt.
+        instructions: String,
+    },
     /// The startup banner: wordmark plus session details.
     ///
     /// Rendered in the transcript rather than written to the raw console, so it
@@ -246,7 +262,71 @@ impl Block {
                 | Block::Permission { .. }
                 | Block::Question { .. }
                 | Block::AgentMessage { .. }
+                | Block::TaskCompletion { .. }
         )
+    }
+
+    /// The expansion key of a task card: `(session id, task id)`.
+    fn task_card_key(&self) -> Option<(String, String)> {
+        match self {
+            Block::TaskCompletion { session_id, task_id, .. } => {
+                Some((session_id.clone().unwrap_or_default(), task_id.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    /// Renders a task completion card, collapsed or expanded. Empty for any
+    /// other block.
+    pub fn render_card(&self, width: usize, expanded: bool) -> Vec<RenderLine> {
+        let Block::TaskCompletion { task_id, status, title, instructions, .. } = self else {
+            return Vec::new();
+        };
+        let width = width.max(1);
+        let title = title.as_deref().map(text::sanitize);
+        let role = if status == "failed" {
+            NoticeLevel::Error.role()
+        } else {
+            NoticeLevel::Info.role()
+        };
+        let marker = if expanded { glyphs::FOLD_EXPANDED } else { glyphs::FOLD_COLLAPSED };
+        let mut out = vec![task_card_header(status, title.as_deref(), task_id, marker, width, role)];
+
+        let (gutter, content) = if width > MARKER_CELLS {
+            (Gutter::Continuation, width - MARKER_CELLS)
+        } else {
+            (Gutter::None, width)
+        };
+        if expanded {
+            let label = text::truncate_with_ellipsis("Instructions", content);
+            out.push(RenderLine::new(label, Role::ThinkingHeader).with_gutter(gutter));
+            if instructions.trim().is_empty() {
+                for chunk in text::wrap("(no instructions recorded)", content) {
+                    out.push(RenderLine::new(chunk, Role::Notification).with_gutter(gutter));
+                }
+            } else {
+                for line in instructions.lines() {
+                    for chunk in text::wrap_preformatted(&text::sanitize(line), content) {
+                        out.push(RenderLine::new(chunk, Role::Notification).with_gutter(gutter));
+                    }
+                }
+            }
+        } else if title.is_none() {
+            let flat = text::sanitize(instructions).split_whitespace().collect::<Vec<_>>().join(" ");
+            if !flat.is_empty() {
+                let mut lines = text::wrap(&flat, content);
+                if lines.len() > 2 {
+                    let mut second = std::mem::take(&mut lines[1]);
+                    second.push_str(" …");
+                    lines[1] = text::truncate_with_ellipsis(&second, content);
+                }
+                lines.truncate(2);
+                for chunk in lines {
+                    out.push(RenderLine::new(chunk, Role::Notification).with_gutter(gutter));
+                }
+            }
+        }
+        out
     }
 
     /// Whether this block can still receive streamed content.
@@ -376,6 +456,7 @@ impl Block {
                 }
                 lines
             }
+            Block::TaskCompletion { .. } => self.render_card(width, false),
             Block::SessionBoundary { id } => {
                 let label = format!("{0}{0} session {id} {0}{0}", glyphs::RULE);
                 text::wrap(&label, width)
@@ -385,6 +466,47 @@ impl Block {
             }
         }
     }
+}
+
+/// The one-row header of a task card; never wraps and never exceeds `width`.
+///
+/// Status and identity win on a narrow terminal: the title is elided first,
+/// then dropped, then the fold marker gives way, and only then is the whole
+/// row cut.
+fn task_card_header(
+    status: &str,
+    title: Option<&str>,
+    id: &str,
+    marker: &str,
+    width: usize,
+    role: Role,
+) -> RenderLine {
+    let tag = format!("[{id}]");
+    // Laid out like `disclosure_header`'s first row, but without its word
+    // wrap, which would collapse the two-space gap before the id.
+    let prefix = format!(" {marker} ");
+    let chrome = text::width(&prefix);
+    let budget = width.saturating_sub(chrome);
+    let preferred = match title {
+        Some(title) => {
+            let lead = format!("Task {status}: ");
+            let fixed = text::width(&lead) + 2 + text::width(&tag);
+            (budget >= fixed + text::width(title).min(4)).then(|| {
+                format!("{lead}{}  {tag}", text::truncate_with_ellipsis(title, budget - fixed))
+            })
+        }
+        None => Some(format!("Task {status}  {tag}")).filter(|full| text::width(full) <= budget),
+    };
+    let compact = format!("Task {status} {tag}");
+    let headline = match preferred {
+        Some(headline) => headline,
+        None if text::width(&compact) <= budget => compact,
+        None if text::width(&compact) <= width || width <= chrome => {
+            return RenderLine::new(text::truncate_with_ellipsis(&compact, width), role);
+        }
+        None => text::truncate_with_ellipsis(&compact, budget),
+    };
+    RenderLine::new(format!("{prefix}{headline}"), role).with_chrome_cells(chrome)
 }
 
 fn render_user(text: &str, timestamp: &str, pending: bool, width: usize) -> Vec<RenderLine> {
@@ -612,6 +734,9 @@ pub struct Transcript {
     blocks: Vec<Block>,
     expanded_tool_groups: std::collections::BTreeSet<usize>,
     tool_group_boundaries: std::collections::BTreeSet<usize>,
+    /// Expanded task cards by `(session id, task id)`, not by index, so the
+    /// state survives streaming, rehydration and duplicate titles.
+    expanded_task_cards: std::collections::BTreeSet<(String, String)>,
 }
 
 fn completed_tools(block: &Block) -> bool {
@@ -665,8 +790,37 @@ impl Transcript {
 
     /// Shows a local notice immediately without hiding the streaming tail.
     pub fn push_notice(&mut self, text: String, level: NoticeLevel) {
+        self.insert_before_open_tail(Block::Notice { text, level });
+    }
+
+    fn insert_before_open_tail(&mut self, block: Block) {
         let index = self.blocks.len() - usize::from(self.blocks.last().is_some_and(Block::is_open));
-        self.blocks.insert(index, Block::Notice { text, level });
+        self.blocks.insert(index, block);
+    }
+
+    /// Shows a task card, replacing the card for the same session and task
+    /// in place, or else adding it like a notice.
+    pub fn upsert_task_card(&mut self, block: Block) {
+        let Some(key) = block.task_card_key() else { return };
+        match self.blocks.iter().position(|b| b.task_card_key().as_ref() == Some(&key)) {
+            Some(index) => self.blocks[index] = block,
+            None => self.insert_before_open_tail(block),
+        }
+    }
+
+    pub fn is_task_card(&self, index: usize) -> bool {
+        matches!(self.blocks.get(index), Some(Block::TaskCompletion { .. }))
+    }
+
+    /// Toggles the task card at `index`, reporting whether it was one.
+    pub fn toggle_task_card(&mut self, index: usize) -> bool {
+        let Some(key) = self.blocks.get(index).and_then(Block::task_card_key) else {
+            return false;
+        };
+        if !self.expanded_task_cards.remove(&key) {
+            self.expanded_task_cards.insert(key);
+        }
+        true
     }
 
     pub fn last_mut(&mut self) -> Option<&mut Block> {
@@ -683,6 +837,7 @@ impl Transcript {
         self.blocks.clear();
         self.expanded_tool_groups.clear();
         self.tool_group_boundaries.clear();
+        self.expanded_task_cards.clear();
     }
 
     /// Replaces the conversation with the engine's authoritative version,
@@ -703,7 +858,8 @@ impl Transcript {
     /// Fold and group state is dropped with the old blocks, exactly as
     /// [`Self::clear`] does: both are recorded by block index, and carrying
     /// them over would expand or fold whichever blocks happen to land on
-    /// those indices next.
+    /// those indices next. Task cards are the exception: their expansion is
+    /// keyed by session and task id, and the cards themselves are kept.
     pub fn replace_conversation(&mut self, conversation: Vec<Block>) {
         let mut conversation = conversation;
         let streaming_tail = if matches!(
@@ -984,7 +1140,10 @@ impl Transcript {
                     continue;
                 }
             }
-            let block_rows = block.render(width, mode);
+            let block_rows = match block.task_card_key() {
+                Some(key) => block.render_card(width, self.expanded_task_cards.contains(&key)),
+                None => block.render(width, mode),
+            };
             if !block_rows.is_empty() {
                 rows.extend(block_rows);
                 rows.push(RenderLine::separator());
@@ -2215,6 +2374,182 @@ mod tests {
             );
             let boundary = rows.iter().find(|r| r.is_chrome).expect("a card boundary");
             assert!(boundary.text.is_empty());
+        }
+    }
+
+    mod task_cards {
+        use super::*;
+        use crate::selection::copy_visible_text;
+
+        fn card(title: Option<&str>, instructions: &str) -> Block {
+            Block::TaskCompletion {
+                session_id: Some("s1".into()),
+                task_id: "task-00000007".into(),
+                status: "completed".into(),
+                kind: Some("subagent".into()),
+                title: title.map(str::to_owned),
+                instructions: instructions.into(),
+            }
+        }
+
+        fn with_id(mut block: Block, id: &str) -> Block {
+            if let Block::TaskCompletion { task_id, .. } = &mut block {
+                *task_id = id.into();
+            }
+            block
+        }
+
+        fn joined(rows: &[RenderLine]) -> String {
+            rows.iter().map(|r| r.text.clone()).collect::<Vec<_>>().join("\n")
+        }
+
+        #[test]
+        fn titled_card_with_long_multiline_prompt_is_one_collapsed_row() {
+            let prompt = "Line one of a very long prompt\n".repeat(50);
+            let rows = card(Some("Review authentication flow"), &prompt).render_card(80, false);
+            assert_eq!(rows.len(), 1);
+            let text = &rows[0].text;
+            assert!(text.contains("Task completed: Review authentication flow"), "{text}");
+            assert!(text.contains("[task-00000007]"), "{text}");
+            assert!(text.contains(glyphs::FOLD_COLLAPSED), "{text}");
+            assert!(!text.contains("Line one"));
+        }
+
+        #[test]
+        fn narrow_widths_keep_status_and_id_and_never_exceed_width() {
+            let c = card(Some("界界界 Review authentication flow with a long title"), "p");
+            for w in [1usize, 5, 12, 20, 30, 44, 60] {
+                let rows = c.render_card(w, false);
+                assert_eq!(rows.len(), 1, "w={w}");
+                assert!(text::width(&rows[0].text) <= w, "w={w}: {:?}", rows[0].text);
+                let expanded = c.render_card(w, true);
+                assert!(expanded.iter().all(|r| text::width(&r.text) <= w), "w={w}");
+            }
+            let r30 = &c.render_card(30, false)[0].text;
+            assert!(r30.contains("completed") && r30.contains("task-00000007"), "{r30}");
+            let r44 = &c.render_card(44, false)[0].text;
+            assert!(r44.contains('…') && r44.contains("[task-00000007]"), "{r44}");
+            assert!(r44.contains("Task completed: 界"), "{r44}");
+        }
+
+        #[test]
+        fn expanded_card_shows_labelled_full_instructions() {
+            let rows = card(Some("Review auth"), "step one\nstep two").render_card(60, true);
+            assert!(rows[0].text.contains(glyphs::FOLD_EXPANDED), "{:?}", rows[0].text);
+            let texts: Vec<_> = rows.iter().map(|r| r.text.trim().to_owned()).collect();
+            assert!(texts.contains(&"Instructions".to_owned()), "{texts:?}");
+            assert!(texts.contains(&"step one".to_owned()) && texts.contains(&"step two".to_owned()));
+            let empty = card(Some("Review auth"), "").render_card(60, true);
+            assert!(joined(&empty).contains("(no instructions recorded)"));
+        }
+
+        #[test]
+        fn legacy_card_is_at_most_three_rows_with_ellipsis() {
+            let long = "word ".repeat(200);
+            let rows = card(None, &long).render_card(40, false);
+            assert_eq!(rows.len(), 3);
+            assert!(rows[0].text.contains("Task completed") && rows[0].text.contains("[task-00000007]"));
+            assert!(rows[2].text.trim_end().ends_with('…'), "{:?}", rows[2].text);
+            assert!(rows.iter().all(|r| text::width(&r.text) <= 40));
+            let short = card(None, "fix it").render_card(40, false);
+            assert_eq!(short.len(), 2);
+            assert!(!short[1].text.contains('…'));
+            assert!(card(None, &long).render_card(40, true).len() > 3);
+            assert_eq!(card(None, "  ").render_card(40, false).len(), 1);
+        }
+
+        #[test]
+        fn a_short_title_is_kept_whenever_the_full_header_fits() {
+            // " ▸ " + "Task completed: T  [task-00000007]" = 3 + 34 cells.
+            let row = &card(Some("T"), "p").render_card(37, false)[0].text;
+            assert!(row.contains("Task completed: T  [task-00000007]"), "{row}");
+        }
+
+        #[test]
+        fn statuses_are_explicit_words() {
+            for s in ["completed", "failed", "stopped"] {
+                let mut c = card(Some("T"), "p");
+                if let Block::TaskCompletion { status, .. } = &mut c {
+                    *status = s.into();
+                }
+                let rows = c.render_card(60, false);
+                assert!(rows[0].text.contains(&format!("Task {s}: T")), "{:?}", rows[0].text);
+                let role = if s == "failed" { Role::Error } else { Role::Notification };
+                assert_eq!(rows[0].role, role);
+            }
+        }
+
+        #[test]
+        fn wide_glyphs_and_unbroken_words_wrap_within_width() {
+            let instructions = format!("界界界界界界界界界界界界 🙂🙂🙂🙂🙂🙂🙂\n{}", "x".repeat(90));
+            for titled in [Some("T"), None] {
+                for expanded in [false, true] {
+                    let rows = card(titled, &instructions).render_card(20, expanded);
+                    for row in &rows {
+                        assert!(text::width(&row.text) <= 20, "{:?}", row.text);
+                    }
+                }
+            }
+            let rows = card(Some("T"), &instructions).render_card(20, true);
+            let xs: usize = rows.iter().map(|r| r.text.matches('x').count()).sum();
+            assert_eq!(xs, 90, "the unbroken word is split, not dropped");
+        }
+
+        #[test]
+        fn expansion_is_keyed_by_session_and_task_and_survives_rebuilds() {
+            let mut t = Transcript::new();
+            t.push(card(Some("Same title"), "first"));
+            t.push(with_id(card(Some("Same title"), "second"), "task-00000008"));
+            assert!(t.is_task_card(0) && t.is_task_card(1));
+            assert!(t.toggle_task_card(0));
+            t.replace_conversation(vec![Block::Assistant { text: "hi".into(), complete: true }]);
+            let all = joined(&t.render(60, ToolDisplayMode::Summary));
+            assert!(all.contains("first"), "first card stays expanded after rehydration: {all}");
+            assert!(!all.contains("second"), "the other card with the same title stays collapsed");
+            t.clear();
+            t.push(card(Some("Same title"), "first"));
+            assert!(!joined(&t.render(60, ToolDisplayMode::Summary)).contains("first"));
+        }
+
+        #[test]
+        fn the_same_task_id_in_another_session_is_a_distinct_card() {
+            let mut t = Transcript::new();
+            t.upsert_task_card(card(Some("A"), "from s1"));
+            let mut other = card(Some("B"), "from s2");
+            if let Block::TaskCompletion { session_id, .. } = &mut other {
+                *session_id = Some("s2".into());
+            }
+            t.upsert_task_card(other);
+            assert_eq!(t.len(), 2);
+            assert!(t.toggle_task_card(1));
+            let all = joined(&t.render(60, ToolDisplayMode::Summary));
+            assert!(all.contains("from s2") && !all.contains("from s1"), "{all}");
+        }
+
+        #[test]
+        fn upsert_replaces_in_place_and_parks_before_an_open_tail() {
+            let mut t = Transcript::new();
+            t.push(Block::Notice { text: "before".into(), level: NoticeLevel::Info });
+            t.upsert_task_card(card(Some("Old"), "p"));
+            t.push(Block::Notice { text: "after".into(), level: NoticeLevel::Info });
+            t.upsert_task_card(card(Some("New"), "p"));
+            assert_eq!(t.len(), 3);
+            assert!(matches!(&t.blocks()[1], Block::TaskCompletion { title: Some(t), .. } if t == "New"));
+
+            t.push(Block::Assistant { text: "stream".into(), complete: false });
+            t.upsert_task_card(with_id(card(Some("Other"), "p"), "task-9"));
+            assert!(t.blocks().last().is_some_and(Block::is_open));
+            assert!(t.is_task_card(t.len() - 2));
+            assert!(!t.is_task_card(0) && !t.toggle_task_card(0));
+        }
+
+        #[test]
+        fn copying_a_collapsed_card_excludes_marker_and_hidden_instructions() {
+            let rows = card(Some("Review auth"), "secret details").render_card(60, false);
+            let copied = copy_visible_text(&rows, 0..rows.len());
+            assert!(!copied.contains("secret"), "{copied}");
+            assert!(!copied.contains(glyphs::FOLD_COLLAPSED), "{copied}");
+            assert!(copied.contains("Task completed: Review auth"), "{copied}");
         }
     }
 }

@@ -615,6 +615,7 @@ impl SubagentFactory for SubagentHost {
             // a task that cannot start.
             let task = self.task_manager.register(
                 TaskKind::Subagent,
+                &request.title,
                 &request.prompt,
                 request.caller_task_id.as_deref(),
                 TaskExecutionMode::Background,
@@ -759,6 +760,7 @@ impl SubagentHost {
         let task = self.task_manager.register_restored(
             &cp.task_id,
             TaskKind::Subagent,
+            cp.title.as_deref(),
             cp.description.clone(),
             cp.owner_task_id.as_deref(),
             TaskExecutionMode::Background,
@@ -772,6 +774,7 @@ impl SubagentHost {
         task.attach_steering(inbox);
         let request = SubagentRequest {
             agent_type: cp.spec.agent_type.clone(),
+            title: cp.title.clone().unwrap_or_default(),
             prompt: cp.spec.prompt.clone(),
             task_id: task.id.clone(),
             depth: task.depth,
@@ -1025,6 +1028,7 @@ mod tests {
         let factory = DepthCheckFactory;
         let bad_request = SubagentRequest {
             agent_type: "general-purpose".into(),
+            title: String::new(),
             prompt: "do something".into(),
             task_id: "t1".into(),
             depth: MAX_SUBAGENT_DEPTH + 1,
@@ -1401,7 +1405,8 @@ mod tests {
         // Exhaust the single slot.
         let _held = host.semaphore.try_acquire().expect("initial slot must be free");
 
-        let mut bg_request = SubagentRequest::foreground("general-purpose", "go", "t1", 1);
+        let mut bg_request =
+            SubagentRequest::foreground("general-purpose", "go", "t1", 1).with_title("Go");
         bg_request.foreground = false;
 
         let result = host.spawn(bg_request, Arc::new(crate::events::NullSink), CancellationToken::new()).await;
@@ -1639,7 +1644,7 @@ mod tests {
 
             // The child's own task, as the `task` tool registers it.
             let child = mgr
-                .register(TaskKind::Subagent, "child work", None, TaskExecutionMode::Foreground)
+                .register(TaskKind::Subagent, "child work", "child work", None, TaskExecutionMode::Foreground)
                 .unwrap();
 
             let mut request =
@@ -1693,7 +1698,7 @@ mod tests {
             // the request to the factory — this is that same registered id,
             // not the parent's and not a fabricated one.
             let child = mgr
-                .register(TaskKind::Scheduled, "nightly audit", None, TaskExecutionMode::Background)
+                .register(TaskKind::Scheduled, "nightly audit", "nightly audit", None, TaskExecutionMode::Background)
                 .unwrap();
             let mut request = SubagentRequest::foreground(
                 "general-purpose",
@@ -1739,7 +1744,7 @@ mod tests {
             );
 
             let child = mgr
-                .register(TaskKind::Subagent, "child work", None, TaskExecutionMode::Foreground)
+                .register(TaskKind::Subagent, "child work", "child work", None, TaskExecutionMode::Foreground)
                 .unwrap();
             let request =
                 SubagentRequest::foreground("general-purpose", "list tasks", &child.id, 1);
@@ -1775,7 +1780,7 @@ mod tests {
                 (
                     "delegate",
                     vec![
-                        tool_turn("c1", "task", r#"{"prompt":"grandchild work"}"#),
+                        tool_turn("c1", "task", r#"{"title":"Grandchild work","prompt":"grandchild work"}"#),
                         text_turn("waiting for the grandchild"),
                         text_turn("child done"),
                     ],
@@ -1784,7 +1789,7 @@ mod tests {
                     "grandchild work",
                     vec![
                         tool_turn("g1", "probe", "{}"),
-                        tool_turn("g2", "task", r#"{"prompt":"great-grandchild"}"#),
+                        tool_turn("g2", "task", r#"{"title":"Great-grandchild","prompt":"great-grandchild"}"#),
                         text_turn("grandchild done"),
                     ],
                 ),
@@ -1800,7 +1805,7 @@ mod tests {
             );
 
             let child = mgr
-                .register(TaskKind::Subagent, "child work", None, TaskExecutionMode::Foreground)
+                .register(TaskKind::Subagent, "child work", "child work", None, TaskExecutionMode::Foreground)
                 .unwrap();
             let request =
                 SubagentRequest::foreground("general-purpose", "delegate", &child.id, 1);
@@ -1871,7 +1876,7 @@ mod tests {
             let mgr = manager(&dir);
 
             let client = ScriptedClient::new(vec![
-                tool_turn("c1", "task", r#"{"prompt":"grandchild work"}"#),
+                tool_turn("c1", "task", r#"{"title":"Grandchild work","prompt":"grandchild work"}"#),
                 text_turn("child done"),
             ]);
             // Pool of 2: one permit held below, one taken by the child itself.
@@ -1884,7 +1889,7 @@ mod tests {
             let _held = host.semaphore.try_acquire().expect("a slot must be free");
 
             let child = mgr
-                .register(TaskKind::Subagent, "child work", None, TaskExecutionMode::Foreground)
+                .register(TaskKind::Subagent, "child work", "child work", None, TaskExecutionMode::Foreground)
                 .unwrap();
             let request =
                 SubagentRequest::foreground("general-purpose", "delegate", &child.id, 1);
@@ -1929,7 +1934,7 @@ mod tests {
             );
 
             let child = mgr
-                .register(TaskKind::Subagent, "explore work", None, TaskExecutionMode::Foreground)
+                .register(TaskKind::Subagent, "explore work", "explore work", None, TaskExecutionMode::Foreground)
                 .unwrap();
             let request = SubagentRequest::foreground("explore", "investigate", &child.id, 1);
 
@@ -1987,7 +1992,8 @@ mod tests {
             );
 
             let mut request =
-                SubagentRequest::foreground("general-purpose", "background work", "", 1);
+                SubagentRequest::foreground("general-purpose", "background work", "", 1)
+                    .with_title("Background work");
             request.foreground = false;
             let task_id = host
                 .spawn(request, Arc::new(CollectingSink::new()), CancellationToken::new())
@@ -2009,6 +2015,36 @@ mod tests {
                 "the background child's identity must be the task the host registered"
             );
             assert!(mgr.get(&task_id).is_some());
+        }
+
+        #[tokio::test]
+        async fn a_background_spawn_requires_a_title() {
+            let dir = tempfile::tempdir().unwrap();
+            let mgr = manager(&dir);
+            let host = host_with(
+                ScriptedClient::new(vec![text_turn("done")]),
+                vec![],
+                Arc::clone(&mgr),
+                4,
+            );
+
+            let mut untitled = SubagentRequest::foreground("general-purpose", "work", "", 1);
+            untitled.foreground = false;
+            let err = host
+                .spawn(untitled, Arc::new(CollectingSink::new()), CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(err.contains("title"), "{err}");
+            assert!(mgr.list().is_empty(), "nothing may be registered");
+
+            let mut titled = SubagentRequest::foreground("general-purpose", "work", "", 1)
+                .with_title("Do the work");
+            titled.foreground = false;
+            let id = host
+                .spawn(titled, Arc::new(CollectingSink::new()), CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(mgr.get(&id).unwrap().title.as_deref(), Some("Do the work"));
         }
 
         // ── Test 3: schedule store + scheduled origin ─────────────────────────
@@ -2044,7 +2080,7 @@ mod tests {
             .with_schedule_store(Arc::clone(&store));
 
             let child = mgr
-                .register(TaskKind::Subagent, "child work", None, TaskExecutionMode::Foreground)
+                .register(TaskKind::Subagent, "child work", "child work", None, TaskExecutionMode::Foreground)
                 .unwrap();
             let request = SubagentRequest::foreground("general-purpose", "look", &child.id, 1);
 
@@ -2093,7 +2129,7 @@ mod tests {
             let client = ScriptedClient::new(vec![
                 // scheduled depth-1 run: probe, then delegate
                 tool_turn("s1", "probe", "{}"),
-                tool_turn("s2", "task", r#"{"prompt":"sub-work","originScheduleId":"other-job"}"#),
+                tool_turn("s2", "task", r#"{"title":"Sub work","prompt":"sub-work","originScheduleId":"other-job"}"#),
                 // grandchild
                 tool_turn("g1", "probe", "{}"),
                 text_turn("grandchild done"),
@@ -2114,7 +2150,7 @@ mod tests {
 
             let origin = ScheduleOrigin::new("sched-42", Some("nightly audit".into()));
             let scheduled = mgr
-                .register(TaskKind::Scheduled, "Scheduled: nightly", None, TaskExecutionMode::Background)
+                .register(TaskKind::Scheduled, "Scheduled: nightly", "Scheduled: nightly", None, TaskExecutionMode::Background)
                 .unwrap();
             let request =
                 SubagentRequest::foreground("general-purpose", "run job", &scheduled.id, 1)
@@ -2124,7 +2160,7 @@ mod tests {
                 .unwrap();
 
             let ordinary = mgr
-                .register(TaskKind::Subagent, "ordinary", None, TaskExecutionMode::Foreground)
+                .register(TaskKind::Subagent, "ordinary", "ordinary", None, TaskExecutionMode::Foreground)
                 .unwrap();
             host.spawn(
                 SubagentRequest::foreground("general-purpose", "plain work", &ordinary.id, 1),
@@ -2224,6 +2260,7 @@ mod tests {
                 .register(
                     TaskKind::Scheduled,
                     "Scheduled: watcher",
+                    "Scheduled: watcher",
                     None,
                     TaskExecutionMode::Background,
                 )
@@ -2281,6 +2318,7 @@ mod tests {
                 .register(
                     TaskKind::Scheduled,
                     "Scheduled: watcher",
+                    "Scheduled: watcher",
                     None,
                     TaskExecutionMode::Background,
                 )
@@ -2324,6 +2362,7 @@ mod tests {
                 .register(
                     TaskKind::Scheduled,
                     "Scheduled: watcher",
+                    "Scheduled: watcher",
                     None,
                     TaskExecutionMode::Background,
                 )
@@ -2331,6 +2370,7 @@ mod tests {
             let nested = mgr
                 .register(
                     TaskKind::Subagent,
+                    "nested worker",
                     "nested worker",
                     Some(&run.id),
                     TaskExecutionMode::Foreground,
@@ -2409,7 +2449,7 @@ mod tests {
 
             // An unrelated top-level task the child has no authority over.
             let sibling = mgr
-                .register(TaskKind::Subagent, "sibling work", None, TaskExecutionMode::Foreground)
+                .register(TaskKind::Subagent, "sibling work", "sibling work", None, TaskExecutionMode::Foreground)
                 .unwrap();
             mgr.append_output(&sibling.id, SIBLING_CANARY);
             mgr.complete(&sibling.id, Some(SIBLING_CANARY.into()));
@@ -2430,7 +2470,7 @@ mod tests {
             );
 
             let child = mgr
-                .register(TaskKind::Subagent, "child work", None, TaskExecutionMode::Foreground)
+                .register(TaskKind::Subagent, "child work", "child work", None, TaskExecutionMode::Foreground)
                 .unwrap();
             let request =
                 SubagentRequest::foreground("general-purpose", "probe sibling", &child.id, 1);
@@ -2655,6 +2695,7 @@ mod tests {
                     .register(
                         TaskKind::Shell,
                         "long job",
+                        "long job",
                         ctx.caller_task_id.as_deref(),
                         TaskExecutionMode::Background,
                     )
@@ -2674,7 +2715,7 @@ mod tests {
         }
 
         fn depth_one_child(mgr: &TaskManager, what: &str) -> String {
-            mgr.register(TaskKind::Subagent, what, None, TaskExecutionMode::Foreground)
+            mgr.register(TaskKind::Subagent, what, what, None, TaskExecutionMode::Foreground)
                 .unwrap()
                 .id
                 .clone()
@@ -2685,7 +2726,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let mgr = manager(&dir);
             let calls: Vec<(String, String)> = (1..=5)
-                .map(|i| (format!("t{i}"), format!(r#"{{"prompt":"leaf {i}"}}"#)))
+                .map(|i| (format!("t{i}"), format!(r#"{{"title":"Leaf {i}","prompt":"leaf {i}"}}"#)))
                 .collect();
             let batch: Vec<(&str, &str, String)> =
                 calls.iter().map(|(id, input)| (id.as_str(), "task", input.clone())).collect();
@@ -2879,7 +2920,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let mgr = manager(&dir);
             let job = mgr
-                .register(TaskKind::Shell, "job", None, TaskExecutionMode::Background)
+                .register(TaskKind::Shell, "job", "job", None, TaskExecutionMode::Background)
                 .unwrap();
             let wait = format!(r#"{{"taskId":"{}","timeoutSeconds":300}}"#, job.id);
             let client = RoutedClient::new(vec![
@@ -2942,7 +2983,7 @@ mod tests {
             let bus = Arc::new(MessageBus::new());
             mgr.set_completion_listener(MainInboxCompletionPush::new(&bus));
             let job = mgr
-                .register(TaskKind::Shell, "job", None, TaskExecutionMode::Background)
+                .register(TaskKind::Shell, "job", "job", None, TaskExecutionMode::Background)
                 .unwrap();
             {
                 let mgr = Arc::clone(&mgr);
@@ -2991,8 +3032,8 @@ mod tests {
                     "parent",
                     vec![
                         tools_turn(&[
-                            ("a", "task", r#"{"prompt":"doomed child"}"#.into()),
-                            ("b", "task", r#"{"prompt":"endless child"}"#.into()),
+                            ("a", "task", r#"{"title":"Doomed child","prompt":"doomed child"}"#.into()),
+                            ("b", "task", r#"{"title":"Endless child","prompt":"endless child"}"#.into()),
                         ]),
                         text_turn("waiting"),
                         text_turn("first wake"),
@@ -3081,7 +3122,7 @@ mod tests {
             let result = tokio::time::timeout(
                 Duration::from_secs(5),
                 crate::tools::TaskTool.execute(
-                    &serde_json::json!({"prompt": "slow job"}),
+                    &serde_json::json!({"title": "Slow job", "prompt": "slow job"}),
                     &ctx,
                     CancellationToken::new(),
                 ),
@@ -3237,6 +3278,7 @@ mod tests {
                 owner_task_id: None,
                 reports_to: "main".into(),
                 kind: "subagent".into(),
+                title: Some("Parent work".into()),
                 description: "parent work".into(),
                 mode: "background".into(),
                 spec: sample_spec(),
@@ -3332,7 +3374,7 @@ mod tests {
                 (
                     "parent work",
                     vec![
-                        tool_turn("t1", "task", r#"{"prompt":"child work"}"#),
+                        tool_turn("t1", "task", r#"{"title":"Child work","prompt":"child work"}"#),
                         text_turn("waiting for the child"),
                     ],
                 ),
@@ -3347,7 +3389,8 @@ mod tests {
                 Arc::clone(&mgr),
                 8,
             );
-            let mut request = SubagentRequest::foreground("general-purpose", "parent work", "", 1);
+            let mut request = SubagentRequest::foreground("general-purpose", "parent work", "", 1)
+                .with_title("Parent work");
             request.foreground = false;
             let parent = host
                 .spawn(request, Arc::new(CollectingSink::new()), CancellationToken::new())
@@ -3539,6 +3582,33 @@ mod tests {
                 .unwrap_err();
             assert!(err.contains("Unknown parent"), "{err}");
             assert!(mgr.list().is_empty());
+        }
+
+        #[tokio::test]
+        async fn checkpoints_carry_titles_and_legacy_ones_restore_untitled() {
+            let (parent_cp, child_cp) = suspended_pair().await;
+            assert_eq!(parent_cp.title.as_deref(), Some("Parent work"), "from_task copies it");
+            assert_eq!(child_cp.title.as_deref(), Some("Child work"));
+
+            let json = serde_json::to_value(&parent_cp).unwrap();
+            assert_eq!(json["title"], "Parent work");
+            let back: SubagentCheckpoint = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(back.title.as_deref(), Some("Parent work"));
+
+            let mut legacy = json;
+            legacy.as_object_mut().unwrap().remove("title");
+            let legacy: SubagentCheckpoint = serde_json::from_value(legacy).unwrap();
+            assert_eq!(legacy.title, None);
+
+            let dir = tempfile::tempdir().unwrap();
+            let mgr = manager(&dir);
+            let host = restored_host(&after_restart_client(), &mgr);
+            let id = host
+                .restore(legacy, true, Arc::new(CollectingSink::new()))
+                .await
+                .unwrap();
+            assert_eq!(mgr.get(&id).unwrap().title, None, "a legacy task restores untitled");
+            mgr.stop_all();
         }
     }
 }

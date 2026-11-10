@@ -201,6 +201,8 @@ pub enum Event {
         task_id: String,
         /// `"completed"`, `"failed"` or `"stopped"`.
         status: String,
+        /// Short task label; absent for legacy tasks and older senders.
+        title: Option<String>,
         description: String,
         report: Option<String>,
         /// The task id of the agent that started it; absent when the main
@@ -219,6 +221,8 @@ pub enum Event {
         task_id: String,
         /// `"shell"`, `"subagent"`, `"scheduled"` or `"tool"`.
         kind: String,
+        /// Short task label; absent for legacy tasks and older senders.
+        title: Option<String>,
         description: String,
         /// The task id of the agent that started it; absent for the main agent.
         owner_task_id: Option<String>,
@@ -512,6 +516,9 @@ struct TaskCompletedPayload {
     task_id: String,
     #[serde(default)]
     status: String,
+    /// Short task label; absent for legacy tasks and older senders.
+    #[serde(default)]
+    title: Option<String>,
     #[serde(default)]
     description: String,
     #[serde(default)]
@@ -534,6 +541,9 @@ struct TaskStartedPayload {
     task_id: String,
     #[serde(default)]
     kind: String,
+    /// Short task label; absent for legacy tasks and older senders.
+    #[serde(default)]
+    title: Option<String>,
     #[serde(default)]
     description: String,
     /// The task id of the agent that started the task; absent for the main
@@ -899,6 +909,7 @@ impl Event {
                 Event::TaskCompleted {
                     task_id: p.task_id,
                     status: p.status,
+                    title: p.title,
                     description: p.description,
                     report: p.report,
                     owner_task_id: p.owner_task_id,
@@ -911,6 +922,7 @@ impl Event {
                 Event::TaskStarted {
                     task_id: p.task_id,
                     kind: p.kind,
+                    title: p.title,
                     description: p.description,
                     owner_task_id: p.owner_task_id,
                     mode: p.mode,
@@ -1161,6 +1173,7 @@ impl Event {
             Event::TaskCompleted {
                 task_id,
                 status,
+                title,
                 description,
                 report,
                 owner_task_id,
@@ -1170,6 +1183,7 @@ impl Event {
                 let mut map = Map::new();
                 map.insert("taskId".into(), task_id.clone().into());
                 map.insert("status".into(), status.clone().into());
+                put_opt(&mut map, "title", title);
                 map.insert("description".into(), description.clone().into());
                 put_opt(&mut map, "report", report);
                 put_opt(&mut map, "ownerTaskId", owner_task_id);
@@ -1177,10 +1191,11 @@ impl Event {
                 put_opt(&mut map, "mode", mode);
                 (m::TASK_COMPLETED, Value::Object(map))
             }
-            Event::TaskStarted { task_id, kind, description, owner_task_id, mode, resumed } => {
+            Event::TaskStarted { task_id, kind, title, description, owner_task_id, mode, resumed } => {
                 let mut map = Map::new();
                 map.insert("taskId".into(), task_id.clone().into());
                 map.insert("kind".into(), kind.clone().into());
+                put_opt(&mut map, "title", title);
                 map.insert("description".into(), description.clone().into());
                 put_opt(&mut map, "ownerTaskId", owner_task_id);
                 map.insert("mode".into(), mode.clone().into());
@@ -1484,6 +1499,7 @@ mod tests {
             assert_round_trips(Event::TaskCompleted {
                 task_id: "t1".into(),
                 status: "completed".into(),
+                title: None,
                 description: "did a thing".into(),
                 report: None,
                 owner_task_id: None,
@@ -1493,6 +1509,7 @@ mod tests {
             assert_round_trips(Event::TaskCompleted {
                 task_id: "t2".into(),
                 status: "failed".into(),
+                title: Some("Review auth".into()),
                 description: "lint".into(),
                 report: Some("exit code: 1".into()),
                 owner_task_id: Some("task-0001".into()),
@@ -1502,6 +1519,7 @@ mod tests {
             assert_round_trips(Event::TaskStarted {
                 task_id: "t3".into(),
                 kind: "subagent".into(),
+                title: Some("Review auth".into()),
                 description: "deep review".into(),
                 owner_task_id: None,
                 mode: "background".into(),
@@ -1510,6 +1528,7 @@ mod tests {
             assert_round_trips(Event::TaskStarted {
                 task_id: "t4".into(),
                 kind: "shell".into(),
+                title: None,
                 description: "cargo test".into(),
                 owner_task_id: Some("t3".into()),
                 mode: "foreground".into(),
@@ -1859,6 +1878,51 @@ mod tests {
     }
 
     #[test]
+    fn task_title_is_optional_on_task_events() {
+        let event = parse_event(
+            event_method::TASK_COMPLETED,
+            json!({ "taskId": "t", "status": "completed", "description": "x" }),
+        );
+        assert!(matches!(event, Event::TaskCompleted { title: None, .. }));
+        let (_, params) = event.to_notification().unwrap();
+        assert!(params.get("title").is_none(), "an absent title is omitted");
+
+        let event = parse_event(
+            event_method::TASK_STARTED,
+            json!({ "taskId": "t", "kind": "shell", "description": "x", "mode": "foreground" }),
+        );
+        assert!(matches!(event, Event::TaskStarted { title: None, .. }));
+        let (_, params) = event.to_notification().unwrap();
+        assert!(params.get("title").is_none(), "an absent title is omitted");
+
+        let completed = Event::TaskCompleted {
+            task_id: "t".into(),
+            status: "completed".into(),
+            title: Some("Review auth".into()),
+            description: "Review the whole auth module in depth".into(),
+            report: None,
+            owner_task_id: None,
+            kind: Some("subagent".into()),
+            mode: Some("background".into()),
+        };
+        let (_, params) = completed.to_notification().unwrap();
+        assert_eq!(params["title"], "Review auth");
+        assert_eq!(params["description"], "Review the whole auth module in depth");
+
+        let started = Event::TaskStarted {
+            task_id: "t".into(),
+            kind: "subagent".into(),
+            title: Some("Review auth".into()),
+            description: "Review the whole auth module in depth".into(),
+            owner_task_id: None,
+            mode: "background".into(),
+            resumed: None,
+        };
+        let (_, params) = started.to_notification().unwrap();
+        assert_eq!(params["title"], "Review auth");
+    }
+
+    #[test]
     fn task_suspended_event_shape() {
         let suspended = Event::TaskSuspended {
             task_id: "task-00000002".into(),
@@ -1887,6 +1951,7 @@ mod tests {
         let started = Event::TaskStarted {
             task_id: "task-00000002".into(),
             kind: "subagent".into(),
+            title: Some("Review".into()),
             description: "review".into(),
             owner_task_id: None,
             mode: "background".into(),

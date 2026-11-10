@@ -240,6 +240,7 @@ pub fn to_proto_event(event: &AgentEvent) -> Option<ProtoEvent> {
             Some(ProtoEvent::TaskCompleted {
                 task_id: task_id.clone(),
                 status: status.clone(),
+                title: None,
                 description: description.clone(),
                 report: report.clone(),
                 owner_task_id: None,

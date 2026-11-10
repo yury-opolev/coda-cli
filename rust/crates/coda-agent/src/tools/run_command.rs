@@ -457,7 +457,13 @@ fn start_shell_task(
     deadline: Option<Duration>,
 ) -> Result<Arc<ManagedTask>, String> {
     let task = manager
-        .register(TaskKind::Shell, describe(command), owner_task_id, TaskExecutionMode::Foreground)
+        .register(
+            TaskKind::Shell,
+            &crate::tasks::derive_task_title(command),
+            describe(command),
+            owner_task_id,
+            TaskExecutionMode::Foreground,
+        )
         .map_err(|e| format!("Failed to start process: {e}"))?;
 
     let mut child = match shell_command(command, working_dir).spawn() {

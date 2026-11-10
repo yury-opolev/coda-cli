@@ -80,7 +80,7 @@ pub fn live_task_brief(manager: &TaskManager, owner: Option<&str>) -> Option<Str
             "- {} {} \"{}\" — {} {}\n",
             s.id,
             s.kind.as_str(),
-            one_line(&s.description, DESCRIPTION_CHARS),
+            one_line(s.label(), DESCRIPTION_CHARS),
             s.status.as_str(),
             format_age(age_of(s, now)),
         ));
@@ -140,7 +140,7 @@ fn push_task(text: &mut String, s: &TaskSnapshot, tail: &str, now: SystemTime) {
         "- {} [{}] \"{}\" — {} {timing}; started by {owner}\n",
         s.id,
         s.kind.as_str(),
-        one_line(&s.description, DESCRIPTION_CHARS),
+        one_line(s.label(), DESCRIPTION_CHARS),
         status_word(s.status),
     ));
     let lines: Vec<&str> = tail.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -166,7 +166,7 @@ mod tests {
     fn no_live_tasks_means_no_prefix() {
         let m = manager();
         assert_eq!(live_task_brief(&m, None), None);
-        let done = m.register(TaskKind::Shell, "cargo build", None, TaskExecutionMode::Background).unwrap();
+        let done = m.register(TaskKind::Shell, "cargo build", "cargo build", None, TaskExecutionMode::Background).unwrap();
         m.complete(&done.id, Some("exit code: 0".into()));
         assert_eq!(live_task_brief(&m, None), None, "finished work is not live");
     }
@@ -175,11 +175,11 @@ mod tests {
     fn the_prefix_lists_only_the_owners_running_tasks() {
         let m = manager();
         let review = m
-            .register(TaskKind::Shell, "pwsh review.ps1 -Post", None, TaskExecutionMode::Background)
+            .register(TaskKind::Shell, "pwsh review.ps1 -Post", "pwsh review.ps1 -Post", None, TaskExecutionMode::Background)
             .unwrap();
-        let agent = m.register(TaskKind::Subagent, "deep review", None, TaskExecutionMode::Background).unwrap();
+        let agent = m.register(TaskKind::Subagent, "deep review", "deep review", None, TaskExecutionMode::Background).unwrap();
         let grandchild = m
-            .register(TaskKind::Shell, "child build", Some(&agent.id), TaskExecutionMode::Background)
+            .register(TaskKind::Shell, "child build", "child build", Some(&agent.id), TaskExecutionMode::Background)
             .unwrap();
         let brief = live_task_brief(&m, None).expect("live tasks");
         assert!(brief.starts_with("[live-tasks]"), "{brief}");
@@ -196,10 +196,10 @@ mod tests {
     #[test]
     fn the_snapshot_shows_owner_status_age_and_the_output_tail() {
         let m = manager();
-        let review = m.register(TaskKind::Shell, "owasp review", None, TaskExecutionMode::Background).unwrap();
+        let review = m.register(TaskKind::Shell, "owasp review", "owasp review", None, TaskExecutionMode::Background).unwrap();
         m.append_output(&review.id, "line 1\nscanning PR 42\n");
-        let agent = m.register(TaskKind::Subagent, "deep review", None, TaskExecutionMode::Background).unwrap();
-        let child = m.register(TaskKind::Shell, "lint", Some(&agent.id), TaskExecutionMode::Background).unwrap();
+        let agent = m.register(TaskKind::Subagent, "deep review", "deep review", None, TaskExecutionMode::Background).unwrap();
+        let child = m.register(TaskKind::Shell, "lint", "lint", Some(&agent.id), TaskExecutionMode::Background).unwrap();
         m.fail(&child.id, Some("exit code: 1".into()));
 
         let snapshot = task_snapshot(&m);

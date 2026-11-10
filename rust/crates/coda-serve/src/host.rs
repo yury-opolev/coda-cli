@@ -5250,6 +5250,7 @@ impl ServeBackend for ServeHost {
                     id: task.id,
                     parent_id: task.parent_id,
                     kind: task.kind.as_str().into(),
+                    title: task.title,
                     description: task.description,
                     status: task.status.as_str().into(),
                     mode: task.mode.as_str().into(),
@@ -12430,7 +12431,7 @@ mod tests {
         ).unwrap();
         tokio::time::timeout(Duration::from_secs(5), completed).await.unwrap().unwrap();
 
-        let mut background = request();
+        let mut background = request().with_title("Reply");
         background.foreground = false;
         let id = services.subagent_host.spawn(background, Arc::new(NullSink), CancellationToken::new())
             .await.unwrap();
@@ -12509,13 +12510,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (host, _rx) = host_with_events(dir.path());
         let task = host.task_manager.register(
-            TaskKind::Subagent, "waiting for the model", None, TaskExecutionMode::Background,
+            TaskKind::Subagent, "waiting", "waiting for the model", None, TaskExecutionMode::Background,
         ).unwrap();
         assert!(!task.log_path.exists(), "the task has not produced a log");
         let listing = crate::dispatch::dispatch("session/listTasks", None, host.as_ref())
             .await.unwrap();
         assert_eq!(listing["tasks"][0]["id"], task.id);
         assert_eq!(listing["tasks"][0]["status"], "running");
+        assert_eq!(listing["tasks"][0]["title"], "waiting");
         assert_eq!(listing["tasks"][0]["description"], "waiting for the model");
         assert_eq!(listing["tasks"][0]["outputTail"], "");
 
@@ -12531,6 +12533,18 @@ mod tests {
         let (found, output, _, _) = host.task_manager.read_output(&task.id, None);
         assert!(found);
         assert_eq!(output, "progress\n", "browsing must not steal the agent's output");
+
+        let legacy = host.task_manager.register_restored(
+            "task-00000099", TaskKind::Subagent, None, "an old prompt", None,
+            TaskExecutionMode::Background, std::time::SystemTime::now(), false,
+        ).unwrap();
+        let listing = crate::dispatch::dispatch("session/listTasks", None, host.as_ref())
+            .await.unwrap();
+        let row = listing["tasks"].as_array().unwrap().iter()
+            .find(|t| t["id"] == legacy.id.as_str()).unwrap();
+        assert!(row.get("title").is_none(), "a legacy task has no title: {row}");
+        assert_eq!(row["description"], "an old prompt");
+        host.task_manager.stop(&legacy.id);
     }
 
     #[tokio::test]
@@ -12541,11 +12555,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (host, _rx) = host_with_events(dir.path());
         let m = &host.task_manager;
-        let fg = m.register(TaskKind::Shell, "fg", None, TaskExecutionMode::Foreground).unwrap();
-        let done = m.register(TaskKind::Shell, "done", None, TaskExecutionMode::Background).unwrap();
-        let failed = m.register(TaskKind::Shell, "failed", None, TaskExecutionMode::Background).unwrap();
-        let stopped = m.register(TaskKind::Shell, "stopped", None, TaskExecutionMode::Background).unwrap();
-        let agent = m.register(TaskKind::Subagent, "agent", None, TaskExecutionMode::Background).unwrap();
+        let fg = m.register(TaskKind::Shell, "fg", "fg", None, TaskExecutionMode::Foreground).unwrap();
+        let done = m.register(TaskKind::Shell, "done", "done", None, TaskExecutionMode::Background).unwrap();
+        let failed = m.register(TaskKind::Shell, "failed", "failed", None, TaskExecutionMode::Background).unwrap();
+        let stopped = m.register(TaskKind::Shell, "stopped", "stopped", None, TaskExecutionMode::Background).unwrap();
+        let agent = m.register(TaskKind::Subagent, "agent", "agent", None, TaskExecutionMode::Background).unwrap();
         m.complete(&done.id, Some("report".into()));
         m.fail(&failed.id, Some("boom".into()));
         m.stop(&stopped.id);
@@ -12633,7 +12647,7 @@ mod tests {
         let host = make_host_in_dir(dir.path().to_str().unwrap(), client);
         let manager = TaskManager::with_defaults("session");
         let task = manager
-            .register(TaskKind::Subagent, "background audit", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "background audit", "background audit", None, TaskExecutionMode::Background)
             .unwrap();
 
         let ctx = ToolContext::new(host.working_dir.clone())
@@ -16405,7 +16419,7 @@ mod tests {
 
             let task = host
                 .task_manager
-                .register(TaskKind::Shell, "cargo build", None, TaskExecutionMode::Foreground)
+                .register(TaskKind::Shell, "cargo build", "cargo build", None, TaskExecutionMode::Foreground)
                 .unwrap();
             host.task_manager.append_output(&task.id, "Finished dev profile\n");
             task.try_promote_to_background().unwrap();
@@ -16435,7 +16449,7 @@ mod tests {
             host.initialize(InitParams::default()).await.unwrap();
             let task = host
                 .task_manager
-                .register(TaskKind::Shell, "server", None, TaskExecutionMode::Foreground)
+                .register(TaskKind::Shell, "server", "server", None, TaskExecutionMode::Foreground)
                 .unwrap();
             task.try_promote_to_background().unwrap();
             crate::dispatch::dispatch("shutdown", None, host.as_ref()).await.unwrap();
@@ -16458,14 +16472,14 @@ mod tests {
 
             let manager = &host.task_manager;
             let awaited = manager
-                .register(TaskKind::Shell, "awaited", None, TaskExecutionMode::Foreground)
+                .register(TaskKind::Shell, "awaited", "awaited", None, TaskExecutionMode::Foreground)
                 .unwrap();
             let detached = manager
-                .register(TaskKind::Shell, "detached", None, TaskExecutionMode::Foreground)
+                .register(TaskKind::Shell, "detached", "detached", None, TaskExecutionMode::Foreground)
                 .unwrap();
             detached.try_promote_to_background().unwrap();
             let done = manager
-                .register(TaskKind::Shell, "done", None, TaskExecutionMode::Foreground)
+                .register(TaskKind::Shell, "done", "done", None, TaskExecutionMode::Foreground)
                 .unwrap();
             manager.complete(&done.id, Some("exit code: 0".into()));
 
@@ -16484,7 +16498,7 @@ mod tests {
             assert_eq!(call("task/background", &done.id).await["reason"], "notRunning");
             assert_eq!(call("task/background", "task-9999").await["reason"], "notFound");
             let subagent = manager
-                .register(TaskKind::Subagent, "agent", None, TaskExecutionMode::Foreground)
+                .register(TaskKind::Subagent, "agent", "agent", None, TaskExecutionMode::Foreground)
                 .unwrap();
             assert_eq!(call("task/background", &subagent.id).await["reason"], "notBackgroundable");
             assert!(dispatch("task/background", None, host.as_ref()).await.is_err(), "taskId is required");
@@ -16519,12 +16533,12 @@ mod tests {
 
             let manager = &host.task_manager;
             let agent = manager
-                .register(TaskKind::Subagent, "agent", None, TaskExecutionMode::Background)
+                .register(TaskKind::Subagent, "agent", "agent", None, TaskExecutionMode::Background)
                 .unwrap();
             let inbox = Arc::new(coda_agent::SteeringInbox::new());
             agent.attach_steering(Arc::clone(&inbox));
             let shell = manager
-                .register(TaskKind::Shell, "build", None, TaskExecutionMode::Background)
+                .register(TaskKind::Shell, "build", "build", None, TaskExecutionMode::Background)
                 .unwrap();
 
             let send = |task_id: String, text: &'static str| {
@@ -16590,7 +16604,7 @@ mod tests {
 
             let review = host
                 .task_manager
-                .register(TaskKind::Shell, "review.ps1 -Post", None, TaskExecutionMode::Background)
+                .register(TaskKind::Shell, "review.ps1 -Post", "review.ps1 -Post", None, TaskExecutionMode::Background)
                 .unwrap();
             host.task_manager.append_output(&review.id, "scanning PR 42\n");
 
@@ -17358,7 +17372,7 @@ mod tests {
                         answer("probe done")
                     }
                 } else if self.main_requests.fetch_add(1, Ordering::SeqCst) == 0 {
-                    tool_use("task", json!({ "prompt": PROBE }))
+                    tool_use("task", json!({ "title": "Probe", "prompt": PROBE }))
                 } else {
                     answer("noted")
                 };
@@ -17488,9 +17502,9 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let (host, _rx) = host_with_events(dir.path());
             let m = &host.task_manager;
-            let shell = m.register(TaskKind::Shell, "build", None, TaskExecutionMode::Background).unwrap();
-            let agent = m.register(TaskKind::Subagent, "agent", None, TaskExecutionMode::Background).unwrap();
-            let done = m.register(TaskKind::Subagent, "done", None, TaskExecutionMode::Background).unwrap();
+            let shell = m.register(TaskKind::Shell, "build", "build", None, TaskExecutionMode::Background).unwrap();
+            let agent = m.register(TaskKind::Subagent, "agent", "agent", None, TaskExecutionMode::Background).unwrap();
+            let done = m.register(TaskKind::Subagent, "done", "done", None, TaskExecutionMode::Background).unwrap();
             m.complete(&done.id, Some("report".into()));
 
             let reason = |r: Result<Value, RpcError>| r.unwrap()["reason"].as_str().map(str::to_owned);
@@ -17514,9 +17528,9 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let (host, _rx) = host_with_events(dir.path());
             let m = &host.task_manager;
-            let parent = m.register(TaskKind::Subagent, "p", None, TaskExecutionMode::Background).unwrap();
+            let parent = m.register(TaskKind::Subagent, "p", "p", None, TaskExecutionMode::Background).unwrap();
             let child = m
-                .register(TaskKind::Subagent, "c", Some(&parent.id), TaskExecutionMode::Background)
+                .register(TaskKind::Subagent, "c", "c", Some(&parent.id), TaskExecutionMode::Background)
                 .unwrap();
             assert_eq!(call(&host, "task/suspend", &parent.id).await.unwrap()["ok"], true);
 
@@ -17533,9 +17547,9 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let (host, _rx) = host_with_events(dir.path());
             let m = &host.task_manager;
-            let a = m.register(TaskKind::Subagent, "a", None, TaskExecutionMode::Background).unwrap();
-            let b = m.register(TaskKind::Subagent, "b", None, TaskExecutionMode::Background).unwrap();
-            let shell = m.register(TaskKind::Shell, "build", None, TaskExecutionMode::Background).unwrap();
+            let a = m.register(TaskKind::Subagent, "a", "a", None, TaskExecutionMode::Background).unwrap();
+            let b = m.register(TaskKind::Subagent, "b", "b", None, TaskExecutionMode::Background).unwrap();
+            let shell = m.register(TaskKind::Shell, "build", "build", None, TaskExecutionMode::Background).unwrap();
 
             let r = dispatch("session/suspendAllTasks", None, host.as_ref()).await.unwrap();
             assert_eq!(r, json!({ "ok": true, "count": 2 }), "shell tasks are not suspendable");
@@ -17557,7 +17571,7 @@ mod tests {
             let (host, _rx) = host_with_events(dir.path());
             let agent = host
                 .task_manager
-                .register(TaskKind::Subagent, "agent", None, TaskExecutionMode::Background)
+                .register(TaskKind::Subagent, "agent", "agent", None, TaskExecutionMode::Background)
                 .unwrap();
             host.begin_draining(None, chrono::Utc::now() + chrono::Duration::minutes(10))
                 .await
@@ -17883,7 +17897,7 @@ mod tests {
             // completing, so it is interrupted at the deadline.
             let shell = host
                 .task_manager
-                .register(TaskKind::Shell, "long build", None, TaskExecutionMode::Background)
+                .register(TaskKind::Shell, "long build", "long build", None, TaskExecutionMode::Background)
                 .unwrap();
             host.session
                 .steering
@@ -17932,7 +17946,7 @@ mod tests {
                 let late_id = Arc::clone(&late_id);
                 move || {
                     let late = tasks
-                        .register(TaskKind::Shell, "late tool", None, TaskExecutionMode::Background)
+                        .register(TaskKind::Shell, "late tool", "late tool", None, TaskExecutionMode::Background)
                         .unwrap();
                     *late_id.lock().unwrap() = Some(late.id.clone());
                 }
@@ -18117,7 +18131,7 @@ mod tests {
                         Reply::Now(tool_use("task_wait", json!({ "taskId": id, "timeoutSeconds": 120 })))
                     }
                     "outer" if r.tool_results.is_empty() => {
-                        Reply::Now(tool_use("task", json!({ "prompt": INNER })))
+                        Reply::Now(tool_use("task", json!({ "title": "Inner agent", "prompt": INNER })))
                     }
                     "outer" => Reply::Now(answer("waiting for the inner agent")),
                     "inner" if r.tool_results.is_empty() => {
@@ -18126,7 +18140,7 @@ mod tests {
                     }
                     "inner" => Reply::Now(answer("inner done")),
                     _ if r.tool_results.is_empty() && r.last_text.contains("start the team") => {
-                        Reply::Now(tool_use("task", json!({ "prompt": OUTER })))
+                        Reply::Now(tool_use("task", json!({ "title": "Outer agent", "prompt": OUTER })))
                     }
                     _ => Reply::Now(answer("DONE")),
                 }

@@ -186,7 +186,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "tasks",
         aliases: &[],
         args: "[all]",
-        summary: "Browse active tasks (all: include finished ones).",
+        summary: "Browse active tasks (all: include finished ones). Enter on a task shows its title, full instructions and report.",
         scope: Scope::Local,
     },
     CommandSpec {

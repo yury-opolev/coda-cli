@@ -33,6 +33,13 @@
         "kind": {
           "type": "string"
         },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Short task label; absent only for tasks restored from older\ncheckpoints (clients fall back to `description`)."
+        },
         "description": {
           "type": "string"
         },

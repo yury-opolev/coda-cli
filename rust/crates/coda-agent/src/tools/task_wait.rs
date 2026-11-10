@@ -152,7 +152,7 @@ mod tests {
     async fn wait_for_already_terminal_task_returns_immediately() {
         let m = TaskManager::with_defaults("session");
         let t = m
-            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "t", "t", None, TaskExecutionMode::Background)
             .unwrap();
         m.complete(&t.id, Some("done!".into()));
         let result = TaskWaitTool
@@ -171,7 +171,7 @@ mod tests {
     async fn a_running_task_is_handed_to_the_executor_with_a_wait_capped_at_30s() {
         let m = TaskManager::with_defaults("session");
         let t = m
-            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "t", "t", None, TaskExecutionMode::Background)
             .unwrap();
         for (requested, expected) in [(None, 30), (Some(300), 30), (Some(5), 5), (Some(-1), 0)] {
             let mut input = serde_json::json!({"taskId": t.id});
@@ -191,7 +191,7 @@ mod tests {
     async fn task_wait_reports_suspended_child() {
         let m = TaskManager::with_defaults("session");
         let t = m
-            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "t", "t", None, TaskExecutionMode::Background)
             .unwrap();
         assert!(m.mark_suspended(&t.id, crate::tasks::TaskCheckpoint {
             history: Vec::new(),
@@ -223,10 +223,10 @@ mod tests {
     async fn wait_denied_for_sibling_looks_like_not_found_and_leaks_no_result() {
         let m = TaskManager::with_defaults("session");
         let a = m
-            .register(TaskKind::Subagent, "a", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "a", "a", None, TaskExecutionMode::Background)
             .unwrap();
         let b = m
-            .register(TaskKind::Subagent, "b", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "b", "b", None, TaskExecutionMode::Background)
             .unwrap();
         m.complete(&b.id, Some(SIBLING_CANARY.into()));
 
@@ -257,11 +257,11 @@ mod tests {
     async fn wait_denied_for_ancestor_looks_like_not_found() {
         let m = TaskManager::with_defaults("session");
         let parent = m
-            .register(TaskKind::Subagent, "parent", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "parent", "parent", None, TaskExecutionMode::Background)
             .unwrap();
         m.complete(&parent.id, Some(SIBLING_CANARY.into()));
         let child = m
-            .register(TaskKind::Subagent, "child", Some(&parent.id), TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "child", "child", Some(&parent.id), TaskExecutionMode::Background)
             .unwrap();
 
         let result = TaskWaitTool
@@ -282,7 +282,7 @@ mod tests {
     async fn wait_denied_for_self_looks_like_not_found() {
         let m = TaskManager::with_defaults("session");
         let t = m
-            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "t", "t", None, TaskExecutionMode::Background)
             .unwrap();
         m.complete(&t.id, Some(SIBLING_CANARY.into()));
 
@@ -303,7 +303,7 @@ mod tests {
     async fn wait_denied_for_unknown_caller_looks_like_not_found() {
         let m = TaskManager::with_defaults("session");
         let t = m
-            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "t", "t", None, TaskExecutionMode::Background)
             .unwrap();
         m.complete(&t.id, Some(SIBLING_CANARY.into()));
 
@@ -325,10 +325,10 @@ mod tests {
     async fn wait_allowed_for_own_descendant() {
         let m = TaskManager::with_defaults("session");
         let parent = m
-            .register(TaskKind::Subagent, "parent", None, TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "parent", "parent", None, TaskExecutionMode::Background)
             .unwrap();
         let child = m
-            .register(TaskKind::Subagent, "child", Some(&parent.id), TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "child", "child", Some(&parent.id), TaskExecutionMode::Background)
             .unwrap();
         m.complete(&child.id, Some("child result".into()));
 

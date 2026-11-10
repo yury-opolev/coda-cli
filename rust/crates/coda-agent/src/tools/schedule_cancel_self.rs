@@ -234,6 +234,7 @@ mod tests {
             .register(
                 TaskKind::Scheduled,
                 "Scheduled: watcher",
+                "Scheduled: watcher",
                 None,
                 TaskExecutionMode::Background,
             )
@@ -468,6 +469,7 @@ mod tests {
             .register(
                 TaskKind::Subagent,
                 "nested child",
+                "nested child",
                 Some(&f.run_task),
                 TaskExecutionMode::Foreground,
             )
@@ -500,6 +502,7 @@ mod tests {
             .register(
                 TaskKind::Subagent,
                 "unrelated worker",
+                "unrelated worker",
                 None,
                 TaskExecutionMode::Background,
             )
@@ -525,7 +528,7 @@ mod tests {
         let f = fixture("cancel-self-uniform-refusal");
         let child = f
             .manager
-            .register(TaskKind::Subagent, "child", Some(&f.run_task), TaskExecutionMode::Foreground)
+            .register(TaskKind::Subagent, "child", "child", Some(&f.run_task), TaskExecutionMode::Foreground)
             .unwrap();
 
         let contexts = vec![

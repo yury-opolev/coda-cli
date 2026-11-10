@@ -71,7 +71,7 @@ pub(crate) fn resolve_trusted_source(ctx: &ToolContext) -> Result<MessageSource,
                  notification."
             ));
         };
-        return Ok(MessageSource::Subagent { task_id: task_id.clone(), label: snapshot.description });
+        return Ok(MessageSource::Subagent { task_id: task_id.clone(), label: snapshot.label().to_owned() });
     }
 
     if ctx.is_main_context {

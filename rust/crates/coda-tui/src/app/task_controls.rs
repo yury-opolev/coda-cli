@@ -503,6 +503,7 @@ mod tests {
                 id: "task-0003".into(),
                 parent_id: None,
                 kind: "shell".into(),
+                title: Some("build".into()),
                 description: "cargo build".into(),
                 status: "running".into(),
                 mode: "foreground".into(),

@@ -570,7 +570,13 @@ fn start_tool_task(
     }
     let manager = Arc::clone(ctx.task_manager.as_ref()?);
     let task = manager
-        .register(TaskKind::Tool, tool.name(), ctx.caller_task_id.as_deref(), TaskExecutionMode::Foreground)
+        .register(
+            TaskKind::Tool,
+            &crate::tasks::derive_task_title(tool.name()),
+            tool.name(),
+            ctx.caller_task_id.as_deref(),
+            TaskExecutionMode::Foreground,
+        )
         .ok()?;
     let tool = Arc::clone(tool);
     let input = input.clone();
@@ -942,11 +948,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let manager = TaskManager::new("s", Some(dir.path().to_path_buf()), 4096, 10);
         let owner =
-            manager.register(TaskKind::Subagent, "owner", None, TaskExecutionMode::Background).unwrap();
+            manager.register(TaskKind::Subagent, "owner", "owner", None, TaskExecutionMode::Background).unwrap();
         let inbox = Arc::new(SteeringInbox::new());
         owner.attach_steering(Arc::clone(&inbox));
         let child = manager
-            .register(TaskKind::Tool, "call", Some(&owner.id), TaskExecutionMode::Foreground)
+            .register(TaskKind::Tool, "call", "call", Some(&owner.id), TaskExecutionMode::Foreground)
             .unwrap();
         assert!(manager.mark_suspended(&child.id, TaskCheckpoint {
             history: Vec::new(),
@@ -1031,11 +1037,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let manager = TaskManager::new("s", Some(dir.path().to_path_buf()), 4096, 10);
         let owner =
-            manager.register(TaskKind::Subagent, "owner", None, TaskExecutionMode::Background).unwrap();
+            manager.register(TaskKind::Subagent, "owner", "owner", None, TaskExecutionMode::Background).unwrap();
         let inbox = Arc::new(SteeringInbox::new());
         owner.attach_steering(Arc::clone(&inbox));
         let child = manager
-            .register(TaskKind::Subagent, "child", Some(&owner.id), TaskExecutionMode::Background)
+            .register(TaskKind::Subagent, "child", "child", Some(&owner.id), TaskExecutionMode::Background)
             .unwrap();
 
         let registry = ToolRegistry::new(Vec::<Arc<dyn crate::tool::Tool>>::new());
@@ -1092,7 +1098,7 @@ mod tests {
 
         for (output, expected_tail) in [("npm test\n3 passing\n", "npm test\n3 passing"), ("", "(no output)")] {
             let task = manager
-                .register(TaskKind::Shell, "npm test", None, TaskExecutionMode::Foreground)
+                .register(TaskKind::Shell, "npm test", "npm test", None, TaskExecutionMode::Foreground)
                 .unwrap();
             if !output.is_empty() {
                 manager.append_output(&task.id, output);
