@@ -90,6 +90,8 @@ struct Layout {
     lines: Vec<Line<'static>>,
     /// Inclusive line range scrolling keeps visible.
     focus_rows: (usize, usize),
+    /// The message under everything else, kept in view while it shows.
+    message_rows: Option<(usize, usize)>,
     option_rows: Vec<(usize, usize)>,
     field_rows: Option<(usize, usize)>,
     /// The caret as (column, line), when the field has focus.
@@ -115,7 +117,6 @@ pub struct QuestionView {
     manual_scroll: Option<usize>,
     last_scroll: Cell<usize>,
     last_height: Cell<u16>,
-    overflowing: Cell<bool>,
 }
 
 impl QuestionView {
@@ -164,7 +165,6 @@ impl QuestionView {
             manual_scroll: None,
             last_scroll: Cell::new(0),
             last_height: Cell::new(0),
-            overflowing: Cell::new(false),
         }
     }
 
@@ -223,6 +223,7 @@ impl QuestionView {
 
     fn set_message(&mut self, message: impl Into<String>) {
         self.message = Some((message.into(), true));
+        self.manual_scroll = None;
     }
 
     /// Shows a message under the question, e.g. a clipboard error.
@@ -551,9 +552,9 @@ impl QuestionView {
         } else if self.allow_free_text {
             hints.push("Ctrl+V/Alt+V paste".into());
         }
-        if self.overflowing.get() {
-            hints.push("PgUp/PgDn scroll".into());
-        }
+        // Always offered: hints are drawn before the body, so overflow
+        // measured while rendering would lag a frame behind.
+        hints.push("PgUp/PgDn scroll".into());
         hints.push("Esc cancel".into());
         hints.join("  ")
     }
@@ -619,6 +620,7 @@ impl QuestionView {
             attachment_rows = Some((start, lines.len() - 1));
         }
 
+        let mut message_rows = None;
         if let Some((message, warning)) = &self.message {
             let (role, prefix) = if *warning {
                 (Role::Warning, "⚠ ")
@@ -626,8 +628,12 @@ impl QuestionView {
                 (Role::Notification, "")
             };
             let message = format!("{prefix}{}", text::sanitize(message));
+            let start = lines.len();
             for row in text::wrap(&message, width) {
                 lines.push(Line::from(Span::styled(row, theme.style(role))));
+            }
+            if lines.len() > start {
+                message_rows = Some((start, lines.len() - 1));
             }
         }
 
@@ -646,6 +652,7 @@ impl QuestionView {
         Layout {
             lines,
             focus_rows,
+            message_rows,
             option_rows,
             field_rows,
             caret,
@@ -755,6 +762,16 @@ impl QuestionView {
                 } else if end >= scroll + height {
                     scroll = end + 1 - height;
                 }
+                // The message is the last thing laid out. Bottom-aligning it
+                // keeps the focus too when both fit, and otherwise as much of
+                // the focus's end as there is room for.
+                if let Some((start, end)) = layout.message_rows {
+                    if end + 1 - start > height {
+                        scroll = start;
+                    } else if end >= scroll + height {
+                        scroll = end + 1 - height;
+                    }
+                }
                 scroll
             }
         };
@@ -765,7 +782,6 @@ impl QuestionView {
         let height = area.height as usize;
         let layout = self.layout(area.width.max(1) as usize, theme);
         self.last_height.set(area.height);
-        self.overflowing.set(layout.lines.len() > height);
         if height == 0 {
             return Vec::new();
         }
@@ -1183,6 +1199,56 @@ mod tests {
         };
         assert_eq!(view.handle_mouse(click, area), QuestionOutcome::Handled);
         assert_eq!(view.handle_key(key(KeyCode::Enter)), submitted("option7"));
+    }
+
+    fn flat(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn a_refusal_stays_in_view_with_the_highlighted_option_on_a_small_area() {
+        let options: Vec<String> = (0..30).map(|i| format!("option{i}")).collect();
+        let mut view = QuestionView::new("Q".into(), options, true, false, true);
+        shown(&view, 30, 10);
+        view.handle_key(key(KeyCode::End));
+        shown(&view, 30, 10);
+        view.handle_key(key(KeyCode::Up));
+        assert_eq!(view.handle_key(key(KeyCode::Enter)), QuestionOutcome::Handled);
+        let visible = flat(&shown(&view, 30, 10));
+        assert!(visible.contains("Choose an option or type an answer"), "{visible}");
+        assert!(visible.contains("option28"), "{visible}");
+    }
+
+    #[test]
+    fn a_refusal_wins_over_a_focus_too_far_away_to_show_with_it() {
+        let options: Vec<String> = (0..30).map(|i| format!("option{i}")).collect();
+        let refs: Vec<&str> = options.iter().map(String::as_str).collect();
+        let mut view = q(&refs, true);
+        shown(&view, 30, 10);
+        assert_eq!(view.handle_key(key(KeyCode::Enter)), QuestionOutcome::Handled);
+        let visible = flat(&shown(&view, 30, 10));
+        assert!(visible.contains("Choose an option or type an answer"), "{visible}");
+    }
+
+    #[test]
+    fn a_new_message_overrides_manual_scroll() {
+        let options: Vec<String> = (0..30).map(|i| format!("option{i}")).collect();
+        let mut view = QuestionView::new("Q".into(), options, false, true, false);
+        shown(&view, 30, 8);
+        view.handle_key(key(KeyCode::PageDown));
+        shown(&view, 30, 8);
+        assert!(view.attach_image("image/png", "AAAA".into()).is_err());
+        let visible = flat(&shown(&view, 30, 8));
+        assert!(visible.contains("does not accept image input"), "{visible}");
+    }
+
+    #[test]
+    fn the_scroll_hint_is_offered_before_any_render() {
+        let view = q(&["one", "two"], false);
+        let hints = view.hints();
+        assert!(hints.contains("PgUp/PgDn scroll"), "{hints}");
+        assert!(hints.ends_with("PgUp/PgDn scroll  Esc cancel"), "{hints}");
+        assert!(hints.starts_with(glyphs::ARROWS_VERTICAL), "{hints}");
     }
 
     #[test]
