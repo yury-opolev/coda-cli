@@ -186,6 +186,11 @@ impl SurfaceStack {
             .is_some_and(|surface| surface.handle_paste(text))
     }
 
+    /// The question hosted by the top surface, if it hosts one.
+    pub fn top_question_mut(&mut self) -> Option<&mut crate::surface::question::QuestionView> {
+        self.surfaces.last_mut().and_then(|surface| surface.question_mut())
+    }
+
     /// Renders every surface bottom-up.
     ///
     /// Each surface is given its *content* area, not its outer region: it

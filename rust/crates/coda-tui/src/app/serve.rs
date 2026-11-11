@@ -1154,16 +1154,17 @@ impl App {
         prompt: &crate::state::PendingPrompt,
         allowed: bool,
         answer: Option<&str>,
+        images: &[coda_proto::messages::WireImage],
     ) {
         match self.pending.take_current(self.view.engine_instance_id()) {
             Delivery::Raw(responder) => {
-                match super::engine::prompt_response(prompt, allowed, answer) {
+                match super::engine::prompt_response(prompt, allowed, answer, images) {
                     Ok(value) => responder.respond(value),
                     Err(error) => responder.fail(error.code, error.message),
                 }
             }
             Delivery::Rpc { request_id } => {
-                let outcome = super::engine::rpc_outcome(prompt, allowed, answer);
+                let outcome = super::engine::rpc_outcome(prompt, allowed, answer, images);
                 let result = match outcome {
                     Some(outcome) => {
                         self.bounded(api::resolve_request(
@@ -2133,7 +2134,7 @@ pub(in crate::app) mod tests {
         let dto = permission_dto("req-e1-1");
         discovered(app, &dto);
 
-        app.answer_prompt(true, None).await;
+        app.answer_prompt(true, None, Vec::new()).await;
 
         assert!(matches!(
             app.state.transcript.blocks().last(),
@@ -2404,6 +2405,113 @@ pub(in crate::app) mod tests {
         frames.iter().filter(|frame| frame.get("method").is_none()).collect()
     }
 
+    /// A `request/question` frame, as the engine sends it.
+    fn question_request(id: i64, handle: &str, accepts_images: bool) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "request/question",
+            "params": {
+                "requestId": handle,
+                "question": "Which?",
+                "options": ["a", "b"],
+                "allowFreeText": true,
+                "acceptsImages": accepts_images,
+            },
+        })
+    }
+
+    fn open_question(app: &mut App) -> &mut crate::surface::question::QuestionView {
+        app.surfaces.top_question_mut().expect("the question is on screen")
+    }
+
+    fn enter() -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_raw_answer_carries_the_attached_images_and_the_transcript_counts_them() {
+        let mut harness = app_with(crate::local::AccessMode::TrustedLocal, |_, _| json!({}));
+        harness.push(question_request(71, "req-e1-71", true));
+        let message = harness.next_inbound().await;
+        harness.app.on_inbound(message);
+        assert!(
+            matches!(harness.app.state.prompt, Some(PendingPrompt::Question { accepts_images: true, .. })),
+            "the engine's image capability was lost: {:?}",
+            harness.app.state.prompt
+        );
+        open_question(&mut harness.app)
+            .attach_image("image/png", "AAAA".into())
+            .expect("the question accepts images");
+
+        harness.app.on_key(enter()).await;
+        harness.settle_wire().await;
+
+        let frames = harness.frames();
+        let reply = response_for(&frames, 71)
+            .unwrap_or_else(|| panic!("the answer never left: {frames:?}"));
+        assert_eq!(
+            reply["result"],
+            json!({ "answer": "a", "images": [{ "mediaType": "image/png", "base64": "AAAA" }] }),
+            "{reply}"
+        );
+        let shown = format!("a\n[{} 1 image(s) attached]", crate::render::glyphs::CAMERA);
+        assert!(
+            harness.app.state.transcript.blocks().iter().any(|b| matches!(
+                b,
+                Block::Question { answer: Some(answer), .. } if *answer == shown
+            )),
+            "{:?}",
+            harness.app.state.transcript.blocks()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_out_of_band_answer_carries_the_attached_images() {
+        let mut harness =
+            app_with(crate::local::AccessMode::TrustedLocal, |_, _| json!({ "ok": true }));
+        let mut dto = question_dto("req-e1-72");
+        dto.display["acceptsImages"] = json!(true);
+        discovered(&mut harness.app, &dto);
+        open_question(&mut harness.app)
+            .attach_image("image/png", "AAAA".into())
+            .expect("the question accepts images");
+
+        harness.app.on_key(enter()).await;
+        harness.settle_wire().await;
+
+        let frames = harness.frames();
+        let resolve = frames
+            .iter()
+            .find(|f| f["method"] == "session/resolveRequest")
+            .unwrap_or_else(|| panic!("the answer never left: {frames:?}"));
+        assert_eq!(
+            resolve["params"]["outcome"],
+            json!({ "answer": "a", "images": [{ "mediaType": "image/png", "base64": "AAAA" }] })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bracketed_paste_reaches_the_open_question_and_never_the_composer() {
+        let mut harness = app_with(crate::local::AccessMode::TrustedLocal, |_, _| json!({}));
+        harness.push(question_request(73, "req-e1-73", false));
+        let message = harness.next_inbound().await;
+        harness.app.on_inbound(message);
+
+        harness.app.on_paste("hello".into());
+        assert!(harness.app.composer.is_empty(), "{:?}", harness.app.composer.text());
+
+        harness.app.on_key(enter()).await;
+        harness.settle_wire().await;
+        let frames = harness.frames();
+        let reply = response_for(&frames, 73)
+            .unwrap_or_else(|| panic!("the answer never left: {frames:?}"));
+        assert_eq!(reply["result"], json!({ "answer": "hello" }), "{reply}");
+    }
+
     #[tokio::test]
     async fn shutdown_rpc_failure_is_not_a_successful_exit() {
         let mut harness = app_answering(crate::local::AccessMode::TrustedLocal, |method, _| {
@@ -2535,7 +2643,7 @@ pub(in crate::app) mod tests {
         harness.push(permission_request(51, "req-e1-51"));
         let message = harness.next_inbound().await;
         harness.app.on_inbound(message);
-        harness.app.answer_prompt(true, None).await;
+        harness.app.answer_prompt(true, None, Vec::new()).await;
         harness.settle_wire().await;
 
         let frames = harness.frames();
@@ -5808,7 +5916,7 @@ pub(in crate::app) mod tests {
 
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            app.answer_prompt(true, None),
+            app.answer_prompt(true, None, Vec::new()),
         )
         .await
         .expect("answering must not hold the loop for ever");

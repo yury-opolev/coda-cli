@@ -641,7 +641,10 @@ pub fn prompt_from_dto(dto: &PendingRequestDto) -> Option<PendingPrompt> {
                 .get("allowFreeText")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true),
-            accepts_images: false,
+            accepts_images: display
+                .get("acceptsImages")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         }),
         PendingRequestKind::PlanApproval => {
             Some(PendingPrompt::PlanApproval { plan: text("plan").unwrap_or_default() })
@@ -1120,6 +1123,18 @@ mod tests {
             }
             other => panic!("expected a question, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_discovered_question_reads_its_image_capability() {
+        let accepts = |display: serde_json::Value| {
+            match prompt_from_dto(&dto("req-e1-4", PendingRequestKind::Question, display)) {
+                Some(PendingPrompt::Question { accepts_images, .. }) => accepts_images,
+                other => panic!("expected a question, got {other:?}"),
+            }
+        };
+        assert!(accepts(json!({ "question": "Q", "acceptsImages": true })));
+        assert!(!accepts(json!({ "question": "Q" })), "an older engine never offers images");
     }
 
     #[test]

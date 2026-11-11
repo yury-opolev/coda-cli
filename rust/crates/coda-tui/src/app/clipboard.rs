@@ -422,76 +422,57 @@ impl App {
             return;
         }
 
-        let mut clipboard = match arboard::Clipboard::new() {
-            Ok(c) => c,
-            Err(err) => {
+        match read_clipboard_for_paste() {
+            ClipboardPaste::Image(png_bytes) => {
+                let token = self.stage_image_bytes("image/png", &png_bytes);
+                let size_kb = png_bytes.len() as f64 / 1024.0;
                 self.notice(
-                    format!("Could not access the clipboard: {err}"),
-                    NoticeLevel::Warning,
+                    format!(
+                        "Pasted clipboard image as {token} ({size_kb:.1} KB). \
+                         It will be sent with your next message."
+                    ),
+                    NoticeLevel::Info,
                 );
-                return;
+                self.dirty = true;
             }
-        };
-
-        match clipboard.get_image() {
-            Ok(img) => {
-                match crate::app::image::rgba_to_png(img.width, img.height, &img.bytes) {
-                    Ok(png_bytes) => {
-                        if png_bytes.len() > crate::app::image::MAX_IMAGE_BYTES {
-                            let size_mb = png_bytes.len() as f64 / (1024.0 * 1024.0);
-                            self.notice(
-                                format!(
-                                    "Clipboard image too large ({size_mb:.1} MB encoded). Maximum is 5 MB."
-                                ),
-                                NoticeLevel::Warning,
-                            );
-                        } else {
-                            let token = self.stage_image_bytes("image/png", &png_bytes);
-                            let size_kb = png_bytes.len() as f64 / 1024.0;
-                            self.notice(
-                                format!(
-                                    "Pasted clipboard image as {token} ({size_kb:.1} KB). \
-                                     It will be sent with your next message."
-                                ),
-                                NoticeLevel::Info,
-                            );
-                            self.dirty = true;
-                        }
-                    }
-                    Err(err) => {
-                        self.notice(
-                            format!("Could not encode clipboard image: {err}"),
-                            NoticeLevel::Warning,
-                        );
-                    }
-                }
+            ClipboardPaste::Text(text) => {
+                self.composer.insert(&text);
+                self.dirty = true;
             }
-            // No image on the clipboard — fall back to text.
-            Err(arboard::Error::ContentNotAvailable) => {
-                match clipboard.get_text() {
-                    Ok(text) if !text.is_empty() => {
-                        self.composer.insert(&text);
-                        self.dirty = true;
-                    }
-                    Ok(_) => {}
-                    Err(arboard::Error::ContentNotAvailable) => {}
-                    Err(err) => {
-                        self.notice(
-                            format!("Could not read the clipboard: {err}"),
-                            NoticeLevel::Warning,
-                        );
-                    }
-                }
-            }
-            // A real clipboard error (not just "no image") — report it and
-            // stop; do not silently fall back to a text read.
-            Err(err) => {
-                self.notice(
-                    format!("Could not read clipboard image: {err}"),
-                    NoticeLevel::Warning,
-                );
-            }
+            ClipboardPaste::Empty => {}
+            ClipboardPaste::Problem(message) => self.notice(message, NoticeLevel::Warning),
         }
+    }
+
+    /// Pastes the clipboard into the open question: an image is attached,
+    /// text goes into the answer field.
+    pub(super) fn paste_into_question(&mut self) {
+        if self.surfaces.top_question_mut().is_none() {
+            return;
+        }
+        let paste = read_clipboard_for_paste();
+        if let Some(view) = self.surfaces.top_question_mut() {
+            paste_into_question_view(view, paste);
+        }
+        self.dirty = true;
+    }
+
+    /// Bracketed paste from the terminal.
+    pub(super) fn on_paste(&mut self, text: String) {
+        self.dirty = true;
+        if self.surfaces.is_empty() {
+            self.composer.insert(&text);
+            return;
+        }
+        // The composer is hidden behind an open surface, so a paste goes to
+        // the surface or nowhere. Some terminals send an empty bracketed
+        // paste when the clipboard holds an image, so an open question reads
+        // the clipboard itself then.
+        if text.is_empty() {
+            self.paste_into_question();
+            return;
+        }
+        self.surfaces.handle_paste(&text);
     }
 
     /// Right-click paste: delegates to the unified clipboard paste which
@@ -540,6 +521,63 @@ impl App {
 /// memory carries over. A selection is consumed by the copy, which is what
 /// makes the alternation feel natural — select, right-click to copy, then
 /// right-click again to paste.
+/// What a clipboard paste found, read once and shared by the composer and the
+/// question modal so both apply the same checks and wording.
+pub(super) enum ClipboardPaste {
+    /// PNG bytes, already within the size cap.
+    Image(Vec<u8>),
+    Text(String),
+    Empty,
+    /// A user-facing explanation of why nothing could be pasted.
+    Problem(String),
+}
+
+/// Reads the clipboard, preferring an image over text.
+///
+/// Text is the fallback only when the clipboard has no image
+/// (`ContentNotAvailable`), *not* on other clipboard errors — a partial read
+/// should not silently downgrade to text.
+pub(super) fn read_clipboard_for_paste() -> ClipboardPaste {
+    let mut clipboard = match arboard::Clipboard::new() {
+        Ok(c) => c,
+        Err(err) => return ClipboardPaste::Problem(format!("Could not access the clipboard: {err}")),
+    };
+    match clipboard.get_image() {
+        Ok(img) => match crate::app::image::rgba_to_png(img.width, img.height, &img.bytes) {
+            Ok(png_bytes) if png_bytes.len() > crate::app::image::MAX_IMAGE_BYTES => {
+                let size_mb = png_bytes.len() as f64 / (1024.0 * 1024.0);
+                ClipboardPaste::Problem(format!(
+                    "Clipboard image too large ({size_mb:.1} MB encoded). Maximum is 5 MB."
+                ))
+            }
+            Ok(png_bytes) => ClipboardPaste::Image(png_bytes),
+            Err(err) => ClipboardPaste::Problem(format!("Could not encode clipboard image: {err}")),
+        },
+        Err(arboard::Error::ContentNotAvailable) => match clipboard.get_text() {
+            Ok(text) if !text.is_empty() => ClipboardPaste::Text(text),
+            Ok(_) | Err(arboard::Error::ContentNotAvailable) => ClipboardPaste::Empty,
+            Err(err) => ClipboardPaste::Problem(format!("Could not read the clipboard: {err}")),
+        },
+        Err(err) => ClipboardPaste::Problem(format!("Could not read clipboard image: {err}")),
+    }
+}
+
+/// Applies a clipboard read to the open question. A refused image (too many,
+/// or a question that does not accept images) is already shown by the view.
+pub(super) fn paste_into_question_view(
+    view: &mut crate::surface::question::QuestionView,
+    paste: ClipboardPaste,
+) {
+    match paste {
+        ClipboardPaste::Image(png) => {
+            let _ = view.attach_image("image/png", crate::app::image::base64_encode(&png));
+        }
+        ClipboardPaste::Text(text) => view.paste_text(&text),
+        ClipboardPaste::Problem(message) => view.show_message(message),
+        ClipboardPaste::Empty => {}
+    }
+}
+
 fn pointer_action(has_selection: bool) -> Option<PointerAction> {
     Some(if has_selection {
         PointerAction::Copy
@@ -614,6 +652,53 @@ fn resolve_copy_payload(
 mod tests {
     use super::*;
 
+    fn question(accepts_images: bool) -> crate::surface::question::QuestionView {
+        crate::surface::question::QuestionView::new(
+            "Which?".into(),
+            vec!["a".into()],
+            false,
+            true,
+            accepts_images,
+        )
+    }
+
+    fn shown(view: &crate::surface::question::QuestionView) -> String {
+        let area = ratatui::layout::Rect::new(0, 0, 100, 40);
+        view.render(area, &coda_render::theme::Theme::default())
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_clipboard_image_is_attached_to_a_question_that_accepts_images() {
+        let mut view = question(true);
+        paste_into_question_view(&mut view, ClipboardPaste::Image(vec![1, 2, 3]));
+        assert_eq!(view.attachment_count(), 1);
+        assert_eq!(view.images()[0].media_type, "image/png");
+        assert_eq!(view.images()[0].base64, crate::app::image::base64_encode(&[1, 2, 3]));
+    }
+
+    #[test]
+    fn a_clipboard_image_is_refused_with_an_explanation_when_images_are_not_accepted() {
+        let mut view = question(false);
+        paste_into_question_view(&mut view, ClipboardPaste::Image(vec![1, 2, 3]));
+        assert_eq!(view.attachment_count(), 0);
+        assert!(shown(&view).contains("Images can't be sent"), "{}", shown(&view));
+    }
+
+    #[test]
+    fn clipboard_text_and_problems_land_in_the_question() {
+        let mut view = question(true);
+        paste_into_question_view(&mut view, ClipboardPaste::Text("typed elsewhere".into()));
+        paste_into_question_view(&mut view, ClipboardPaste::Problem("Could not read the clipboard: x".into()));
+        paste_into_question_view(&mut view, ClipboardPaste::Empty);
+        let shown = shown(&view);
+        assert!(shown.contains("typed elsewhere"), "{shown}");
+        assert!(shown.contains("Could not read the clipboard: x"), "{shown}");
+        assert_eq!(view.attachment_count(), 0);
+    }
     #[test]
     fn right_click_with_a_selection_copies() {
         assert_eq!(pointer_action(true), Some(PointerAction::Copy));

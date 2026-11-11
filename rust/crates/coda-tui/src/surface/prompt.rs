@@ -186,6 +186,10 @@ impl Surface for PromptSurface {
         }
     }
 
+    fn question_mut(&mut self) -> Option<&mut QuestionView> {
+        self.question.as_mut()
+    }
+
     fn desired_size(&self, max_width: u16, theme: &Theme) -> (u16, u16) {
         // Measured without rendering: rendering a question records its scroll
         // position, and a probe at an unlimited height would reset it.

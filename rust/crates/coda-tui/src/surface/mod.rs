@@ -300,10 +300,16 @@ pub trait Surface {
 
     /// Takes bracketed-paste text, returning whether it was consumed.
     ///
-    /// The default declines, so a paste reaches the composer unless the open
-    /// surface has somewhere to put it.
+    /// The default declines. A paste never reaches the composer while a
+    /// surface is open, so a declined paste is simply dropped.
     fn handle_paste(&mut self, _text: &str) -> bool {
         false
+    }
+
+    /// The open question, for a surface that hosts one, so the application
+    /// can attach a clipboard image to it.
+    fn question_mut(&mut self) -> Option<&mut question::QuestionView> {
+        None
     }
 
     /// Renders at most `area.height` lines, scrolled so the focused element is
