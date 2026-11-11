@@ -380,6 +380,16 @@ pub struct TextArea {
     row: usize,
     column: usize,
     visible_rows: usize,
+    soft_wrap: bool,
+}
+
+/// One visual row of a soft-wrapped [`TextArea`]: the logical line it belongs
+/// to and the `start..end` character range it shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Segment {
+    row: usize,
+    start: usize,
+    end: usize,
 }
 
 impl TextArea {
@@ -390,13 +400,122 @@ impl TextArea {
             row: 0,
             column: 0,
             visible_rows: 5,
+            soft_wrap: false,
         }
     }
 
     /// Sets how many rows the field shows before it scrolls.
     pub fn with_visible_rows(mut self, rows: usize) -> Self {
-        self.visible_rows = rows.max(1);
+        self.set_visible_rows(rows);
         self
+    }
+
+    /// Sets how many rows the field shows before it scrolls.
+    pub fn set_visible_rows(&mut self, rows: usize) {
+        self.visible_rows = rows.max(1);
+    }
+
+    /// Wraps long lines onto further rows instead of truncating them, so
+    /// everything typed or pasted stays visible.
+    pub fn with_soft_wrap(mut self) -> Self {
+        self.soft_wrap = true;
+        self
+    }
+
+    /// Number of logical lines in the value.
+    pub fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// Rows the content occupies at `width`; the line count unless soft
+    /// wrapping.
+    pub fn visual_rows(&self, width: u16) -> usize {
+        if self.soft_wrap {
+            self.segments(content_width(width)).len()
+        } else {
+            self.lines.len()
+        }
+    }
+
+    /// Inserts `text` at the caret, as a paste would.
+    ///
+    /// Line endings are normalised to `\n` and tabs become spaces; any other
+    /// control character is dropped so a pasted escape sequence cannot reach
+    /// the terminal or the value.
+    pub fn insert_text(&mut self, text: &str) {
+        let normalised = text.replace("\r\n", "\n").replace('\r', "\n");
+        let tail = self.lines[self.row].split_off(self.column);
+        for c in normalised.chars() {
+            match c {
+                '\n' => self.break_line(),
+                '\t' => {
+                    for _ in 0..text::TAB_WIDTH {
+                        self.lines[self.row].push(' ');
+                        self.column += 1;
+                    }
+                }
+                c if c.is_control() => {}
+                c => {
+                    self.lines[self.row].push(c);
+                    self.column += 1;
+                }
+            }
+        }
+        self.lines[self.row].extend(tail);
+    }
+
+    /// Splits the current line at the caret and moves to the new line.
+    fn break_line(&mut self) {
+        let tail = self.lines[self.row].split_off(self.column);
+        self.lines.insert(self.row + 1, tail);
+        self.row += 1;
+        self.column = 0;
+    }
+
+    /// Lays the value out in visual rows of at most `inner` cells.
+    ///
+    /// Characters are measured as they will be drawn (after sanitising), and a
+    /// wide glyph that does not fit the rest of a row moves to the next one
+    /// whole rather than being split.
+    fn segments(&self, inner: usize) -> Vec<Segment> {
+        let inner = inner.max(1);
+        let mut segments = Vec::new();
+        for (row, line) in self.lines.iter().enumerate() {
+            let mut start = 0;
+            let mut used = 0;
+            for (index, c) in line.iter().enumerate() {
+                let cells = text::width(&text::sanitize(&c.to_string()));
+                // A row always takes at least one character, so a glyph wider
+                // than the field cannot stall the layout.
+                if used + cells > inner && index > start {
+                    segments.push(Segment { row, start, end: index });
+                    start = index;
+                    used = 0;
+                }
+                used += cells;
+            }
+            segments.push(Segment { row, start, end: line.len() });
+        }
+        segments
+    }
+
+    /// Index into `segments` of the visual row holding the caret.
+    fn caret_segment(&self, segments: &[Segment]) -> usize {
+        segments
+            .iter()
+            .position(|s| s.row == self.row && self.column >= s.start && self.column < s.end)
+            // At the end of its line the caret sits after the last character.
+            .or_else(|| segments.iter().rposition(|s| s.row == self.row))
+            .unwrap_or(0)
+    }
+
+    /// First visible visual row, scrolled to keep the caret's row in view.
+    fn wrapped_scroll(&self, caret: usize) -> usize {
+        caret.saturating_sub(self.visible_rows.saturating_sub(1))
+    }
+
+    fn segment_text(&self, segment: Segment) -> String {
+        text::sanitize(&self.lines[segment.row][segment.start..segment.end].iter().collect::<String>())
     }
 
     pub fn with_value(mut self, value: impl Into<String>) -> Self {
@@ -452,10 +571,7 @@ impl Control for TextArea {
             // field the newline is the whole point, so the form's submit key
             // has to give way here.
             KeyCode::Enter => {
-                let tail = self.lines[self.row].split_off(self.column);
-                self.lines.insert(self.row + 1, tail);
-                self.row += 1;
-                self.column = 0;
+                self.break_line();
                 KeyOutcome::Consumed
             }
             KeyCode::Backspace => {
@@ -527,12 +643,26 @@ impl Control for TextArea {
     fn render(&self, width: u16, focused: bool, theme: &Theme) -> Vec<Line<'static>> {
         let style = theme.style(Role::ComposerText);
         let inner = content_width(width);
-        let scroll = self.scroll();
-
         let mut rows = vec![Line::from(vec![
             gutter(focused, theme),
             Span::styled(self.label.clone(), label_style(focused, theme)),
         ])];
+        if self.soft_wrap {
+            let segments = self.segments(inner);
+            let scroll = self.wrapped_scroll(self.caret_segment(&segments));
+            for offset in 0..self.visible_rows {
+                let content = segments
+                    .get(scroll + offset)
+                    .map(|&segment| self.segment_text(segment))
+                    .unwrap_or_default();
+                rows.push(Line::from(vec![
+                    Span::raw(FOCUS_BLANK),
+                    Span::styled(content, style),
+                ]));
+            }
+            return band(rows, focused, theme);
+        }
+        let scroll = self.scroll();
         for offset in 0..self.visible_rows {
             let content = self
                 .lines
@@ -548,6 +678,17 @@ impl Control for TextArea {
     }
 
     fn cursor(&self, width: u16) -> Option<(u16, u16)> {
+        if self.soft_wrap {
+            let segments = self.segments(content_width(width));
+            let caret = self.caret_segment(&segments);
+            let segment = segments[caret];
+            let before = self.segment_text(Segment { end: self.column, ..segment });
+            return Some((
+                (FOCUS_BLANK.len() + text::width(&before)) as u16,
+                // + 1 for the label row.
+                (caret - self.wrapped_scroll(caret) + 1) as u16,
+            ));
+        }
         let before: String = self.lines[self.row][..self.column].iter().collect();
         let column = text::width(&before).min(content_width(width));
         Some((
@@ -1192,6 +1333,91 @@ mod tests {
         let (_, row) = area.cursor(40).expect("a caret");
         // Label row plus at most `visible_rows`.
         assert!(row <= 2, "caret row {row} fell outside the visible window");
+    }
+
+    #[test]
+    fn text_area_without_soft_wrap_truncates_long_lines() {
+        let area = TextArea::new("Notes").with_value(format!("{}\nb", "x".repeat(30)));
+        let rows = plain(&area.render(20, false, &theme()));
+        assert_eq!(rows.len(), 6, "label row plus the default five visible rows");
+        assert_eq!(rows[1], format!("  {}", "x".repeat(content_width(20))));
+        assert_eq!(rows[2], "  b");
+        assert_eq!(area.cursor(20), Some((3, 2)));
+        assert_eq!(area.line_count(), 2);
+        assert_eq!(area.visual_rows(20), 2);
+    }
+
+    #[test]
+    fn text_area_inserts_pasted_text_with_normalised_newlines() {
+        let mut area = TextArea::new("Answer");
+        area.insert_text("one\r\ntwo\rthree\u{1b}[2J\tx");
+        assert_eq!(area.value(), "one\ntwo\nthree[2J    x");
+    }
+
+    #[test]
+    fn text_area_inserts_pasted_text_at_the_caret() {
+        let mut area = TextArea::new("Answer").with_value("ab");
+        area.handle_key(key(KeyCode::Left));
+        area.insert_text("1\n2");
+        assert_eq!(area.value(), "a1\n2b");
+        area.handle_key(key(KeyCode::Char('3')));
+        assert_eq!(area.value(), "a1\n23b");
+    }
+
+    #[test]
+    fn soft_wrap_shows_every_character_of_a_long_line() {
+        let area = TextArea::new("Answer")
+            .with_soft_wrap()
+            .with_value("abcdefghijklmnopqrstuvwxyz".repeat(3));
+        let shown: String = plain(&area.render(20, false, &theme())).join("");
+        assert!(shown.contains("abcdefghij"), "{shown}");
+        assert_eq!(shown.matches('z').count(), 3, "{shown}");
+    }
+
+    #[test]
+    fn soft_wrap_places_the_caret_on_the_wrapped_row() {
+        let area = TextArea::new("A").with_soft_wrap().with_value("x".repeat(25));
+        let inner = content_width(20);
+        assert_eq!(area.visual_rows(20), 25usize.div_ceil(inner));
+        let (col, row) = area.cursor(20).unwrap();
+        assert_eq!(row, 2, "label row + second visual row");
+        assert_eq!(col as usize, FOCUS_BLANK.len() + 25 - inner);
+        assert!(col as usize <= 20);
+    }
+
+    #[test]
+    fn soft_wrap_measures_wide_glyphs_in_cells() {
+        let area = TextArea::new("A").with_soft_wrap().with_value("界".repeat(20));
+        for line in area.render(20, false, &theme()) {
+            let w: usize = line.spans.iter().map(|s| coda_render::text::width(&s.content)).sum();
+            assert!(w <= 20, "a row overflowed: {w}");
+        }
+        let (col, _) = area.cursor(20).unwrap();
+        assert!(col as usize <= 20);
+    }
+
+    #[test]
+    fn soft_wrap_moves_a_wide_glyph_that_does_not_fit_to_the_next_row() {
+        // One narrow char first leaves an odd number of cells, so a wide glyph
+        // would straddle the edge if it were not moved down.
+        let inner = content_width(20);
+        let area = TextArea::new("A")
+            .with_soft_wrap()
+            .with_value(format!("a{}", "界".repeat(inner / 2)));
+        let rows = plain(&area.render(20, false, &theme()));
+        assert_eq!(rows[1], format!("  a{}", "界".repeat(inner / 2 - 1)));
+        assert_eq!(rows[2], "  界");
+    }
+
+    #[test]
+    fn soft_wrap_scrolls_to_keep_the_caret_visible() {
+        let mut area = TextArea::new("A").with_soft_wrap().with_value("x".repeat(100));
+        area.set_visible_rows(2);
+        let rows = plain(&area.render(20, false, &theme()));
+        assert_eq!(rows.len(), 3);
+        let (_, row) = area.cursor(20).unwrap();
+        assert_eq!(row, 2);
+        assert_eq!(rows[2], format!("  {}", "x".repeat(100 % content_width(20))));
     }
 
     // --- Select ------------------------------------------------------------
