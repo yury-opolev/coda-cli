@@ -284,6 +284,21 @@ no image is available. Use `Alt+V` if the terminal intercepts `Ctrl+V`: terminal
 paste events carry text only. Use `/image <path>` to attach a file. Images are capped
 at 5 MiB before base64 encoding. Removing a placeholder excludes that image from
 the next prompt; drafts with images must wait until the current turn finishes.
+
+**Questions:** when the agent asks a question (`ask_user_question`), a large modal shows the whole question and
+every option word-wrapped. On a small terminal, scroll with `PgUp`/`PgDn` or the mouse wheel. The footer lists
+the keys for the part that has focus. In the option list, `↑`/`↓` move. For a single-choice question, `Enter`
+or `1`–`9` answers, and `Space` selects an option without sending it. For a multiple-choice question, `Space`
+or a digit ticks options and `Enter` sends them. `Tab` moves between the options, the **answer / explanation**
+field and the attachments. Text typed in the field is sent together with the chosen options. Without a chosen
+option it is the answer itself. Choosing **Other** (the agent's own "other" option or the added
+"Other — type your own answer below" row) moves to the field instead of answering "Other"; an empty Other answer
+is refused with a hint. In the field, `Enter` sends and `Shift+Enter` (or `Alt+Enter`, `Ctrl+J`) adds a new
+line. Pasted text goes into the field. `Ctrl+V`, `Alt+V`, or `Shift+Insert` attaches a copied **image** (at most
+5, 5 MiB each). Attachments show under the field, and `Delete` removes the one selected there. The images reach
+the model with your answer. If the current model cannot take images (for example GitHub Copilot models served
+over chat completions), the modal says so and attaches nothing. `Esc` cancels the question without sending
+anything.
 The **session id** in the header, and the body of the modal browsers
 (`/model`, `/skills`, `/mcp`, `/tasks`, `/schedule`, `/plugins`), can be selected with a **left-drag**
 and copied the same way. In each browser the **list pane** uses a TableView widget that highlights the selected row; drag-select with `Ctrl+C` is available in the **detail pane** where a full `SelectableTextView` is rendered. **`Shift`-drag** hands native selection and copy to the terminal where
