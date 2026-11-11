@@ -326,6 +326,11 @@ impl LlmClient for CopilotClient {
         models::cache_invalidate(&self.config.base_url);
         self.do_list_models().await
     }
+
+    fn accepts_image_input(&self, model: &str) -> bool {
+        // The chat-completions encoder replaces images with placeholder text.
+        self.endpoint_for(&models::normalize_model_id(model)) != CopilotEndpoint::ChatCompletions
+    }
 }
 
 fn build_body(request: &ChatRequest, endpoint: CopilotEndpoint) -> serde_json::Value {
@@ -590,5 +595,27 @@ mod tests {
             models::resolve_endpoint(&models[1]),
             CopilotEndpoint::Messages
         );
+    }
+
+    #[test]
+    fn image_input_is_refused_only_where_the_encoder_drops_images() {
+        let base = "https://images-capability.example.com";
+        let model = |id: &str, endpoint: &str| {
+            let mut m = ModelInfo::new(id);
+            m.supported_endpoints = vec![endpoint.into()];
+            m
+        };
+        models::cache_set(
+            base,
+            vec![
+                model("chat-only", "/chat/completions"),
+                model("responses-model", "/responses"),
+                model("claude-x", "/v1/messages"),
+            ],
+        );
+        let c = client(base);
+        assert!(!c.accepts_image_input("chat-only"));
+        assert!(c.accepts_image_input("responses-model"));
+        assert!(c.accepts_image_input("claude-x"));
     }
 }
