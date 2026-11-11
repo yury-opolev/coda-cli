@@ -641,6 +641,10 @@ pub fn prompt_from_dto(dto: &PendingRequestDto) -> Option<PendingPrompt> {
                 .get("allowFreeText")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true),
+            accepts_images: display
+                .get("acceptsImages")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         }),
         PendingRequestKind::PlanApproval => {
             Some(PendingPrompt::PlanApproval { plan: text("plan").unwrap_or_default() })
@@ -1122,6 +1126,18 @@ mod tests {
     }
 
     #[test]
+    fn a_discovered_question_reads_its_image_capability() {
+        let accepts = |display: serde_json::Value| {
+            match prompt_from_dto(&dto("req-e1-4", PendingRequestKind::Question, display)) {
+                Some(PendingPrompt::Question { accepts_images, .. }) => accepts_images,
+                other => panic!("expected a question, got {other:?}"),
+            }
+        };
+        assert!(accepts(json!({ "question": "Q", "acceptsImages": true })));
+        assert!(!accepts(json!({ "question": "Q" })), "an older engine never offers images");
+    }
+
+    #[test]
     fn a_replaced_engine_retires_every_decision_the_previous_process_raised() {
         // An engine restart (or a proxy swapping the engine behind the same
         // connection) invalidates every handle the old process minted. An
@@ -1297,6 +1313,7 @@ mod tests {
                 options: vec!["a".into()],
                 multi_select: false,
                 allow_free_text: true,
+                accepts_images: false,
             },
             responder,
         );

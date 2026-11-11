@@ -564,10 +564,7 @@ impl App {
                 self.on_key(key).await
             }
             TerminalEvent::Key(_) => {}
-            TerminalEvent::Paste(text) => {
-                self.composer.insert(&text);
-                self.dirty = true;
-            }
+            TerminalEvent::Paste(text) => self.on_paste(text),
             TerminalEvent::Resize(..) => {
                 // Force a relayout; cached rows were wrapped for the old width.
                 self.laid_out_width = 0;
@@ -1525,9 +1522,9 @@ impl App {
             SurfaceAction::SubmitAuthChoice => self.start_prepared_login(),
             SurfaceAction::CancelAuth => self.cancel_auth(),
             SurfaceAction::AnswerPrompt { allowed, answer } => {
-                self.surfaces.pop();
-                self.answer_prompt(allowed, answer).await;
+                self.answer_open_prompt(allowed, answer).await;
             }
+            SurfaceAction::PasteIntoPrompt => self.paste_into_question(),
             SurfaceAction::SetEffort { effort, persist, for_model } => {
                 self.apply_set_effort(effort, persist, for_model).await;
             }

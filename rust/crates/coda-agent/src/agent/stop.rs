@@ -102,7 +102,8 @@ pub(crate) async fn decide_stop(
                 // option in the list.
                 let granted_answer = match &outcome {
                     AnswerOutcome::Answered(a)
-                        if !a.trim().is_empty() && !a.eq_ignore_ascii_case(GOAL_STOP_OPTION) =>
+                        if !a.trim().is_empty()
+                            && !a.lines().next().unwrap_or("").trim().eq_ignore_ascii_case(GOAL_STOP_OPTION) =>
                     {
                         Some(a.clone())
                     }
@@ -471,6 +472,34 @@ mod tests {
         assert!(
             matches!(result, StopAction::Stop),
             "mixed-case stop option must be recognised as Stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_option_with_an_explanation_below_it_still_stops() {
+        let mut goal = Some(escalating_supervisor());
+        let sink = NullSink;
+        let prompt = FixedPrompt(AnswerOutcome::Answered(format!(
+            "{GOAL_STOP_OPTION}\n\nAdditional details from the user:\nno more budget"
+        )));
+
+        let result = decide_stop(
+            None,
+            "some text",
+            &mut goal,
+            &mut 0,
+            None,
+            None,
+            &sink,
+            CancellationToken::new(),
+            Some(&prompt),
+        )
+        .await
+        .expect("no error");
+
+        assert!(
+            matches!(result, StopAction::Stop),
+            "the stop option on the first line must be recognised as Stop"
         );
     }
 

@@ -16,8 +16,8 @@ pub mod context;
 pub mod sandbox;
 
 pub use context::{
-    AnswerOutcome, NoAnswerReason, OpaqueServiceHandle, PlanApprover, ScheduleOrigin, ServiceMap,
-    ToolContext, ToolDescriptor, UserQuestion,
+    AnswerOutcome, ImageAttachment, NoAnswerReason, OpaqueServiceHandle, PlanApprover,
+    QuestionReply, ScheduleOrigin, ServiceMap, ToolContext, ToolDescriptor, UserQuestion,
 };
 pub use sandbox::{is_within_root, resolve_path, try_resolve_within_root};
 
@@ -44,14 +44,20 @@ pub enum ToolControl {
     /// within `wait`, and a task handle otherwise. `None` waits until the
     /// task finishes (still bounded by the per-tool ceiling and cut short by
     /// a user "background now"). `content` of the carrying result is unused.
-    RunningTask { task_id: String, wait: Option<std::time::Duration> },
+    RunningTask {
+        task_id: String,
+        wait: Option<std::time::Duration>,
+    },
     /// Attach to an already running task (`task_wait`): the executor waits up
     /// to `wait` for it under the same rules as `RunningTask` — cut short only
     /// by a cancelled turn, never by a message — but never stops, promotes
     /// or otherwise touches the task, and never skips the rest of the batch.
     /// `content` of the carrying result is what the model sees when the wait
     /// ends before the task does.
-    AttachTask { task_id: String, wait: std::time::Duration },
+    AttachTask {
+        task_id: String,
+        wait: std::time::Duration,
+    },
 }
 
 /// The output of running a tool, fed back to the model as a content block.
@@ -66,15 +72,27 @@ pub struct ToolResult {
     pub is_error: bool,
     /// `None` for every ordinary result. See [`ToolControl`].
     pub control: Option<ToolControl>,
+    /// Images to show the model after this result; empty for every ordinary tool.
+    pub images: Vec<ImageAttachment>,
 }
 
 impl ToolResult {
     pub fn ok(content: impl Into<String>) -> Self {
-        Self { content: content.into(), is_error: false, control: None }
+        Self {
+            content: content.into(),
+            is_error: false,
+            control: None,
+            images: Vec::new(),
+        }
     }
 
     pub fn error(content: impl Into<String>) -> Self {
-        Self { content: content.into(), is_error: true, control: None }
+        Self {
+            content: content.into(),
+            is_error: true,
+            control: None,
+            images: Vec::new(),
+        }
     }
 
     /// A terminal failure: the recorded result plus an explicit instruction
@@ -83,7 +101,10 @@ impl ToolResult {
         Self {
             content: content.into(),
             is_error: true,
-            control: Some(ToolControl::AbortRun { reason: reason.into() }),
+            control: Some(ToolControl::AbortRun {
+                reason: reason.into(),
+            }),
+            images: Vec::new(),
         }
     }
 
@@ -107,7 +128,11 @@ impl ToolResult {
         Self {
             content: content.into(),
             is_error: false,
-            control: Some(ToolControl::AttachTask { task_id: task_id.into(), wait }),
+            control: Some(ToolControl::AttachTask {
+                task_id: task_id.into(),
+                wait,
+            }),
+            images: Vec::new(),
         }
     }
 
@@ -126,7 +151,13 @@ impl ToolResult {
             content: format!("Running as task {task_id}."),
             is_error: false,
             control: Some(ToolControl::RunningTask { task_id, wait }),
+            images: Vec::new(),
         }
+    }
+
+    pub fn with_images(mut self, images: Vec<ImageAttachment>) -> Self {
+        self.images = images;
+        self
     }
 
     /// The task id and wait budget, when this result hands over a running task.
@@ -187,5 +218,21 @@ pub trait Tool: Send + Sync {
     /// The wire definition advertised to the model.
     fn to_definition(&self) -> coda_llm::ToolDefinition {
         coda_llm::ToolDefinition::new(self.name(), self.description(), self.input_schema_json())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_result_carries_images_only_when_asked() {
+        assert!(ToolResult::ok("x").images.is_empty());
+        let image = ImageAttachment {
+            media_type: "image/png".into(),
+            base64: "AAAA".into(),
+        };
+        let result = ToolResult::ok("x").with_images(vec![image.clone()]);
+        assert_eq!(result.images, vec![image]);
     }
 }

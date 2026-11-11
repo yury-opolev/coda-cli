@@ -50,7 +50,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use coda_proto::state::{PendingRequestDto, PendingRequestKind};
-use coda_tool::{AnswerOutcome, NoAnswerReason};
+use coda_tool::{AnswerOutcome, ImageAttachment, NoAnswerReason};
 use serde_json::Value;
 use tokio::sync::oneshot;
 
@@ -84,7 +84,9 @@ pub fn configured_timeout() -> Option<Duration> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestOutcome {
     Permission { allow: bool },
-    Question(AnswerOutcome),
+    /// The answer plus any images attached to it. The images never reach a
+    /// label or an event; they only travel back to the asking tool.
+    Question(AnswerOutcome, Vec<ImageAttachment>),
     PlanApproval { approve: bool },
 }
 
@@ -92,7 +94,7 @@ impl RequestOutcome {
     pub fn kind(&self) -> PendingRequestKind {
         match self {
             RequestOutcome::Permission { .. } => PendingRequestKind::Permission,
-            RequestOutcome::Question(_) => PendingRequestKind::Question,
+            RequestOutcome::Question(..) => PendingRequestKind::Question,
             RequestOutcome::PlanApproval { .. } => PendingRequestKind::PlanApproval,
         }
     }
@@ -104,11 +106,11 @@ impl RequestOutcome {
             RequestOutcome::Permission { allow: false } => "denied".into(),
             RequestOutcome::PlanApproval { approve: true } => "approved".into(),
             RequestOutcome::PlanApproval { approve: false } => "rejected".into(),
-            RequestOutcome::Question(AnswerOutcome::Answered(_)) => "answered".into(),
-            RequestOutcome::Question(AnswerOutcome::NoAnswer(r)) => {
+            RequestOutcome::Question(AnswerOutcome::Answered(_), _) => "answered".into(),
+            RequestOutcome::Question(AnswerOutcome::NoAnswer(r), _) => {
                 format!("noAnswer.{}", r.as_str())
             }
-            RequestOutcome::Question(AnswerOutcome::Parked { .. }) => "parked".into(),
+            RequestOutcome::Question(AnswerOutcome::Parked { .. }, _) => "parked".into(),
         }
     }
 
@@ -118,7 +120,7 @@ impl RequestOutcome {
             PendingRequestKind::Permission => RequestOutcome::Permission { allow: false },
             PendingRequestKind::PlanApproval => RequestOutcome::PlanApproval { approve: false },
             PendingRequestKind::Question => {
-                RequestOutcome::Question(AnswerOutcome::NoAnswer(reason))
+                RequestOutcome::Question(AnswerOutcome::NoAnswer(reason), Vec::new())
             }
         }
     }
@@ -478,7 +480,7 @@ mod tests {
         // The caller offers a question answer for a permission request.
         let err = registry
             .resolve_with(&handle, |_| {
-                Ok(RequestOutcome::Question(AnswerOutcome::Answered("yes".into())))
+                Ok(RequestOutcome::Question(AnswerOutcome::Answered("yes".into()), Vec::new()))
             })
             .expect_err("kind mismatch must be refused");
         assert_eq!(err, ResolveError::KindMismatch { expected: PendingRequestKind::Permission });
@@ -542,7 +544,7 @@ mod tests {
         assert_eq!(permission_rx.await.unwrap(), RequestOutcome::Permission { allow: false });
         assert_eq!(
             question_rx.await.unwrap(),
-            RequestOutcome::Question(AnswerOutcome::NoAnswer(NoAnswerReason::Disconnected)),
+            RequestOutcome::Question(AnswerOutcome::NoAnswer(NoAnswerReason::Disconnected), Vec::new()),
             "SECURITY: a lost connection is never the first option"
         );
         assert!(registry.is_empty());
@@ -844,7 +846,7 @@ mod tests {
                 "{kind:?}: a fail-closed default must never grant"
             );
             assert!(
-                !matches!(outcome, RequestOutcome::Question(AnswerOutcome::Answered(_))),
+                !matches!(outcome, RequestOutcome::Question(AnswerOutcome::Answered(_), _)),
                 "{kind:?}: a fail-closed default must never fabricate an answer"
             );
         }

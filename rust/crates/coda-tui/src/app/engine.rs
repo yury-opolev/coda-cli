@@ -5,17 +5,28 @@
 //! `SurfaceAction`, which is what lets the rest be tested without an engine.
 
 use coda_client::{ClientError, Responder};
-use coda_proto::messages::{self, method, server_method};
+use coda_proto::messages::{self, method, server_method, WireImage};
 use serde_json::Value;
 
 use super::App;
 use crate::state::{PendingPrompt, UiEvent};
 use crate::transcript::NoticeLevel;
 
+/// A question's answer, with its images only when there are some, so a reply
+/// without attachments keeps exactly the shape an older engine expects.
+fn answer_value(answer: &str, images: &[WireImage]) -> Value {
+    let mut value = serde_json::json!({ "answer": answer });
+    if !images.is_empty() {
+        value["images"] = serde_json::to_value(images).unwrap_or_default();
+    }
+    value
+}
+
 pub(super) fn prompt_response(
     prompt: &PendingPrompt,
     allowed: bool,
     answer: Option<&str>,
+    images: &[WireImage],
 ) -> Result<Value, coda_proto::ResponseError> {
     if matches!(prompt, PendingPrompt::Question { .. }) && !allowed {
         return Err(coda_proto::ResponseError {
@@ -27,7 +38,7 @@ pub(super) fn prompt_response(
     Ok(match prompt {
         PendingPrompt::Permission { .. } => serde_json::json!({ "allow": allowed }),
         PendingPrompt::PlanApproval { .. } => serde_json::json!({ "approve": allowed }),
-        PendingPrompt::Question { .. } => serde_json::json!({ "answer": answer.unwrap_or_default() }),
+        PendingPrompt::Question { .. } => answer_value(answer.unwrap_or_default(), images),
     })
 }
 
@@ -43,14 +54,13 @@ pub(super) fn rpc_outcome(
     prompt: &PendingPrompt,
     allowed: bool,
     answer: Option<&str>,
+    images: &[WireImage],
 ) -> Option<Value> {
     match prompt {
         PendingPrompt::Permission { .. } => Some(serde_json::json!({ "allow": allowed })),
         PendingPrompt::PlanApproval { .. } => Some(serde_json::json!({ "approve": allowed })),
         PendingPrompt::Question { .. } => match (allowed, answer) {
-            (true, Some(answer)) if !answer.trim().is_empty() => {
-                Some(serde_json::json!({ "answer": answer }))
-            }
+            (true, Some(answer)) if !answer.trim().is_empty() => Some(answer_value(answer, images)),
             _ => None,
         },
     }
@@ -63,24 +73,24 @@ mod prompt_response_tests {
     fn question() -> PendingPrompt {
         PendingPrompt::Question {
             question: "Choose".into(), options: vec!["Delete".into(), "Keep".into()],
-            multi_select: false, allow_free_text: true,
+            multi_select: false, allow_free_text: true, accepts_images: false,
         }
     }
 
     #[test]
     fn deliberate_question_cancel_is_an_explicit_cancel_not_an_empty_answer() {
         for answer in [None, Some("Delete")] {
-            let error = prompt_response(&question(), false, answer).unwrap_err();
+            let error = prompt_response(&question(), false, answer, &[]).unwrap_err();
             assert_eq!(error.code, coda_proto::error_codes::REQUEST_CANCELLED);
         }
     }
 
     #[test]
     fn accepted_question_and_denied_permission_keep_their_wire_shapes() {
-        assert_eq!(prompt_response(&question(), true, Some("Keep")).unwrap(),
+        assert_eq!(prompt_response(&question(), true, Some("Keep"), &[]).unwrap(),
             serde_json::json!({"answer":"Keep"}));
         let permission = PendingPrompt::Permission { tool: "edit".into(), preview: "file".into() };
-        assert_eq!(prompt_response(&permission, false, None).unwrap(),
+        assert_eq!(prompt_response(&permission, false, None, &[]).unwrap(),
             serde_json::json!({"allow":false}));
     }
 
@@ -89,24 +99,49 @@ mod prompt_response_tests {
         // `session/resolveRequest` refuses an empty answer on purpose: an
         // empty string is not a decision. A decline must reach the engine as
         // a cancellation, which is what `None` asks the caller to do.
-        assert_eq!(rpc_outcome(&question(), false, None), None);
-        assert_eq!(rpc_outcome(&question(), false, Some("Delete")), None);
-        assert_eq!(rpc_outcome(&question(), true, Some("   ")), None);
+        assert_eq!(rpc_outcome(&question(), false, None, &[]), None);
+        assert_eq!(rpc_outcome(&question(), false, Some("Delete"), &[]), None);
+        assert_eq!(rpc_outcome(&question(), true, Some("   "), &[]), None);
         assert_eq!(
-            rpc_outcome(&question(), true, Some("Keep")),
+            rpc_outcome(&question(), true, Some("Keep"), &[]),
             Some(serde_json::json!({ "answer": "Keep" }))
         );
+    }
+
+    fn image() -> WireImage {
+        WireImage { media_type: "image/png".into(), base64: "AAAA".into() }
+    }
+
+    #[test]
+    fn an_answer_carries_its_images_on_both_paths_and_only_when_there_are_some() {
+        let with_images = serde_json::json!({
+            "answer": "Keep",
+            "images": [{ "mediaType": "image/png", "base64": "AAAA" }],
+        });
+        assert_eq!(prompt_response(&question(), true, Some("Keep"), &[image()]).unwrap(), with_images);
+        assert_eq!(rpc_outcome(&question(), true, Some("Keep"), &[image()]), Some(with_images));
+        // No images: exactly the old shape, so an older engine sees nothing new.
+        assert_eq!(prompt_response(&question(), true, Some("Keep"), &[]).unwrap(),
+            serde_json::json!({ "answer": "Keep" }));
+        assert_eq!(rpc_outcome(&question(), true, Some("Keep"), &[]),
+            Some(serde_json::json!({ "answer": "Keep" })));
+    }
+
+    #[test]
+    fn a_declined_question_never_carries_images() {
+        assert!(prompt_response(&question(), false, Some("Keep"), &[image()]).is_err());
+        assert_eq!(rpc_outcome(&question(), false, Some("Keep"), &[image()]), None);
     }
 
     #[test]
     fn the_out_of_band_path_carries_a_denial_as_a_real_decision() {
         let permission = PendingPrompt::Permission { tool: "edit".into(), preview: "f".into() };
         assert_eq!(
-            rpc_outcome(&permission, false, None),
+            rpc_outcome(&permission, false, None, &[]),
             Some(serde_json::json!({ "allow": false }))
         );
         let plan = PendingPrompt::PlanApproval { plan: "p".into() };
-        assert_eq!(rpc_outcome(&plan, true, None), Some(serde_json::json!({ "approve": true })));
+        assert_eq!(rpc_outcome(&plan, true, None, &[]), Some(serde_json::json!({ "approve": true })));
     }
 }
 
@@ -137,6 +172,7 @@ impl App {
                     options: request.options,
                     multi_select: request.multi_select,
                     allow_free_text: request.allow_free_text,
+                    accepts_images: request.accepts_images,
                 }),
             server_method::PLAN_APPROVAL => serde_json::from_value::<
                 messages::PlanApprovalRequest,
@@ -295,6 +331,19 @@ impl App {
             self.surfaces.pop();
         }
     }
+    /// Answers the prompt surface on top and closes it.
+    pub(super) async fn answer_open_prompt(&mut self, allowed: bool, answer: Option<String>) {
+        // Read before the pop: the attachments live in the surface.
+        let images = self
+            .surfaces
+            .top()
+            .and_then(|s| s.as_any().downcast_ref::<crate::surface::prompt::PromptSurface>())
+            .map(|p| p.answer_images())
+            .unwrap_or_default();
+        self.surfaces.pop();
+        self.answer_prompt(allowed, answer, images).await;
+    }
+
     /// Split from the surface deliberately: the responder is engine state, so
     /// a surface must not hold it. The surface decides what the answer is and
     /// this sends it.
@@ -304,13 +353,28 @@ impl App {
     /// can only be answered by an RPC. The reducer is advanced first so the
     /// screen never waits on the network to acknowledge a decision the user
     /// has already made.
-    pub(super) async fn answer_prompt(&mut self, allowed: bool, answer: Option<String>) {
+    pub(super) async fn answer_prompt(
+        &mut self,
+        allowed: bool,
+        answer: Option<String>,
+        images: Vec<WireImage>,
+    ) {
         let Some(prompt) = self.state.prompt.clone() else {
             return;
         };
+        // A decline sends nothing, so it can carry no images either.
+        let images = if allowed { images } else { Vec::new() };
         self.dirty = true;
-        self.apply(UiEvent::PromptAnswered { allowed, answer: answer.clone() });
-        self.deliver_answer(&prompt, allowed, answer.as_deref()).await;
+        // The count is for the transcript only; the wire gets the plain answer.
+        let shown = match (&answer, images.len()) {
+            (Some(answer), count) if count > 0 => Some(format!(
+                "{answer}\n[{} {count} image(s) attached]",
+                crate::render::glyphs::CAMERA
+            )),
+            _ => answer.clone(),
+        };
+        self.apply(UiEvent::PromptAnswered { allowed, answer: shown });
+        self.deliver_answer(&prompt, allowed, answer.as_deref(), &images).await;
         // A queued decision — a background subagent asking while a foreground
         // turn waits — takes the screen next rather than being forgotten.
         self.open_current_prompt();

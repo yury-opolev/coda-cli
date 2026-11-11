@@ -137,7 +137,7 @@ impl Tool for McpTool {
                     text = text.chars().take(MAX_TOOL_OUTPUT_CHARS).collect::<String>();
                     text.push_str(&format!("\n{OUTPUT_TRUNCATED}"));
                 }
-                ToolResult { content: text, is_error, control: None }
+                ToolResult { content: text, is_error, control: None, images: Vec::new() }
             }
             Err(e) => ToolResult::error(e),
         }

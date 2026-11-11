@@ -28,6 +28,7 @@ pub mod config_api;
 pub mod dispatch;
 pub mod history;
 pub mod host;
+mod images;
 mod mcp;
 pub mod mcp_list;
 pub mod output_budget;

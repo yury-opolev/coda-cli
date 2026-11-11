@@ -102,6 +102,14 @@ pub trait LlmClient: Send + Sync {
     async fn count_tokens(&self, _request: &ChatRequest) -> Result<Option<u32>, LlmError> {
         Ok(None)
     }
+
+    /// Whether a request to `model` delivers image blocks to the model.
+    ///
+    /// `true` unless the provider is known to drop or rewrite images, so a caller can say so up front instead of the
+    /// model silently receiving placeholder text.
+    fn accepts_image_input(&self, _model: &str) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

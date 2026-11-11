@@ -3,11 +3,36 @@
   "properties": {
     "answer": {
       "type": "string"
+    },
+    "images": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/WireImage"
+      },
+      "description": "Images attached to the answer; only honoured when the request had `acceptsImages`."
     }
   },
   "required": [
     "answer"
   ],
   "title": "QuestionResponse",
-  "$schema": "https://json-schema.org/draft/2020-12/schema"
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "WireImage": {
+      "type": "object",
+      "properties": {
+        "mediaType": {
+          "type": "string",
+          "description": "`image/png`, `image/jpeg`, `image/gif` or `image/webp`."
+        },
+        "base64": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "mediaType",
+        "base64"
+      ]
+    }
+  }
 }

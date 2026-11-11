@@ -47,7 +47,11 @@ impl TodoItem {
         active_form: impl Into<String>,
         status: TodoStatus,
     ) -> Self {
-        Self { content: content.into(), active_form: active_form.into(), status }
+        Self {
+            content: content.into(),
+            active_form: active_form.into(),
+            status,
+        }
     }
 }
 
@@ -165,6 +169,32 @@ impl AnswerOutcome {
     }
 }
 
+/// An image the operator attached, carried as base64 so it can be replayed to a provider verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageAttachment {
+    /// `image/png`, `image/jpeg`, `image/gif` or `image/webp`.
+    pub media_type: String,
+    pub base64: String,
+}
+
+/// A question's outcome plus any images the operator attached to an answer.
+///
+/// Images are meaningful only with [`AnswerOutcome::Answered`]; every other outcome carries none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestionReply {
+    pub outcome: AnswerOutcome,
+    pub images: Vec<ImageAttachment>,
+}
+
+impl From<AnswerOutcome> for QuestionReply {
+    fn from(outcome: AnswerOutcome) -> Self {
+        Self {
+            outcome,
+            images: Vec::new(),
+        }
+    }
+}
+
 /// Seam for surfacing a multiple-choice question to the user.
 ///
 /// The loop wires a concrete implementation; `None` in `ToolContext` signals
@@ -178,6 +208,21 @@ pub trait UserQuestion: Send + Sync {
         multi_select: bool,
         cancel: CancellationToken,
     ) -> AnswerOutcome;
+
+    /// Like [`ask`](Self::ask), but lets the operator attach images to the answer.
+    ///
+    /// The default attaches none, so every existing implementation keeps its behaviour.
+    async fn ask_with_attachments(
+        &self,
+        question: &str,
+        options: &[String],
+        multi_select: bool,
+        cancel: CancellationToken,
+    ) -> QuestionReply {
+        self.ask(question, options, multi_select, cancel)
+            .await
+            .into()
+    }
 }
 
 /// Seam for presenting a plan to the user and receiving an approval decision.
@@ -221,7 +266,10 @@ pub struct ScheduleOrigin {
 
 impl ScheduleOrigin {
     pub fn new(definition_id: impl Into<String>, definition_name: Option<String>) -> Self {
-        Self { definition_id: definition_id.into(), definition_name }
+        Self {
+            definition_id: definition_id.into(),
+            definition_name,
+        }
     }
 }
 
@@ -327,7 +375,10 @@ impl std::fmt::Debug for ToolContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ToolContext")
             .field("working_directory", &self.working_directory)
-            .field("allow_outside_working_directory", &self.allow_outside_working_directory)
+            .field(
+                "allow_outside_working_directory",
+                &self.allow_outside_working_directory,
+            )
             .field("granted_directories", &self.granted_directories)
             .field("readable_directories", &self.readable_directories)
             .field("todos", &self.todos.is_some())
@@ -450,5 +501,23 @@ mod tests {
         store.set(vec![TodoItem::new("x", "x", TodoStatus::Pending)]);
         store.set(vec![]);
         assert!(store.items().is_empty());
+    }
+
+    struct Fixed(AnswerOutcome);
+
+    #[async_trait]
+    impl UserQuestion for Fixed {
+        async fn ask(&self, _: &str, _: &[String], _: bool, _: CancellationToken) -> AnswerOutcome {
+            self.0.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn the_default_rich_ask_delegates_and_attaches_no_images() {
+        let reply = Fixed(AnswerOutcome::Answered("A".into()))
+            .ask_with_attachments("q", &["A".into()], false, CancellationToken::new())
+            .await;
+        assert_eq!(reply.outcome, AnswerOutcome::Answered("A".into()));
+        assert!(reply.images.is_empty());
     }
 }

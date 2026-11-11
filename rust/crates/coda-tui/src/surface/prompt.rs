@@ -6,107 +6,84 @@
 //! never receives a reply.
 //!
 //! The surface decides *what the answer is*; the application sends it. That
-//! split is what lets every branch below be tested without an engine.
+//! split is what lets every branch below be tested without an engine. A
+//! question's body lives in [`QuestionView`], which this surface owns so the
+//! application keeps retiring every prompt the same way.
 
+use super::question::{QuestionOutcome, QuestionView};
 use super::{Modality, Surface, SurfaceAction, SurfaceOutcome};
-use crate::render::glyphs;
 use crate::state::PendingPrompt;
-use crate::widgets::{Control, TextInput};
+use coda_proto::messages::WireImage;
 use coda_render::text;
 use coda_render::theme::{Role, Theme};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 
 pub struct PromptSurface {
     prompt: PendingPrompt,
-    /// Which option the arrows have moved to, for a question.
-    highlighted: usize,
-    /// Which options are ticked, for a multi-select question. Parallel to the
-    /// option list.
-    chosen: Vec<bool>,
-    /// A typed answer, when the question allows one.
-    free_text: Option<TextInput>,
-    /// Whether the typed answer has the keyboard rather than the list.
-    editing: bool,
+    /// The question's state, for a question prompt.
+    question: Option<QuestionView>,
 }
 
 impl PromptSurface {
     pub fn new(prompt: PendingPrompt) -> Self {
-        let (count, free_text) = match &prompt {
+        let question = match &prompt {
             PendingPrompt::Question {
+                question,
                 options,
+                multi_select,
                 allow_free_text,
-                ..
-            } => (
-                options.len(),
-                allow_free_text.then(|| TextInput::new("Or type an answer")),
-            ),
-            _ => (0, None),
+                accepts_images,
+            } => Some(QuestionView::new(
+                question.clone(),
+                options.clone(),
+                *multi_select,
+                *allow_free_text,
+                *accepts_images,
+            )),
+            _ => None,
         };
-        Self {
-            prompt,
-            highlighted: 0,
-            chosen: vec![false; count],
-            free_text,
-            editing: false,
-        }
+        Self { prompt, question }
     }
 
     pub fn prompt(&self) -> &PendingPrompt {
         &self.prompt
     }
 
-    fn options(&self) -> &[String] {
-        match &self.prompt {
-            PendingPrompt::Question { options, .. } => options,
-            _ => &[],
-        }
+    /// The open question, so the application can attach a pasted image or
+    /// report a clipboard error.
+    pub fn question_view_mut(&mut self) -> Option<&mut QuestionView> {
+        self.question.as_mut()
     }
 
-    fn is_multi_select(&self) -> bool {
-        matches!(
-            &self.prompt,
-            PendingPrompt::Question {
-                multi_select: true,
-                ..
+    /// The images to send with the answer; empty for anything but a question.
+    pub fn answer_images(&self) -> Vec<WireImage> {
+        self.question
+            .as_ref()
+            .map(QuestionView::images)
+            .unwrap_or_default()
+    }
+
+    fn deny() -> SurfaceOutcome {
+        SurfaceOutcome::Emit(SurfaceAction::AnswerPrompt {
+            allowed: false,
+            answer: None,
+        })
+    }
+
+    fn question_outcome(outcome: QuestionOutcome) -> SurfaceOutcome {
+        match outcome {
+            QuestionOutcome::Handled => SurfaceOutcome::Handled,
+            QuestionOutcome::Submit { answer } => {
+                SurfaceOutcome::Emit(SurfaceAction::AnswerPrompt {
+                    allowed: true,
+                    answer: Some(answer),
+                })
             }
-        )
-    }
-
-    /// The answer a question would send right now.
-    ///
-    /// A typed answer wins outright. Otherwise a multi-select joins its ticked
-    /// options in their original order, and a single-select takes the
-    /// highlighted one. This mirrors the C# `TuiUserQuestionPrompt`, whose
-    /// contract is that multi-select returns the labels joined by ", ".
-    fn answer(&self) -> Option<String> {
-        if let Some(typed) = self.free_text.as_ref().filter(|f| !f.is_empty()) {
-            return Some(typed.value());
+            QuestionOutcome::Cancel => Self::deny(),
+            QuestionOutcome::RequestPaste => SurfaceOutcome::Emit(SurfaceAction::PasteIntoPrompt),
         }
-        if self.is_multi_select() {
-            let picked: Vec<&str> = self
-                .options()
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| self.chosen.get(*i).copied().unwrap_or(false))
-                .map(|(_, o)| o.as_str())
-                .collect();
-            // No tick and no typing is not an answer; refuse rather than
-            // sending an empty string that reads as a considered "none".
-            return (!picked.is_empty()).then(|| picked.join(", "));
-        }
-        self.options().get(self.highlighted).cloned()
-    }
-
-    /// The answer for the option at `index`, if there is one.
-    fn answer_at(&self, index: usize) -> Option<SurfaceAction> {
-        self.options()
-            .get(index)
-            .map(|option| SurfaceAction::AnswerPrompt {
-                allowed: true,
-                answer: Some(option.clone()),
-            })
     }
 }
 
@@ -124,26 +101,26 @@ impl Surface for PromptSurface {
     }
 
     fn hints(&self) -> String {
+        if let Some(question) = &self.question {
+            return question.hints();
+        }
         match &self.prompt {
-            PendingPrompt::Question { options, .. } if !options.is_empty() => format!(
-                "{}: choose    1-9: pick    Enter: answer    Esc: cancel",
-                glyphs::ARROWS_VERTICAL
-            ),
-            PendingPrompt::Question { .. } => "Enter: answer    Esc: cancel".into(),
             PendingPrompt::PlanApproval { .. } => {
                 "y: approve    n: reject    Esc: reject".into()
             }
-            PendingPrompt::Permission { .. } => "y: allow    n: deny    Esc: deny".into(),
+            _ => "y: allow    n: deny    Esc: deny".into(),
         }
     }
 
     fn placement(&self) -> super::Placement {
-        // A permission prompt has short content: a tool name and a path. A
-        // plan-approval prompt has a plan that can be long but scrolls.
-        // FitContent keeps the modal compact for short prompts and scrolls
-        // longer ones without ever allocating 70% of the terminal for three
-        // lines.
-        super::Placement::FitContent { preferred_width: 60 }
+        // A question can carry long options and a typed explanation, so it
+        // gets a wide box. A permission prompt has short content: a tool name
+        // and a path. A plan-approval prompt has a plan that can be long but
+        // scrolls. FitContent keeps the modal compact for short prompts and
+        // scrolls longer ones without ever allocating 70% of the terminal for
+        // three lines.
+        let preferred_width = if self.question.is_some() { 110 } else { 60 };
+        super::Placement::FitContent { preferred_width }
     }
 
     fn modality(&self) -> Modality {
@@ -151,6 +128,12 @@ impl Surface for PromptSurface {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> SurfaceOutcome {
+        // The question applies its own chord rule, because its answer field
+        // takes the composer's newline chords.
+        if let Some(question) = self.question.as_mut() {
+            return Self::question_outcome(question.handle_key(key));
+        }
+
         // A chord is never an answer. Only an unmodified keystroke may approve
         // or refuse.
         //
@@ -171,110 +154,66 @@ impl Surface for PromptSurface {
             return SurfaceOutcome::Handled;
         }
 
-        let deny = SurfaceOutcome::Emit(SurfaceAction::AnswerPrompt {
-            allowed: false,
-            answer: None,
-        });
-
-        match &self.prompt {
-            PendingPrompt::Permission { .. } | PendingPrompt::PlanApproval { .. } => {
-                match key.code {
-                    KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                        SurfaceOutcome::Emit(SurfaceAction::AnswerPrompt {
-                            allowed: true,
-                            answer: None,
-                        })
-                    }
-                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => deny,
-                    // Everything else is swallowed rather than ignored.
-                    // Ignored would let the stack's Esc handling pop a prompt
-                    // the engine is still waiting on.
-                    _ => SurfaceOutcome::Handled,
-                }
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                SurfaceOutcome::Emit(SurfaceAction::AnswerPrompt {
+                    allowed: true,
+                    answer: None,
+                })
             }
-            PendingPrompt::Question { options, .. } => {
-                // Tab moves between the option list and the typed answer, the
-                // same split the form controls use.
-                if key.code == KeyCode::Tab && self.free_text.is_some() {
-                    self.editing = !self.editing;
-                    return SurfaceOutcome::Handled;
-                }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Self::deny(),
+            // Everything else is swallowed rather than ignored. Ignored would
+            // let the stack's Esc handling pop a prompt the engine is still
+            // waiting on.
+            _ => SurfaceOutcome::Handled,
+        }
+    }
 
-                if self.editing {
-                    return match key.code {
-                        KeyCode::Enter => match self.answer() {
-                            Some(answer) => SurfaceOutcome::Emit(SurfaceAction::AnswerPrompt {
-                                allowed: true,
-                                answer: Some(answer),
-                            }),
-                            None => SurfaceOutcome::Handled,
-                        },
-                        KeyCode::Esc => deny,
-                        _ => {
-                            if let Some(field) = self.free_text.as_mut() {
-                                field.handle_key(key);
-                            }
-                            SurfaceOutcome::Handled
-                        }
-                    };
-                }
+    fn handle_mouse(&mut self, event: MouseEvent, content: Rect) -> SurfaceOutcome {
+        match self.question.as_mut() {
+            Some(question) => Self::question_outcome(question.handle_mouse(event, content)),
+            None => SurfaceOutcome::Ignored,
+        }
+    }
 
-                match key.code {
-                    KeyCode::Up => {
-                        self.highlighted = self.highlighted.saturating_sub(1);
-                        SurfaceOutcome::Handled
-                    }
-                    KeyCode::Down => {
-                        if self.highlighted + 1 < options.len() {
-                            self.highlighted += 1;
-                        }
-                        SurfaceOutcome::Handled
-                    }
-                    // Space ticks an option when several may be chosen. On a
-                    // single-select question there is nothing to tick, so it
-                    // does nothing rather than answering by accident.
-                    KeyCode::Char(' ') if self.is_multi_select() => {
-                        if let Some(slot) = self.chosen.get_mut(self.highlighted) {
-                            *slot = !*slot;
-                        }
-                        SurfaceOutcome::Handled
-                    }
-                    KeyCode::Char(c) if c.is_ascii_digit() => {
-                        // 1-9 pick directly. A digit past the end does nothing
-                        // rather than answering something the user cannot see.
-                        let Some(index) = c.to_digit(10).and_then(|d| (d as usize).checked_sub(1))
-                        else {
-                            return SurfaceOutcome::Handled;
-                        };
-                        if self.is_multi_select() {
-                            if let Some(slot) = self.chosen.get_mut(index) {
-                                *slot = !*slot;
-                            }
-                            return SurfaceOutcome::Handled;
-                        }
-                        match self.answer_at(index) {
-                            Some(action) => SurfaceOutcome::Emit(action),
-                            None => SurfaceOutcome::Handled,
-                        }
-                    }
-                    // Answers the highlighted option, not the first. The footer
-                    // has always advertised arrow selection; before this surface
-                    // the arrows did nothing and Enter always took option one.
-                    KeyCode::Enter => match self.answer() {
-                        Some(answer) => SurfaceOutcome::Emit(SurfaceAction::AnswerPrompt {
-                            allowed: true,
-                            answer: Some(answer),
-                        }),
-                        None => SurfaceOutcome::Handled,
-                    },
-                    KeyCode::Esc => deny,
-                    _ => SurfaceOutcome::Handled,
-                }
+    fn handle_paste(&mut self, pasted: &str) -> bool {
+        match self.question.as_mut() {
+            Some(question) => {
+                question.paste_text(pasted);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn question_mut(&mut self) -> Option<&mut QuestionView> {
+        self.question.as_mut()
+    }
+
+    fn desired_size(&self, max_width: u16, theme: &Theme) -> (u16, u16) {
+        // Measured without rendering: rendering a question records its scroll
+        // position, and a probe at an unlimited height would reset it.
+        match &self.question {
+            Some(question) => {
+                let height = question.content_height(max_width, theme);
+                (max_width, height.min(usize::from(u16::MAX / 2)) as u16)
+            }
+            None => {
+                let probe = Rect::new(0, 0, max_width.max(1), u16::MAX / 2);
+                (max_width, self.render(probe, theme).len() as u16)
             }
         }
     }
 
+    fn cursor(&self, area: Rect, theme: &Theme) -> Option<(u16, u16)> {
+        self.question.as_ref()?.cursor(area, theme)
+    }
+
     fn render(&self, area: Rect, theme: &Theme) -> Vec<Line<'static>> {
+        if let Some(question) = &self.question {
+            return question.render(area, theme);
+        }
+
         let width = area.width.max(1) as usize;
         let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -291,71 +230,7 @@ impl Surface for PromptSurface {
             }
         }
 
-        let options = self.options();
-        let mut highlight_row = None;
-        if !options.is_empty() {
-            lines.push(Line::default());
-            let multi = self.is_multi_select();
-            for (index, option) in options.iter().enumerate() {
-                let focused = index == self.highlighted && !self.editing;
-                if focused {
-                    highlight_row = Some(lines.len());
-                }
-                let marker = if focused {
-                    glyphs::OPTION_MARKER
-                } else {
-                    glyphs::OPTION_BLANK
-                };
-                let style = if focused {
-                    theme
-                        .style(Role::CompletionSelectedText)
-                        .bg(theme.fg(Role::CompletionSelectedBackground))
-                } else {
-                    theme.style(Role::CompletionNormal)
-                };
-                // A tick box only where several may be chosen, so a
-                // single-select question does not look as though it takes more
-                // than one answer.
-                let label = if multi {
-                    let ticked = self.chosen.get(index).copied().unwrap_or(false);
-                    let box_ = if ticked {
-                        glyphs::RADIO_ON
-                    } else {
-                        glyphs::RADIO_OFF
-                    };
-                    format!("{marker}{box_} {}. {option}", index + 1)
-                } else {
-                    format!("{marker}{}. {option}", index + 1)
-                };
-                lines.push(Line::from(Span::styled(
-                    text::truncate(&text::sanitize(&label), width),
-                    style,
-                )));
-            }
-        }
-
-        if let Some(field) = &self.free_text {
-            lines.push(Line::default());
-            let rendered = field.render(width as u16, self.editing, theme);
-            if self.editing {
-                highlight_row = Some(lines.len() + rendered.len().saturating_sub(1));
-            }
-            lines.extend(rendered);
-        }
-
-        // Scrolled to keep the highlighted option visible: a long plan or a
-        // long option list must not hide the thing being answered. The row is
-        // recorded while building rather than derived afterwards, so it cannot
-        // drift from the layout it describes.
-        let height = area.height as usize;
-        if lines.len() > height && height > 0 {
-            let anchor = highlight_row.unwrap_or(0);
-            let scroll = (anchor + 1).saturating_sub(height).min(lines.len() - height);
-            lines.drain(..scroll);
-            lines.truncate(height);
-        } else {
-            lines.truncate(height);
-        }
+        lines.truncate(area.height as usize);
         lines
     }
 }
@@ -363,7 +238,7 @@ impl Surface for PromptSurface {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyModifiers;
+    use crate::render::glyphs;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -382,6 +257,7 @@ mod tests {
             options: vec!["first".into(), "second".into(), "third".into()],
             multi_select: false,
             allow_free_text: false,
+            accepts_images: false,
         })
     }
 
@@ -500,15 +376,23 @@ mod tests {
         }
     }
 
+    fn answer_of(outcome: SurfaceOutcome) -> Option<String> {
+        match outcome {
+            SurfaceOutcome::Emit(SurfaceAction::AnswerPrompt { answer, .. }) => answer,
+            _ => None,
+        }
+    }
+
     #[test]
     fn the_highlight_stops_at_both_ends() {
         let mut q = question();
         q.handle_key(key(KeyCode::Up));
-        assert_eq!(q.highlighted, 0);
+        assert_eq!(answer_of(q.handle_key(key(KeyCode::Enter))).as_deref(), Some("first"));
+        let mut q = question();
         for _ in 0..9 {
             q.handle_key(key(KeyCode::Down));
         }
-        assert_eq!(q.highlighted, 2);
+        assert_eq!(answer_of(q.handle_key(key(KeyCode::Enter))).as_deref(), Some("third"));
     }
 
     #[test]
@@ -554,6 +438,7 @@ mod tests {
             options: vec!["one".into(), "two".into(), "three".into()],
             multi_select: true,
             allow_free_text: false,
+            accepts_images: false,
         })
     }
 
@@ -563,6 +448,7 @@ mod tests {
             options: vec!["first".into(), "second".into()],
             multi_select: false,
             allow_free_text: true,
+            accepts_images: false,
         })
     }
 
@@ -585,19 +471,29 @@ mod tests {
     fn space_ticks_and_unticks_in_a_multi_select() {
         let mut q = multi();
         q.handle_key(key(KeyCode::Char(' ')));
-        assert!(q.chosen[0], "Space did not tick");
         q.handle_key(key(KeyCode::Char(' ')));
-        assert!(!q.chosen[0], "Space did not untick");
+        assert!(
+            matches!(q.handle_key(key(KeyCode::Enter)), SurfaceOutcome::Handled),
+            "Space did not untick"
+        );
+        q.handle_key(key(KeyCode::Char(' ')));
+        assert_eq!(answer_of(q.handle_key(key(KeyCode::Enter))).as_deref(), Some("one"));
     }
 
     #[test]
-    fn space_does_nothing_on_a_single_select() {
-        // Nothing to tick, so it must not answer by accident.
+    fn space_selects_without_answering_on_a_single_select() {
+        // Space marks the radio; only Enter or a digit sends it.
         let mut q = question();
         assert!(matches!(
             q.handle_key(key(KeyCode::Char(' '))),
             SurfaceOutcome::Handled
         ));
+        let text: String = q
+            .render(Rect::new(0, 0, 60, 20), &Theme::default())
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(text.contains(glyphs::RADIO_ON));
     }
 
     #[test]
@@ -617,11 +513,11 @@ mod tests {
             q.handle_key(key(KeyCode::Char('2'))),
             SurfaceOutcome::Handled
         ));
-        assert!(q.chosen[1]);
+        assert_eq!(answer_of(q.handle_key(key(KeyCode::Enter))).as_deref(), Some("two"));
     }
 
     #[test]
-    fn a_typed_answer_wins_over_the_selection() {
+    fn a_typed_answer_with_no_option_chosen_is_sent_as_typed() {
         let mut q = free_text();
         q.handle_key(key(KeyCode::Tab));
         for c in "custom".chars() {
@@ -639,11 +535,15 @@ mod tests {
     fn tab_only_offers_typing_where_the_question_allows_it() {
         let mut plain = question();
         plain.handle_key(key(KeyCode::Tab));
-        assert!(!plain.editing, "typing was offered on a fixed-choice question");
+        assert!(
+            plain.hints().starts_with(glyphs::ARROWS_VERTICAL),
+            "typing was offered on a fixed-choice question: {}",
+            plain.hints()
+        );
 
         let mut typed = free_text();
         typed.handle_key(key(KeyCode::Tab));
-        assert!(typed.editing);
+        assert!(typed.hints().starts_with("Enter submit"), "{}", typed.hints());
     }
 
     #[test]
@@ -664,8 +564,87 @@ mod tests {
                 .flat_map(|l| l.spans.iter().map(|sp| sp.content.to_string()))
                 .collect()
         };
-        assert!(text(&multi()).contains(glyphs::RADIO_OFF));
-        assert!(!text(&question()).contains(glyphs::RADIO_OFF));
+        assert!(text(&multi()).contains(glyphs::CHECK_OFF));
+        assert!(!text(&multi()).contains(glyphs::RADIO_OFF));
+        assert!(text(&question()).contains(glyphs::RADIO_OFF));
+        assert!(!text(&question()).contains(glyphs::CHECK_OFF));
+    }
+
+    #[test]
+    fn a_question_gets_a_wide_modal_and_other_prompts_stay_compact() {
+        assert_eq!(
+            question().placement(),
+            super::super::Placement::FitContent { preferred_width: 110 }
+        );
+        assert_eq!(
+            permission().placement(),
+            super::super::Placement::FitContent { preferred_width: 60 }
+        );
+    }
+
+    #[test]
+    fn a_paste_chord_asks_the_application_for_the_clipboard() {
+        let mut q = free_text();
+        assert!(matches!(
+            q.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)),
+            SurfaceOutcome::Emit(SurfaceAction::PasteIntoPrompt)
+        ));
+        // A permission gate has nothing to paste into.
+        assert!(matches!(
+            permission().handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)),
+            SurfaceOutcome::Handled
+        ));
+    }
+
+    #[test]
+    fn a_bracketed_paste_lands_in_the_question_and_nowhere_else() {
+        let mut q = free_text();
+        assert!(q.handle_paste("pasted"));
+        assert_eq!(answer_of(q.handle_key(key(KeyCode::Enter))).as_deref(), Some("pasted"));
+        assert!(!permission().handle_paste("pasted"));
+    }
+
+    #[test]
+    fn attached_images_travel_with_the_answer() {
+        let mut q = PromptSurface::new(PendingPrompt::Question {
+            question: "Which?".into(),
+            options: vec!["a".into()],
+            multi_select: false,
+            allow_free_text: true,
+            accepts_images: true,
+        });
+        q.question_view_mut()
+            .expect("a question view")
+            .attach_image("image/png", "AAAA".into())
+            .expect("images are accepted");
+        assert_eq!(
+            q.answer_images(),
+            vec![WireImage {
+                media_type: "image/png".into(),
+                base64: "AAAA".into()
+            }]
+        );
+        assert!(permission().answer_images().is_empty());
+    }
+
+    #[test]
+    fn measuring_a_question_does_not_move_its_scroll_position() {
+        let mut q = PromptSurface::new(PendingPrompt::Question {
+            question: "Pick".into(),
+            options: (0..40).map(|i| format!("option{i}")).collect(),
+            multi_select: false,
+            allow_free_text: false,
+            accepts_images: false,
+        });
+        for _ in 0..39 {
+            q.handle_key(key(KeyCode::Down));
+        }
+        let area = Rect::new(0, 0, 40, 8);
+        let theme = Theme::default();
+        let before = q.render(area, &theme);
+        let (_, height) = q.desired_size(40, &theme);
+        assert!(height as usize > 40);
+        assert_eq!(q.render(area, &theme), before);
     }
 
     #[test]
@@ -689,6 +668,7 @@ mod tests {
             options: (0..40).map(|i| format!("option{i}")).collect(),
             multi_select: false,
             allow_free_text: false,
+            accepts_images: false,
         });
         for _ in 0..39 {
             q.handle_key(key(KeyCode::Down));
