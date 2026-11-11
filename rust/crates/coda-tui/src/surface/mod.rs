@@ -25,6 +25,7 @@ pub mod effort;
 pub mod form;
 pub mod mcp_editor;
 pub mod prompt;
+pub mod question;
 pub mod settings;
 pub mod stack;
 
@@ -130,6 +131,9 @@ pub enum SurfaceAction {
         allowed: bool,
         answer: Option<String>,
     },
+    /// Read the clipboard for the open question: an image is attached, text
+    /// is pasted into its answer field.
+    PasteIntoPrompt,
     /// Persist the MCP server held by the editor that emitted this.
     SaveMcpServer,
 
@@ -292,6 +296,14 @@ pub trait Surface {
     /// mouse support to one surface can never regress another.
     fn handle_mouse(&mut self, _event: MouseEvent, _content: Rect) -> SurfaceOutcome {
         SurfaceOutcome::Ignored
+    }
+
+    /// Takes bracketed-paste text, returning whether it was consumed.
+    ///
+    /// The default declines, so a paste reaches the composer unless the open
+    /// surface has somewhere to put it.
+    fn handle_paste(&mut self, _text: &str) -> bool {
+        false
     }
 
     /// Renders at most `area.height` lines, scrolled so the focused element is

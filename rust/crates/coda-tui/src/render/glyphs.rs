@@ -118,6 +118,12 @@ pub const RADIO_ON: &str = "(\u{25CF})"; // "(●)"
 /// An unchosen radio option.
 pub const RADIO_OFF: &str = "( )";
 
+/// A ticked box, where several options may be chosen at once. Square, so a
+/// multiple-choice list never reads as a radio group.
+pub const CHECK_ON: &str = "[\u{2713}]"; // "[✓]"
+/// An unticked box.
+pub const CHECK_OFF: &str = "[ ]";
+
 /// A switch that is on. The knob's position carries the state, so the switch
 /// stays readable where colour is not.
 pub const SWITCH_ON: &str = "[ \u{25CF}]"; // "[ ●]"

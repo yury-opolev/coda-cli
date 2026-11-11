@@ -1528,6 +1528,7 @@ impl App {
                 self.surfaces.pop();
                 self.answer_prompt(allowed, answer).await;
             }
+            SurfaceAction::PasteIntoPrompt => {}
             SurfaceAction::SetEffort { effort, persist, for_model } => {
                 self.apply_set_effort(effort, persist, for_model).await;
             }

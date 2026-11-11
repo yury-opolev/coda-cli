@@ -265,6 +265,7 @@ fn renders_a_question_prompt_with_numbered_options() {
                 options: vec!["rewrite".into(), "patch".into()],
                 multi_select: false,
                 allow_free_text: true,
+                accepts_images: false,
             },
         )),
         80,

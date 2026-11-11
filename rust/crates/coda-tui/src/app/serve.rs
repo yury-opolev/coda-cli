@@ -6334,6 +6334,7 @@ pub(in crate::app) mod tests {
                 options: vec!["a".into()],
                 multi_select: false,
                 allow_free_text: true,
+                accepts_images: false,
             },
             old,
         );

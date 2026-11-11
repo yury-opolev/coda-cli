@@ -249,6 +249,8 @@ pub enum PendingPrompt {
         options: Vec<String>,
         multi_select: bool,
         allow_free_text: bool,
+        /// Whether the engine takes images with the answer.
+        accepts_images: bool,
     },
     PlanApproval { plan: String },
 }
@@ -3412,6 +3414,7 @@ mod tests {
             options: vec!["a".into()],
             multi_select: false,
             allow_free_text: true,
+            accepts_images: false,
         }));
 
         state.apply(UiEvent::PromptResolved(ExternalResolution::Outcome {
@@ -3443,6 +3446,7 @@ mod tests {
             options: vec!["a".into()],
             multi_select: false,
             allow_free_text: true,
+            accepts_images: false,
         }));
         state.apply(UiEvent::PromptResolved(ExternalResolution::Outcome {
             kind: Some(coda_proto::state::PendingRequestKind::Question),
@@ -3506,6 +3510,7 @@ mod tests {
             options: vec!["a".into()],
             multi_select: false,
             allow_free_text: true,
+            accepts_images: false,
         }));
         state.apply(UiEvent::PromptAnswered {
             allowed: true,

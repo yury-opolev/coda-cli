@@ -178,6 +178,14 @@ impl SurfaceStack {
         }
     }
 
+    /// Routes bracketed-paste text to the top surface; `false` when nothing
+    /// took it.
+    pub fn handle_paste(&mut self, text: &str) -> bool {
+        self.surfaces
+            .last_mut()
+            .is_some_and(|surface| surface.handle_paste(text))
+    }
+
     /// Renders every surface bottom-up.
     ///
     /// Each surface is given its *content* area, not its outer region: it

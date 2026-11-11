@@ -641,6 +641,7 @@ pub fn prompt_from_dto(dto: &PendingRequestDto) -> Option<PendingPrompt> {
                 .get("allowFreeText")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true),
+            accepts_images: false,
         }),
         PendingRequestKind::PlanApproval => {
             Some(PendingPrompt::PlanApproval { plan: text("plan").unwrap_or_default() })
@@ -1297,6 +1298,7 @@ mod tests {
                 options: vec!["a".into()],
                 multi_select: false,
                 allow_free_text: true,
+                accepts_images: false,
             },
             responder,
         );

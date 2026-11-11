@@ -63,7 +63,7 @@ mod prompt_response_tests {
     fn question() -> PendingPrompt {
         PendingPrompt::Question {
             question: "Choose".into(), options: vec!["Delete".into(), "Keep".into()],
-            multi_select: false, allow_free_text: true,
+            multi_select: false, allow_free_text: true, accepts_images: false,
         }
     }
 
@@ -137,6 +137,7 @@ impl App {
                     options: request.options,
                     multi_select: request.multi_select,
                     allow_free_text: request.allow_free_text,
+                    accepts_images: false,
                 }),
             server_method::PLAN_APPROVAL => serde_json::from_value::<
                 messages::PlanApprovalRequest,

@@ -120,6 +120,16 @@ fn every_surface_stays_inside_its_area_at_any_terminal_size() {
                 options: (0..30).map(|i| format!("option number {i}")).collect(),
                 multi_select: false,
                 allow_free_text: false,
+                accepts_images: false,
+            })),
+            Box::new(PromptSurface::new(PendingPrompt::Question {
+                question: "Pick any of these, then explain why in the field below".into(),
+                options: (0..12)
+                    .map(|i| format!("option {i} with a long description that must wrap onto several rows of the modal"))
+                    .collect(),
+                multi_select: true,
+                allow_free_text: true,
+                accepts_images: true,
             })),
         ] {
             let mut stack = SurfaceStack::default();
