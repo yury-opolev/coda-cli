@@ -21,7 +21,9 @@ impl Tool for AskUserQuestionTool {
     fn description(&self) -> &str {
         "Ask the user a structured multiple-choice question and get their answer. \
          Use when you need clarification or a decision before proceeding. \
-         Provide clear options. For multiSelect, the user may choose more than one option."
+         Provide clear options. For multiSelect, the user may choose more than one option. \
+         The user can also type their own answer instead and attach screenshots, which \
+         follow the tool result."
     }
 
     fn input_schema_json(&self) -> &str {
@@ -92,32 +94,46 @@ impl Tool for AskUserQuestionTool {
             None => ToolResult::ok(
                 "No interactive user is available; proceed using your best judgment.",
             ),
-            Some(uq) => match uq.ask(&question, &options, multi_select, cancel).await {
-                AnswerOutcome::Answered(answer) => {
-                    ToolResult::ok(format!("User answered: {answer}"))
-                }
-                // A deliberate set-aside, not a fault: the question was
-                // recorded as a blocker and the run should carry on elsewhere.
-                // Non-fatal, so the agent can route around it, and phrased so
-                // it cannot read as an answer.
-                AnswerOutcome::Parked { reason } => ToolResult::error(format!(
-                    "This question was not settled and has been recorded as a blocker ({reason}). \
-                     No option was chosen. Do not ask it again — continue with a different part \
-                     of the task."
-                )),
-                // SECURITY: a fault is not an answer. Never the first option,
-                // never an empty success, never a retry. The run stops with a
-                // typed abort so no follow-up model request can be issued on
-                // the strength of a fabricated choice.
-                AnswerOutcome::NoAnswer(reason) => ToolResult::abort(
-                    format!("question.noAnswer.{}", reason.as_str()),
-                    format!(
-                        "The question was not answered ({}). No answer was received, \
-                         so the run stopped without choosing any option.",
-                        reason.as_str()
+            Some(uq) => {
+                let reply = uq.ask_with_attachments(&question, &options, multi_select, cancel).await;
+                match reply.outcome {
+                    AnswerOutcome::Answered(answer) => {
+                        let images = reply.images;
+                        if images.is_empty() {
+                            ToolResult::ok(format!("User answered: {answer}"))
+                        } else {
+                            let n = images.len();
+                            let noun = if n == 1 { "image" } else { "images" };
+                            ToolResult::ok(format!(
+                                "User answered: {answer}\n\n(The user attached {n} {noun} to this \
+                                 answer; they follow this tool result.)"
+                            ))
+                            .with_images(images)
+                        }
+                    }
+                    // A deliberate set-aside, not a fault: the question was
+                    // recorded as a blocker and the run should carry on elsewhere.
+                    // Non-fatal, so the agent can route around it, and phrased so
+                    // it cannot read as an answer.
+                    AnswerOutcome::Parked { reason } => ToolResult::error(format!(
+                        "This question was not settled and has been recorded as a blocker ({reason}). \
+                         No option was chosen. Do not ask it again — continue with a different part \
+                         of the task."
+                    )),
+                    // SECURITY: a fault is not an answer. Never the first option,
+                    // never an empty success, never a retry. The run stops with a
+                    // typed abort so no follow-up model request can be issued on
+                    // the strength of a fabricated choice.
+                    AnswerOutcome::NoAnswer(reason) => ToolResult::abort(
+                        format!("question.noAnswer.{}", reason.as_str()),
+                        format!(
+                            "The question was not answered ({}). No answer was received, \
+                             so the run stopped without choosing any option.",
+                            reason.as_str()
+                        ),
                     ),
-                ),
-            },
+                }
+            }
         }
     }
 }
@@ -327,5 +343,59 @@ mod tests {
             .await;
         assert!(result.control.is_none());
         assert!(!result.is_error);
+    }
+
+    struct AnswersWithImage;
+
+    #[async_trait]
+    impl UserQuestion for AnswersWithImage {
+        async fn ask(&self, _: &str, _: &[String], _: bool, _: CancellationToken) -> AnswerOutcome {
+            AnswerOutcome::Answered("plain".into())
+        }
+
+        async fn ask_with_attachments(
+            &self,
+            _: &str,
+            _: &[String],
+            _: bool,
+            _: CancellationToken,
+        ) -> coda_tool::QuestionReply {
+            coda_tool::QuestionReply {
+                outcome: AnswerOutcome::Answered("alpha".into()),
+                images: vec![coda_tool::ImageAttachment {
+                    media_type: "image/png".into(),
+                    base64: "AAAA".into(),
+                }],
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_answer_with_images_returns_them_and_says_how_many() {
+        let ctx = ToolContext::new("/").with_user_question(Arc::new(AnswersWithImage));
+        let result = AskUserQuestionTool
+            .execute(
+                &serde_json::json!({"question": "Pick", "options": ["alpha"]}),
+                &ctx,
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!result.is_error);
+        assert!(result.content.contains("User answered: alpha"), "{}", result.content);
+        assert!(result.content.contains("1 image"), "{}", result.content);
+        assert_eq!(result.images.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_answer_without_images_attaches_none_and_does_not_mention_them() {
+        let result = AskUserQuestionTool
+            .execute(
+                &serde_json::json!({"question": "Pick", "options": ["alpha"]}),
+                &ctx_with_question(),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(result.images.is_empty());
+        assert!(!result.content.contains("image"), "{}", result.content);
     }
 }

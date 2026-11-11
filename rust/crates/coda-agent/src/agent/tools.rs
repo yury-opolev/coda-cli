@@ -178,6 +178,7 @@ async fn run_tools_body(
     cancel: CancellationToken,
 ) -> Result<ToolBatchResult, AgentError> {
     let mut results: Vec<Content> = Vec::with_capacity(tool_uses.len());
+    let mut trailing_images: Vec<Content> = Vec::new();
     let abort_reason: Option<String> = None;
     let mut control_abort: Option<String> = None;
 
@@ -378,6 +379,10 @@ async fn run_tools_body(
         });
 
         results.push(make_result_block(id, &tool_result.content, tool_result.is_error, terminal_status, correlation.clone()));
+        trailing_images.extend(tool_result.images.iter().map(|i| Content::Image {
+            media_type: i.media_type.clone(),
+            base64: i.base64.clone(),
+        }));
 
         // Batch rule (§6.2, P6): once a tool is still running in the
         // background, nothing planned after it may run against its unfinished
@@ -426,6 +431,8 @@ async fn run_tools_body(
         }
     }
 
+    // Providers require every tool_result block before any other content in the message.
+    results.extend(trailing_images);
     Ok(ToolBatchResult { result_blocks: results, abort_reason, control_abort })
 }
 
@@ -1029,6 +1036,67 @@ mod tests {
             message_bus: None,
             is_main_context: false,
         }
+    }
+
+    struct FixedTool {
+        name: &'static str,
+        result: ToolResult,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tool::Tool for FixedTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "test"
+        }
+        fn input_schema_json(&self) -> &str {
+            "{}"
+        }
+        fn is_read_only(&self) -> bool {
+            true
+        }
+        async fn execute(&self, _: &serde_json::Value, _: &ToolContext, _: CancellationToken) -> ToolResult {
+            self.result.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn result_images_follow_every_tool_result_in_the_batch() {
+        let image = coda_tool::ImageAttachment { media_type: "image/png".into(), base64: "AAAA".into() };
+        let registry = ToolRegistry::new(vec![
+            Arc::new(FixedTool { name: "pictures", result: ToolResult::ok("done").with_images(vec![image]) })
+                as Arc<dyn crate::tool::Tool>,
+            Arc::new(FixedTool { name: "plain", result: ToolResult::ok("plain") }),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let manager = TaskManager::new("s", Some(dir.path().to_path_buf()), 4096, 10);
+        let ctx = test_ctx(&registry, &manager, None);
+        let tool_use = |id: &str, name: &str| Content::ToolUse {
+            id: id.into(),
+            name: name.into(),
+            input_json: "{}".into(),
+            correlation: LlmCorrelation::default(),
+        };
+        let batch = run_tools_body(
+            &[tool_use("t1", "pictures"), tool_use("t2", "plain")],
+            &ToolActivity::new(),
+            &crate::events::NullSink,
+            &ctx,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("batch runs");
+
+        let blocks = &batch.result_blocks;
+        assert_eq!(blocks.len(), 3, "{blocks:?}");
+        assert!(matches!(&blocks[0], Content::ToolResult { tool_use_id, .. } if tool_use_id == "t1"));
+        assert!(matches!(&blocks[1], Content::ToolResult { tool_use_id, .. } if tool_use_id == "t2"));
+        assert_eq!(
+            blocks[2],
+            Content::Image { media_type: "image/png".into(), base64: "AAAA".into() }
+        );
     }
 
     #[tokio::test(start_paused = true)]
