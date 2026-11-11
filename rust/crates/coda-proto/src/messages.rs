@@ -1234,7 +1234,7 @@ pub struct QuestionRequest {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct QuestionResponse {
     pub answer: String,
-    /// Images attached to the answer; only honoured when the request had cceptsImages.
+    /// Images attached to the answer; only honoured when the request had `acceptsImages`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<WireImage>,
 }

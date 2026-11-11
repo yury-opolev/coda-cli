@@ -9,7 +9,7 @@
       "items": {
         "$ref": "#/$defs/WireImage"
       },
-      "description": "Images attached to the answer; only honoured when the request had \u0007cceptsImages."
+      "description": "Images attached to the answer; only honoured when the request had `acceptsImages`."
     }
   },
   "required": [
