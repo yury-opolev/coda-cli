@@ -859,7 +859,7 @@ mod tests {
                 .await
                 .expect("EOF must resolve the waiter, not leave it hanging on a human who is gone")
                 .expect("the waiter must be answered, not dropped"),
-            RequestOutcome::Question(AnswerOutcome::NoAnswer(NoAnswerReason::Disconnected)),
+            RequestOutcome::Question(AnswerOutcome::NoAnswer(NoAnswerReason::Disconnected), Vec::new()),
             "SECURITY: a lost connection is never the first option and never an empty answer"
         );
         assert_eq!(

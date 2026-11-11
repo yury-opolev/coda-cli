@@ -163,6 +163,15 @@ ID, or resolve the canonical `requestId` through the session API. Both paths
 share one registry: a second resolution never grants twice. Never answer a
 new engine using a previous instance's numeric RPC ID.
 
+`request/question` params include `acceptsImages` (absent means `false`; also in
+the pending `display`). The reply, raw or as the `session/resolveRequest`
+outcome, is `{ answer, images? }`, where `images` holds at most 8 `WireImage`
+values (`image/png`, `image/jpeg`, `image/gif` or `image/webp`, valid base64,
+at most 5 MiB each). An invalid raw reply is `noAnswer.malformed`; an invalid
+`resolveRequest` outcome is refused for correction. The engine drops images on
+an `acceptsImages: false` question. Accepted images follow the tool result in
+history and never appear in an event.
+
 Permission requests currently have no `callId`: the permission callback does
 not receive the tool-call identity. Use the request's own identity and display
 context; do not infer a correlation with a concurrent tool call.

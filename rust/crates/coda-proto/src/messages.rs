@@ -456,7 +456,7 @@ impl PromptParams {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WireImage {
@@ -1222,15 +1222,21 @@ pub struct QuestionRequest {
     pub multi_select: bool,
     #[serde(default)]
     pub allow_free_text: bool,
+    /// Whether the reply may carry images (additive; absent means no).
+    #[serde(default)]
+    pub accepts_images: bool,
     /// See [`PermissionRequest::request_id`].
     #[serde(default)]
     pub request_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct QuestionResponse {
     pub answer: String,
+    /// Images attached to the answer; only honoured when the request had cceptsImages.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<WireImage>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

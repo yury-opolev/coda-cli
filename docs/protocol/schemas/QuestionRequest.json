@@ -20,6 +20,11 @@
       "type": "boolean",
       "default": false
     },
+    "acceptsImages": {
+      "type": "boolean",
+      "description": "Whether the reply may carry images (additive; absent means no).",
+      "default": false
+    },
     "requestId": {
       "type": [
         "string",

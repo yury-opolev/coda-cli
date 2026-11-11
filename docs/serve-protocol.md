@@ -1193,11 +1193,23 @@ something was interrupted or declined.
 | Method | Params | Reply |
 |---|---|---|
 | `request/permission` | `{ toolName, inputPreview, requestId? }` | `{ allow: bool }` |
-| `request/question` | `{ question, options[], multiSelect, allowFreeText, requestId? }` | `{ answer: string }` |
+| `request/question` | `{ question, options[], multiSelect, allowFreeText, acceptsImages?, requestId? }` | `{ answer: string, images?: WireImage[] }` |
 | `request/planApproval` | `{ plan, requestId? }` | `{ approve: bool }` |
 
 These are Coda's interactive host callbacks routed to the wire. If you interrupt a turn while one
 is outstanding, the awaiting callback resolves as deny/decline so the turn unwinds cleanly.
+
+**Images on a question answer (additive).** `acceptsImages` (absent means `false`, also published
+in the pending request's `display`) says whether the reply may carry `images`, each a `WireImage`
+`{ mediaType, base64 }`. The engine sets it only when the active provider/model actually delivers
+images to the model. An answer carries at most 8 images; `mediaType` must be `image/png`,
+`image/jpeg`, `image/gif` or `image/webp`; `base64` must be valid and at most 7,000,000
+characters (5 MiB raw). `answer` stays required and non-empty. A raw reply with an invalid
+`images` field resolves as `noAnswer.malformed`; the same outcome offered through
+`session/resolveRequest` is refused (`-32602`) so you can correct it. Images sent for an
+`acceptsImages: false` question are dropped with a warning. Accepted images follow the
+`ask_user_question` tool result in history. They never appear in `event/requestResolved` or any
+other event. An older engine ignores `images`; an older client never sends it.
 
 ### `requestId` on the raw frame (additive)
 
@@ -1276,7 +1288,8 @@ and one exactly-once resolution:
 - The request handle is `req-<engineInstanceId>-<n>`. A handle minted by a previous engine
   process is rejected (`-32010`), never re-applied to whatever happens to be pending now.
 - The offered outcome is validated against the pending request's own **kind** *before* the entry
-  is consumed. A wrong-kind or malformed payload is refused (`-32015` / `-32602`) and the
+  is consumed. A question outcome is `{ answer, images? }`, with the same `images` rules as the
+  raw reply. A wrong-kind or malformed payload is refused (`-32015` / `-32602`) and the
   request stays outstanding for you to correct.
 - A duplicate or replayed resolution is refused (`-32014`). A denial can never be turned into a
   grant by sending the reply twice.

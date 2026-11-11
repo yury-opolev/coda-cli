@@ -43,11 +43,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use coda_proto::state::PendingRequestKind;
 use coda_proto::{RequestId, Request, ResponseError, encode_frame};
-use coda_tool::{AnswerOutcome, NoAnswerReason};
+use coda_tool::{AnswerOutcome, ImageAttachment, NoAnswerReason, QuestionReply};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::images::validate_base64;
 use crate::state::requests::{
     DEFAULT_DISPLAY_TEXT_CAP, PendingRegistry, RequestOutcome, ResolveError, configured_timeout,
     display_text,
@@ -278,15 +279,51 @@ fn parse_wire_response(
         PendingRequestKind::PlanApproval => RequestOutcome::PlanApproval {
             approve: value.get("approve").and_then(Value::as_bool).unwrap_or(false),
         },
-        PendingRequestKind::Question => match value.get("answer").and_then(Value::as_str) {
-            // An all-whitespace answer is not a decision. It is reported as a
-            // malformed reply rather than sent onward as a choice.
-            Some(a) if !a.trim().is_empty() => {
-                RequestOutcome::Question(AnswerOutcome::Answered(a.to_string()))
+        PendingRequestKind::Question => {
+            match (value.get("answer").and_then(Value::as_str), answer_images(value)) {
+                // An all-whitespace answer is not a decision. It is reported as a
+                // malformed reply rather than sent onward as a choice; so is an
+                // answer whose images cannot be used.
+                (Some(a), Ok(images)) if !a.trim().is_empty() => {
+                    RequestOutcome::Question(AnswerOutcome::Answered(a.to_string()), images)
+                }
+                _ => RequestOutcome::fail_closed(kind, NoAnswerReason::Malformed),
             }
-            _ => RequestOutcome::Question(AnswerOutcome::NoAnswer(NoAnswerReason::Malformed)),
-        },
+        }
     }
+}
+
+/// Most images one answer may carry.
+pub(crate) const MAX_ANSWER_IMAGES: usize = 8;
+/// Largest base64 payload per image (5 MiB raw).
+const MAX_ANSWER_IMAGE_BASE64: usize = 7_000_000;
+
+/// Reads the optional `images` of a question reply. `Err` names the first problem.
+fn answer_images(value: &Value) -> Result<Vec<ImageAttachment>, String> {
+    let Some(raw) = value.get("images") else { return Ok(Vec::new()) };
+    let Some(items) = raw.as_array() else { return Err("`images` must be an array".into()) };
+    if items.len() > MAX_ANSWER_IMAGES {
+        return Err(format!("at most {MAX_ANSWER_IMAGES} images may accompany an answer"));
+    }
+    items
+        .iter()
+        .map(|item| {
+            let media_type = item
+                .get("mediaType")
+                .and_then(Value::as_str)
+                .ok_or("an image needs `mediaType`")?;
+            if !matches!(media_type, "image/png" | "image/jpeg" | "image/gif" | "image/webp") {
+                return Err(format!("unsupported image media type: {media_type}"));
+            }
+            let base64 =
+                item.get("base64").and_then(Value::as_str).ok_or("an image needs `base64`")?;
+            if base64.len() > MAX_ANSWER_IMAGE_BASE64 {
+                return Err("an image exceeds 5 MiB".into());
+            }
+            validate_base64(base64)?;
+            Ok(ImageAttachment { media_type: media_type.into(), base64: base64.into() })
+        })
+        .collect()
 }
 
 /// Builds a [`RequestOutcome`] from an out-of-band `session/resolveRequest`
@@ -320,7 +357,9 @@ pub fn outcome_from_rpc(
             }),
         PendingRequestKind::Question => match outcome.get("answer").and_then(Value::as_str) {
             Some(a) if !a.trim().is_empty() => {
-                Ok(RequestOutcome::Question(AnswerOutcome::Answered(a.to_string())))
+                let images = answer_images(outcome)
+                    .map_err(|detail| ResolveError::MalformedOutcome { detail })?;
+                Ok(RequestOutcome::Question(AnswerOutcome::Answered(a.to_string()), images))
             }
             Some(_) => Err(ResolveError::MalformedOutcome {
                 detail: "an empty answer is not a decision; use session/cancelRequest to decline"
@@ -394,24 +433,29 @@ pub struct WireUserQuestion {
 }
 
 impl WireUserQuestion {
-    async fn ask_impl(
+    /// `accepts_images` tells the client whether the reply may carry images;
+    /// images arriving on a question that did not offer them are dropped.
+    pub(crate) async fn ask_impl(
         &self,
         question: &str,
         options: &[String],
         multi_select: bool,
+        accepts_images: bool,
         cancel: CancellationToken,
-    ) -> AnswerOutcome {
+    ) -> QuestionReply {
         let params = serde_json::json!({
             "question": question,
             "options": options,
             "multiSelect": multi_select,
             "allowFreeText": true,
+            "acceptsImages": accepts_images,
         });
         let display = serde_json::json!({
             "question": display_text(question, DEFAULT_DISPLAY_TEXT_CAP),
             "options": options,
             "multiSelect": multi_select,
             "allowFreeText": true,
+            "acceptsImages": accepts_images,
         });
 
         match self
@@ -426,11 +470,20 @@ impl WireUserQuestion {
             )
             .await
         {
-            RequestOutcome::Question(answer) => answer,
+            RequestOutcome::Question(outcome, images) => {
+                if !accepts_images && !images.is_empty() {
+                    tracing::warn!(
+                        count = images.len(),
+                        "dropping images attached to a question that did not accept them"
+                    );
+                    return QuestionReply::from(outcome);
+                }
+                QuestionReply { outcome, images }
+            }
             // Structurally impossible (the registry validates kind), but a
             // fallback that invented an answer would be exactly the bug this
             // change exists to remove.
-            _ => AnswerOutcome::NoAnswer(NoAnswerReason::Malformed),
+            _ => AnswerOutcome::NoAnswer(NoAnswerReason::Malformed).into(),
         }
     }
 }
@@ -444,7 +497,40 @@ impl coda_tool::UserQuestion for WireUserQuestion {
         multi_select: bool,
         cancel: CancellationToken,
     ) -> AnswerOutcome {
-        self.ask_impl(question, options, multi_select, cancel).await
+        self.ask_impl(question, options, multi_select, false, cancel).await.outcome
+    }
+}
+
+/// The tool-path question seam for one turn: offers image attachments only when the
+/// active provider/model actually delivers images to the model.
+pub struct ImageAwareQuestion {
+    pub inner: Arc<WireUserQuestion>,
+    pub client: Arc<dyn coda_llm::LlmClient>,
+    pub model: String,
+}
+
+#[async_trait]
+impl coda_tool::UserQuestion for ImageAwareQuestion {
+    async fn ask(
+        &self,
+        question: &str,
+        options: &[String],
+        multi_select: bool,
+        cancel: CancellationToken,
+    ) -> AnswerOutcome {
+        self.inner.ask_impl(question, options, multi_select, false, cancel).await.outcome
+    }
+
+    async fn ask_with_attachments(
+        &self,
+        question: &str,
+        options: &[String],
+        multi_select: bool,
+        cancel: CancellationToken,
+    ) -> QuestionReply {
+        // Asked at question time: the provider's model metadata is loaded by then.
+        let accepts = self.client.accepts_image_input(&self.model);
+        self.inner.ask_impl(question, options, multi_select, accepts, cancel).await
     }
 }
 
@@ -460,7 +546,7 @@ impl coda_agent::agent::stop::UserQuestionPrompt for WireUserQuestion {
         cancel: CancellationToken,
     ) -> Pin<Box<dyn std::future::Future<Output = AnswerOutcome> + Send + 'a>> {
         let opts: Vec<String> = options.iter().map(|s| s.to_string()).collect();
-        Box::pin(async move { self.ask_impl(question, &opts, false, cancel).await })
+        Box::pin(async move { self.ask_impl(question, &opts, false, false, cancel).await.outcome })
     }
 }
 
@@ -830,13 +916,13 @@ mod tests {
         });
         assert_eq!(
             parse_wire_response(PendingRequestKind::Question, &cancelled),
-            RequestOutcome::Question(AnswerOutcome::NoAnswer(NoAnswerReason::Declined))
+            RequestOutcome::Question(AnswerOutcome::NoAnswer(NoAnswerReason::Declined), Vec::new())
         );
 
         let empty_answer: Result<Value, ResponseError> = Ok(json!({ "answer": "" }));
         assert_eq!(
             parse_wire_response(PendingRequestKind::Question, &empty_answer),
-            RequestOutcome::Question(AnswerOutcome::NoAnswer(NoAnswerReason::Malformed)),
+            RequestOutcome::Question(AnswerOutcome::NoAnswer(NoAnswerReason::Malformed), Vec::new()),
             "an empty string is an attempt to answer that produced nothing, not a decision"
         );
     }
@@ -868,7 +954,7 @@ mod tests {
     #[test]
     fn a_declined_question_is_labelled_no_answer_declined() {
         let outcome =
-            RequestOutcome::Question(AnswerOutcome::NoAnswer(NoAnswerReason::Declined));
+            RequestOutcome::Question(AnswerOutcome::NoAnswer(NoAnswerReason::Declined), Vec::new());
         assert_eq!(outcome.label(), "noAnswer.declined");
         assert_ne!(outcome.label(), "noAnswer.malformed");
         assert_ne!(outcome.label(), "noAnswer.disconnected");
@@ -1183,7 +1269,186 @@ mod tests {
         );
         assert_eq!(
             outcome_from_rpc(PendingRequestKind::Question, &json!({ "answer": "Keep" })).unwrap(),
-            RequestOutcome::Question(AnswerOutcome::Answered("Keep".into()))
+            RequestOutcome::Question(AnswerOutcome::Answered("Keep".into()), Vec::new())
         );
+    }
+
+    // ── Answer images ────────────────────────────────────────────────────
+
+    const PNG_B64: &str = "iVBORw0KGgo="; // valid base64; content is not decoded as PNG
+
+    fn png() -> ImageAttachment {
+        ImageAttachment { media_type: "image/png".into(), base64: PNG_B64.into() }
+    }
+
+    /// Reads the body of the next framed request the engine wrote.
+    async fn next_frame(rx: &mut mpsc::UnboundedReceiver<Vec<u8>>) -> Value {
+        let frame = rx.recv().await.expect("a request frame was written");
+        let text = String::from_utf8_lossy(&frame);
+        serde_json::from_str(text.split("\r\n\r\n").nth(1).expect("framed body")).expect("json")
+    }
+
+    #[test]
+    fn a_raw_answer_carries_its_images() {
+        let reply = Ok(json!({ "answer": "Keep", "images": [{ "mediaType": "image/png", "base64": PNG_B64 }] }));
+        match parse_wire_response(PendingRequestKind::Question, &reply) {
+            RequestOutcome::Question(AnswerOutcome::Answered(a), images) => {
+                assert_eq!(a, "Keep");
+                assert_eq!(images, vec![png()]);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_raw_answer_with_an_unusable_image_is_malformed_not_answered() {
+        for images in [
+            json!([{ "mediaType": "image/bmp", "base64": PNG_B64 }]),
+            json!([{ "mediaType": "image/png", "base64": "not base64!!" }]),
+            json!([{ "mediaType": "image/png" }]),
+            json!({ "mediaType": "image/png", "base64": PNG_B64 }),
+            json!((0..9).map(|_| json!({ "mediaType": "image/png", "base64": PNG_B64 })).collect::<Vec<_>>()),
+        ] {
+            let reply = Ok(json!({ "answer": "Keep", "images": images }));
+            assert_eq!(
+                parse_wire_response(PendingRequestKind::Question, &reply),
+                RequestOutcome::Question(AnswerOutcome::NoAnswer(NoAnswerReason::Malformed), Vec::new())
+            );
+        }
+    }
+
+    #[test]
+    fn an_oversized_answer_image_is_refused() {
+        let huge = "A".repeat(MAX_ANSWER_IMAGE_BASE64 + 4);
+        let value = json!({ "answer": "Keep", "images": [{ "mediaType": "image/png", "base64": huge }] });
+        assert!(answer_images(&value).is_err());
+    }
+
+    #[test]
+    fn an_out_of_band_answer_with_a_bad_image_is_rejected_for_correction() {
+        let err = outcome_from_rpc(
+            PendingRequestKind::Question,
+            &json!({ "answer": "Keep", "images": [{ "mediaType": "image/bmp", "base64": PNG_B64 }] }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ResolveError::MalformedOutcome { .. }));
+        let ok = outcome_from_rpc(
+            PendingRequestKind::Question,
+            &json!({ "answer": "Keep", "images": [{ "mediaType": "image/jpeg", "base64": PNG_B64 }] }),
+        )
+        .unwrap();
+        assert!(matches!(ok, RequestOutcome::Question(AnswerOutcome::Answered(_), ref i) if i.len() == 1));
+    }
+
+    /// The label feeds `event/requestResolved`; image payloads must never leak into it.
+    #[test]
+    fn an_answer_with_images_is_labelled_answered_only() {
+        let outcome = RequestOutcome::Question(AnswerOutcome::Answered("Keep".into()), vec![png()]);
+        assert_eq!(outcome.label(), "answered");
+    }
+
+    #[tokio::test]
+    async fn a_question_advertises_whether_it_accepts_images() {
+        for accepts in [false, true] {
+            let (channel, mut rx) = channel();
+            let question = Arc::new(WireUserQuestion { channel: Arc::clone(&channel) });
+            let task = tokio::spawn({
+                let q = Arc::clone(&question);
+                async move {
+                    let options = ["a".to_string()];
+                    if accepts {
+                        q.ask_impl("Which?", &options, false, true, CancellationToken::new()).await
+                    } else {
+                        coda_tool::UserQuestion::ask(q.as_ref(), "Which?", &options, false, CancellationToken::new())
+                            .await
+                            .into()
+                    }
+                }
+            });
+            let dto = await_pending(&channel).await;
+            let request = next_frame(&mut rx).await;
+            assert_eq!(request["params"]["acceptsImages"], json!(accepts));
+            assert_eq!(dto.display["acceptsImages"], json!(accepts));
+            channel.fail_all_pending();
+            let _ = task.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn an_image_capable_question_returns_the_attached_images() {
+        let (channel, _rx) = channel();
+        let uq = WireUserQuestion { channel: Arc::clone(&channel) };
+        let c = Arc::clone(&channel);
+        let task = tokio::spawn(async move {
+            uq.ask_impl("q?", &["Keep".to_string()], false, true, CancellationToken::new()).await
+        });
+        await_pending(&channel).await;
+        c.route_response(
+            &RequestId::Number(1),
+            Ok(json!({ "answer": "Keep", "images": [{ "mediaType": "image/png", "base64": PNG_B64 }] })),
+        );
+        let reply = task.await.expect("task");
+        assert_eq!(reply.outcome, AnswerOutcome::Answered("Keep".into()));
+        assert_eq!(reply.images, vec![png()]);
+    }
+
+    #[tokio::test]
+    async fn images_on_a_question_that_did_not_offer_them_are_dropped() {
+        let (channel, _rx) = channel();
+        let uq = WireUserQuestion { channel: Arc::clone(&channel) };
+        let c = Arc::clone(&channel);
+        let task = tokio::spawn(async move {
+            uq.ask_impl("q?", &["Keep".to_string()], false, false, CancellationToken::new()).await
+        });
+        await_pending(&channel).await;
+        c.route_response(
+            &RequestId::Number(1),
+            Ok(json!({ "answer": "Keep", "images": [{ "mediaType": "image/png", "base64": PNG_B64 }] })),
+        );
+        let reply = task.await.expect("task");
+        assert_eq!(reply.outcome, AnswerOutcome::Answered("Keep".into()));
+        assert!(reply.images.is_empty(), "an unoffered attachment must not reach the model");
+    }
+
+    struct ImageCapability(bool);
+
+    #[async_trait]
+    impl coda_llm::LlmClient for ImageCapability {
+        fn provider_id(&self) -> &str {
+            "fake"
+        }
+        async fn stream(
+            &self,
+            _request: coda_llm::ChatRequest,
+        ) -> Result<coda_llm::ResponseStream, coda_llm::LlmError> {
+            Err(coda_llm::LlmError::Unauthorized("not used".into()))
+        }
+        fn accepts_image_input(&self, _model: &str) -> bool {
+            self.0
+        }
+    }
+
+    #[tokio::test]
+    async fn an_image_aware_question_offers_images_only_when_the_model_takes_them() {
+        for accepts in [false, true] {
+            let (channel, mut rx) = channel();
+            let question = Arc::new(ImageAwareQuestion {
+                inner: Arc::new(WireUserQuestion { channel: Arc::clone(&channel) }),
+                client: Arc::new(ImageCapability(accepts)),
+                model: "some-model".into(),
+            });
+            let task = tokio::spawn({
+                let q = Arc::clone(&question);
+                async move {
+                    q.ask_with_attachments("Which?", &["a".to_string()], false, CancellationToken::new())
+                        .await
+                }
+            });
+            await_pending(&channel).await;
+            let request = next_frame(&mut rx).await;
+            assert_eq!(request["params"]["acceptsImages"], json!(accepts));
+            channel.fail_all_pending();
+            let _ = task.await;
+        }
     }
 }
