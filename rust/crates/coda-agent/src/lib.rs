@@ -21,7 +21,8 @@
 //! - **`steering`**: `SteeringInbox`, `SteeringEntry`.
 //! - **`events`**: `AgentEvent`, `AgentSink`, `ProtoAdapter`, `NullSink`,
 //!   `CollectingSink`, `ToolCallStatus`.
-//! - **`agent`**: `AgentLoop`, `AgentLoopBuilder`, `AgentError`.
+//! - **`agent`**: `AgentLoop`, `AgentLoopBuilder`, `AgentError`, and the
+//!   compaction trigger's `OccupancyTracker` / `Projection`.
 //!
 //! ## Phase 3 — Built-in tools
 //!
@@ -64,6 +65,9 @@ pub mod tools;
 
 // Convenience re-exports — the most frequently used public surface.
 pub use agent::{AgentError, AgentLoop, AgentLoopBuilder, DEFAULT_MAX_TOKENS};
+pub use agent::occupancy::{
+    OccupancyTracker, Projection, request_fingerprint, request_overhead_tokens,
+};
 pub use agent::output_budget::{
     clamp_to_context_window, resolve_max_output_tokens, ModelBudget, OutputBudgetSource,
     FALLBACK_MAX_OUTPUT_TOKENS, MIN_MAX_OUTPUT_TOKENS,

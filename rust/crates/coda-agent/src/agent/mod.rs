@@ -38,6 +38,7 @@ use crate::tasks::TaskManager;
 use crate::todos::TodoStore;
 use crate::tool::{PlanApprover, ScheduleOrigin, ToolQuarantine, ToolRegistry, UserQuestion};
 
+pub mod occupancy;
 pub mod output_budget;
 pub mod park;
 pub mod stop;
@@ -45,6 +46,7 @@ pub mod stream;
 mod suspend;
 pub mod tools;
 
+use occupancy::{OccupancyTracker, Projection, request_fingerprint, request_overhead_tokens};
 use stop::{StopAction, UserQuestionPrompt, decide_stop};
 use stream::{
     is_context_overflow_error, stream_with_retries, OutageRetryPolicy, RetryConfig,
@@ -146,6 +148,8 @@ pub struct AgentLoop {
     compaction_service: Option<Arc<CompactionService>>,
     /// Policy controlling when proactive compaction fires.
     compaction_policy: CompactionPolicy,
+    /// Measured-usage anchor the compaction trigger projects from.
+    occupancy: Arc<OccupancyTracker>,
 
     // ── Stateful service handles forwarded into ToolContext on every batch ────
     // Without these the built-in tools that need a store or factory all silently
@@ -252,17 +256,23 @@ impl AgentLoop {
     /// only when the estimated prompt leaves less room than that in the
     /// model's context window.
     fn request_max_tokens(&self, history: &[Message], tools: &[coda_llm::ToolDefinition]) -> u32 {
-        let fixed_chars = self.system_prompt.as_deref().map_or(0, str::len)
-            + tools
-                .iter()
-                .map(|t| t.name.len() + t.description.len() + t.input_schema_json.len())
-                .sum::<usize>();
-        let estimate = TokenEstimator::estimate(history) + fixed_chars / 4;
+        let estimate = TokenEstimator::estimate(history)
+            + request_overhead_tokens(self.system_prompt.as_deref(), tools);
         output_budget::clamp_to_context_window(self.max_tokens, self.context_window, estimate)
     }
 
+    /// Fingerprint and overhead of a request this loop sends with `tools`.
+    fn request_shape(&self, tools: &[coda_llm::ToolDefinition]) -> (u64, usize) {
+        let system = self.system_prompt.as_deref();
+        (request_fingerprint(&self.model, system, tools), request_overhead_tokens(system, tools))
+    }
+
     /// The limits a compaction in this loop works within.
-    fn compaction_limits(&self) -> CompactionLimits {
+    ///
+    /// A policy without a window falls back to the loop's own window (set via
+    /// `with_context_window`) before the default; the source stays whatever
+    /// the policy says, since the loop's window carries no provenance.
+    fn compaction_limits(&self, overhead_tokens: usize) -> CompactionLimits {
         let policy = &self.compaction_policy;
         CompactionLimits {
             context_window: policy
@@ -271,9 +281,57 @@ impl AgentLoop {
                 .unwrap_or(DEFAULT_CONTEXT_WINDOW),
             window_source: policy.window_source,
             model_output_limit: policy.model_output_limit,
-            request_overhead_tokens: 0,
+            request_overhead_tokens: overhead_tokens,
             reply_reserve_tokens: self.max_tokens as usize,
         }
+    }
+
+    /// Runs one automatic compaction and updates the suppression mark: a
+    /// declined or failed compaction, or one that left the projection over
+    /// the threshold, blocks further attempts until occupancy has grown by
+    /// another full threshold. A cancellation blocks nothing.
+    #[allow(clippy::too_many_arguments)]
+    async fn compact_and_settle(
+        &self,
+        svc: &CompactionService,
+        history: &mut Vec<Message>,
+        sink: &dyn AgentSink,
+        trigger: CompactionTriggerKind,
+        tools: &[coda_llm::ToolDefinition],
+        projection: Projection,
+        blocked_compaction_at: &mut Option<usize>,
+        cancel: &CancellationToken,
+    ) -> CompactStep {
+        let threshold = self.compaction_policy.token_threshold;
+        let (fp, overhead) = self.request_shape(tools);
+        let step = compact_history(
+            CompactionCall {
+                svc,
+                hook_runner: self.hook_runner.as_deref(),
+                tracker: &self.occupancy,
+                trigger,
+                limits: self.compaction_limits(overhead),
+                threshold,
+                projection,
+            },
+            history,
+            sink,
+            cancel.clone(),
+        )
+        .await;
+        match step {
+            CompactStep::Compacted => {
+                let after = self.occupancy.project(history, fp, overhead);
+                if after.tokens > threshold {
+                    *blocked_compaction_at = Some(after.tokens);
+                }
+            }
+            CompactStep::Declined | CompactStep::Failed => {
+                *blocked_compaction_at = Some(projection.tokens);
+            }
+            CompactStep::Cancelled => {}
+        }
+        step
     }
 
     /// Begin an agent turn.
@@ -415,38 +473,36 @@ impl AgentLoop {
             // check pre-turn unconditionally, and this restores that.
             //
             // Fires when: compaction is configured, the threshold is positive,
-            // and the estimated token count exceeds it — with suppression so a
-            // summariser that declined to shrink anything is not asked again
-            // until history has grown by a further full threshold.
+            // and the projected size of the full request (measured usage plus
+            // growth, or messages + system prompt + tool schemas) exceeds it —
+            // with suppression so a compaction that declined, failed or did
+            // not get below the threshold is not run again until occupancy has
+            // grown by a further full threshold.
+            //
+            // It runs before steering and the main inbox are drained, so
+            // anything that arrives while the summariser works stays queued
+            // and is appended once, after the compacted history.
+            let tool_defs = self.quarantine.filter(self.tools.definitions());
             if let Some(svc) = &self.compaction_service {
                 let threshold = self.compaction_policy.token_threshold;
                 if threshold > 0 && !history.is_empty() {
-                    let current = TokenEstimator::estimate(history);
+                    let (fp, overhead) = self.request_shape(&tool_defs);
+                    let projection = self.occupancy.project(history, fp, overhead);
                     let suppressed = blocked_compaction_at
-                        .map(|b| current <= b + threshold)
+                        .map(|b| projection.tokens <= b + threshold)
                         .unwrap_or(false);
-                    if !suppressed && current > threshold {
-                        match compact_history(
+                    if !suppressed && projection.tokens > threshold {
+                        self.compact_and_settle(
                             svc,
-                            self.hook_runner.as_deref(),
                             history,
                             sink,
                             CompactionTriggerKind::Auto,
-                            self.compaction_limits(),
-                            cancel.clone(),
+                            &tool_defs,
+                            projection,
+                            &mut blocked_compaction_at,
+                            &cancel,
                         )
-                        .await
-                        {
-                            Ok(true) => {} // compacted; blocked_compaction_at stays None
-                            // A declined or failed compaction is not retried
-                            // until history grows by a further threshold;
-                            // compaction is best-effort, so the error is not
-                            // surfaced. A cancellation blocks nothing.
-                            Ok(false) | Err(CompactError::Failed(_)) => {
-                                blocked_compaction_at = Some(current);
-                            }
-                            Err(CompactError::Cancelled) => {}
-                        }
+                        .await;
                     }
                 }
             }
@@ -505,8 +561,7 @@ impl AgentLoop {
             }
             // 4d. Deferred-tools reminder (no-op seam; later phase).
 
-            // 5. Wire tool definitions.
-            let tool_defs = self.quarantine.filter(self.tools.definitions());
+            // 5. Tool definitions were wired before step 3.
 
             // 6. Build ChatRequest.
             let mut request = ChatRequest::new(self.model.clone(), history.clone())
@@ -542,10 +597,11 @@ impl AgentLoop {
                     {
                         if let Some(svc) = &self.compaction_service {
                             let threshold = self.compaction_policy.token_threshold;
-                            let current = TokenEstimator::estimate(history);
+                            let (fp, overhead) = self.request_shape(&tool_defs);
+                            let projection = self.occupancy.project(history, fp, overhead);
                             let suppressed = if threshold > 0 {
                                 blocked_compaction_at
-                                    .map(|b| current <= b + threshold)
+                                    .map(|b| projection.tokens <= b + threshold)
                                     .unwrap_or(false)
                             } else {
                                 false
@@ -553,39 +609,32 @@ impl AgentLoop {
 
                             if !suppressed {
                                 overflow_retried = true;
-                                match compact_history(
-                                    svc,
-                                    self.hook_runner.as_deref(),
-                                    history,
-                                    sink,
-                                    CompactionTriggerKind::Overflow,
-                                    self.compaction_limits(),
-                                    cancel.clone(),
-                                )
-                                .await
-                                {
-                                    Ok(true) => {
-                                        // Rebuild request with compacted history and retry.
-                                        request = ChatRequest::new(
-                                            self.model.clone(),
-                                            history.clone(),
-                                        )
+                                // On anything but success the overflow error
+                                // surfaces; the suppression mark is updated.
+                                let step = self
+                                    .compact_and_settle(
+                                        svc,
+                                        history,
+                                        sink,
+                                        CompactionTriggerKind::Overflow,
+                                        &tool_defs,
+                                        projection,
+                                        &mut blocked_compaction_at,
+                                        &cancel,
+                                    )
+                                    .await;
+                                if step == CompactStep::Compacted {
+                                    // Rebuild request with compacted history and retry.
+                                    request = ChatRequest::new(self.model.clone(), history.clone())
                                         .with_max_tokens(
                                             self.request_max_tokens(history, &tool_defs),
                                         )
                                         .with_effort(self.effort)
                                         .with_tools(tool_defs.clone());
-                                        if let Some(sys) = &self.system_prompt {
-                                            request = request.with_system(sys.clone());
-                                        }
-                                        continue; // retry with compacted history
+                                    if let Some(sys) = &self.system_prompt {
+                                        request = request.with_system(sys.clone());
                                     }
-                                    // Let the overflow error surface; a failure
-                                    // also blocks re-running the same compaction.
-                                    Ok(false) | Err(CompactError::Failed(_)) => {
-                                        blocked_compaction_at = Some(current);
-                                    }
-                                    Err(CompactError::Cancelled) => {}
+                                    continue; // retry with compacted history
                                 }
                             }
                         }
@@ -664,6 +713,18 @@ impl AgentLoop {
             }
 
             history.push(Message::new(Role::Assistant, assistant_content));
+
+            // Anchor occupancy on this response's measured usage, with the
+            // shape of the request that produced it (schema evictions during
+            // streaming may have changed its tools).
+            if let Some(usage) = &acc.usage {
+                let fp = request_fingerprint(
+                    &request.model,
+                    request.system.as_deref(),
+                    &request.tools,
+                );
+                self.occupancy.record(history, fp, usage);
+            }
 
             // §8 item 28: persist after assistant turn commit (seam; no-op here).
 
@@ -985,42 +1046,45 @@ fn replace_last_assistant_text(history: &mut Vec<coda_llm::Message>, new_text: &
     }
 }
 
-/// Why [`compact_history`] left the history unchanged.
-#[derive(Debug)]
-enum CompactError {
+/// How [`compact_history`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactStep {
+    /// The history was replaced.
+    Compacted,
+    /// Nothing to compact, or a `PreCompact` hook cancelled it.
+    Declined,
     /// The compaction ran and failed; retrying at once would fail the same way.
-    Failed(String),
+    Failed,
     /// The compaction was cancelled; it says nothing about a later attempt.
     Cancelled,
 }
 
-impl std::fmt::Display for CompactError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CompactError::Failed(sentence) => f.write_str(sentence),
-            CompactError::Cancelled => f.write_str("compaction cancelled"),
-        }
-    }
+/// One automatic compaction: what runs it and why it was started.
+struct CompactionCall<'a> {
+    svc: &'a CompactionService,
+    hook_runner: Option<&'a crate::hooks::HookRunner>,
+    tracker: &'a OccupancyTracker,
+    trigger: CompactionTriggerKind,
+    limits: CompactionLimits,
+    threshold: usize,
+    /// The projection that started it.
+    projection: Projection,
 }
-
-impl std::error::Error for CompactError {}
 
 /// Runs compaction on `history` in-place: fires PreCompact hook (if configured),
 /// calls the compaction service, and fires PostCompact hook (if configured).
 ///
-/// Returns `Ok(true)` when history was successfully compacted, `Ok(false)` when
-/// a hook blocked compaction, and `Err` when compaction failed or was
-/// cancelled.  The original history is preserved intact on failure — no
-/// silent data loss.
+/// Every outcome except a hook cancel (which keeps its own
+/// `CompactionCancelled` event) is recorded in diagnostics and emitted as
+/// [`AgentEvent::Compaction`]. The original history is preserved intact
+/// unless the outcome is `Compacted` — no silent data loss.
 async fn compact_history(
-    svc: &CompactionService,
-    hook_runner: Option<&crate::hooks::HookRunner>,
+    call: CompactionCall<'_>,
     history: &mut Vec<Message>,
     sink: &dyn AgentSink,
-    trigger: CompactionTriggerKind,
-    limits: CompactionLimits,
     cancel: CancellationToken,
-) -> Result<bool, CompactError> {
+) -> CompactStep {
+    let CompactionCall { svc, hook_runner, tracker, trigger, limits, threshold, projection } = call;
     // Pre-compact hook.
     let instructions_override = if let Some(hr) = hook_runner {
         if hr.has_pre_compact {
@@ -1038,7 +1102,7 @@ async fn compact_history(
                     hook_command: pre.by_hook_command.unwrap_or_default(),
                     trigger: trigger.as_str().to_owned(),
                 });
-                return Ok(false);
+                return CompactStep::Declined;
             }
             pre.instructions_override
         } else {
@@ -1049,7 +1113,7 @@ async fn compact_history(
     };
 
     let tokens_before = TokenEstimator::estimate(history);
-    let outcome = svc
+    let mut outcome = svc
         .compact(
             CompactionRequest {
                 history,
@@ -1061,17 +1125,23 @@ async fn compact_history(
         )
         .await;
 
+    let report = outcome.report_mut();
+    report.threshold = Some(threshold as u64);
+    report.estimated_tokens = projection.tokens as u64;
+    report.measured_tokens = projection.measured.map(|m| m as u64);
+    report.record_diagnostics();
+    sink.emit(AgentEvent::Compaction { report: report.clone() });
+
     let summary = match outcome {
         CompactionOutcome::Compacted { history: new_history, summary, .. } => {
             *history = new_history;
+            tracker.invalidate();
             summary
         }
-        CompactionOutcome::NotCompacted { .. } => return Ok(false),
         // History is unchanged on every other outcome.
-        CompactionOutcome::Failed { report } => {
-            return Err(CompactError::Failed(report.failure_sentence()));
-        }
-        CompactionOutcome::Cancelled { .. } => return Err(CompactError::Cancelled),
+        CompactionOutcome::NotCompacted { .. } => return CompactStep::Declined,
+        CompactionOutcome::Failed { .. } => return CompactStep::Failed,
+        CompactionOutcome::Cancelled { .. } => return CompactStep::Cancelled,
     };
 
     // Post-compact hook.
@@ -1093,7 +1163,7 @@ async fn compact_history(
         }
     }
 
-    Ok(true)
+    CompactStep::Compacted
 }
 
 /// Output tokens a loop requests per response when its host does not resolve
@@ -1117,6 +1187,7 @@ pub struct AgentLoopBuilder {
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
     compaction_service: Option<Arc<CompactionService>>,
     compaction_policy: CompactionPolicy,
+    occupancy: Arc<OccupancyTracker>,
     // Service handles for ToolContext (see AgentLoop fields for WHY).
     todos: Option<Arc<TodoStore>>,
     tool_user_question: Option<Arc<dyn UserQuestion>>,
@@ -1167,6 +1238,7 @@ impl AgentLoopBuilder {
             hook_runner: None,
             compaction_service: None,
             compaction_policy: CompactionPolicy::default(),
+            occupancy: Arc::new(OccupancyTracker::new()),
             todos: None,
             tool_user_question: None,
             plan_approver: None,
@@ -1211,6 +1283,13 @@ impl AgentLoopBuilder {
 
     pub fn with_compaction_policy(mut self, policy: CompactionPolicy) -> Self {
         self.compaction_policy = policy;
+        self
+    }
+
+    /// Shares an occupancy anchor across loops of one session, so the
+    /// compaction trigger keeps the provider's measured usage between turns.
+    pub fn with_occupancy_tracker(mut self, tracker: Arc<OccupancyTracker>) -> Self {
+        self.occupancy = tracker;
         self
     }
 
@@ -1422,6 +1501,7 @@ impl AgentLoopBuilder {
             hook_runner: self.hook_runner,
             compaction_service: self.compaction_service,
             compaction_policy: self.compaction_policy,
+            occupancy: self.occupancy,
             todos: self.todos,
             tool_user_question: self.tool_user_question,
             plan_approver: self.plan_approver,
@@ -3604,40 +3684,85 @@ mod tests {
         );
     }
 
-    /// A compaction that keeps failing must not re-run (up to two summariser
-    /// calls) on every loop iteration: a failure blocks the trigger until
-    /// history grows by a further threshold, like a declined compaction.
-    #[tokio::test]
-    async fn a_failed_compaction_is_not_retried_every_iteration() {
-        use crate::compaction::CompactionService;
-        use std::sync::atomic::{AtomicUsize, Ordering};
+    /// A scripted summariser: records every request's text, runs `on_call`,
+    /// then returns `reply`.
+    struct ScriptedSummarizer {
+        inputs: Mutex<Vec<String>>,
+        on_call: Box<dyn Fn(&CancellationToken) + Send + Sync>,
+        reply: Result<crate::compaction::SummaryResponse, crate::compaction::SummarizerError>,
+    }
 
-        struct AlwaysTruncated(Arc<AtomicUsize>);
-        #[async_trait]
-        impl crate::compaction::Summarizer for AlwaysTruncated {
-            async fn summarize(
-                &self,
-                _: crate::compaction::SummaryRequest,
-                _: CancellationToken,
-            ) -> Result<crate::compaction::SummaryResponse, crate::compaction::SummarizerError> {
-                self.0.fetch_add(1, Ordering::SeqCst);
-                Ok(crate::compaction::SummaryResponse {
-                    text: "partial summary".into(),
-                    stop_reason: Some("max_tokens".into()),
-                    ..Default::default()
-                })
-            }
+    impl ScriptedSummarizer {
+        fn new(
+            reply: Result<crate::compaction::SummaryResponse, crate::compaction::SummarizerError>,
+        ) -> Self {
+            Self { inputs: Mutex::new(Vec::new()), on_call: Box::new(|_| {}), reply }
         }
 
-        let calls = Arc::new(AtomicUsize::new(0));
-        let svc = Arc::new(CompactionService::new(Arc::new(AlwaysTruncated(calls.clone()))));
+        fn complete(text: &str) -> Self {
+            Self::new(Ok(crate::compaction::SummaryResponse {
+                text: text.into(),
+                stop_reason: Some("end_turn".into()),
+                ..Default::default()
+            }))
+        }
+
+        fn calls(&self) -> usize {
+            self.inputs.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait]
+    impl crate::compaction::Summarizer for ScriptedSummarizer {
+        async fn summarize(
+            &self,
+            request: crate::compaction::SummaryRequest,
+            cancel: CancellationToken,
+        ) -> Result<crate::compaction::SummaryResponse, crate::compaction::SummarizerError> {
+            let text = request.messages.iter().map(Message::text).collect::<Vec<_>>().join("\n");
+            self.inputs.lock().unwrap().push(format!("{}\n{text}", request.system));
+            (self.on_call)(&cancel);
+            self.reply.clone()
+        }
+    }
+
+    fn compaction_reports(events: Vec<AgentEvent>) -> Vec<crate::compaction::CompactionReport> {
+        events
+            .into_iter()
+            .filter_map(|e| match e {
+                AgentEvent::Compaction { report } => Some(report),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A response that reports no usage, so the occupancy stays a full
+    /// estimate rather than re-anchoring on the mock's tiny numbers.
+    fn done_without_usage() -> StreamEvent {
+        StreamEvent::Done { stop_reason: Some("end_turn".into()), usage: Usage::ZERO }
+    }
+
+    /// A compaction that keeps failing must not re-run (up to two summariser
+    /// calls) on every loop iteration: a failure blocks the trigger until
+    /// occupancy grows by a further threshold, like a declined compaction —
+    /// and the failure is visible, not silent.
+    #[tokio::test]
+    async fn failed_compaction_is_visible_and_not_retried_every_iteration() {
+        use crate::compaction::CompactionService;
+
+        let summarizer = Arc::new(ScriptedSummarizer::new(Ok(crate::compaction::SummaryResponse {
+            text: "partial summary".into(),
+            stop_reason: Some("max_tokens".into()),
+            ..Default::default()
+        })));
+        let svc = Arc::new(CompactionService::new(summarizer.clone()));
         let policy =
             crate::compaction::CompactionPolicy { token_threshold: 1_000, ..Default::default() };
 
         let client = MockLlmClient::new(vec![
-            vec![Ok(tool_use_event("t1", "tool_a")), Ok(done())],
-            vec![Ok(tool_use_event("t2", "tool_a")), Ok(done())],
-            vec![Ok(StreamEvent::TextDelta("finished".into())), Ok(done())],
+            vec![Ok(tool_use_event("t1", "tool_a")), Ok(done_without_usage())],
+            vec![Ok(tool_use_event("t2", "tool_a")), Ok(done_without_usage())],
+            vec![Ok(StreamEvent::TextDelta("finished".into())), Ok(done_without_usage())],
         ]);
         let log = Arc::new(Mutex::new(Vec::new()));
         let tools = Arc::new(ToolRegistry::new([dyn_tool(MockTool::new("tool_a", true, log.clone()))]));
@@ -3645,6 +3770,151 @@ mod tests {
         let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
             .with_compaction_service(svc)
             .with_compaction_policy(policy)
+            .with_tool_max_duration(None)
+            .build();
+
+        let first = format!("early context {}", "e".repeat(80_000));
+        let mut history = vec![
+            Message::user(first.clone()),
+            Message::assistant("noted"),
+            Message::user("a second prompt"),
+            Message::assistant("a second response"),
+            Message::user("a third prompt"),
+        ];
+        let sink = CollectingSink::new();
+        agent.run(&mut history, &sink, None, CancellationToken::new()).await.unwrap();
+
+        assert_eq!(log.lock().unwrap().len(), 2, "both tool iterations ran");
+        assert_eq!(
+            summarizer.calls(),
+            2,
+            "one attempt and one retry in the first iteration, then suppressed"
+        );
+        let reports = compaction_reports(sink.take());
+        assert_eq!(reports.len(), 1, "one visible outcome: {reports:?}");
+        assert_eq!((reports[0].outcome, reports[0].reason), ("failed", Some("summary_truncated")));
+        assert_eq!(reports[0].threshold, Some(1_000));
+        assert!(history.iter().any(|m| m.text() == first), "the original first message survives");
+    }
+
+    /// A tool registry used to make the request overhead large.
+    struct BigSchemaTool {
+        name: String,
+        schema: String,
+    }
+
+    #[async_trait]
+    impl crate::tool::Tool for BigSchemaTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "a tool with a large schema"
+        }
+        fn input_schema_json(&self) -> &str {
+            &self.schema
+        }
+        fn is_read_only(&self) -> bool {
+            true
+        }
+        async fn execute(
+            &self,
+            _: &serde_json::Value,
+            _: &ToolContext,
+            _: CancellationToken,
+        ) -> ToolOutcome {
+            ToolResult::ok("ok")
+        }
+    }
+
+    /// BUG-3: the trigger used to see message bytes only, so a session whose
+    /// system prompt and tool schemas filled most of the window never
+    /// compacted until the provider refused the request.
+    #[tokio::test]
+    async fn tool_schemas_trigger_compaction_even_with_small_history() {
+        use crate::compaction::CompactionService;
+
+        let summarizer = Arc::new(ScriptedSummarizer::complete("summary text"));
+        let svc = Arc::new(CompactionService::new(summarizer.clone()));
+        let threshold = 30_000;
+        let policy =
+            crate::compaction::CompactionPolicy { token_threshold: threshold, ..Default::default() };
+
+        let tools: Vec<Arc<dyn crate::tool::Tool>> = (0..30)
+            .map(|i| {
+                Arc::new(BigSchemaTool { name: format!("big_{i}"), schema: "x".repeat(4_100) })
+                    as Arc<dyn crate::tool::Tool>
+            })
+            .collect();
+        let tools = Arc::new(ToolRegistry::new(tools));
+        let schema_chars: usize = tools
+            .definitions()
+            .iter()
+            .map(|t| t.name.len() + t.description.len() + t.input_schema_json.len())
+            .sum();
+        assert!(schema_chars > 120_000);
+
+        let client = MockLlmClient::new(vec![vec![
+            Ok(StreamEvent::TextDelta("ok".into())),
+            Ok(done()),
+        ]]);
+        let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
+            .with_compaction_service(svc)
+            .with_compaction_policy(policy)
+            .with_tool_max_duration(None)
+            .build();
+
+        let mut history = vec![
+            Message::user(format!("early context {}", "e".repeat(70_000))),
+            Message::assistant("noted"),
+            Message::user("a second prompt"),
+            Message::assistant("a second response"),
+            Message::user("a third prompt"),
+        ];
+        assert!(TokenEstimator::estimate(&history) < threshold, "messages alone stay under");
+
+        let sink = CollectingSink::new();
+        agent.run(&mut history, &sink, None, CancellationToken::new()).await.unwrap();
+
+        assert_eq!(summarizer.calls(), 1, "the full request was over the threshold");
+        let reports = compaction_reports(sink.take());
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].outcome, "compacted");
+        assert!(reports[0].estimated_tokens > threshold as u64);
+        assert!(history.iter().any(|m| m.text().contains("summary text")));
+    }
+
+    /// Steering and main-inbox items that arrive while the summariser works
+    /// stay queued, are never summarised, and are appended once, after the
+    /// compacted history.
+    #[tokio::test]
+    async fn steering_arriving_during_compaction_is_delivered_once_in_order() {
+        use crate::compaction::CompactionService;
+
+        let steering = Arc::new(SteeringInbox::new());
+        let bus = Arc::new(crate::message::MessageBus::new());
+        let mut summarizer = ScriptedSummarizer::complete("summary text");
+        let (inbox, main) = (steering.clone(), bus.clone());
+        summarizer.on_call = Box::new(move |_| {
+            inbox.enqueue("STEER-1").expect("the inbox is open during a run");
+            main.publish_main(&subagent_source("t1", "worker"), "MAIN-1", None, None).unwrap();
+        });
+        let summarizer = Arc::new(summarizer);
+        let svc = Arc::new(CompactionService::new(summarizer.clone()));
+        let policy =
+            crate::compaction::CompactionPolicy { token_threshold: 10_000, ..Default::default() };
+
+        let client = MockLlmClient::new(vec![vec![
+            Ok(StreamEvent::TextDelta("ok".into())),
+            Ok(done()),
+        ]]);
+        let tools = Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
+        let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
+            .with_compaction_service(svc)
+            .with_compaction_policy(policy)
+            .with_steering(steering.clone())
+            .with_message_bus(bus.clone())
+            .with_main_context()
             .with_tool_max_duration(None)
             .build();
 
@@ -3657,12 +3927,70 @@ mod tests {
         ];
         agent.run(&mut history, &NullSink, None, CancellationToken::new()).await.unwrap();
 
-        assert_eq!(log.lock().unwrap().len(), 2, "both tool iterations ran");
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            2,
-            "one attempt and one retry in the first iteration, then suppressed"
+        assert_eq!(summarizer.calls(), 1);
+        let position = |needle: &str| {
+            let hits: Vec<usize> = history
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| m.text().contains(needle))
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(hits.len(), 1, "{needle} must appear exactly once: {history:?}");
+            hits[0]
+        };
+        let checkpoint = position("summary text");
+        let tail_end = position("a third prompt");
+        let steer = position("STEER-1");
+        let main_item = position("MAIN-1");
+        assert!(checkpoint < tail_end && tail_end < steer, "{history:?}");
+        assert!(steer < main_item, "steering is drained before the main inbox");
+        assert!(
+            summarizer.inputs.lock().unwrap().iter().all(|i| !i.contains("STEER-1") && !i.contains("MAIN-1")),
+            "nothing that arrived during compaction is summarised"
         );
+    }
+
+    #[tokio::test]
+    async fn cancel_during_compaction_keeps_history() {
+        use crate::compaction::CompactionService;
+
+        let mut summarizer =
+            ScriptedSummarizer::new(Err(crate::compaction::SummarizerError::Cancelled));
+        summarizer.on_call = Box::new(|cancel| cancel.cancel());
+        let svc = Arc::new(CompactionService::new(Arc::new(summarizer)));
+        let policy =
+            crate::compaction::CompactionPolicy { token_threshold: 1_000, ..Default::default() };
+
+        let client = MockLlmClient::new(vec![vec![
+            Ok(StreamEvent::TextDelta("never reached".into())),
+            Ok(done()),
+        ]]);
+        let tools = Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
+        let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
+            .with_compaction_service(svc)
+            .with_compaction_policy(policy)
+            .with_tool_max_duration(None)
+            .build();
+
+        let original = vec![
+            Message::user(format!("early context {}", "e".repeat(80_000))),
+            Message::assistant("noted"),
+            Message::user("a second prompt"),
+            Message::assistant("a second response"),
+            Message::user("a third prompt"),
+        ];
+        let mut history = original.clone();
+        let sink = CollectingSink::new();
+        let result = agent.run(&mut history, &sink, None, CancellationToken::new()).await;
+
+        assert!(matches!(result, Err(AgentError::Cancelled)), "{result:?}");
+        assert!(
+            original.iter().all(|m| history.contains(m)),
+            "every original message is still present"
+        );
+        let reports = compaction_reports(sink.take());
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].outcome, "cancelled");
     }
 
     /// A fixed threshold cannot suit every model: 50k against a 1.1M window
@@ -3856,7 +4184,6 @@ mod tests {
     #[tokio::test]
     async fn compaction_failure_preserves_original_history() {
         use crate::compaction::{CompactionLimits, CompactionService, CompactionTriggerKind};
-        use crate::events::NullSink;
 
         struct EmptyFork;
         #[async_trait]
@@ -3886,19 +4213,38 @@ mod tests {
             Message::assistant("third response"),
         ];
         let mut h = history.clone();
-        // compact_history should return Err (empty summary) and leave h unchanged.
-        let result = compact_history(
-            &svc,
-            None,
+        let tracker = OccupancyTracker::new();
+        let sink = CollectingSink::new();
+        let step = compact_history(
+            CompactionCall {
+                svc: &svc,
+                hook_runner: None,
+                tracker: &tracker,
+                trigger: CompactionTriggerKind::Auto,
+                limits: CompactionLimits::default(),
+                threshold: 1,
+                projection: Projection { tokens: 20_000, measured: None, full_estimate: 20_000 },
+            },
             &mut h,
-            &NullSink,
-            CompactionTriggerKind::Auto,
-            CompactionLimits::default(),
+            &sink,
             CancellationToken::new(),
-        ).await;
+        )
+        .await;
 
-        assert!(result.is_err(), "empty summarizer must return an error");
+        assert_eq!(step, CompactStep::Failed, "an empty summary is a failure");
         assert_eq!(h, history, "history must be preserved on compaction failure");
+        let reports: Vec<_> = sink
+            .take()
+            .into_iter()
+            .filter_map(|e| match e {
+                AgentEvent::Compaction { report } => Some(report),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reports.len(), 1);
+        assert_eq!((reports[0].outcome, reports[0].reason), ("failed", Some("summary_empty")));
+        assert_eq!(reports[0].threshold, Some(1));
+        assert_eq!(reports[0].estimated_tokens, 20_000);
     }
 
     // ── Feature 3: AgentResponse hook mutation ──────────────────────────────
