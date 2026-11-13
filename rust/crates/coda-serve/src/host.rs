@@ -1833,12 +1833,9 @@ impl ServeHost {
         )
     }
 
-    /// Publishes the active model's effective context window.
-    ///
-    /// A fallback window is published as `None`: the 200,000-token
-    /// assumption is announced separately (`event/contextWindow`) rather
-    /// than displayed as if it were known. `context_limit_resolved` ignores a
-    /// repeat, so calling this every turn publishes only changes.
+    /// Publishes the active model's effective context window — an estimate
+    /// from the configured provider; a running turn republishes the window
+    /// it actually resolved (`publish_context_limit`).
     fn note_effective_context_limit(&self) {
         let captured = self.capture_runtime().config;
         let provider = captured
@@ -1846,6 +1843,16 @@ impl ServeHost {
             .as_deref()
             .unwrap_or(crate::settings::FALLBACK_PROVIDER);
         let resolved = self.effective_limits(provider, &captured.model);
+        self.publish_context_limit(&resolved);
+    }
+
+    /// Publishes the context window of a resolved budget.
+    ///
+    /// A fallback window is published as `None`: the 200,000-token
+    /// assumption is announced separately (`event/contextWindow`) rather
+    /// than displayed as if it were known. `context_limit_resolved` ignores a
+    /// repeat, so calling this every turn publishes only changes.
+    fn publish_context_limit(&self, resolved: &crate::output_budget::ResolvedBudget) {
         let limit = match resolved.context_source {
             WindowSource::Fallback => None,
             _ => resolved.budget.context_window.map(|n| n as i64),
@@ -6228,6 +6235,9 @@ impl ServeHost {
         // the `max_tokens` on the wire, the reply reserve auto-compaction
         // keeps free, the compaction threshold and the displayed window.
         let output_budget = self.effective_limits(client.provider_id(), &captured.config.model);
+        // Correct the claim-time estimate: lazy wiring, live discovery or a
+        // config change during the awaits above can move the window.
+        self.publish_context_limit(&output_budget);
         // The threshold is a fraction of the model's window (80% by default),
         // overridable per user via `compactAtPercent` / `compactFreeTokens`,
         // or per model via `compactByModel`. The agent is rebuilt every turn,
@@ -13949,6 +13959,32 @@ mod tests {
         assert_eq!(info.source, "fallback");
         assert_eq!(info.context_window, coda_agent::compaction::DEFAULT_CONTEXT_WINDOW as u64);
         assert_eq!(info.compaction_threshold, 160_000);
+    }
+
+    /// The displayed window is the one the turn actually ran with. Here the
+    /// claim-time estimate (provider unset, so the fallback provider) knows no
+    /// window, while the turn resolves a live 1M window for the client's own
+    /// provider — the display must end on the turn's window.
+    #[tokio::test]
+    async fn context_limit_matches_the_window_the_turn_used() {
+        use crate::output_budget::{live_key, LiveLimits};
+
+        let (host, client) = make_capturing_host();
+        host.runtime.lock().unwrap().provider_id = None;
+        set_model(&host, "mystery-1m");
+        host.live_model_limits.lock().unwrap().insert(
+            live_key("capturing", "mystery-1m"),
+            LiveLimits { context: Some(1_000_000), output: Some(64_000) },
+        );
+        host.note_effective_context_limit();
+        assert_eq!(published_context_limit(&host).await, Value::Null);
+
+        host.session_prompt(PromptParams { text: Some("hello".into()), images: None })
+            .await
+            .unwrap();
+
+        assert_eq!(client.last_model().as_deref(), Some("mystery-1m"));
+        assert_eq!(published_context_limit(&host).await, json!(1_000_000));
     }
 
     #[tokio::test]
