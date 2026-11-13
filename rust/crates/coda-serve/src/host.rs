@@ -4910,7 +4910,17 @@ impl ServeBackend for ServeHost {
                 refused.into_error("another prompt is already in progress; busy")
             })?;
 
-        let result = self.run_compact_inner(client, p).await;
+        let result = match self.diagnostics.as_ref() {
+            Some(ctx) => {
+                let provider = client.provider_id().to_owned();
+                let ctx = ctx
+                    .with_session(self.active_session_id())
+                    .with_turn(compaction_turn_id.clone())
+                    .with_provider_model(Some(provider), Some(self.current_model()));
+                coda_diagnostics::scope(ctx, self.run_compact_inner(client, p)).await
+            }
+            None => self.run_compact_inner(client, p).await,
+        };
         self.engine_state.end_turn(TurnEnd {
             turn_id: compaction_turn_id,
             stop_reason: TurnKind::Compaction.stop_reason(),
@@ -14237,6 +14247,59 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0]["outcome"], "failed");
         assert_eq!(frames[0]["reason"], "history_changed");
+    }
+
+    /// The manual path records its report in the diagnostics log like the
+    /// automatic one does inside a prompt turn.
+    #[tokio::test]
+    async fn manual_compaction_records_diagnostics() {
+        use crate::output_budget::{live_key, LiveLimits};
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = tempfile::tempdir().unwrap();
+        let logger = coda_diagnostics::Logger::open(
+            coda_diagnostics::Options {
+                directory: log_dir.path().to_path_buf(),
+                file: None,
+                role: coda_diagnostics::ProcessRole::Serve,
+                version: "test".into(),
+                verbosity: coda_diagnostics::Verbosity::Normal,
+            },
+            coda_diagnostics::Limits::default(),
+        )
+        .expect("logger opens");
+        let ctx = coda_diagnostics::DiagnosticContext::root(Arc::new(logger), "run-1");
+        let client = CountingClient::new(vec![summary_turn("## Next Move\nContinue.", "end_turn")]);
+        let provider = client.provider_id().to_owned();
+        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let host = ServeHost::new_with_optional_client_and_mcp(
+            Some(client as Arc<dyn LlmClient>),
+            Arc::new(ServeSink::new(tx.clone())),
+            Arc::new(PromptChannel::new(tx)),
+            dir.path().display().to_string(),
+            crate::mcp::McpBundle::disabled(),
+            StartupOptions::default(),
+            None,
+            Some(ctx.clone()),
+        );
+        set_model(&host, "mystery-1m");
+        host.live_model_limits.lock().unwrap().insert(
+            live_key(&provider, "mystery-1m"),
+            LiveLimits { context: Some(1_000_000), output: Some(64_000) },
+        );
+        *host.session.history.lock().unwrap() = compactable_history();
+
+        let r = host.session_compact(CompactParams { instructions: None }).await.unwrap();
+        assert_eq!(r["ok"], true);
+
+        let path = ctx.logger().status().path.expect("a log path");
+        let log = std::fs::read_to_string(&path).unwrap();
+        let record = log
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .find(|v| v["kind"] == "compaction")
+            .unwrap_or_else(|| panic!("no compaction record in {log}"));
+        assert_eq!(record["trigger"], "manual", "{record}");
+        assert_eq!(record["outcome"], "compacted", "{record}");
     }
 
     /// `session/setSystemPrompt` stores the text and it reaches the LLM.
