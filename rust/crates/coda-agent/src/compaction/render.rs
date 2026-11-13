@@ -136,9 +136,115 @@ pub fn render_summary_input(
     if previous.is_some() {
         cuts.push(head.len());
     }
-    cuts.into_iter()
-        .map(|cut| render_stage(&head[cut..], previous, last, cut))
-        .find(|r| fits(r))
+    let cut = oldest_fitting_cut(head, previous, &cuts, max_input_tokens)?;
+    Some(render_stage(&head[cut..], previous, last, cut))
+}
+
+/// The first (oldest) cut in `cuts` whose last-stage rendering fits
+/// `max_input_tokens`, equivalent to rendering `head[cut..]` for every cut but
+/// linear: each segment between consecutive cuts is rendered once and the
+/// output length of every cut is derived from suffix sums.
+fn oldest_fitting_cut(
+    head: &[Message],
+    previous: Option<&str>,
+    cuts: &[usize],
+    max_input_tokens: usize,
+) -> Option<usize> {
+    let last = STAGES.len() - 1;
+    // Per segment `head[cuts[k]..cuts[k + 1]]`: rendered length, length with
+    // trailing whitespace trimmed (None when the segment is all whitespace),
+    // and omitted tool outputs. Abbreviated outputs are always zero at the
+    // last stage but are tracked anyway to mirror `render_stage`.
+    struct Segment {
+        len: usize,
+        trimmed_len: Option<usize>,
+        abbreviated: usize,
+        omitted: usize,
+    }
+    let segments: Vec<Segment> = cuts
+        .iter()
+        .enumerate()
+        .map(|(k, &start)| {
+            let end = cuts.get(k + 1).copied().unwrap_or(head.len());
+            let mut text = String::new();
+            let (abbreviated, omitted) = render_transcript_into(&head[start..end], last, &mut text);
+            let trimmed = text.trim_end().len();
+            Segment {
+                len: text.len(),
+                trimmed_len: (trimmed > 0).then_some(trimmed),
+                abbreviated,
+                omitted,
+            }
+        })
+        .collect();
+
+    let instructions_len = instructions(previous).len();
+    let mut fitting = None;
+    // Running suffix state, walked newest → oldest.
+    let mut suffix_trimmed: Option<usize> = None;
+    let mut suffix_abbreviated = 0usize;
+    let mut suffix_omitted = 0usize;
+    for (k, segment) in segments.iter().enumerate().rev() {
+        suffix_trimmed = match suffix_trimmed {
+            Some(rest) => Some(segment.len + rest),
+            None => segment.trimmed_len,
+        };
+        suffix_abbreviated += segment.abbreviated;
+        suffix_omitted += segment.omitted;
+
+        let cut = cuts[k];
+        let header = omission_header(cut);
+        let transcript_len = match suffix_trimmed {
+            Some(rest) => header.len() + rest,
+            None => header.trim_end().len(),
+        };
+        let total = instructions_len
+            + transcript_len
+            + conversation_wrapper("", suffix_abbreviated, suffix_omitted, cut).len();
+        if total / 4 <= max_input_tokens {
+            fitting = Some(cut);
+        }
+    }
+    fitting
+}
+
+fn omission_header(omitted_messages: usize) -> String {
+    if omitted_messages > 0 {
+        format!("[{omitted_messages} earlier messages omitted to fit the summariser input]\n")
+    } else {
+        String::new()
+    }
+}
+
+fn instructions(previous: Option<&str>) -> String {
+    let mut user_message = String::from(
+        "Write the continuation checkpoint for the conversation below, using exactly the required sections.",
+    );
+    if let Some(previous) = previous {
+        user_message.push_str(&format!(
+            " Reconcile it with the PREVIOUS CHECKPOINT: produce one updated checkpoint — newer \
+             evidence supersedes older statements, completed items leave the pending lists, \
+             unresolved constraints and decisions remain. Do not copy the previous checkpoint \
+             verbatim and do not nest it.\n\n<previous-checkpoint>\n{}\n</previous-checkpoint>",
+            previous.trim()
+        ));
+    }
+    user_message
+}
+
+/// The conversation block and input notes; `trimmed_transcript` must already
+/// have its trailing whitespace removed.
+fn conversation_wrapper(
+    trimmed_transcript: &str,
+    abbreviated: usize,
+    omitted: usize,
+    omitted_messages: usize,
+) -> String {
+    format!(
+        "\n\n<conversation>\n{trimmed_transcript}\n</conversation>\n\nInput notes: {abbreviated} \
+         tool outputs abbreviated, {omitted} tool outputs omitted, {omitted_messages} earlier \
+         messages omitted."
+    )
 }
 
 fn render_stage(
@@ -147,17 +253,37 @@ fn render_stage(
     stage: usize,
     omitted_messages: usize,
 ) -> RenderedInput {
+    let mut transcript = omission_header(omitted_messages);
+    let (abbreviated, omitted) = render_transcript_into(head, stage, &mut transcript);
+
+    let mut user_message = instructions(previous);
+    user_message.push_str(&conversation_wrapper(
+        transcript.trim_end(),
+        abbreviated,
+        omitted,
+        omitted_messages,
+    ));
+
+    RenderedInput {
+        user_message,
+        stage,
+        abbreviated_tool_outputs: abbreviated,
+        omitted_tool_outputs: omitted,
+        omitted_messages,
+    }
+}
+
+/// Appends the transcript lines of `msgs` at `stage`; returns
+/// `(abbreviated, omitted)` tool-output counts.
+fn render_transcript_into(
+    msgs: &[Message],
+    stage: usize,
+    transcript: &mut String,
+) -> (usize, usize) {
     let (result_bytes, args_bytes) = STAGES[stage];
     let mut abbreviated = 0usize;
     let mut omitted = 0usize;
-    let mut transcript = String::new();
-    if omitted_messages > 0 {
-        transcript.push_str(&format!(
-            "[{omitted_messages} earlier messages omitted to fit the summariser input]\n"
-        ));
-    }
-
-    for msg in head {
+    for msg in msgs {
         let role = if msg.role == Role::User { "User" } else { "Assistant" };
         for block in &msg.content {
             match block {
@@ -198,32 +324,7 @@ fn render_stage(
             }
         }
     }
-
-    let mut user_message = String::from(
-        "Write the continuation checkpoint for the conversation below, using exactly the required sections.",
-    );
-    if let Some(previous) = previous {
-        user_message.push_str(&format!(
-            " Reconcile it with the PREVIOUS CHECKPOINT: produce one updated checkpoint — newer \
-             evidence supersedes older statements, completed items leave the pending lists, \
-             unresolved constraints and decisions remain. Do not copy the previous checkpoint \
-             verbatim and do not nest it.\n\n<previous-checkpoint>\n{}\n</previous-checkpoint>",
-            previous.trim()
-        ));
-    }
-    user_message.push_str(&format!(
-        "\n\n<conversation>\n{}\n</conversation>\n\nInput notes: {abbreviated} tool outputs \
-         abbreviated, {omitted} tool outputs omitted, {omitted_messages} earlier messages omitted.",
-        transcript.trim_end()
-    ));
-
-    RenderedInput {
-        user_message,
-        stage,
-        abbreviated_tool_outputs: abbreviated,
-        omitted_tool_outputs: omitted,
-        omitted_messages,
-    }
+    (abbreviated, omitted)
 }
 
 /// Cuts `content` to at most `budget` bytes, marking a cut with `…`.
@@ -543,5 +644,54 @@ mod tests {
         let all = REQUIRED_HEADINGS.map(|h| format!("{h}\nbody")).join("\n");
         assert!(is_structured(&all));
         assert!(!is_structured(&all.replace("## Next Move", "## Next")));
+    }
+
+    /// The straightforward quadratic fallback the linear one replaced.
+    fn reference_render(
+        head: &[Message],
+        previous: Option<&str>,
+        max_input_tokens: usize,
+    ) -> Option<RenderedInput> {
+        let fits = |r: &RenderedInput| r.user_message.len() / 4 <= max_input_tokens;
+        for stage in 0..STAGES.len() {
+            let rendered = render_stage(head, previous, stage, 0);
+            if fits(&rendered) {
+                return Some(rendered);
+            }
+        }
+        let last = STAGES.len() - 1;
+        let mut cuts: Vec<usize> =
+            exchange_boundaries(head).into_iter().filter(|&b| b > 0).collect();
+        if previous.is_some() {
+            cuts.push(head.len());
+        }
+        cuts.into_iter()
+            .map(|cut| render_stage(&head[cut..], previous, last, cut))
+            .find(|r| fits(r))
+    }
+
+    #[test]
+    fn last_resort_dropping_matches_reference() {
+        let mut head = Vec::new();
+        for i in 0..300 {
+            // Trailing whitespace exercises the transcript's `trim_end`.
+            head.push(Message::user(format!("request {i} {}   ", "x".repeat(i % 37))));
+            if i % 3 != 0 {
+                let id = format!("t{i}");
+                head.push(tool_use(&id, "read", &format!("{{\"path\":\"f{i}\"}}")));
+                head.push(tool_result(&id, &"o".repeat(50 + (i * 97) % 3000), i % 5 == 0));
+            }
+            head.push(Message::assistant(format!("answer {i}{}", " ".repeat(i % 4))));
+        }
+        let previous = "PREVIOUS ".repeat(40);
+        for previous in [None, Some(previous.as_str())] {
+            let full = render_stage(&head, previous, STAGES.len() - 1, 0).user_message.len() / 4;
+            for max_input_tokens in (0..full).step_by(full / 60).chain([full - 1]) {
+                let actual = render_summary_input(&head, previous, max_input_tokens);
+                assert_eq!(actual, reference_render(&head, previous, max_input_tokens));
+            }
+            let dropped = render_summary_input(&head, previous, full / 3).expect("fits");
+            assert!(dropped.omitted_messages > 0);
+        }
     }
 }
