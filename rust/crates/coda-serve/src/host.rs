@@ -1118,9 +1118,6 @@ pub struct ServeHost {
     /// recorded whenever `session/models` fetches it. Preferred over the
     /// catalogue when sizing a turn's output budget.
     live_model_limits: Arc<Mutex<crate::output_budget::LiveLimitMap>>,
-    /// Provider/model pairs whose live limits were already looked up for an
-    /// unknown window (D12): at most once each per process.
-    live_discovery_attempted: Mutex<std::collections::HashSet<String>>,
     /// The last `(provider, model, window, source)` announced as
     /// `event/contextWindow`; a turn announces only a change.
     last_context_window: Mutex<Option<(String, String, u64, String)>>,
@@ -1690,7 +1687,6 @@ impl ServeHost {
             }),
             effort_overrides: Mutex::new(HashMap::new()),
             live_model_limits: Arc::new(Mutex::new(HashMap::new())),
-            live_discovery_attempted: Mutex::new(std::collections::HashSet::new()),
             last_context_window: Mutex::new(None),
             config_commit: tokio::sync::Mutex::new(()),
             goal_params: Mutex::new(startup_goals),
@@ -1868,31 +1864,6 @@ impl ServeHost {
                 crate::output_budget::live_key(provider, &m.id),
                 crate::output_budget::LiveLimits { context: m.context_limit, output: m.output_limit },
             );
-        }
-    }
-
-    /// D12: when neither the live list recorded so far nor the catalogue
-    /// knows `model`'s window, asks the client's (cached) model list — once
-    /// per provider/model per process, bounded to 5 s — so a live window is
-    /// found even when no client ever called `session/models`.
-    async fn discover_live_limits_if_unknown(&self, client: &Arc<dyn LlmClient>, model: &str) {
-        let provider = client.provider_id().to_owned();
-        if self.effective_limits(&provider, model).context_source != WindowSource::Fallback {
-            return;
-        }
-        let first = self
-            .live_discovery_attempted
-            .lock()
-            .expect("live discovery poisoned")
-            .insert(crate::output_budget::live_key(&provider, model));
-        if !first {
-            return;
-        }
-        if let Ok(Ok(models)) =
-            tokio::time::timeout(LIVE_DISCOVERY_TIMEOUT, client.list_models()).await
-        {
-            self.record_live_limits(&provider, &models);
-            self.note_effective_context_limit();
         }
     }
 
@@ -6229,10 +6200,6 @@ impl ServeHost {
             None => Arc::clone(&self.permission_prompt),
         };
 
-        // A model neither the live list nor the catalogue knows would be
-        // sized against the 200k fallback; ask the provider once (D12).
-        self.discover_live_limits_if_unknown(&client, &self.current_model()).await;
-
         // ONE coherent read of the configuration this turn runs under, taken
         // after every await that precedes the build. Everything below — the
         // model and effort handed to the builder, the system-prompt override
@@ -7556,9 +7523,6 @@ fn context_window_info(
         compaction_threshold: policy.token_threshold as u64,
     }
 }
-
-/// How long the turn path waits for a live model list (D12).
-const LIVE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Saves the pre-compaction history under
 /// `.coda/sessions/<id>.compactions/` before a compaction commits.
@@ -14028,47 +13992,6 @@ mod tests {
         assert!(!host.announce_context_window(info(200_000, "fallback")));
         assert!(host.announce_context_window(info(200_000, "catalog")));
         assert!(host.announce_context_window(info(1_000_000, "live")));
-    }
-
-    /// D12: a model with no known window asks the client's model list once,
-    /// and the live window it reports is then used.
-    #[tokio::test]
-    async fn live_limits_are_discovered_once_for_an_unknown_window() {
-        struct ListingClient {
-            lists: std::sync::atomic::AtomicUsize,
-        }
-        #[async_trait]
-        impl LlmClient for ListingClient {
-            fn provider_id(&self) -> &str {
-                "listing"
-            }
-            async fn stream(
-                &self,
-                _: coda_llm::ChatRequest,
-            ) -> Result<coda_llm::ResponseStream, coda_llm::LlmError> {
-                Err(coda_llm::LlmError::Cancelled)
-            }
-            async fn list_models(&self) -> Result<Vec<coda_llm::ModelInfo>, coda_llm::LlmError> {
-                self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let mut model = coda_llm::ModelInfo::new("mystery-1m");
-                model.context_limit = Some(1_000_000);
-                model.output_limit = Some(64_000);
-                Ok(vec![model])
-            }
-        }
-        let client = Arc::new(ListingClient { lists: Default::default() });
-        let dyn_client = Arc::clone(&client) as Arc<dyn LlmClient>;
-        let host = make_host_in_dir(".", Arc::clone(&dyn_client));
-        set_model(&host, "mystery-1m");
-
-        host.discover_live_limits_if_unknown(&dyn_client, "mystery-1m").await;
-        host.discover_live_limits_if_unknown(&dyn_client, "mystery-1m").await;
-
-        assert_eq!(client.lists.load(std::sync::atomic::Ordering::SeqCst), 1);
-        let budget = host.effective_limits("listing", "mystery-1m");
-        assert_eq!(budget.budget.context_window, Some(1_000_000));
-        assert_eq!(budget.context_source, WindowSource::Live);
-        assert_eq!(published_context_limit(&host).await, json!(1_000_000));
     }
 
     fn summary_turn(text: &str, stop: &str) -> Vec<coda_llm::anthropic::StreamEvent> {

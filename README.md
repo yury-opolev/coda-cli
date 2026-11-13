@@ -1217,14 +1217,16 @@ messages, system prompt and tool/MCP schemas — with the threshold. The project
 anchored on the token usage the provider measured for the last response, plus an estimate
 of whatever was appended since; a change of model, system prompt or tools (or a rewritten
 history) drops the anchor and re-estimates everything, so new overhead is never missed and
-nothing is counted twice. The window comes from the provider's live model list, then the
-bundled catalogue; when neither knows the model, the engine asks the provider's model list
-once (bounded to 5 s) and otherwise assumes **200,000 tokens** and says so with a visible
-warning (the status bar then shows no limit rather than a guess). Inference, compaction and
+nothing is counted twice. The window comes from the provider's live model list (fetched
+through `session/models`, which the TUI requests at startup and after every model switch),
+then the bundled catalogue; when neither knows the model, the engine assumes **200,000
+tokens** and says so with a visible warning (the status bar then shows no limit rather than
+a guess). A prompt never makes its own model-list request. Inference, compaction and
 the status bar all use this same window.
 
-**What is kept verbatim.** The last two exchanges (an exchange starts at a message you, or
-the runtime, sent) are always kept, so a short reply like "yes, proceed" keeps the question
+**What is kept verbatim.** The last two exchanges (an exchange starts at a message you
+sent; runtime notices such as task completions do not start one) are always kept, so a
+short reply like "yes, proceed" keeps the question
 it answers. Older exchanges are added back whole while the kept tail stays within about
 16,000 tokens. A tool call is never separated from its result. Only if the next request
 would still not fit, oversized **tool results** inside the kept tail are shortened to their
