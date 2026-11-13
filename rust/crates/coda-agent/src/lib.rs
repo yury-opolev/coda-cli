@@ -36,8 +36,10 @@
 //! - **`hooks`**: `HookRunner`, `UserHook`, `HookScope`, `HookEventPolicy`,
 //!   `HookMatcher`, `HookContentHash`, `HookTrustStore`, `HookTrustGuard`,
 //!   and the decision result types.
-//! - **`compaction`**: `CompactionService`, `TokenEstimator`,
-//!   `CompactionPolicy`, `CompactionTrigger`, `compaction_tail_start`;
+//! - **`compaction`**: `CompactionService`, `CompactionRequest`,
+//!   `CompactionOutcome`, `CompactionReport`, `Summarizer`, `CheckpointSink`,
+//!   `CompactionLimits`, `TokenEstimator`, `CompactionPolicy`,
+//!   `CompactionTrigger`, `compaction_tail_start`;
 //!   `compaction::tail` (exchange-based protected tail) and
 //!   `compaction::render` (summariser input and checkpoint message).
 //! - **`output_styles`**: `OutputStyle`, `BuiltInOutputStyles`.
@@ -67,7 +69,10 @@ pub use agent::output_budget::{
     FALLBACK_MAX_OUTPUT_TOKENS, MIN_MAX_OUTPUT_TOKENS,
 };
 pub use compaction::{
-    CompactionPolicy, CompactionService, CompactionTrigger, TokenEstimator, compaction_tail_start,
+    CheckpointMeta, CheckpointRef, CheckpointSink, CompactionLimits, CompactionOutcome,
+    CompactionPolicy, CompactionReport, CompactionRequest, CompactionService, CompactionTrigger,
+    CompactionTriggerKind, SummarizerError, Summarizer, SummaryRequest, SummaryResponse,
+    TokenEstimator, WindowSource, compaction_tail_start,
 };
 pub use events::{AgentEvent, AgentSink, CollectingSink, NullSink, ToolCallStatus};
 pub use autonomy::{

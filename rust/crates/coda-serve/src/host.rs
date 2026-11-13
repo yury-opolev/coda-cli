@@ -9,8 +9,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::Utc;
 use coda_agent::{
-    AgentError, AgentLoopBuilder, CompactionPolicy, CompactionService, GoalBudget, GoalOutcome,
-    GoalStatus,
+    AgentError, AgentLoopBuilder, CompactionLimits, CompactionOutcome, CompactionPolicy,
+    CompactionRequest, CompactionService, CompactionTriggerKind, GoalBudget, GoalOutcome,
+    GoalStatus, SummarizerError, Summarizer, SummaryRequest, SummaryResponse, WindowSource,
     AutonomySupervisor, HookContentHash, HookRunner, HookScope, HookTrustGuard, HookTrustStore,
     InMemoryHookTrustStore, NullScheduleLifecycleSink, ScheduleRuntime, SubagentFactory,
     TaskManagerRunner, TodoStore, TokenEstimator, ToolQuarantine, ToolRegistry, UserHook,
@@ -453,6 +454,46 @@ impl ClassifierForkedAgent for LlmForkedAgent {
         cancel: CancellationToken,
     ) -> anyhow::Result<String> {
         self.run_once(system, messages, cancel).await
+    }
+}
+
+/// The compaction summariser: the session's own client with the explicit
+/// output allowance compaction asks for. Kept apart from [`LlmForkedAgent`]
+/// so the short judge/classifier calls keep their 512-token cap.
+struct LlmSummarizer {
+    client: Arc<dyn LlmClient>,
+    model: String,
+}
+
+#[async_trait]
+impl Summarizer for LlmSummarizer {
+    async fn summarize(
+        &self,
+        request: SummaryRequest,
+        cancel: CancellationToken,
+    ) -> Result<SummaryResponse, SummarizerError> {
+        let failed = |e: &coda_llm::LlmError| match e {
+            coda_llm::LlmError::Cancelled => SummarizerError::Cancelled,
+            other => SummarizerError::Failed { category: coda_llm::diagnostics::category(other) },
+        };
+        let chat = ChatRequest::new(self.model.clone(), request.messages)
+            .with_system(request.system)
+            .with_max_tokens(request.max_output_tokens);
+        let stream = tokio::select! {
+            stream = self.client.stream(chat) => stream.map_err(|e| failed(&e))?,
+            _ = cancel.cancelled() => return Err(SummarizerError::Cancelled),
+        };
+        tokio::select! {
+            result = stream.collect() => {
+                let response = result.map_err(|e| failed(&e))?;
+                Ok(SummaryResponse {
+                    text: response.text,
+                    stop_reason: response.stop_reason,
+                    usage: response.usage,
+                })
+            }
+            _ = cancel.cancelled() => Err(SummarizerError::Cancelled),
+        }
     }
 }
 
@@ -6156,28 +6197,34 @@ impl ServeHost {
         // proactively, and not on the overflow-retry path either. History grew
         // until the provider refused the request.
         //
-        // The summariser is the same `LlmForkedAgent` the manual `/compact`
+        // The summariser is the same `LlmSummarizer` the manual `/compact`
         // route builds, so an automatic compaction and a requested one produce
         // the same thing by construction rather than by two implementations
         // agreeing.
-        .with_compaction_service(Arc::new(CompactionService::new(Arc::new(
-            LlmForkedAgent { client: Arc::clone(&client), model: captured.config.model.clone() },
-        ) as Arc<dyn ForkedAgent>)))
+        .with_compaction_service(Arc::new(CompactionService::new(Arc::new(LlmSummarizer {
+            client: Arc::clone(&client),
+            model: captured.config.model.clone(),
+        }))))
         // The threshold is a fraction of the model's window (80% by default),
         // overridable per user via `compactAtPercent` / `compactFreeTokens`,
         // or per model via `compactByModel`. The agent is rebuilt every turn,
         // so a model switch picks up the new model's entry.
         // The reserve is the `max_tokens` the loop actually requests. It only
         // caps the threshold, so on a large window the fraction still rules.
-        .with_compaction_policy(CompactionPolicy::for_context_window_with(
-            crate::settings::compaction_trigger_from(
-                &load_settings_value(),
-                client.provider_id(),
-                &captured.config.model,
-            ),
-            self.active_context_window(),
-            Some(output_budget.budget.max_tokens as usize),
-        ));
+        .with_compaction_policy({
+            let context_window = self.active_context_window();
+            CompactionPolicy::for_context_window_with(
+                crate::settings::compaction_trigger_from(
+                    &load_settings_value(),
+                    client.provider_id(),
+                    &captured.config.model,
+                ),
+                context_window,
+                Some(output_budget.budget.max_tokens as usize),
+            )
+            .with_window_source(catalog_window_source(context_window))
+            .with_model_output_limit(output_budget.model_output_limit)
+        });
 
         // Apply the session-only system prompt override the captured record
         // carries. The text is cloned here, outside CONFIG, and only because
@@ -6401,16 +6448,35 @@ impl ServeHost {
         let cancel = CancellationToken::new();
         *self.current_cancel.lock().expect("cancel poisoned") = Some(cancel.clone());
 
-        let fork: Arc<dyn ForkedAgent> =
-            Arc::new(LlmForkedAgent { client, model: self.current_model() });
-        let service = CompactionService::new(fork);
+        let model = self.current_model();
+        let context_window = self.active_context_window();
+        let output_budget =
+            resolve_output_budget_now(&self.live_model_limits, client.provider_id(), &model);
+        let limits = CompactionLimits {
+            context_window: context_window.unwrap_or(coda_agent::compaction::DEFAULT_CONTEXT_WINDOW),
+            window_source: catalog_window_source(context_window),
+            model_output_limit: output_budget.model_output_limit,
+            request_overhead_tokens: 0,
+            reply_reserve_tokens: output_budget.budget.max_tokens as usize,
+        };
+        let service = CompactionService::new(Arc::new(LlmSummarizer { client, model }));
 
-        let (compacted, summary) =
-            service.compact(&history, p.instructions.as_deref(), cancel.clone()).await;
+        let outcome = service
+            .compact(
+                CompactionRequest {
+                    history: &history,
+                    instructions_override: p.instructions.as_deref(),
+                    trigger: CompactionTriggerKind::Manual,
+                    limits,
+                },
+                cancel.clone(),
+            )
+            .await;
 
         *self.current_cancel.lock().expect("cancel poisoned") = None;
 
-        let was_cancelled = cancel.is_cancelled();
+        let was_cancelled =
+            cancel.is_cancelled() || matches!(outcome, CompactionOutcome::Cancelled { .. });
 
         if was_cancelled {
             // Emit the cancellation event; history is unchanged.
@@ -6421,8 +6487,8 @@ impl ServeHost {
             return Err(RpcError::cancelled());
         }
 
-        match summary {
-            Some(_) => {
+        match outcome {
+            CompactionOutcome::Compacted { history: compacted, .. } => {
                 // Compaction succeeded — atomically replace history.
                 let tokens_after = TokenEstimator::estimate(&compacted) as i64;
                 let session_id = self.active_session_id();
@@ -6446,17 +6512,15 @@ impl ServeHost {
                 })
                 .map_err(|e| RpcError::internal(e.to_string()))
             }
-            None => {
-                // Summariser returned empty — original history preserved.
+            outcome => {
+                // Not compacted or failed — original history preserved.
                 serde_json::to_value(&CompactResponse {
                     ok: true,
                     messages_before,
                     messages_after: messages_before,
                     tokens_before: Some(tokens_before),
                     tokens_after: None,
-                    error: Some(
-                        "summariser returned empty response; history unchanged".into(),
-                    ),
+                    error: Some(outcome.report().failure_sentence()),
                 })
                 .map_err(|e| RpcError::internal(e.to_string()))
             }
@@ -7349,6 +7413,15 @@ fn resolve_output_budget_now(
         provider,
         model,
     )
+}
+
+/// Where a window from `active_context_window` (catalogue only) came from.
+fn catalog_window_source(context_window: Option<usize>) -> WindowSource {
+    if context_window.is_some() {
+        WindowSource::Catalog
+    } else {
+        WindowSource::Fallback
+    }
 }
 
 /// Read the user's settings.json as a JSON value (best-effort; empty object on failure).

@@ -75,6 +75,47 @@ pub enum Event {
         #[serde(skip_serializing_if = "Option::is_none")]
         context_window: Option<u64>,
     },
+    /// One compaction attempt and its result. Every field is a number or a
+    /// closed label (`trigger`: `auto`/`overflow`/`manual`; `outcome`:
+    /// `compacted`/`not_compacted`/`failed`/`cancelled`; `reason`: the
+    /// compaction reason vocabulary; `stop_reason`: a normalised label) —
+    /// never conversation content or the checkpoint's path.
+    Compaction {
+        trigger: &'static str,
+        outcome: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<&'static str>,
+        window_source: &'static str,
+        context_window: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        threshold: Option<u64>,
+        estimated_tokens: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        measured_tokens: Option<u64>,
+        messages_before: u32,
+        messages_after: u32,
+        tokens_before: u64,
+        tokens_after: u64,
+        tail_messages: u32,
+        tail_tokens: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        summary_allowance: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        retry_allowance: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output_tokens: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stop_reason: Option<&'static str>,
+        attempts: u32,
+        duration_ms: u64,
+        abbreviated_tool_outputs: u32,
+        omitted_tool_outputs: u32,
+        omitted_messages: u32,
+        previewed_tail_results: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        structured: Option<bool>,
+        checkpoint_saved: bool,
+    },
     /// A prompt turn ended in failure. `category` is a fixed, closed
     /// classification — never the provider's own error text.
     TurnFailed {

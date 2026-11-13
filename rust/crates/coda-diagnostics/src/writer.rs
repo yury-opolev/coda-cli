@@ -942,6 +942,48 @@ mod tests {
     }
 
     #[test]
+    fn a_compaction_is_recorded_with_closed_labels_and_numbers_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let logger = Arc::new(Logger::open(options(dir.path()), Limits::default()).expect("opens"));
+        let ctx = DiagnosticContext::root(Arc::clone(&logger), "run-1");
+        ctx.record(Event::Compaction {
+            trigger: "auto",
+            outcome: "failed",
+            reason: Some("summary_truncated"),
+            window_source: "fallback",
+            context_window: 200_000,
+            threshold: None,
+            estimated_tokens: 181_234,
+            measured_tokens: None,
+            messages_before: 312,
+            messages_after: 312,
+            tokens_before: 181_234,
+            tokens_after: 181_234,
+            tail_messages: 9,
+            tail_tokens: 4_000,
+            summary_allowance: Some(8_192),
+            retry_allowance: Some(32_768),
+            output_tokens: Some(40_960),
+            stop_reason: Some("max_tokens"),
+            attempts: 2,
+            duration_ms: 12,
+            abbreviated_tool_outputs: 3,
+            omitted_tool_outputs: 0,
+            omitted_messages: 0,
+            previewed_tail_results: 0,
+            structured: Some(true),
+            checkpoint_saved: false,
+        });
+
+        let lines = read_lines(&logger.status().path.unwrap());
+        assert_eq!(lines[0]["kind"], "compaction");
+        assert_eq!(lines[0]["reason"], "summary_truncated");
+        assert_eq!(lines[0]["attempts"], 2);
+        assert_eq!(lines[0]["checkpoint_saved"], false);
+        assert!(lines[0].get("threshold").is_none());
+    }
+
+    #[test]
     fn a_record_over_the_byte_bound_is_replaced_with_a_safe_dropped_marker() {
         let dir = tempfile::tempdir().unwrap();
         // Small enough that a record carrying full context (session/turn/

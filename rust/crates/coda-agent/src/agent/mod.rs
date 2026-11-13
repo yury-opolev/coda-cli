@@ -23,7 +23,10 @@ use coda_llm::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::compaction::{CompactionPolicy, CompactionService, TokenEstimator};
+use crate::compaction::{
+    CompactionLimits, CompactionOutcome, CompactionPolicy, CompactionRequest, CompactionService,
+    CompactionTriggerKind, TokenEstimator, DEFAULT_CONTEXT_WINDOW,
+};
 use crate::events::{AgentEvent, AgentSink};
 use crate::autonomy::{GoalStatus, AutonomySupervisor, last_assistant_text};
 use crate::lsp::LspServerManager;
@@ -258,6 +261,21 @@ impl AgentLoop {
         output_budget::clamp_to_context_window(self.max_tokens, self.context_window, estimate)
     }
 
+    /// The limits a compaction in this loop works within.
+    fn compaction_limits(&self) -> CompactionLimits {
+        let policy = &self.compaction_policy;
+        CompactionLimits {
+            context_window: policy
+                .context_window
+                .or(self.context_window)
+                .unwrap_or(DEFAULT_CONTEXT_WINDOW),
+            window_source: policy.window_source,
+            model_output_limit: policy.model_output_limit,
+            request_overhead_tokens: 0,
+            reply_reserve_tokens: self.max_tokens as usize,
+        }
+    }
+
     /// Begin an agent turn.
     ///
     /// - `history` is mutated in place (assistant turns, tool results, and
@@ -413,7 +431,8 @@ impl AgentLoop {
                             self.hook_runner.as_deref(),
                             history,
                             sink,
-                            "auto",
+                            CompactionTriggerKind::Auto,
+                            self.compaction_limits(),
                             cancel.clone(),
                         )
                         .await
@@ -535,7 +554,8 @@ impl AgentLoop {
                                     self.hook_runner.as_deref(),
                                     history,
                                     sink,
-                                    "overflow",
+                                    CompactionTriggerKind::Overflow,
+                                    self.compaction_limits(),
                                     cancel.clone(),
                                 )
                                 .await
@@ -970,7 +990,8 @@ async fn compact_history(
     hook_runner: Option<&crate::hooks::HookRunner>,
     history: &mut Vec<Message>,
     sink: &dyn AgentSink,
-    trigger: &str,
+    trigger: CompactionTriggerKind,
+    limits: CompactionLimits,
     cancel: CancellationToken,
 ) -> anyhow::Result<bool> {
     // Pre-compact hook.
@@ -978,7 +999,7 @@ async fn compact_history(
         if hr.has_pre_compact {
             let pre = hr
                 .run_pre_compact(
-                    trigger,
+                    trigger.as_str(),
                     TokenEstimator::estimate(history),
                     history.len(),
                     None,
@@ -988,7 +1009,7 @@ async fn compact_history(
             if pre.cancel {
                 sink.emit(AgentEvent::CompactionCancelled {
                     hook_command: pre.by_hook_command.unwrap_or_default(),
-                    trigger: trigger.to_owned(),
+                    trigger: trigger.as_str().to_owned(),
                 });
                 return Ok(false);
             }
@@ -1001,16 +1022,29 @@ async fn compact_history(
     };
 
     let tokens_before = TokenEstimator::estimate(history);
-    let (new_history, summary) = svc
-        .compact(history, instructions_override.as_deref(), cancel.clone())
+    let outcome = svc
+        .compact(
+            CompactionRequest {
+                history,
+                instructions_override: instructions_override.as_deref(),
+                trigger,
+                limits,
+            },
+            cancel.clone(),
+        )
         .await;
 
-    // If the summariser returned nothing, history is unchanged — fail gracefully.
-    if summary.is_none() {
-        return Err(anyhow::anyhow!("compaction returned no summary"));
-    }
-
-    *history = new_history;
+    let summary = match outcome {
+        CompactionOutcome::Compacted { history: new_history, summary, .. } => {
+            *history = new_history;
+            summary
+        }
+        CompactionOutcome::NotCompacted { .. } => return Ok(false),
+        // History is unchanged on every other outcome.
+        CompactionOutcome::Failed { report } | CompactionOutcome::Cancelled { report } => {
+            return Err(anyhow::anyhow!(report.failure_sentence()));
+        }
+    };
 
     // Post-compact hook.
     if let Some(hr) = hook_runner {
@@ -1020,7 +1054,7 @@ async fn compact_history(
                     tokens_before,
                     TokenEstimator::estimate(history),
                     history.len(),
-                    summary.as_deref().unwrap_or(""),
+                    &summary,
                     cancel.clone(),
                 )
                 .await;
@@ -3272,18 +3306,21 @@ mod tests {
     //   - Proactive compaction: when token count exceeds threshold (goal-only).
     //   - Overflow compaction: when the LLM rejects the request due to context.
 
-    /// Mock ForkedAgent that returns a canned summary.
+    /// Mock summariser that returns a canned, complete summary.
     struct MockFork(String);
 
     #[async_trait]
-    impl crate::autonomy::ForkedAgent for MockFork {
-        async fn run(
+    impl crate::compaction::Summarizer for MockFork {
+        async fn summarize(
             &self,
-            _system: &str,
-            _messages: Vec<Message>,
+            _request: crate::compaction::SummaryRequest,
             _cancel: CancellationToken,
-        ) -> anyhow::Result<String> {
-            Ok(self.0.clone())
+        ) -> Result<crate::compaction::SummaryResponse, crate::compaction::SummarizerError> {
+            Ok(crate::compaction::SummaryResponse {
+                text: self.0.clone(),
+                stop_reason: Some("end_turn".into()),
+                ..Default::default()
+            })
         }
     }
 
@@ -3663,10 +3700,18 @@ mod tests {
 
         struct CountingFork(Arc<AtomicUsize>);
         #[async_trait]
-        impl crate::autonomy::ForkedAgent for CountingFork {
-            async fn run(&self, _: &str, _: Vec<Message>, _: CancellationToken) -> anyhow::Result<String> {
+        impl crate::compaction::Summarizer for CountingFork {
+            async fn summarize(
+                &self,
+                _: crate::compaction::SummaryRequest,
+                _: CancellationToken,
+            ) -> Result<crate::compaction::SummaryResponse, crate::compaction::SummarizerError> {
                 self.0.fetch_add(1, Ordering::SeqCst);
-                Ok("summary".to_owned())
+                Ok(crate::compaction::SummaryResponse {
+                    text: "summary".to_owned(),
+                    stop_reason: Some("end_turn".into()),
+                    ..Default::default()
+                })
             }
         }
 
@@ -3701,7 +3746,11 @@ mod tests {
             .build();
 
         let mut history = vec![
-            Message::user("big context".repeat(1000)),
+            Message::user(format!("big context {}", "e".repeat(80_000))),
+            Message::assistant("noted"),
+            Message::user("prompt"),
+            Message::assistant("response"),
+            Message::user("another prompt"),
         ];
         agent.run(&mut history, &NullSink, Some(goal), CancellationToken::new()).await.unwrap();
 
@@ -3717,21 +3766,35 @@ mod tests {
     /// Mirrors C# invariant: a failed compaction must not corrupt history.
     #[tokio::test]
     async fn compaction_failure_preserves_original_history() {
-        use crate::compaction::CompactionService;
+        use crate::compaction::{CompactionLimits, CompactionService, CompactionTriggerKind};
         use crate::events::NullSink;
 
         struct EmptyFork;
         #[async_trait]
-        impl crate::autonomy::ForkedAgent for EmptyFork {
-            async fn run(&self, _: &str, _: Vec<Message>, _: CancellationToken) -> anyhow::Result<String> {
-                Ok(String::new()) // empty → fail
+        impl crate::compaction::Summarizer for EmptyFork {
+            async fn summarize(
+                &self,
+                _: crate::compaction::SummaryRequest,
+                _: CancellationToken,
+            ) -> Result<crate::compaction::SummaryResponse, crate::compaction::SummarizerError> {
+                // A normal stop with no text → empty summary → failure.
+                Ok(crate::compaction::SummaryResponse {
+                    stop_reason: Some("end_turn".into()),
+                    ..Default::default()
+                })
             }
         }
 
         let svc = Arc::new(CompactionService::new(Arc::new(EmptyFork)));
+        // Three exchanges, the first too bulky for the protected tail, so
+        // there is something to summarise and the empty reply is reached.
         let history = vec![
-            Message::user("original prompt"),
+            Message::user(format!("original prompt {}", "e".repeat(80_000))),
             Message::assistant("original response"),
+            Message::user("second prompt"),
+            Message::assistant("second response"),
+            Message::user("third prompt"),
+            Message::assistant("third response"),
         ];
         let mut h = history.clone();
         // compact_history should return Err (empty summary) and leave h unchanged.
@@ -3740,13 +3803,13 @@ mod tests {
             None,
             &mut h,
             &NullSink,
-            "test",
+            CompactionTriggerKind::Auto,
+            CompactionLimits::default(),
             CancellationToken::new(),
         ).await;
 
         assert!(result.is_err(), "empty summarizer must return an error");
-        assert_eq!(h.len(), 2, "history must be preserved on compaction failure");
-        assert_eq!(h[0].text(), "original prompt");
+        assert_eq!(h, history, "history must be preserved on compaction failure");
     }
 
     // ── Feature 3: AgentResponse hook mutation ──────────────────────────────
