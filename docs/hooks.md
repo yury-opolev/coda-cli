@@ -526,7 +526,7 @@ the summarisation step.
 | Field | Type | Description |
 |-------|------|-------------|
 | `decision` | `"allow"\|"block"` | `block` cancels the compaction for this turn. |
-| `instructions` | `string` | Custom instructions passed to the summarisation model. Last-writer-wins. |
+| `instructions` | `string` | Custom instructions passed to the summarisation model. Last-writer-wins. They **replace** the built-in structured checkpoint prompt (Next Move, Pending Decisions & Open Questions, …) entirely rather than adding to it. |
 
 ---
 
@@ -548,6 +548,10 @@ compacted history.
   "summary": "The session so far: ..."
 }
 ```
+
+`summary` may be an empty string for a **tail-only** compaction: when there is nothing older
+to summarise but the protected recent tool output is too large to fit, Coda shortens that
+output without calling the summariser.
 
 **Output fields** (`hookSpecificOutput`):
 

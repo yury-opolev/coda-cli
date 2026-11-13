@@ -715,7 +715,7 @@ the engine, and `checkpoint` is a bare file name, never a path. Older clients ig
 | `durationMs` | Wall time of the attempt. |
 | `abbreviatedToolOutputs`, `omittedToolOutputs`, `omittedMessages` | How much of the summariser input was shortened or left out to fit. |
 | `previewedTailResults` | Tool results in the protected tail replaced by a bounded preview. |
-| `checkpoint?` | File name of the pre-compaction checkpoint saved under the session's `compactions` directory. |
+| `checkpoint?` | File name of the pre-compaction checkpoint saved under `.coda/sessions/<session-id>.compactions/`. |
 
 **`event/contextWindow`** — the effective context window was resolved, sent at turn start
 whenever the (model, window, source) differs from the last one announced:
