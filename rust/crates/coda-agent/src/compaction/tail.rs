@@ -105,19 +105,54 @@ pub fn compaction_tail_start_with(history: &[Message], target_tokens: usize) -> 
     boundaries[pos]
 }
 
+/// What a shortened tail result's marker may say about the full output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointNote<'a> {
+    /// No checkpoint is written; the marker claims none.
+    None,
+    /// A checkpoint will be written; its name is not known yet.
+    Pending,
+    /// The checkpoint file that holds the full output.
+    Named(&'a str),
+}
+
+const MARKER_PREFIX: &str = "[coda: ";
+const MARKER_OMITTED: &str = " bytes of this tool output were omitted during compaction";
+
+fn preview_marker(omitted: usize, note: CheckpointNote<'_>) -> String {
+    let kept = "; the complete output is kept in the local pre-compaction checkpoint";
+    match note {
+        CheckpointNote::None => format!("{MARKER_PREFIX}{omitted}{MARKER_OMITTED}]"),
+        CheckpointNote::Pending => format!("{MARKER_PREFIX}{omitted}{MARKER_OMITTED}{kept}]"),
+        CheckpointNote::Named(name) => {
+            format!("{MARKER_PREFIX}{omitted}{MARKER_OMITTED}{kept} {name}]")
+        }
+    }
+}
+
+/// Whether `content` already carries a preview marker from an earlier
+/// compaction.
+pub fn is_tail_preview(content: &str) -> bool {
+    content.match_indices(MARKER_PREFIX).any(|(at, _)| {
+        let rest = &content[at + MARKER_PREFIX.len()..];
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        digits > 0 && rest[digits..].starts_with(MARKER_OMITTED)
+    })
+}
+
 /// Shortens `ToolResult` contents in `tail`, oldest first, until the estimated
 /// tokens saved reach `tokens_to_free` (or nothing shortenable is left).
 ///
 /// Only results longer than head + tail preview bytes are touched; each keeps
 /// its first 6 KiB and last 2 KiB around a marker naming the omission and,
-/// when given, the checkpoint file that holds the full output. User and
+/// per `note`, the checkpoint that holds the full output. A result already
+/// shortened by an earlier compaction keeps its original marker. User and
 /// assistant text is never shortened. Returns how many results were shortened.
 pub fn preview_tail_tool_results(
     tail: &mut [Message],
     tokens_to_free: usize,
-    checkpoint_name: Option<&str>,
+    note: CheckpointNote<'_>,
 ) -> usize {
-    let name_part = checkpoint_name.map(|n| format!(" {n}")).unwrap_or_default();
     let mut freed = 0usize;
     let mut shortened = 0usize;
     for msg in tail.iter_mut() {
@@ -126,7 +161,9 @@ pub fn preview_tail_tool_results(
                 return shortened;
             }
             let Content::ToolResult { content, .. } = block else { continue };
-            if content.len() <= TAIL_PREVIEW_HEAD_BYTES + TAIL_PREVIEW_TAIL_BYTES {
+            if content.len() <= TAIL_PREVIEW_HEAD_BYTES + TAIL_PREVIEW_TAIL_BYTES
+                || is_tail_preview(content)
+            {
                 continue;
             }
             let (head, _) = coda_proto::history::truncate_text(content, TAIL_PREVIEW_HEAD_BYTES);
@@ -136,10 +173,7 @@ pub fn preview_tail_tool_results(
             }
             let suffix = &content[suffix_start..];
             let omitted = suffix_start - head.len();
-            let preview = format!(
-                "{head}\n[coda: {omitted} bytes of this tool output were omitted during compaction; \
-                 the complete output is kept in the local pre-compaction checkpoint{name_part}]\n{suffix}"
-            );
+            let preview = format!("{head}\n{}\n{suffix}", preview_marker(omitted, note));
             if preview.len() >= content.len() {
                 continue;
             }
@@ -361,7 +395,7 @@ mod tests {
             tool_result("c2", "0123456789"),
         ];
 
-        assert_eq!(preview_tail_tool_results(&mut tail, 1, Some("x.json")), 1);
+        assert_eq!(preview_tail_tool_results(&mut tail, 1, CheckpointNote::Named("x.json")), 1);
 
         let shortened = result_content(&tail[2]);
         assert!(shortened.starts_with(&big[..TAIL_PREVIEW_HEAD_BYTES]));
@@ -375,10 +409,47 @@ mod tests {
     }
 
     #[test]
+    fn an_already_shortened_result_is_not_shortened_again() {
+        let big: String = (0..100_000).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+        let mut tail = vec![tool_use("c1", "cat"), tool_result("c1", &big)];
+
+        assert_eq!(preview_tail_tool_results(&mut tail, 1, CheckpointNote::Named("first.json")), 1);
+        let first = result_content(&tail[1]).to_owned();
+        assert!(first.len() > TAIL_PREVIEW_HEAD_BYTES + TAIL_PREVIEW_TAIL_BYTES);
+        assert!(is_tail_preview(&first));
+
+        assert_eq!(
+            preview_tail_tool_results(&mut tail, usize::MAX, CheckpointNote::Named("second.json")),
+            0
+        );
+        let second = result_content(&tail[1]);
+        assert_eq!(second, first);
+        let omitted = big.len() - TAIL_PREVIEW_HEAD_BYTES - TAIL_PREVIEW_TAIL_BYTES;
+        assert!(second.contains(&format!("[coda: {omitted} bytes of this tool output were omitted")));
+        assert!(second.contains("first.json"));
+        assert!(!second.contains("second.json"));
+    }
+
+    #[test]
+    fn without_a_checkpoint_the_marker_claims_none() {
+        let big = "z".repeat(50_000);
+        let mut tail = vec![tool_result("c1", &big)];
+        assert_eq!(preview_tail_tool_results(&mut tail, 1, CheckpointNote::None), 1);
+        let shortened = result_content(&tail[0]);
+        assert!(shortened.contains(&format!(
+            "[coda: {} bytes of this tool output were omitted during compaction]",
+            big.len() - TAIL_PREVIEW_HEAD_BYTES - TAIL_PREVIEW_TAIL_BYTES
+        )));
+        assert!(!shortened.contains("checkpoint"));
+        assert!(is_tail_preview(shortened));
+        assert!(!is_tail_preview("[coda: many bytes of this tool output were omitted during compaction]"));
+    }
+
+    #[test]
     fn previews_respect_utf8() {
         let wide = "\u{2500}".repeat(20_000);
         let mut tail = vec![tool_result("c1", &wide)];
-        assert_eq!(preview_tail_tool_results(&mut tail, 1, None), 1);
+        assert_eq!(preview_tail_tool_results(&mut tail, 1, CheckpointNote::None), 1);
         let shortened = result_content(&tail[0]);
         assert!(shortened.len() < wide.len());
         assert!(shortened.starts_with('\u{2500}') && shortened.ends_with('\u{2500}'));

@@ -438,10 +438,14 @@ impl AgentLoop {
                         .await
                         {
                             Ok(true) => {} // compacted; blocked_compaction_at stays None
-                            Ok(false) => {
+                            // A declined or failed compaction is not retried
+                            // until history grows by a further threshold;
+                            // compaction is best-effort, so the error is not
+                            // surfaced. A cancellation blocks nothing.
+                            Ok(false) | Err(CompactError::Failed(_)) => {
                                 blocked_compaction_at = Some(current);
                             }
-                            Err(_) => {} // swallow; compaction is best-effort
+                            Err(CompactError::Cancelled) => {}
                         }
                     }
                 }
@@ -576,10 +580,12 @@ impl AgentLoop {
                                         }
                                         continue; // retry with compacted history
                                     }
-                                    Ok(false) => {
+                                    // Let the overflow error surface; a failure
+                                    // also blocks re-running the same compaction.
+                                    Ok(false) | Err(CompactError::Failed(_)) => {
                                         blocked_compaction_at = Some(current);
                                     }
-                                    Err(_) => {} // swallow; let the overflow error surface
+                                    Err(CompactError::Cancelled) => {}
                                 }
                             }
                         }
@@ -979,12 +985,33 @@ fn replace_last_assistant_text(history: &mut Vec<coda_llm::Message>, new_text: &
     }
 }
 
+/// Why [`compact_history`] left the history unchanged.
+#[derive(Debug)]
+enum CompactError {
+    /// The compaction ran and failed; retrying at once would fail the same way.
+    Failed(String),
+    /// The compaction was cancelled; it says nothing about a later attempt.
+    Cancelled,
+}
+
+impl std::fmt::Display for CompactError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CompactError::Failed(sentence) => f.write_str(sentence),
+            CompactError::Cancelled => f.write_str("compaction cancelled"),
+        }
+    }
+}
+
+impl std::error::Error for CompactError {}
+
 /// Runs compaction on `history` in-place: fires PreCompact hook (if configured),
 /// calls the compaction service, and fires PostCompact hook (if configured).
 ///
 /// Returns `Ok(true)` when history was successfully compacted, `Ok(false)` when
-/// a hook blocked compaction, and `Err` when compaction failed.  The original
-/// history is preserved intact on failure — no silent data loss.
+/// a hook blocked compaction, and `Err` when compaction failed or was
+/// cancelled.  The original history is preserved intact on failure — no
+/// silent data loss.
 async fn compact_history(
     svc: &CompactionService,
     hook_runner: Option<&crate::hooks::HookRunner>,
@@ -993,7 +1020,7 @@ async fn compact_history(
     trigger: CompactionTriggerKind,
     limits: CompactionLimits,
     cancel: CancellationToken,
-) -> anyhow::Result<bool> {
+) -> Result<bool, CompactError> {
     // Pre-compact hook.
     let instructions_override = if let Some(hr) = hook_runner {
         if hr.has_pre_compact {
@@ -1041,9 +1068,10 @@ async fn compact_history(
         }
         CompactionOutcome::NotCompacted { .. } => return Ok(false),
         // History is unchanged on every other outcome.
-        CompactionOutcome::Failed { report } | CompactionOutcome::Cancelled { report } => {
-            return Err(anyhow::anyhow!(report.failure_sentence()));
+        CompactionOutcome::Failed { report } => {
+            return Err(CompactError::Failed(report.failure_sentence()));
         }
+        CompactionOutcome::Cancelled { .. } => return Err(CompactError::Cancelled),
     };
 
     // Post-compact hook.
@@ -3573,6 +3601,67 @@ mod tests {
         assert!(
             history.iter().any(|m| m.text().contains("summary text")),
             "an ordinary turn must compact once it is over the threshold: {history:?}",
+        );
+    }
+
+    /// A compaction that keeps failing must not re-run (up to two summariser
+    /// calls) on every loop iteration: a failure blocks the trigger until
+    /// history grows by a further threshold, like a declined compaction.
+    #[tokio::test]
+    async fn a_failed_compaction_is_not_retried_every_iteration() {
+        use crate::compaction::CompactionService;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct AlwaysTruncated(Arc<AtomicUsize>);
+        #[async_trait]
+        impl crate::compaction::Summarizer for AlwaysTruncated {
+            async fn summarize(
+                &self,
+                _: crate::compaction::SummaryRequest,
+                _: CancellationToken,
+            ) -> Result<crate::compaction::SummaryResponse, crate::compaction::SummarizerError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(crate::compaction::SummaryResponse {
+                    text: "partial summary".into(),
+                    stop_reason: Some("max_tokens".into()),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let svc = Arc::new(CompactionService::new(Arc::new(AlwaysTruncated(calls.clone()))));
+        let policy =
+            crate::compaction::CompactionPolicy { token_threshold: 1_000, ..Default::default() };
+
+        let client = MockLlmClient::new(vec![
+            vec![Ok(tool_use_event("t1", "tool_a")), Ok(done())],
+            vec![Ok(tool_use_event("t2", "tool_a")), Ok(done())],
+            vec![Ok(StreamEvent::TextDelta("finished".into())), Ok(done())],
+        ]);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let tools = Arc::new(ToolRegistry::new([dyn_tool(MockTool::new("tool_a", true, log.clone()))]));
+
+        let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
+            .with_compaction_service(svc)
+            .with_compaction_policy(policy)
+            .with_tool_max_duration(None)
+            .build();
+
+        let mut history = vec![
+            Message::user(format!("early context {}", "e".repeat(80_000))),
+            Message::assistant("noted"),
+            Message::user("a second prompt"),
+            Message::assistant("a second response"),
+            Message::user("a third prompt"),
+        ];
+        agent.run(&mut history, &NullSink, None, CancellationToken::new()).await.unwrap();
+
+        assert_eq!(log.lock().unwrap().len(), 2, "both tool iterations ran");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "one attempt and one retry in the first iteration, then suppressed"
         );
     }
 

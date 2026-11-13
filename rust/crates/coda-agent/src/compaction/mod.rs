@@ -165,7 +165,11 @@ struct Candidate<'h> {
 }
 
 impl Candidate<'_> {
-    fn build(&self, checkpoint_name: Option<&str>) -> (Vec<Message>, usize) {
+    fn build(&self, note: tail::CheckpointNote<'_>) -> (Vec<Message>, usize) {
+        let checkpoint_name = match note {
+            tail::CheckpointNote::Named(name) => Some(name),
+            _ => None,
+        };
         let mut history = match self.summary {
             Some(summary) => {
                 vec![render::checkpoint_message(summary, checkpoint_name), render::ack_message()]
@@ -175,7 +179,7 @@ impl Candidate<'_> {
         let offset = history.len();
         history.extend_from_slice(self.tail);
         let previewed = if self.to_free > 0 {
-            tail::preview_tail_tool_results(&mut history[offset..], self.to_free, checkpoint_name)
+            tail::preview_tail_tool_results(&mut history[offset..], self.to_free, note)
         } else {
             0
         };
@@ -227,6 +231,15 @@ impl CompactionService {
         self
     }
 
+    /// The marker wording used before the checkpoint (if any) is saved.
+    fn pending_note(&self) -> tail::CheckpointNote<'static> {
+        if self.checkpoint.is_some() {
+            tail::CheckpointNote::Pending
+        } else {
+            tail::CheckpointNote::None
+        }
+    }
+
     pub async fn compact(
         &self,
         request: CompactionRequest<'_>,
@@ -267,11 +280,13 @@ impl CompactionService {
                 tail,
                 to_free: overflow_tokens(&limits, tokens_before),
             };
-            let (shortened, previewed) = candidate.build(None);
+            let (shortened, previewed) = candidate.build(self.pending_note());
             if previewed == 0 || !request_fits(&limits, TokenEstimator::estimate(&shortened)) {
                 return failed(report, started, "protected_context_too_large");
             }
-            return self.commit(history, &candidate, String::new(), report, trigger, started).await;
+            return self
+                .commit(history, &candidate, String::new(), report, trigger, started, &cancel)
+                .await;
         }
 
         let system = instructions_override.unwrap_or(render::SYSTEM_PROMPT).to_owned();
@@ -340,20 +355,22 @@ impl CompactionService {
         report.structured = Some(render::is_structured(&summary));
 
         let mut candidate = Candidate { summary: Some(&summary), kept_head: &[], tail, to_free: 0 };
-        let (rebuilt, _) = candidate.build(None);
+        let (rebuilt, _) = candidate.build(self.pending_note());
         let rebuilt_tokens = TokenEstimator::estimate(&rebuilt);
         if !request_fits(&limits, rebuilt_tokens) {
             candidate.to_free = overflow_tokens(&limits, rebuilt_tokens);
-            let (shortened, _) = candidate.build(None);
+            let (shortened, _) = candidate.build(self.pending_note());
             if !request_fits(&limits, TokenEstimator::estimate(&shortened)) {
                 return failed(report, started, "protected_context_too_large");
             }
         }
-        self.commit(history, &candidate, summary.clone(), report, trigger, started).await
+        self.commit(history, &candidate, summary.clone(), report, trigger, started, &cancel).await
     }
 
     /// Saves the pre-compaction history (when a sink is configured) and only
-    /// then hands back the candidate, rebuilt so it names the saved file.
+    /// then hands back the candidate, rebuilt so it names the saved file. A
+    /// cancellation before or during the save leaves the history untouched.
+    #[allow(clippy::too_many_arguments)]
     async fn commit(
         &self,
         history: &[Message],
@@ -362,7 +379,11 @@ impl CompactionService {
         mut report: CompactionReport,
         trigger: CompactionTriggerKind,
         started: Instant,
+        cancel: &CancellationToken,
     ) -> CompactionOutcome {
+        if cancel.is_cancelled() {
+            return cancelled(report, started);
+        }
         let checkpoint_name = match &self.checkpoint {
             Some(sink) => {
                 let meta = CheckpointMeta {
@@ -370,7 +391,11 @@ impl CompactionService {
                     messages_before: history.len(),
                     estimated_tokens_before: report.tokens_before as usize,
                 };
-                match sink.save(history, &meta).await {
+                let saved = sink.save(history, &meta).await;
+                if cancel.is_cancelled() {
+                    return cancelled(report, started);
+                }
+                match saved {
                     Ok(saved) => Some(saved.name),
                     Err(error) => {
                         tracing::warn!(%error, "pre-compaction checkpoint could not be saved");
@@ -380,7 +405,11 @@ impl CompactionService {
             }
             None => None,
         };
-        let (compacted, previewed) = candidate.build(checkpoint_name.as_deref());
+        let note = match checkpoint_name.as_deref() {
+            Some(name) => tail::CheckpointNote::Named(name),
+            None => tail::CheckpointNote::None,
+        };
+        let (compacted, previewed) = candidate.build(note);
         report.previewed_tail_results = saturating_u32(previewed);
         report.checkpoint = checkpoint_name;
         report.outcome = "compacted";
@@ -1125,13 +1154,7 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_single_exchange_does_not_loop_or_lose_intent() {
-        let history = vec![
-            user_msg("Please refactor module X; do not touch Y"),
-            tool_use_msg("c1", "read"),
-            tool_result_msg("c1", &"r".repeat(900_000)),
-            assistant_msg("Found it"),
-            user_msg("go ahead"),
-        ];
+        let history = oversized_single_exchange();
         let sink = Arc::new(RecordingSink(Mutex::default()));
         let summarizer = ScriptedSummarizer::new(vec![ok(HEADINGS, "end_turn", 10)]);
         let svc = CompactionService::new(summarizer.clone()).with_checkpoint_sink(sink.clone());
@@ -1139,30 +1162,89 @@ mod tests {
             svc.compact(request(&history, limits(200_000, None)), CancellationToken::new()).await;
 
         assert!(summarizer.calls() <= 2);
-        match outcome {
-            CompactionOutcome::Compacted { history: compacted, summary, report } => {
-                assert!(has_text(&compacted, Role::User, "Please refactor module X; do not touch Y"));
-                assert!(has_text(&compacted, Role::User, "go ahead"));
-                assert!(summary.is_empty(), "tail-only compaction has no summary");
-                assert_eq!(report.attempts, 0);
-                assert_eq!(report.previewed_tail_results, 1);
-                let result = compacted
-                    .iter()
-                    .flat_map(|m| &m.content)
-                    .find_map(|c| match c {
-                        Content::ToolResult { content, .. } => Some(content.clone()),
-                        _ => None,
-                    })
-                    .expect("the tool result stays paired");
-                assert!(result.contains("omitted during compaction"));
-                assert!(result.contains("20261113T120000000Z.json"), "marker names the checkpoint");
-                assert_eq!(sink.0.lock().unwrap().len(), 1, "checkpointed before commit");
-            }
-            CompactionOutcome::Failed { report } => {
-                assert_eq!(report.reason, Some("protected_context_too_large"));
-            }
-            other => panic!("unexpected outcome {other:?}"),
+        let CompactionOutcome::Compacted { history: compacted, summary, report } = outcome else {
+            panic!("expected a tail-only Compacted, got {outcome:?}");
+        };
+        assert!(has_text(&compacted, Role::User, "Please refactor module X; do not touch Y"));
+        assert!(has_text(&compacted, Role::User, "go ahead"));
+        assert!(summary.is_empty(), "tail-only compaction has no summary");
+        assert_eq!(report.attempts, 0);
+        assert_eq!(report.previewed_tail_results, 1);
+        let result = first_tool_result(&compacted);
+        assert!(result.contains("omitted during compaction"));
+        assert!(result.contains("20261113T120000000Z.json"), "marker names the checkpoint");
+        assert_eq!(sink.0.lock().unwrap().len(), 1, "checkpointed before commit");
+    }
+
+    fn oversized_single_exchange() -> Vec<Message> {
+        vec![
+            user_msg("Please refactor module X; do not touch Y"),
+            tool_use_msg("c1", "read"),
+            tool_result_msg("c1", &"r".repeat(900_000)),
+            assistant_msg("Found it"),
+            user_msg("go ahead"),
+        ]
+    }
+
+    fn first_tool_result(history: &[Message]) -> String {
+        history
+            .iter()
+            .flat_map(|m| &m.content)
+            .find_map(|c| match c {
+                Content::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .expect("the tool result stays paired")
+    }
+
+    #[tokio::test]
+    async fn without_a_sink_the_marker_claims_no_checkpoint() {
+        let history = oversized_single_exchange();
+        let svc = CompactionService::new(ScriptedSummarizer::new(vec![]));
+        let outcome =
+            svc.compact(request(&history, limits(200_000, None)), CancellationToken::new()).await;
+        let CompactionOutcome::Compacted { history: compacted, report, .. } = outcome else {
+            panic!("expected Compacted, got {outcome:?}");
+        };
+        assert_eq!(report.checkpoint, None);
+        let result = first_tool_result(&compacted);
+        assert!(result.contains("bytes of this tool output were omitted during compaction]"));
+        assert!(!result.contains("checkpoint"), "no checkpoint exists: {}", &result[6_000..6_200]);
+    }
+
+    struct CancellingSink(CancellationToken, Mutex<usize>);
+
+    #[async_trait]
+    impl CheckpointSink for CancellingSink {
+        async fn save(&self, _: &[Message], _: &CheckpointMeta) -> anyhow::Result<CheckpointRef> {
+            *self.1.lock().unwrap() += 1;
+            self.0.cancel();
+            Ok(CheckpointRef { name: "late.json".into() })
         }
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_or_before_checkpoint_save_does_not_compact() {
+        // Cancelled while the checkpoint was being written, on both paths.
+        for history in [long_history(), oversized_single_exchange()] {
+            let cancel = CancellationToken::new();
+            let sink = Arc::new(CancellingSink(cancel.clone(), Mutex::new(0)));
+            let summarizer = ScriptedSummarizer::new(vec![ok(HEADINGS, "end_turn", 10)]);
+            let svc = CompactionService::new(summarizer).with_checkpoint_sink(sink.clone());
+            let outcome = svc.compact(request(&history, limits(200_000, None)), cancel).await;
+            assert!(matches!(outcome, CompactionOutcome::Cancelled { .. }), "{outcome:?}");
+            assert_eq!(*sink.1.lock().unwrap(), 1);
+        }
+
+        // Cancelled before the tail-only path reaches the save.
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let sink = Arc::new(RecordingSink(Mutex::default()));
+        let svc = CompactionService::new(ScriptedSummarizer::new(vec![])).with_checkpoint_sink(sink.clone());
+        let history = oversized_single_exchange();
+        let outcome = svc.compact(request(&history, limits(200_000, None)), cancel).await;
+        assert!(matches!(outcome, CompactionOutcome::Cancelled { .. }), "{outcome:?}");
+        assert!(sink.0.lock().unwrap().is_empty(), "no checkpoint is written after a cancel");
     }
 
     /// A summarised-away `ToolResult` would leave its `ToolUse` orphaned, which
