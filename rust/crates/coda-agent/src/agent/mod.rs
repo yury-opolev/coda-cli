@@ -289,7 +289,8 @@ impl AgentLoop {
     /// Runs one automatic compaction and updates the suppression mark: a
     /// declined or failed compaction, or one that left the projection over
     /// the threshold, blocks further attempts until occupancy has grown by
-    /// another full threshold. A cancellation blocks nothing.
+    /// another full threshold. A compaction that brings the projection back
+    /// within the threshold clears the mark. A cancellation changes nothing.
     #[allow(clippy::too_many_arguments)]
     async fn compact_and_settle(
         &self,
@@ -322,9 +323,10 @@ impl AgentLoop {
         match step {
             CompactStep::Compacted => {
                 let after = self.occupancy.project(history, fp, overhead);
-                if after.tokens > threshold {
-                    *blocked_compaction_at = Some(after.tokens);
-                }
+                // An effective compaction clears any mark left by an
+                // earlier failed or declined attempt.
+                *blocked_compaction_at =
+                    if after.tokens > threshold { Some(after.tokens) } else { None };
             }
             CompactStep::Declined | CompactStep::Failed => {
                 *blocked_compaction_at = Some(projection.tokens);
@@ -3795,6 +3797,137 @@ mod tests {
         assert_eq!((reports[0].outcome, reports[0].reason), ("failed", Some("summary_truncated")));
         assert_eq!(reports[0].threshold, Some(1_000));
         assert!(history.iter().any(|m| m.text() == first), "the original first message survives");
+    }
+
+    /// A summariser whose first `failures` calls are truncated (a failure)
+    /// and whose later calls complete.
+    struct FailThenSucceedSummarizer {
+        failures: usize,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl crate::compaction::Summarizer for FailThenSucceedSummarizer {
+        async fn summarize(
+            &self,
+            _: crate::compaction::SummaryRequest,
+            _: CancellationToken,
+        ) -> Result<crate::compaction::SummaryResponse, crate::compaction::SummarizerError> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let stop = if n < self.failures { "max_tokens" } else { "end_turn" };
+            Ok(crate::compaction::SummaryResponse {
+                text: format!("summary {n}"),
+                stop_reason: Some(stop.into()),
+                ..Default::default()
+            })
+        }
+    }
+
+    /// A read-only tool whose `n`th call queues the `n`th scripted steering
+    /// message, so each later iteration opens a new exchange of known size.
+    struct SteerScriptTool {
+        inbox: Arc<SteeringInbox>,
+        steers: Mutex<std::collections::VecDeque<String>>,
+    }
+
+    #[async_trait]
+    impl crate::tool::Tool for SteerScriptTool {
+        fn name(&self) -> &str {
+            "steer_script"
+        }
+        fn description(&self) -> &str {
+            "queues the next scripted steering message"
+        }
+        fn input_schema_json(&self) -> &str {
+            "{}"
+        }
+        fn is_read_only(&self) -> bool {
+            true
+        }
+        async fn execute(
+            &self,
+            _: &serde_json::Value,
+            _: &ToolContext,
+            _: CancellationToken,
+        ) -> ToolOutcome {
+            if let Some(text) = self.steers.lock().unwrap().pop_front() {
+                self.inbox.enqueue(&text).expect("the inbox is open during a run");
+            }
+            ToolResult::ok("ok")
+        }
+    }
+
+    /// A failed compaction leaves a suppression mark; a later compaction that
+    /// brings occupancy back under the threshold must clear it, or the next
+    /// growth past the threshold would stay suppressed until it exceeded the
+    /// stale mark by a further full threshold.
+    #[tokio::test]
+    async fn effective_compaction_clears_an_earlier_failure_suppression() {
+        use crate::compaction::CompactionService;
+
+        let summarizer = Arc::new(FailThenSucceedSummarizer {
+            failures: 2,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let svc = Arc::new(CompactionService::new(summarizer.clone()));
+        let threshold = 20_000;
+        let policy =
+            crate::compaction::CompactionPolicy { token_threshold: threshold, ..Default::default() };
+
+        // Token sizes (chars / 4), the threshold being 20k:
+        // - iteration 0: ~25k (the early context) → fails; suppressed to ~45k.
+        // - iterations 1-3: S1 (18k), S2 (tiny) keep it at ~43k: suppressed.
+        // - iteration 4: S3 (3k) takes it to ~46k → compacts; S1's exchange
+        //   is summarised (it would push the tail past its 16k target), so
+        //   occupancy drops to ~3k, under the threshold.
+        // - iteration 5: S4 (20k) takes it to ~23k: over the threshold, but
+        //   under the stale ~45k mark — it compacts only if the mark cleared.
+        let steering = Arc::new(SteeringInbox::new());
+        let steers = [
+            format!("S1 {}", "a".repeat(72_000)),
+            "S2".to_string(),
+            format!("S3 {}", "c".repeat(12_000)),
+            format!("S4 {}", "d".repeat(80_000)),
+        ];
+        let tool: Arc<dyn crate::tool::Tool> = Arc::new(SteerScriptTool {
+            inbox: steering.clone(),
+            steers: Mutex::new(steers.into_iter().collect()),
+        });
+        let tools = Arc::new(ToolRegistry::new([tool]));
+
+        let mut script: Vec<_> = (1..=5)
+            .map(|i| {
+                vec![Ok(tool_use_event(&format!("t{i}"), "steer_script")), Ok(done_without_usage())]
+            })
+            .collect();
+        script.push(vec![Ok(StreamEvent::TextDelta("finished".into())), Ok(done_without_usage())]);
+        let client = MockLlmClient::new(script);
+
+        let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
+            .with_compaction_service(svc)
+            .with_compaction_policy(policy)
+            .with_steering(steering)
+            .with_tool_max_duration(None)
+            .build();
+
+        let mut history = vec![
+            Message::user(format!("early context {}", "e".repeat(100_000))),
+            Message::assistant("noted"),
+            Message::user("a second prompt"),
+            Message::assistant("a second response"),
+            Message::user("a third prompt"),
+        ];
+        let sink = CollectingSink::new();
+        agent.run(&mut history, &sink, None, CancellationToken::new()).await.unwrap();
+
+        let outcomes: Vec<_> =
+            compaction_reports(sink.take()).into_iter().map(|r| r.outcome).collect();
+        assert_eq!(
+            outcomes,
+            ["failed", "compacted", "compacted"],
+            "fail (suppressing), compact once past the mark, then again once over the threshold"
+        );
+        assert_eq!(summarizer.calls.load(std::sync::atomic::Ordering::SeqCst), 4);
     }
 
     /// A tool registry used to make the request overhead large.
