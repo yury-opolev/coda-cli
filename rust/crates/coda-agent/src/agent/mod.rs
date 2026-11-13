@@ -516,7 +516,14 @@ impl AgentLoop {
             if let Some(steering) = &self.steering {
                 let steers = steering.take_all_for_delivery();
                 if !steers.is_empty() {
-                    let text = steers
+                    // Operator words lead, so a delivery that carries them
+                    // starts an exchange even when a runtime item (a
+                    // `[task-completed]` or `[deadline]` frame) arrived first.
+                    let (mut ordered, runtime): (Vec<_>, Vec<_>) = steers
+                        .iter()
+                        .partition(|e| e.kind == crate::steering::InboxItemKind::Message);
+                    ordered.extend(runtime);
+                    let text = ordered
                         .iter()
                         .map(|e| e.text.as_str())
                         .collect::<Vec<_>>()
@@ -1159,13 +1166,19 @@ async fn compact_history(
                 )
                 .await;
             if let Some(ctx) = post.additional_context {
-                history.push(Message::user(ctx.clone()));
+                history.push(post_compact_message(&ctx));
                 sink.emit(AgentEvent::PostCompactContextInjected { context: ctx });
             }
         }
     }
 
     CompactStep::Compacted
+}
+
+/// The user message carrying PostCompact hook context, framed so the tail
+/// selection treats it as a runtime injection rather than an exchange start.
+fn post_compact_message(context: &str) -> Message {
+    Message::user(format!("[post-compact-context]\n{context}"))
 }
 
 /// Output tokens a loop requests per response when its host does not resolve
@@ -5241,6 +5254,30 @@ mod tests {
         let seen = client.requests.lock().unwrap()[0].messages.last().unwrap().text();
         assert_eq!(seen, "[task-completed] taskId=task-9", "runtime items are not user messages");
         manager.stop(&live.id);
+    }
+
+    #[tokio::test]
+    async fn operator_words_delivered_with_a_completion_still_start_an_exchange() {
+        let manager = task_manager_for_test();
+        let inbox = Arc::new(crate::SteeringInbox::new());
+        inbox.push_item(crate::steering::InboxItemKind::TaskCompleted, "[task-completed] taskId=task-9");
+        inbox.enqueue("now run the tests").unwrap();
+        let (agent, client) = steered_run(manager, inbox);
+
+        let mut history = vec![Message::user("go")];
+        agent.run(&mut history, &NullSink, None, CancellationToken::new()).await.unwrap();
+
+        let delivered = client.requests.lock().unwrap()[0].messages.last().unwrap().clone();
+        let seen = delivered.text();
+        assert!(seen.contains("now run the tests") && seen.contains("[task-completed] taskId=task-9"), "{seen}");
+        assert!(crate::compaction::tail::is_exchange_start(&delivered), "{seen}");
+    }
+
+    #[test]
+    fn post_compact_context_is_framed_as_a_runtime_injection() {
+        let msg = post_compact_message("remember the plan");
+        assert_eq!(msg.text(), "[post-compact-context]\nremember the plan");
+        assert!(!crate::compaction::tail::is_exchange_start(&msg));
     }
 
     // ── Long tool calls wrapped as tasks (Phase 3 generic fallback) ──────

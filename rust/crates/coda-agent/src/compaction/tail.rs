@@ -24,10 +24,19 @@ pub const TAIL_PREVIEW_HEAD_BYTES: usize = 6 * 1024;
 /// Bytes kept from the end of an oversized tail tool result.
 pub const TAIL_PREVIEW_TAIL_BYTES: usize = 2 * 1024;
 
-/// A user message with at least one non-blank Text block and no ToolResult block.
+/// Prefixes that open a runtime-injected user message: task completions
+/// (`tasks::completion_push`), inter-agent messages (`message` injected text),
+/// lifetime/parked deadlines (`agent::park`) and PostCompact hook context.
+/// Such a message is not something the operator said, so it never starts an
+/// exchange and never takes a protected slot.
+pub const RUNTIME_FRAME_PREFIXES: &[&str] =
+    &["[task-completed]", "[agent-message]", "[deadline]", "[post-compact-context]"];
+
+/// A user message with at least one non-blank Text block, no ToolResult block,
+/// and text not opening with a [`RUNTIME_FRAME_PREFIXES`] frame.
 ///
-/// Runtime injections (steering, task completions, PostCompact context) are
-/// user text too, and so start exchanges; tool-result messages never do.
+/// Operator steering is an exchange start, including when it carries a
+/// `[live-tasks]` brief; tool-result messages and runtime injections never are.
 pub fn is_exchange_start(msg: &Message) -> bool {
     msg.role == Role::User
         && msg
@@ -35,6 +44,15 @@ pub fn is_exchange_start(msg: &Message) -> bool {
             .iter()
             .any(|b| matches!(b, Content::Text(t) if !t.trim().is_empty()))
         && !msg.content.iter().any(|b| matches!(b, Content::ToolResult { .. }))
+        && !is_runtime_injection(msg)
+}
+
+fn is_runtime_injection(msg: &Message) -> bool {
+    let first_text = msg.content.iter().find_map(|b| match b {
+        Content::Text(t) if !t.trim().is_empty() => Some(t.trim_start()),
+        _ => None,
+    });
+    first_text.is_some_and(|t| RUNTIME_FRAME_PREFIXES.iter().any(|p| t.starts_with(p)))
 }
 
 /// Ascending indices `i` where `is_exchange_start(history[i])`, `history[i..]`
@@ -267,6 +285,47 @@ mod tests {
         let start = compaction_tail_start_with(&h, 0);
         assert_eq!(start, 2);
         assert!(texts(&h[start..]).iter().any(|t| t == "Apply option B; leave option A unchanged."));
+    }
+
+    /// A runtime injection after the confirmation must not take one of the
+    /// two protected slots and push the antecedent out.
+    #[test]
+    fn runtime_injections_do_not_take_a_protected_slot() {
+        let h = vec![
+            user("old"),
+            assistant("old"),
+            user("Which option?"),
+            assistant("Apply option B; leave option A unchanged"),
+            user("Yes, proceed."),
+            tool_use("c1", "shell"),
+            tool_result("c1", &"x".repeat(100 * 1024)),
+            user("[task-completed] taskId=task-7 (shell): done"),
+            assistant("The task finished."),
+        ];
+        let start = compaction_tail_start_with(&h, 0);
+        assert!(start <= 2, "tail_start {start} drops the antecedent");
+    }
+
+    #[test]
+    fn runtime_frames_are_not_exchange_starts() {
+        for text in [
+            "[task-completed] taskId=task-1 (shell): done",
+            "  [agent-message] from reviewer (source=task): hi",
+            "[deadline] You have reached your limit",
+            "[post-compact-context]\nremember the plan",
+        ] {
+            assert!(!is_exchange_start(&user(text)), "{text}");
+        }
+        let h = vec![user("go"), assistant("ok"), user("[task-completed] taskId=task-1")];
+        assert_eq!(exchange_boundaries(&h), vec![0]);
+    }
+
+    #[test]
+    fn operator_steering_is_an_exchange_start() {
+        assert!(is_exchange_start(&user("and then run the tests")));
+        assert!(is_exchange_start(&user(
+            "[live-tasks] Tasks you started are still running.\n- task-1 shell\n\nmake it a dry run"
+        )));
     }
 
     #[test]

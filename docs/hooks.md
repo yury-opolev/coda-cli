@@ -557,7 +557,7 @@ output without calling the summariser.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `additionalContext` | `string` | Appended to the compacted history as a synthetic message. Concatenated across hooks. |
+| `additionalContext` | `string` | Appended to the compacted history as a synthetic user message prefixed with `[post-compact-context]` and a newline, so later compactions treat it as a runtime injection rather than something the operator said. Concatenated across hooks. The `PostCompactContextInjected` event carries the hook text without the prefix. |
 
 ---
 
