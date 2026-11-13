@@ -516,28 +516,30 @@ impl AgentLoop {
             if let Some(steering) = &self.steering {
                 let steers = steering.take_all_for_delivery();
                 if !steers.is_empty() {
-                    // Operator words lead, so a delivery that carries them
-                    // starts an exchange even when a runtime item (a
-                    // `[task-completed]` or `[deadline]` frame) arrived first.
-                    let (mut ordered, runtime): (Vec<_>, Vec<_>) = steers
-                        .iter()
-                        .partition(|e| e.kind == crate::steering::InboxItemKind::Message);
-                    ordered.extend(runtime);
-                    let text = ordered
-                        .iter()
-                        .map(|e| e.text.as_str())
-                        .collect::<Vec<_>>()
-                        .join("\n\n");
+                    // Arrival order is kept, but each maximal run of operator
+                    // messages or runtime items (`[task-completed]`,
+                    // `[deadline]` frames) becomes its own user message, so
+                    // operator words always open a message and start an
+                    // exchange, while runtime frames never do.
+                    let is_operator =
+                        |e: &crate::steering::SteeringEntry| e.kind == crate::steering::InboxItemKind::Message;
+                    let has_message = steers.iter().any(is_operator);
                     // A message cannot change work that is already running
                     // (§6.9): the model is shown what is, before it reads it.
-                    let has_message = steers
-                        .iter()
-                        .any(|e| e.kind == crate::steering::InboxItemKind::Message);
-                    let text = match self.live_task_brief().filter(|_| has_message) {
-                        Some(brief) => format!("{brief}\n\n{text}"),
-                        None => text,
-                    };
-                    history.push(Message::user(text));
+                    let mut brief = self.live_task_brief().filter(|_| has_message);
+                    for run in steers.chunk_by(|a, b| is_operator(a) == is_operator(b)) {
+                        let text = run
+                            .iter()
+                            .map(|e| e.text.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n\n");
+                        let brief = if is_operator(&run[0]) { brief.take() } else { None };
+                        let text = match brief {
+                            Some(brief) => format!("{brief}\n\n{text}"),
+                            None => text,
+                        };
+                        history.push(Message::user(text));
+                    }
                     // Runtime items (task completions, deadlines) are not
                     // operator steering; only messages are reported as such.
                     let message_ids: Vec<String> = steers
@@ -5267,10 +5269,43 @@ mod tests {
         let mut history = vec![Message::user("go")];
         agent.run(&mut history, &NullSink, None, CancellationToken::new()).await.unwrap();
 
-        let delivered = client.requests.lock().unwrap()[0].messages.last().unwrap().clone();
-        let seen = delivered.text();
-        assert!(seen.contains("now run the tests") && seen.contains("[task-completed] taskId=task-9"), "{seen}");
-        assert!(crate::compaction::tail::is_exchange_start(&delivered), "{seen}");
+        let messages = client.requests.lock().unwrap()[0].messages.clone();
+        let [.., completion, operator] = messages.as_slice() else { panic!("{messages:?}") };
+        assert_eq!(completion.role, Role::User);
+        assert_eq!(completion.text(), "[task-completed] taskId=task-9");
+        assert!(!crate::compaction::tail::is_exchange_start(completion));
+        assert_eq!(operator.role, Role::User);
+        assert_eq!(operator.text(), "now run the tests");
+        assert!(crate::compaction::tail::is_exchange_start(operator));
+    }
+
+    #[tokio::test]
+    async fn alternating_steering_runs_keep_arrival_order_in_separate_messages() {
+        let manager = task_manager_for_test();
+        let inbox = Arc::new(crate::SteeringInbox::new());
+        inbox.push_item(crate::steering::InboxItemKind::TaskCompleted, "[task-completed] taskId=task-1");
+        inbox.enqueue("check the logs").unwrap();
+        inbox.enqueue("then the tests").unwrap();
+        inbox.push_item(crate::steering::InboxItemKind::Deadline, "[deadline] taskId=task-2");
+        let live = manager
+            .register(crate::tasks::TaskKind::Shell, "server", "server", None, crate::tasks::TaskExecutionMode::Background)
+            .unwrap();
+        let (agent, client) = steered_run(Arc::clone(&manager), inbox);
+
+        let mut history = vec![Message::user("go")];
+        agent.run(&mut history, &NullSink, None, CancellationToken::new()).await.unwrap();
+
+        let messages = client.requests.lock().unwrap()[0].messages.clone();
+        let [.., first, second, third] = messages.as_slice() else { panic!("{messages:?}") };
+        assert_eq!(first.text(), "[task-completed] taskId=task-1");
+        let operator = second.text();
+        assert!(operator.starts_with("[live-tasks]"), "the brief leads the operator run: {operator}");
+        assert!(operator.ends_with("check the logs\n\nthen the tests"), "{operator}");
+        assert_eq!(third.text(), "[deadline] taskId=task-2");
+        let starts: Vec<bool> =
+            [first, second, third].into_iter().map(crate::compaction::tail::is_exchange_start).collect();
+        assert_eq!(starts, vec![false, true, false]);
+        manager.stop(&live.id);
     }
 
     #[test]
