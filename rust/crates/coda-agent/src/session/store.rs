@@ -80,6 +80,9 @@ pub struct SessionSummary {
 // Store
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Pre-compaction checkpoints kept per session.
+pub const COMPACTION_CHECKPOINTS_KEPT: usize = 5;
+
 /// Persists and loads conversation transcripts.
 pub struct SessionTranscriptStore {
     working_dir: PathBuf,
@@ -107,8 +110,64 @@ impl SessionTranscriptStore {
         self.sessions_dir().join(format!("{session_id}.tasks"))
     }
 
+    /// The directory holding pre-compaction checkpoints for `session_id`:
+    /// `<id>.compactions`.
+    pub fn compactions_dir(&self, session_id: &str) -> PathBuf {
+        self.sessions_dir().join(format!("{session_id}.compactions"))
+    }
+
     fn file_path(&self, session_id: &str) -> PathBuf {
         self.sessions_dir().join(format!("{session_id}.json"))
+    }
+
+    /// Saves the history a compaction is about to replace, owner-only and
+    /// atomically, as `<compactions_dir>/<UTC yyyyMMddTHHmmssfffZ>.json`
+    /// (`-<n>` appended on a name clash), then prunes the directory to the
+    /// newest [`COMPACTION_CHECKPOINTS_KEPT`]. Returns the file name.
+    ///
+    /// The messages use the transcript's own serialisation, so nothing is
+    /// persisted that the transcript would not persist.
+    pub async fn save_compaction_checkpoint(
+        &self,
+        session_id: &str,
+        messages: &[Message],
+        trigger: &str,
+        messages_before: usize,
+        estimated_tokens_before: usize,
+    ) -> std::io::Result<String> {
+        if !ids::is_valid(session_id) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid session id"));
+        }
+        if messages.is_empty() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "no messages to checkpoint"));
+        }
+        let dir = self.compactions_dir(session_id);
+        tokio::fs::create_dir_all(&dir).await?;
+
+        let now = Utc::now();
+        let stem = now.format("%Y%m%dT%H%M%S%3fZ").to_string();
+        let mut name = format!("{stem}.json");
+        let mut n = 1;
+        while tokio::fs::try_exists(dir.join(&name)).await? {
+            name = format!("{stem}-{n}.json");
+            n += 1;
+        }
+
+        let root = json!({
+            "version": 1,
+            "sessionId": session_id,
+            "createdUtc": now.to_rfc3339(),
+            "trigger": trigger,
+            "messagesBefore": messages_before,
+            "estimatedTokensBefore": estimated_tokens_before,
+            "messages": message_json::serialize_messages(messages),
+        });
+        let text = serde_json::to_string(&root)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        super::private_file::write_private_atomic(&dir.join(&name), text.as_bytes()).await?;
+
+        prune_checkpoints(&dir, COMPACTION_CHECKPOINTS_KEPT);
+        Ok(name)
     }
 
     // ── Write ─────────────────────────────────────────────────────────────────
@@ -259,6 +318,37 @@ impl SessionTranscriptStore {
 // ─────────────────────────────────────────────────────────────────────────────
 // Private helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Orders checkpoint names oldest first: by timestamp, then clash suffix.
+fn checkpoint_order(name: &str) -> (&str, u64) {
+    let stem = name.strip_suffix(".json").unwrap_or(name);
+    match stem.rsplit_once('-') {
+        Some((base, n)) => match n.parse() {
+            Ok(n) => (base, n),
+            Err(_) => (stem, 0),
+        },
+        None => (stem, 0),
+    }
+}
+
+/// Deletes all but the newest `keep` checkpoint files in `dir`. Best effort:
+/// a file that cannot be removed is left for the next pruning.
+fn prune_checkpoints(dir: &Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.ends_with(".json") && !n.starts_with('.'))
+        .collect();
+    if names.len() <= keep {
+        return;
+    }
+    names.sort_by(|a, b| checkpoint_order(a).cmp(&checkpoint_order(b)));
+    for name in &names[..names.len() - keep] {
+        let _ = std::fs::remove_file(dir.join(name));
+    }
+}
 
 /// The transcript currently on disk, parsed, or `None` when it is missing or
 /// corrupt (a corrupt file is overwritten by the next save, as before).
@@ -722,5 +812,66 @@ mod tests {
         assert_eq!(loaded.len(), 3);
         assert!(matches!(&loaded[1].content[0], Content::ToolUse { name, .. } if name == "shell"));
         assert!(matches!(&loaded[2].content[0], Content::ToolResult { tool_use_id, .. } if tool_use_id == "tu1"));
+    }
+
+    #[tokio::test]
+    async fn compaction_checkpoints_keep_the_newest_five() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(&dir);
+        let id = "abc123456789";
+        let mut names = Vec::new();
+        for i in 0..7 {
+            let msgs = vec![Message::user(format!("prompt {i}")), Message::assistant("ok")];
+            names.push(store.save_compaction_checkpoint(id, &msgs, "manual", 2, 10 + i).await.unwrap());
+        }
+
+        let mut kept: Vec<String> = std::fs::read_dir(store.compactions_dir(id))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        kept.sort();
+        assert_eq!(kept.len(), COMPACTION_CHECKPOINTS_KEPT);
+        let mut expected = names[2..].to_vec();
+        expected.sort();
+        assert_eq!(kept, expected, "the two oldest are pruned");
+
+        let newest = store.compactions_dir(id).join(names.last().unwrap());
+        let root: Value = serde_json::from_str(&std::fs::read_to_string(newest).unwrap()).unwrap();
+        assert_eq!(root["version"], 1);
+        assert_eq!(root["sessionId"], id);
+        assert_eq!(root["trigger"], "manual");
+        assert_eq!(root["messagesBefore"], 2);
+        assert_eq!(root["estimatedTokensBefore"], 16);
+        assert!(root["createdUtc"].as_str().is_some());
+        let messages = message_json::deserialize_messages(&root["messages"]);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].text(), "prompt 6");
+    }
+
+    #[tokio::test]
+    async fn a_compaction_checkpoint_needs_a_valid_id_and_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(&dir);
+        let msgs = [Message::user("hi")];
+
+        let bad_id = store.save_compaction_checkpoint("../escape", &msgs, "auto", 1, 1).await;
+        assert_eq!(bad_id.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+        let empty = store.save_compaction_checkpoint("abc123456789", &[], "auto", 0, 0).await;
+        assert_eq!(empty.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!store.sessions_dir().exists());
+    }
+
+    #[tokio::test]
+    async fn list_skips_the_compactions_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(&dir);
+        let id = "abc123456789";
+        store.save(id, &[Message::user("hi")], None).await.unwrap();
+        store.save_compaction_checkpoint(id, &[Message::user("hi")], "auto", 1, 1).await.unwrap();
+
+        let list = store.list();
+
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, id);
     }
 }

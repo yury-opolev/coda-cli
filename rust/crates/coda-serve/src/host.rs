@@ -1118,6 +1118,12 @@ pub struct ServeHost {
     /// recorded whenever `session/models` fetches it. Preferred over the
     /// catalogue when sizing a turn's output budget.
     live_model_limits: Arc<Mutex<crate::output_budget::LiveLimitMap>>,
+    /// Provider/model pairs whose live limits were already looked up for an
+    /// unknown window (D12): at most once each per process.
+    live_discovery_attempted: Mutex<std::collections::HashSet<String>>,
+    /// The last `(provider, model, window, source)` announced as
+    /// `event/contextWindow`; a turn announces only a change.
+    last_context_window: Mutex<Option<(String, String, u64, String)>>,
     /// Serialises configuration mutations so a commit that awaits a provider
     /// capability lookup cannot interleave with another one.
     ///
@@ -1684,6 +1690,8 @@ impl ServeHost {
             }),
             effort_overrides: Mutex::new(HashMap::new()),
             live_model_limits: Arc::new(Mutex::new(HashMap::new())),
+            live_discovery_attempted: Mutex::new(std::collections::HashSet::new()),
+            last_context_window: Mutex::new(None),
             config_commit: tokio::sync::Mutex::new(()),
             goal_params: Mutex::new(startup_goals),
             configured_endpoint,
@@ -1807,36 +1815,98 @@ impl ServeHost {
         capture
     }
 
-    /// The active model's context window, from the bundled catalogue.
-    ///
-    /// Offline and cheap, so it is safe on the turn path. Used to size the
-    /// auto-compaction threshold: a fixed number cannot suit both a 200k model
-    /// and a 1.1M one.
-    fn active_context_window(&self) -> Option<usize> {
-        let captured = self.capture_runtime().config;
-        crate::catalog::ModelCatalog::load()
-            .find(captured.provider_id.as_deref(), &captured.model)
-            .and_then(|m| m.context_limit)
-            .and_then(|n| usize::try_from(n).ok())
+    /// The effective limits for `model` on `provider`: live list, then
+    /// catalogue, then fallback for the window; settings override the output
+    /// only. The one resolution inference, compaction and display share.
+    fn effective_limits(&self, provider: &str, model: &str) -> crate::output_budget::ResolvedBudget {
+        resolve_output_budget_now(&self.live_model_limits, provider, model)
     }
 
-    /// Resolves the active model's context window from the bundled catalogue.
+    /// The compaction service both the automatic and the manual path use: a
+    /// dedicated summariser budget and a pre-compaction checkpoint file.
+    fn compaction_service(&self, client: Arc<dyn LlmClient>, model: String) -> CompactionService {
+        CompactionService::new(Arc::new(LlmSummarizer { client, model })).with_checkpoint_sink(
+            Arc::new(FileCheckpointSink {
+                store: SessionTranscriptStore::new(&self.working_dir),
+                session_id: self.active_session_id(),
+            }),
+        )
+    }
+
+    /// Publishes the active model's effective context window.
     ///
-    /// Cheap and offline — no client, no network — so it is safe on the turn
-    /// path. `session/models` reports a better answer when a live list is
-    /// available (a provider knows about models the catalogue does not), and
-    /// because `context_limit_resolved` ignores a value equal to the one it
-    /// already holds, the two never fight: whichever ran last with a real
-    /// answer wins, and a repeat publishes nothing.
-    fn note_catalog_context_limit(&self) {
+    /// A fallback window is published as `None`: the 200,000-token
+    /// assumption is announced separately (`event/contextWindow`) rather
+    /// than displayed as if it were known. `context_limit_resolved` ignores a
+    /// repeat, so calling this every turn publishes only changes.
+    fn note_effective_context_limit(&self) {
         let captured = self.capture_runtime().config;
-        let catalog = crate::catalog::ModelCatalog::load();
-        let Some(model) = catalog.find(captured.provider_id.as_deref(), &captured.model) else {
-            return;
+        let provider = captured
+            .provider_id
+            .as_deref()
+            .unwrap_or(crate::settings::FALLBACK_PROVIDER);
+        let resolved = self.effective_limits(provider, &captured.model);
+        let limit = match resolved.context_source {
+            WindowSource::Fallback => None,
+            _ => resolved.budget.context_window.map(|n| n as i64),
         };
-        if let Some(limit) = model.context_limit {
-            self.engine_state.context_limit_resolved(Some(limit));
+        self.engine_state.context_limit_resolved(limit);
+    }
+
+    /// Records the limits a provider's live model list reported.
+    fn record_live_limits(&self, provider: &str, models: &[coda_llm::ModelInfo]) {
+        let mut limits = self.live_model_limits.lock().expect("live model limits poisoned");
+        for m in models {
+            limits.insert(
+                crate::output_budget::live_key(provider, &m.id),
+                crate::output_budget::LiveLimits { context: m.context_limit, output: m.output_limit },
+            );
         }
+    }
+
+    /// D12: when neither the live list recorded so far nor the catalogue
+    /// knows `model`'s window, asks the client's (cached) model list — once
+    /// per provider/model per process, bounded to 5 s — so a live window is
+    /// found even when no client ever called `session/models`.
+    async fn discover_live_limits_if_unknown(&self, client: &Arc<dyn LlmClient>, model: &str) {
+        let provider = client.provider_id().to_owned();
+        if self.effective_limits(&provider, model).context_source != WindowSource::Fallback {
+            return;
+        }
+        let first = self
+            .live_discovery_attempted
+            .lock()
+            .expect("live discovery poisoned")
+            .insert(crate::output_budget::live_key(&provider, model));
+        if !first {
+            return;
+        }
+        if let Ok(Ok(models)) =
+            tokio::time::timeout(LIVE_DISCOVERY_TIMEOUT, client.list_models()).await
+        {
+            self.record_live_limits(&provider, &models);
+            self.note_effective_context_limit();
+        }
+    }
+
+    /// Announces the effective window as `event/contextWindow` when it
+    /// differs from the last announcement. Returns whether it was announced.
+    fn announce_context_window(&self, info: coda_proto::events::ContextWindowInfo) -> bool {
+        let key = (
+            info.provider_id.clone().unwrap_or_default(),
+            info.model.clone(),
+            info.context_window,
+            info.source.clone(),
+        );
+        {
+            let mut last = self.last_context_window.lock().expect("context window poisoned");
+            if last.as_ref() == Some(&key) {
+                return false;
+            }
+            *last = Some(key);
+        }
+        self.sink.emit(AgentEvent::ContextWindow { info });
+        true
     }
 
     /// Resolves the active model's price from the catalogue, per category.
@@ -3207,12 +3277,13 @@ impl ServeHost {
             Err(TurnRefusal::Stopped) => return Err(ClaimRefused::Stopped),
             Err(TurnRefusal::Draining) => return Err(ClaimRefused::Draining),
         }
-        // Resolve the window the turn is about to fill, from the catalogue
-        // alone. `session/models` also reports it, but a headless client may
-        // never call that — and then nothing in a `coda serve` session would
-        // ever say how big the context window is, which is exactly the
-        // "usage is unknowable in serve mode" gap this closes.
-        self.note_catalog_context_limit();
+        // Resolve the window the turn is about to fill — the same effective
+        // limits inference and compaction use. `session/models` also reports
+        // it, but a headless client may never call that — and then nothing
+        // in a `coda serve` session would ever say how big the context
+        // window is, which is exactly the "usage is unknowable in serve mode"
+        // gap this closes.
+        self.note_effective_context_limit();
         // And the price its responses will be charged at, so the cost
         // estimate attributes each response to the model that served it.
         self.note_catalog_pricing();
@@ -4183,7 +4254,7 @@ impl ServeBackend for ServeHost {
                 .unwrap_or_else(|| crate::settings::FALLBACK_PROVIDER.to_owned());
             let mut catalog = catalog_models();
             self.annotate_effort(&mut catalog, &captured, &provider_id);
-            note_active_context_limit(&self.engine_state, &catalog, Some(active.as_str()));
+            self.note_effective_context_limit();
             let catalog = serde_json::to_value(&catalog)
                 .map_err(|e| RpcError::internal(e.to_string()))?;
             return Ok(json!({
@@ -4198,19 +4269,8 @@ impl ServeBackend for ServeHost {
             if p.refresh { client.refresh_models().await } else { client.list_models().await };
         match result {
             Ok(models) if !models.is_empty() => {
-                {
-                    let mut limits =
-                        self.live_model_limits.lock().expect("live model limits poisoned");
-                    for m in &models {
-                        limits.insert(
-                            crate::output_budget::live_key(&provider_id, &m.id),
-                            crate::output_budget::LiveLimits {
-                                context: m.context_limit,
-                                output: m.output_limit,
-                            },
-                        );
-                    }
-                }
+                self.record_live_limits(&provider_id, &models);
+
                 // A live list says what the provider offers; the catalogue
                 // says what it costs. The provider does not report prices, so
                 // without this join a live list has none and the cost quietly
@@ -4232,7 +4292,7 @@ impl ServeBackend for ServeHost {
                     })
                     .collect();
                 self.annotate_effort(&mut wire, &captured, &provider_id);
-                note_active_context_limit(&self.engine_state, &wire, Some(active.as_str()));
+                self.note_effective_context_limit();
                 let v = serde_json::to_value(&wire)
                     .map_err(|e| RpcError::internal(e.to_string()))?;
                 Ok(json!({
@@ -4248,7 +4308,7 @@ impl ServeBackend for ServeHost {
             _ => {
                 let mut catalog = catalog_models();
                 self.annotate_effort(&mut catalog, &captured, &provider_id);
-                note_active_context_limit(&self.engine_state, &catalog, Some(active.as_str()));
+                self.note_effective_context_limit();
                 let catalog = serde_json::to_value(&catalog)
                     .map_err(|e| RpcError::internal(e.to_string()))?;
                 Ok(json!({
@@ -6152,6 +6212,10 @@ impl ServeHost {
             None => Arc::clone(&self.permission_prompt),
         };
 
+        // A model neither the live list nor the catalogue knows would be
+        // sized against the 200k fallback; ask the provider once (D12).
+        self.discover_live_limits_if_unknown(&client, &self.current_model()).await;
+
         // ONE coherent read of the configuration this turn runs under, taken
         // after every await that precedes the build. Everything below — the
         // model and effort handed to the builder, the system-prompt override
@@ -6160,14 +6224,27 @@ impl ServeHost {
         // builder would let a setter landing in between make the public
         // `activeConfig` describe an agent that was never run.
         let captured = self.capture_runtime();
-        // The output budget for this turn's model. The same value is the
-        // `max_tokens` on the wire and the reply reserve auto-compaction keeps
-        // free, so the trigger protects exactly the room the loop asks for.
-        let output_budget = resolve_output_budget_now(
-            &self.live_model_limits,
+        // The effective limits for this turn's model: one resolution sizes
+        // the `max_tokens` on the wire, the reply reserve auto-compaction
+        // keeps free, the compaction threshold and the displayed window.
+        let output_budget = self.effective_limits(client.provider_id(), &captured.config.model);
+        // The threshold is a fraction of the model's window (80% by default),
+        // overridable per user via `compactAtPercent` / `compactFreeTokens`,
+        // or per model via `compactByModel`. The agent is rebuilt every turn,
+        // so a model switch picks up the new model's entry. The reserve only
+        // caps the threshold, so on a large window the fraction still rules.
+        let compaction_policy = compaction_policy_for(
+            &load_settings_value(),
             client.provider_id(),
             &captured.config.model,
+            &output_budget,
         );
+        self.announce_context_window(context_window_info(
+            client.provider_id(),
+            &captured.config.model,
+            &output_budget,
+            &compaction_policy,
+        ));
 
         let agent = AgentLoopBuilder::new(
             Arc::clone(&client),
@@ -6197,34 +6274,17 @@ impl ServeHost {
         // proactively, and not on the overflow-retry path either. History grew
         // until the provider refused the request.
         //
-        // The summariser is the same `LlmSummarizer` the manual `/compact`
-        // route builds, so an automatic compaction and a requested one produce
-        // the same thing by construction rather than by two implementations
-        // agreeing.
-        .with_compaction_service(Arc::new(CompactionService::new(Arc::new(LlmSummarizer {
-            client: Arc::clone(&client),
-            model: captured.config.model.clone(),
-        }))))
-        // The threshold is a fraction of the model's window (80% by default),
-        // overridable per user via `compactAtPercent` / `compactFreeTokens`,
-        // or per model via `compactByModel`. The agent is rebuilt every turn,
-        // so a model switch picks up the new model's entry.
-        // The reserve is the `max_tokens` the loop actually requests. It only
-        // caps the threshold, so on a large window the fraction still rules.
-        .with_compaction_policy({
-            let context_window = self.active_context_window();
-            CompactionPolicy::for_context_window_with(
-                crate::settings::compaction_trigger_from(
-                    &load_settings_value(),
-                    client.provider_id(),
-                    &captured.config.model,
-                ),
-                context_window,
-                Some(output_budget.budget.max_tokens as usize),
-            )
-            .with_window_source(catalog_window_source(context_window))
-            .with_model_output_limit(output_budget.model_output_limit)
-        });
+        // The summariser and checkpoint file are the ones the manual
+        // `/compact` route builds, so an automatic compaction and a requested
+        // one produce the same thing by construction rather than by two
+        // implementations agreeing.
+        .with_compaction_service(Arc::new(
+            self.compaction_service(Arc::clone(&client), captured.config.model.clone()),
+        ))
+        .with_compaction_policy(compaction_policy)
+        // Shared across the session's turns so the trigger projects from the
+        // last measured usage rather than re-estimating from scratch.
+        .with_occupancy_tracker(Arc::clone(&self.session.occupancy));
 
         // Apply the session-only system prompt override the captured record
         // carries. The text is cloned here, outside CONFIG, and only because
@@ -6448,20 +6508,26 @@ impl ServeHost {
         let cancel = CancellationToken::new();
         *self.current_cancel.lock().expect("cancel poisoned") = Some(cancel.clone());
 
-        let model = self.current_model();
-        let context_window = self.active_context_window();
-        let output_budget =
-            resolve_output_budget_now(&self.live_model_limits, client.provider_id(), &model);
+        // The same effective limits a prompt turn would use, including the
+        // system prompt and tool schemas the next request will carry.
+        let captured = self.capture_runtime().config;
+        let budget = self.effective_limits(client.provider_id(), &captured.model);
         let limits = CompactionLimits {
-            context_window: context_window.unwrap_or(coda_agent::compaction::DEFAULT_CONTEXT_WINDOW),
-            window_source: catalog_window_source(context_window),
-            model_output_limit: output_budget.model_output_limit,
-            request_overhead_tokens: 0,
-            reply_reserve_tokens: output_budget.budget.max_tokens as usize,
+            context_window: budget
+                .budget
+                .context_window
+                .unwrap_or(coda_agent::compaction::DEFAULT_CONTEXT_WINDOW),
+            window_source: budget.context_source,
+            model_output_limit: budget.model_output_limit,
+            request_overhead_tokens: coda_agent::request_overhead_tokens(
+                captured.system_prompt.as_deref(),
+                &self.tools.definitions(),
+            ),
+            reply_reserve_tokens: budget.budget.max_tokens as usize,
         };
-        let service = CompactionService::new(Arc::new(LlmSummarizer { client, model }));
+        let service = self.compaction_service(client, captured.model.clone());
 
-        let outcome = service
+        let mut outcome = service
             .compact(
                 CompactionRequest {
                     history: &history,
@@ -6478,6 +6544,39 @@ impl ServeHost {
         let was_cancelled =
             cancel.is_cancelled() || matches!(outcome, CompactionOutcome::Cancelled { .. });
 
+        // Commit only onto the history that was summarised: anything that
+        // landed meanwhile would otherwise be silently replaced. Replacement
+        // and announcement are one critical section under HISTORY (F3, see
+        // `run_fork_inner`).
+        let mut committed_len = None;
+        if !was_cancelled {
+            if let CompactionOutcome::Compacted { history: compacted, .. } = &outcome {
+                let mut committed = self.session.history.lock().expect("history poisoned");
+                if *committed == history {
+                    *committed = compacted.clone();
+                    let after = committed.len() as i64;
+                    self.engine_state.session_changed("compact", self.active_session_id(), after);
+                    committed_len = Some(after);
+                }
+            }
+        }
+
+        let report = outcome.report_mut();
+        fn abandoned(report: &mut coda_agent::CompactionReport, outcome: &'static str, reason: &'static str) {
+            report.outcome = outcome;
+            report.reason = Some(reason);
+            report.messages_after = report.messages_before;
+            report.tokens_after = report.tokens_before;
+        }
+        if was_cancelled && report.outcome != "cancelled" {
+            abandoned(report, "cancelled", "cancelled");
+        } else if !was_cancelled && report.outcome == "compacted" && committed_len.is_none() {
+            abandoned(report, "failed", "history_changed");
+        }
+        report.record_diagnostics();
+        let report = report.clone();
+        self.sink.emit(AgentEvent::Compaction { report: report.clone() });
+
         if was_cancelled {
             // Emit the cancellation event; history is unchanged.
             self.sink.emit(AgentEvent::CompactionCancelled {
@@ -6487,44 +6586,28 @@ impl ServeHost {
             return Err(RpcError::cancelled());
         }
 
-        match outcome {
-            CompactionOutcome::Compacted { history: compacted, .. } => {
-                // Compaction succeeded — atomically replace history.
-                let tokens_after = TokenEstimator::estimate(&compacted) as i64;
-                let session_id = self.active_session_id();
-                // F2: compact used to replace history wholesale, silently.
-                // F3 (review): replacement and announcement are one critical
-                // section under HISTORY — see `run_fork_inner`.
-                let messages_after = {
-                    let mut committed = self.session.history.lock().expect("history poisoned");
-                    *committed = compacted;
-                    let after = committed.len() as i64;
-                    self.engine_state.session_changed("compact", session_id, after);
-                    after
-                };
-                serde_json::to_value(&CompactResponse {
+        let response = match (outcome, committed_len) {
+            (CompactionOutcome::Compacted { history: compacted, .. }, Some(messages_after)) => {
+                CompactResponse {
                     ok: true,
                     messages_before,
                     messages_after,
                     tokens_before: Some(tokens_before),
-                    tokens_after: Some(tokens_after),
+                    tokens_after: Some(TokenEstimator::estimate(&compacted) as i64),
                     error: None,
-                })
-                .map_err(|e| RpcError::internal(e.to_string()))
+                }
             }
-            outcome => {
-                // Not compacted or failed — original history preserved.
-                serde_json::to_value(&CompactResponse {
-                    ok: true,
-                    messages_before,
-                    messages_after: messages_before,
-                    tokens_before: Some(tokens_before),
-                    tokens_after: None,
-                    error: Some(outcome.report().failure_sentence()),
-                })
-                .map_err(|e| RpcError::internal(e.to_string()))
-            }
-        }
+            // Not compacted, failed or abandoned — original history preserved.
+            _ => CompactResponse {
+                ok: true,
+                messages_before,
+                messages_after: messages_before,
+                tokens_before: Some(tokens_before),
+                tokens_after: None,
+                error: Some(report.failure_sentence()),
+            },
+        };
+        serde_json::to_value(&response).map_err(|e| RpcError::internal(e.to_string()))
     }
 }
 
@@ -7415,12 +7498,72 @@ fn resolve_output_budget_now(
     )
 }
 
-/// Where a window from `active_context_window` (catalogue only) came from.
-fn catalog_window_source(context_window: Option<usize>) -> WindowSource {
-    if context_window.is_some() {
-        WindowSource::Catalog
-    } else {
-        WindowSource::Fallback
+/// The auto-compaction policy for a turn: the configured trigger (settings,
+/// `compactByModel`) resolved against the effective window, with the turn's
+/// `max_tokens` as the reply reserve.
+fn compaction_policy_for(
+    settings: &Value,
+    provider: &str,
+    model: &str,
+    budget: &crate::output_budget::ResolvedBudget,
+) -> CompactionPolicy {
+    CompactionPolicy::for_context_window_with(
+        crate::settings::compaction_trigger_from(settings, provider, model),
+        budget.budget.context_window,
+        Some(budget.budget.max_tokens as usize),
+    )
+    .with_window_source(budget.context_source)
+    .with_model_output_limit(budget.model_output_limit)
+}
+
+/// The `event/contextWindow` payload; an unknown window is reported as the
+/// 200,000-token assumption it is, labelled `fallback`.
+fn context_window_info(
+    provider: &str,
+    model: &str,
+    budget: &crate::output_budget::ResolvedBudget,
+    policy: &CompactionPolicy,
+) -> coda_proto::events::ContextWindowInfo {
+    coda_proto::events::ContextWindowInfo {
+        provider_id: Some(provider.to_owned()),
+        model: model.to_owned(),
+        context_window: budget
+            .budget
+            .context_window
+            .unwrap_or(coda_agent::compaction::DEFAULT_CONTEXT_WINDOW) as u64,
+        source: budget.context_source.as_str().to_owned(),
+        compaction_threshold: policy.token_threshold as u64,
+    }
+}
+
+/// How long the turn path waits for a live model list (D12).
+const LIVE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Saves the pre-compaction history under
+/// `.coda/sessions/<id>.compactions/` before a compaction commits.
+struct FileCheckpointSink {
+    store: SessionTranscriptStore,
+    session_id: String,
+}
+
+#[async_trait]
+impl coda_agent::CheckpointSink for FileCheckpointSink {
+    async fn save(
+        &self,
+        history: &[Message],
+        meta: &coda_agent::CheckpointMeta,
+    ) -> anyhow::Result<coda_agent::CheckpointRef> {
+        let name = self
+            .store
+            .save_compaction_checkpoint(
+                &self.session_id,
+                history,
+                meta.trigger,
+                meta.messages_before,
+                meta.estimated_tokens_before,
+            )
+            .await?;
+        Ok(coda_agent::CheckpointRef { name })
     }
 }
 
@@ -7541,29 +7684,6 @@ pub(crate) fn load_hooks_from_file(path: &Path) -> Vec<UserHook> {
 /// Was a hand-written list with no prices and context limits typed in beside
 /// the names. The snapshot carries both, and stays right when a provider
 /// changes them.
-/// Records the active model's context window on the usage projection.
-///
-/// Model listing is the only place the window is known — the catalogue and the
-/// provider both report it per model, and nothing else the engine does
-/// mentions it. Without this the snapshot reported `contextLimit: null` for the
-/// entire life of the process, so no client could say how full the window was
-/// and the status bar simply omitted the gauge.
-///
-/// Deliberately silent when the active model cannot be found in the list: the
-/// window is only reported when it is actually known, so a list that happens
-/// not to contain the active model leaves the previous, correct value in place
-/// rather than erasing it. When the row *is* found its limit is taken as-is,
-/// `None` included — that model genuinely has no known window, and keeping the
-/// previous model's would understate usage.
-fn note_active_context_limit(
-    state: &crate::state::EngineState,
-    models: &[WireModel],
-    active: Option<&str>,
-) {
-    let Some(id) = active else { return };
-    let Some(row) = models.iter().find(|m| m.id == id) else { return };
-    state.context_limit_resolved(row.context_limit);
-}
 fn catalog_models() -> Vec<WireModel> {    let catalog = crate::catalog::ModelCatalog::load();
     let mut seen: Vec<WireModel> = Vec::new();
     for provider in ["anthropic", "github-copilot"] {
@@ -13737,6 +13857,350 @@ mod tests {
         } else {
             assert_eq!(expected.source, coda_agent::OutputBudgetSource::Setting);
         }
+    }
+
+    // ── Compaction continuity: summariser budget, effective limits, manual path ──
+
+    /// The judge, stand-in answerer and safety classifier keep their short
+    /// 512-token cap; only the summariser gets compaction's allowance.
+    #[tokio::test]
+    async fn short_judge_calls_keep_their_512_token_cap() {
+        let client = CapturingClient::new(vec![coda_llm::anthropic::StreamEvent::Done {
+            stop_reason: Some("end_turn".into()),
+            usage: coda_llm::Usage::ZERO,
+        }]);
+        let forked = LlmForkedAgent {
+            client: Arc::clone(&client) as Arc<dyn LlmClient>,
+            model: "m".into(),
+        };
+
+        ForkedAgent::run(&forked, "judge", vec![Message::user("q")], CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(client.last_max_tokens(), Some(512));
+
+        ClassifierForkedAgent::run(&forked, "classify", vec![Message::user("q")], CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(client.last_max_tokens(), Some(512));
+
+        let summarizer = LlmSummarizer {
+            client: Arc::clone(&client) as Arc<dyn LlmClient>,
+            model: "m".into(),
+        };
+        summarizer
+            .summarize(
+                SummaryRequest {
+                    system: "summarise".into(),
+                    messages: vec![Message::user("q")],
+                    max_output_tokens: 8_192,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(client.last_max_tokens(), Some(8_192));
+    }
+
+    fn set_model(host: &ServeHost, model: &str) {
+        host.runtime.lock().unwrap().model = model.to_owned();
+    }
+
+    async fn published_context_limit(host: &ServeHost) -> Value {
+        host.session_get_state(GetStateParams::default()).await.unwrap()["usage"]["contextLimit"].clone()
+    }
+
+    /// BUG-3: a live 1M window for a model the catalogue does not know drives
+    /// inference, the compaction threshold and the display alike; without it
+    /// all three fall back to 200k, honestly labelled.
+    #[tokio::test]
+    async fn a_live_1m_window_absent_from_the_catalogue_is_used_everywhere() {
+        use crate::output_budget::{live_key, LiveLimits};
+
+        let (host, _client) = make_capturing_host();
+        set_model(&host, "mystery-1m");
+        host.live_model_limits.lock().unwrap().insert(
+            live_key("capturing", "mystery-1m"),
+            LiveLimits { context: Some(1_000_000), output: Some(64_000) },
+        );
+
+        let budget = host.effective_limits("capturing", "mystery-1m");
+        assert_eq!(budget.budget.context_window, Some(1_000_000));
+        assert_eq!(budget.context_source, WindowSource::Live);
+        let policy = compaction_policy_for(&json!({}), "capturing", "mystery-1m", &budget);
+        assert_eq!(policy.token_threshold, 800_000);
+        assert_eq!(policy.window_source, WindowSource::Live);
+        let at_60 = json!({ "compactAtPercent": 60 });
+        assert_eq!(compaction_policy_for(&at_60, "capturing", "mystery-1m", &budget).token_threshold, 600_000);
+        host.note_effective_context_limit();
+        assert_eq!(published_context_limit(&host).await, json!(1_000_000));
+        let info = context_window_info("capturing", "mystery-1m", &budget, &policy);
+        assert_eq!((info.context_window, info.source.as_str()), (1_000_000, "live"));
+
+        host.live_model_limits.lock().unwrap().clear();
+        let budget = host.effective_limits("capturing", "mystery-1m");
+        assert_eq!(budget.context_source, WindowSource::Fallback);
+        let policy = compaction_policy_for(&json!({}), "capturing", "mystery-1m", &budget);
+        assert_eq!(policy.token_threshold, 160_000);
+        assert_eq!(compaction_policy_for(&at_60, "capturing", "mystery-1m", &budget).token_threshold, 120_000);
+        host.note_effective_context_limit();
+        assert_eq!(published_context_limit(&host).await, Value::Null);
+        let info = context_window_info("capturing", "mystery-1m", &budget, &policy);
+        assert_eq!(info.source, "fallback");
+        assert_eq!(info.context_window, coda_agent::compaction::DEFAULT_CONTEXT_WINDOW as u64);
+        assert_eq!(info.compaction_threshold, 160_000);
+    }
+
+    #[tokio::test]
+    async fn explicit_lower_trigger_is_not_raised() {
+        use crate::output_budget::{live_key, LiveLimits};
+
+        let (host, _client) = make_capturing_host();
+        host.live_model_limits.lock().unwrap().insert(
+            live_key("capturing", "mystery-1m"),
+            LiveLimits { context: Some(1_000_000), output: Some(64_000) },
+        );
+        let budget = host.effective_limits("capturing", "mystery-1m");
+        let policy =
+            compaction_policy_for(&json!({ "compactAtPercent": 30 }), "capturing", "mystery-1m", &budget);
+        assert_eq!(policy.token_threshold, 300_000);
+    }
+
+    /// The window is announced once per change, not on every turn.
+    #[tokio::test]
+    async fn the_context_window_is_announced_only_when_it_changes() {
+        let (host, _client) = make_capturing_host();
+        let info = |window: u64, source: &str| coda_proto::events::ContextWindowInfo {
+            provider_id: Some("capturing".into()),
+            model: "m".into(),
+            context_window: window,
+            source: source.into(),
+            compaction_threshold: 1,
+        };
+        assert!(host.announce_context_window(info(200_000, "fallback")));
+        assert!(!host.announce_context_window(info(200_000, "fallback")));
+        assert!(host.announce_context_window(info(200_000, "catalog")));
+        assert!(host.announce_context_window(info(1_000_000, "live")));
+    }
+
+    /// D12: a model with no known window asks the client's model list once,
+    /// and the live window it reports is then used.
+    #[tokio::test]
+    async fn live_limits_are_discovered_once_for_an_unknown_window() {
+        struct ListingClient {
+            lists: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait]
+        impl LlmClient for ListingClient {
+            fn provider_id(&self) -> &str {
+                "listing"
+            }
+            async fn stream(
+                &self,
+                _: coda_llm::ChatRequest,
+            ) -> Result<coda_llm::ResponseStream, coda_llm::LlmError> {
+                Err(coda_llm::LlmError::Cancelled)
+            }
+            async fn list_models(&self) -> Result<Vec<coda_llm::ModelInfo>, coda_llm::LlmError> {
+                self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut model = coda_llm::ModelInfo::new("mystery-1m");
+                model.context_limit = Some(1_000_000);
+                model.output_limit = Some(64_000);
+                Ok(vec![model])
+            }
+        }
+        let client = Arc::new(ListingClient { lists: Default::default() });
+        let dyn_client = Arc::clone(&client) as Arc<dyn LlmClient>;
+        let host = make_host_in_dir(".", Arc::clone(&dyn_client));
+        set_model(&host, "mystery-1m");
+
+        host.discover_live_limits_if_unknown(&dyn_client, "mystery-1m").await;
+        host.discover_live_limits_if_unknown(&dyn_client, "mystery-1m").await;
+
+        assert_eq!(client.lists.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let budget = host.effective_limits("listing", "mystery-1m");
+        assert_eq!(budget.budget.context_window, Some(1_000_000));
+        assert_eq!(budget.context_source, WindowSource::Live);
+        assert_eq!(published_context_limit(&host).await, json!(1_000_000));
+    }
+
+    fn summary_turn(text: &str, stop: &str) -> Vec<coda_llm::anthropic::StreamEvent> {
+        use coda_llm::anthropic::StreamEvent;
+        vec![
+            StreamEvent::TextDelta(text.into()),
+            StreamEvent::Done { stop_reason: Some(stop.into()), usage: coda_llm::Usage::ZERO },
+        ]
+    }
+
+    /// History whose oldest exchange is too big for the protected tail, so a
+    /// manual compaction has something to summarise.
+    fn compactable_history() -> Vec<Message> {
+        vec![
+            Message::user("old question"),
+            Message::assistant("x".repeat(100_000)),
+            Message::user("Which option?"),
+            Message::assistant("Apply option B; leave option A unchanged."),
+            Message::user("Yes, proceed."),
+            Message::assistant("Done."),
+        ]
+    }
+
+    /// A host in `dir` on model `mystery-1m` with a live 1M window, whose
+    /// outbound frames are kept for inspection.
+    fn compaction_host(
+        dir: &std::path::Path,
+        client: Arc<dyn LlmClient>,
+    ) -> (Arc<ServeHost>, mpsc::UnboundedReceiver<Vec<u8>>) {
+        use crate::output_budget::{live_key, LiveLimits};
+        let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let sink = Arc::new(ServeSink::new(tx.clone()));
+        let ch = Arc::new(PromptChannel::new(tx));
+        let provider = client.provider_id().to_owned();
+        let host = ServeHost::new_with_client(client, sink, ch, dir.to_string_lossy().into_owned());
+        set_model(&host, "mystery-1m");
+        host.live_model_limits.lock().unwrap().insert(
+            live_key(&provider, "mystery-1m"),
+            LiveLimits { context: Some(1_000_000), output: Some(64_000) },
+        );
+        *host.session.history.lock().unwrap() = compactable_history();
+        (host, rx)
+    }
+
+    /// The `event/compaction` frames published so far.
+    fn compaction_frames(rx: &mut mpsc::UnboundedReceiver<Vec<u8>>) -> Vec<Value> {
+        let mut out = Vec::new();
+        while let Ok(bytes) = rx.try_recv() {
+            let s = String::from_utf8(bytes).unwrap();
+            let body = s.find("\r\n\r\n").map(|i| &s[i + 4..]).unwrap_or(&s);
+            let msg: Value = serde_json::from_str(body).unwrap();
+            if msg["method"] == "event/compaction" {
+                out.push(msg["params"].clone());
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_rejects_truncated_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = CountingClient::new(vec![
+            summary_turn("partial", "max_tokens"),
+            summary_turn("still partial", "max_tokens"),
+        ]);
+        let (host, mut rx) = compaction_host(dir.path(), Arc::clone(&client) as Arc<dyn LlmClient>);
+
+        let r = host.session_compact(CompactParams { instructions: None }).await.unwrap();
+
+        assert_eq!(*host.session.history.lock().unwrap(), compactable_history());
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["messagesAfter"], r["messagesBefore"]);
+        assert_eq!(
+            r["error"],
+            "Compaction failed: the summary hit its output limit after 1 retry; history unchanged."
+        );
+        let requests = client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].max_tokens, 8_192);
+        assert!(requests[1].max_tokens > 8_192, "retry allowance {}", requests[1].max_tokens);
+        let frames = compaction_frames(&mut rx);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["outcome"], "failed");
+        assert_eq!(frames[0]["reason"], "summary_truncated");
+        assert_eq!(frames[0]["trigger"], "manual");
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_checkpoint_failure_keeps_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = CountingClient::new(vec![summary_turn("## Next Move\nContinue.", "end_turn")]);
+        let (host, mut rx) = compaction_host(dir.path(), client as Arc<dyn LlmClient>);
+        let store = SessionTranscriptStore::new(dir.path());
+        let blocker = store.compactions_dir(&host.active_session_id());
+        std::fs::create_dir_all(blocker.parent().unwrap()).unwrap();
+        std::fs::write(&blocker, b"not a directory").unwrap();
+
+        let r = host.session_compact(CompactParams { instructions: None }).await.unwrap();
+
+        assert_eq!(*host.session.history.lock().unwrap(), compactable_history());
+        let error = r["error"].as_str().unwrap();
+        assert!(error.contains("checkpoint"), "{error}");
+        let frames = compaction_frames(&mut rx);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["reason"], "checkpoint_write_failed");
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_writes_checkpoint_then_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = CountingClient::new(vec![summary_turn("## Next Move\nContinue.", "end_turn")]);
+        let (host, mut rx) = compaction_host(dir.path(), client as Arc<dyn LlmClient>);
+
+        let r = host.session_compact(CompactParams { instructions: None }).await.unwrap();
+
+        assert_eq!(r["ok"], true);
+        assert!(r.get("error").is_none_or(Value::is_null), "{r}");
+        let files: Vec<String> = std::fs::read_dir(
+            SessionTranscriptStore::new(dir.path()).compactions_dir(&host.active_session_id()),
+        )
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+        assert_eq!(files.len(), 1);
+        let history = host.session.history.lock().unwrap().clone();
+        assert!(history[0].text().contains(&files[0]), "checkpoint not named: {}", history[0].text());
+        assert!(history.iter().any(|m| m.text().contains("Apply option B")));
+        assert_eq!(r["messagesAfter"], history.len());
+        let frames = compaction_frames(&mut rx);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["outcome"], "compacted");
+        assert_eq!(frames[0]["checkpoint"], files[0].as_str());
+    }
+
+    /// A manual compaction commits only onto the history it summarised.
+    #[tokio::test]
+    async fn manual_compaction_abandons_a_changed_history() {
+        struct MutatingClient {
+            session: std::sync::OnceLock<Arc<Session>>,
+        }
+        #[async_trait]
+        impl LlmClient for MutatingClient {
+            fn provider_id(&self) -> &str {
+                "mutating"
+            }
+            async fn stream(
+                &self,
+                _: coda_llm::ChatRequest,
+            ) -> Result<coda_llm::ResponseStream, coda_llm::LlmError> {
+                if let Some(session) = self.session.get() {
+                    session.history.lock().unwrap().push(Message::user("arrived meanwhile"));
+                }
+                let (tx, rx) = tokio::sync::mpsc::channel(64);
+                tokio::spawn(async move {
+                    for ev in summary_turn("## Next Move\nContinue.", "end_turn") {
+                        let _ = tx.send(Ok(ev)).await;
+                    }
+                });
+                Ok(coda_llm::ResponseStream::new(rx))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let client = Arc::new(MutatingClient { session: std::sync::OnceLock::new() });
+        let (host, mut rx) = compaction_host(dir.path(), Arc::clone(&client) as Arc<dyn LlmClient>);
+        let _ = client.session.set(Arc::clone(&host.session));
+
+        let r = host.session_compact(CompactParams { instructions: None }).await.unwrap();
+
+        let mut expected = compactable_history();
+        expected.push(Message::user("arrived meanwhile"));
+        assert_eq!(*host.session.history.lock().unwrap(), expected);
+        assert_eq!(
+            r["error"],
+            "Compaction abandoned: the conversation changed while it was being compacted; history unchanged."
+        );
+        let frames = compaction_frames(&mut rx);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["outcome"], "failed");
+        assert_eq!(frames[0]["reason"], "history_changed");
     }
 
     /// `session/setSystemPrompt` stores the text and it reaches the LLM.

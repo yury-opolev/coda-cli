@@ -14,7 +14,7 @@
 use std::sync::{Arc, Mutex};
 
 use coda_agent::steering::SteeringObserver;
-use coda_agent::SteeringInbox;
+use coda_agent::{OccupancyTracker, SteeringInbox};
 use coda_llm::Message;
 
 /// Per-connection session state.
@@ -24,6 +24,9 @@ pub struct Session {
     pub history: Mutex<Vec<Message>>,
     /// Delivery inbox shared with the agent loop.
     pub steering: Arc<SteeringInbox>,
+    /// Measured context occupancy, shared by every turn of this session so
+    /// auto-compaction projects from the last real usage figure.
+    pub occupancy: Arc<OccupancyTracker>,
 }
 
 impl Session {
@@ -39,6 +42,7 @@ impl Session {
             session_id: session_id.into(),
             history: Mutex::new(Vec::new()),
             steering: Arc::new(SteeringInbox::with_observer(observer)),
+            occupancy: Arc::new(OccupancyTracker::new()),
         })
     }
 }
