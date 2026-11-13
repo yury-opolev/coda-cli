@@ -242,7 +242,8 @@ mod tests {
         for name in [
             "AssistantTextEvent.json", "ToolCallEvent.json", "ToolResultEvent.json",
             "TurnCompleteEvent.json", "ErrorEvent.json", "ScheduleLifecycleEvent.json",
-            "PostCompactContextInjectedEvent.json",
+            "PostCompactContextInjectedEvent.json", "CompactionEvent.json",
+            "ContextWindowEvent.json",
         ] {
             assert!(schemas.contains_key(name), "missing event schema: {name}");
             assert!(schemas[name]["properties"].get("seq").is_some());

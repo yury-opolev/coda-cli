@@ -1,0 +1,191 @@
+{
+  "type": "object",
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "engineInstanceId": {
+      "type": "string"
+    },
+    "trigger": {
+      "type": "string",
+      "description": "`\"auto\"`, `\"overflow\"` or `\"manual\"`."
+    },
+    "outcome": {
+      "type": "string",
+      "description": "`\"compacted\"`, `\"not_compacted\"`, `\"failed\"` or `\"cancelled\"`."
+    },
+    "reason": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Why the history was not compacted; absent when it was."
+    },
+    "message": {
+      "type": "string",
+      "description": "Fixed, content-free sentence suitable for display."
+    },
+    "windowSource": {
+      "type": "string",
+      "description": "Where the context window came from: `\"live\"`, `\"catalog\"`,\n`\"setting\"` or `\"fallback\"`."
+    },
+    "contextWindow": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "threshold": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0,
+      "description": "Auto-compaction threshold, when one applied."
+    },
+    "estimatedTokens": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0,
+      "description": "Projected request size when compaction was considered."
+    },
+    "measuredTokens": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0,
+      "description": "The measured (provider-reported) part of `estimatedTokens`, if any."
+    },
+    "messagesBefore": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "messagesAfter": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "tokensBefore": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "tokensAfter": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "tailMessages": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0,
+      "description": "Messages (and their estimated tokens) kept verbatim as the protected tail."
+    },
+    "tailTokens": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "summaryAllowance": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0,
+      "description": "Output token allowance of the first summariser attempt."
+    },
+    "retryAllowance": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0,
+      "description": "Output token allowance of the retry, when one was made."
+    },
+    "outputTokens": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0,
+      "description": "Summariser output tokens, summed over attempts."
+    },
+    "stopReason": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Normalised stop reason of the last summariser attempt."
+    },
+    "attempts": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "durationMs": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "abbreviatedToolOutputs": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "omittedToolOutputs": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "omittedMessages": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "previewedTailResults": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "checkpoint": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "File name (never a path) of the pre-compaction checkpoint, if saved."
+    }
+  },
+  "required": [
+    "seq",
+    "engineInstanceId",
+    "trigger",
+    "outcome",
+    "message",
+    "windowSource",
+    "contextWindow",
+    "estimatedTokens",
+    "messagesBefore",
+    "messagesAfter",
+    "tokensBefore",
+    "tokensAfter",
+    "tailMessages",
+    "tailTokens",
+    "attempts",
+    "durationMs",
+    "abbreviatedToolOutputs",
+    "omittedToolOutputs",
+    "omittedMessages",
+    "previewedTailResults"
+  ],
+  "description": "`event/compaction` payload: a content-free account of one compaction\nattempt. Every field is a number or a closed label; no conversation text\never travels here.",
+  "title": "CompactionEvent",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

@@ -683,6 +683,51 @@ older readers ignore) at every turn end, rewind and fork, and restored by assign
 `initialize` resumes the session — before anything reports the resumed totals — so restoring,
 reconnecting or replaying never double-counts. A fork starts from its parent's accounting.
 
+### Compaction diagnostics (Rust)
+
+Two additive, ungated notifications report compaction and the context window it is measured
+against. Both are **content-free**: every field is a number or a closed label. No conversation
+text, summary text or tool output ever travels in them; `message` is a fixed sentence chosen by
+the engine, and `checkpoint` is a bare file name, never a path. Older clients ignore them.
+`session/compact`'s response shape is unchanged; a manual compaction emits the same
+`event/compaction` as an automatic one.
+
+**`event/compaction`** — one compaction attempt finished, whatever its outcome:
+
+| Field | Meaning |
+|---|---|
+| `trigger` | `auto` (threshold reached), `overflow` (the provider rejected the request as too large) or `manual` (`/compact`, `session/compact`). |
+| `outcome` | `compacted`, `not_compacted` (nothing safe to do; history unchanged), `failed` (history unchanged) or `cancelled`. |
+| `reason?` | Absent when compacted. One of `nothing_to_compact`, `summary_truncated`, `summary_empty`, `summary_rejected`, `summarizer_failed`, `insufficient_room`, `input_too_large`, `protected_context_too_large`, `checkpoint_write_failed`, `history_changed`, `cancelled`. |
+| `message` | A fixed, display-ready sentence for this outcome/reason (e.g. `Context compacted: 312 → 14 messages, ~181k → ~23k tokens (summary 2.4k tokens).`). Never contains conversation content. |
+| `windowSource` | Where `contextWindow` came from: `live` (provider model list), `catalog`, `setting` or `fallback` (assumed 200,000). |
+| `contextWindow` | The effective context window, in tokens. |
+| `threshold?` | The auto-compaction threshold in tokens, when one applied. |
+| `estimatedTokens` | The projected request size when compaction was considered. |
+| `measuredTokens?` | The provider-measured part of that projection, when an anchor existed. |
+| `messagesBefore`, `messagesAfter` | History length before and after (equal unless compacted). |
+| `tokensBefore`, `tokensAfter` | Estimated history tokens before and after. |
+| `tailMessages`, `tailTokens` | Size of the protected recent tail kept verbatim. |
+| `summaryAllowance?`, `retryAllowance?` | Output-token allowance of the first summariser attempt and of the retry, if any. |
+| `outputTokens?` | Summariser output tokens, summed over attempts. |
+| `stopReason?` | Normalised stop reason of the last summariser attempt: `end_turn`, `max_tokens`, `tool_use`, `content_filter`, `refusal`, `pause_turn`, `other` or `unknown`. |
+| `attempts` | Summariser calls made (0–2). |
+| `durationMs` | Wall time of the attempt. |
+| `abbreviatedToolOutputs`, `omittedToolOutputs`, `omittedMessages` | How much of the summariser input was shortened or left out to fit. |
+| `previewedTailResults` | Tool results in the protected tail replaced by a bounded preview. |
+| `checkpoint?` | File name of the pre-compaction checkpoint saved under the session's `compactions` directory. |
+
+**`event/contextWindow`** — the effective context window was resolved, sent at turn start
+whenever the (model, window, source) differs from the last one announced:
+
+| Field | Meaning |
+|---|---|
+| `providerId?` | The provider serving the model. |
+| `model` | The model id. |
+| `contextWindow` | The effective window used for inference, compaction and display. |
+| `source` | `live`, `catalog`, `setting` or `fallback`. With `fallback` the window is an assumption (200,000 tokens) and `usage.contextLimit` stays `null`. |
+| `compactionThreshold` | The auto-compaction threshold resolved against this window. |
+
 ### Failure reporting and retention (Rust)
 
 `lastTurnOutcome.error` is a bounded classification — `{ category, status?, parameter? }` —

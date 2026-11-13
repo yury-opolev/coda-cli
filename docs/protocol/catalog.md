@@ -148,6 +148,8 @@ the same structured projection regardless of that hint.
 | `event/permissionDecided`, `event/permissionsUpdated` | Permission hook/control notifications. |
 | `event/subagentBlocked`, `event/subagentResultModified` | Subagent hook decisions/content changes. |
 | `event/compactionCancelled`, `event/postCompactContextInjected` | Compaction hook notifications. |
+| `event/compaction` | One compaction attempt finished (automatic, overflow or manual): outcome, reason, sizes, summariser budget and checkpoint file name. Content-free; `message` is a fixed display sentence. See [Compaction diagnostics](../serve-protocol.md#compaction-diagnostics-rust). |
+| `event/contextWindow` | The effective context window, its source (`live`, `catalog`, `setting`, `fallback`) and the resolved auto-compaction threshold, sent when they change. Content-free. |
 | `event/lifecycle`, `event/activity` | **Gated:** engine availability and foreground activity transitions. |
 | `event/turnEnded`, `event/sessionChanged` | **Gated:** authoritative turn outcome and history/session reset fences. |
 | `event/configChanged`, `event/steeringQueue` | **Gated:** effective configuration and authoritative queue state/outcomes. |

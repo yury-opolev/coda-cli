@@ -675,6 +675,18 @@
       "paramsContract": "clientReaderWithRustMetadata"
     },
     {
+      "method": "event/compaction",
+      "paramsSchema": "schemas/CompactionEvent.json",
+      "requiresStateEvents": false,
+      "paramsContract": "clientReaderWithRustMetadata"
+    },
+    {
+      "method": "event/contextWindow",
+      "paramsSchema": "schemas/ContextWindowEvent.json",
+      "requiresStateEvents": false,
+      "paramsContract": "clientReaderWithRustMetadata"
+    },
+    {
       "method": "event/agentMessage",
       "paramsSchema": "schemas/AgentMessageEvent.json",
       "requiresStateEvents": false,

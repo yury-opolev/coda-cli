@@ -1794,6 +1794,9 @@ impl UiState {
             // A suspended task is not finished; it stays in `running_tasks`.
             | Event::TaskSuspended { .. }
             | Event::TaskResumed { .. }
+            // Rendered as notices in a later change.
+            | Event::Compaction(_)
+            | Event::ContextWindow(_)
             | Event::Unknown { .. } => {}
             // When a display-mutating AgentResponse hook rewrites the assistant
             // response, replace the buffer with the hook's display content so

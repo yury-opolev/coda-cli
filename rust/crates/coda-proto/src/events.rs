@@ -50,6 +50,12 @@ pub mod event_method {
     pub const SUBAGENT_RESULT_MODIFIED: &str = "event/subagentResultModified";
     pub const COMPACTION_CANCELLED: &str = "event/compactionCancelled";
     pub const POST_COMPACT_CONTEXT_INJECTED: &str = "event/postCompactContextInjected";
+    /// One compaction attempt finished (compacted, not compacted, failed or
+    /// cancelled). Content-free: counts and closed labels only.
+    pub const COMPACTION: &str = "event/compaction";
+    /// The effective context window (and its source) changed for this
+    /// session's model. Content-free.
+    pub const CONTEXT_WINDOW: &str = "event/contextWindow";
 
     // ── New, gated behind `stateEvents` (§2.4 of the serve API implementation
     // plan). Not modelled as `Event` enum variants: they are synthesised
@@ -352,6 +358,11 @@ pub enum Event {
     CompactionCancelled { hook_command: String, trigger: String },
     /// A hook injected extra context immediately after compaction.
     PostCompactContextInjected { additional_context: String },
+    /// One compaction attempt finished; see [`CompactionInfo`].
+    Compaction(CompactionInfo),
+    /// The effective context window was resolved or changed; see
+    /// [`ContextWindowInfo`].
+    ContextWindow(ContextWindowInfo),
     /// An event this build does not model. Kept so newer engines still work.
     Unknown { method: String, params: Option<Value> },
 }
@@ -362,6 +373,81 @@ fn parse<T: for<'de> Deserialize<'de> + Default>(params: Option<&Value>) -> T {
         Some(value) => serde_json::from_value(value.clone()).unwrap_or_default(),
         None => T::default(),
     }
+}
+
+/// `event/compaction` payload: a content-free account of one compaction
+/// attempt. Every field is a number or a closed label; no conversation text
+/// ever travels here.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct CompactionInfo {
+    /// `"auto"`, `"overflow"` or `"manual"`.
+    pub trigger: String,
+    /// `"compacted"`, `"not_compacted"`, `"failed"` or `"cancelled"`.
+    pub outcome: String,
+    /// Why the history was not compacted; absent when it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Fixed, content-free sentence suitable for display.
+    pub message: String,
+    /// Where the context window came from: `"live"`, `"catalog"`,
+    /// `"setting"` or `"fallback"`.
+    pub window_source: String,
+    pub context_window: u64,
+    /// Auto-compaction threshold, when one applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<u64>,
+    /// Projected request size when compaction was considered.
+    pub estimated_tokens: u64,
+    /// The measured (provider-reported) part of `estimatedTokens`, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_tokens: Option<u64>,
+    pub messages_before: u32,
+    pub messages_after: u32,
+    pub tokens_before: u64,
+    pub tokens_after: u64,
+    /// Messages (and their estimated tokens) kept verbatim as the protected tail.
+    pub tail_messages: u32,
+    pub tail_tokens: u64,
+    /// Output token allowance of the first summariser attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_allowance: Option<u32>,
+    /// Output token allowance of the retry, when one was made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_allowance: Option<u32>,
+    /// Summariser output tokens, summed over attempts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u32>,
+    /// Normalised stop reason of the last summariser attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    pub attempts: u32,
+    pub duration_ms: u64,
+    pub abbreviated_tool_outputs: u32,
+    pub omitted_tool_outputs: u32,
+    pub omitted_messages: u32,
+    pub previewed_tail_results: u32,
+    /// File name (never a path) of the pre-compaction checkpoint, if saved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+}
+
+/// `event/contextWindow` payload: the effective context window for the
+/// session's model. Content-free.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ContextWindowInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    pub model: String,
+    /// The effective window used for inference, compaction and display.
+    pub context_window: u64,
+    /// `"live"`, `"catalog"`, `"setting"` or `"fallback"`.
+    pub source: String,
+    /// Auto-compaction threshold resolved against this window.
+    pub compaction_threshold: u64,
 }
 
 #[derive(Default, Deserialize)]
@@ -1056,6 +1142,8 @@ impl Event {
                     additional_context: p.additional_context,
                 }
             }
+            m::COMPACTION => Event::Compaction(parse(params)),
+            m::CONTEXT_WINDOW => Event::ContextWindow(parse(params)),
             other => Event::Unknown {
                 method: other.to_string(),
                 params: params.cloned(),
@@ -1342,6 +1430,14 @@ impl Event {
                 m::POST_COMPACT_CONTEXT_INJECTED,
                 serde_json::json!({ "additionalContext": additional_context }),
             ),
+            Event::Compaction(info) => (
+                m::COMPACTION,
+                serde_json::to_value(info).unwrap_or(Value::Null),
+            ),
+            Event::ContextWindow(info) => (
+                m::CONTEXT_WINDOW,
+                serde_json::to_value(info).unwrap_or(Value::Null),
+            ),
             Event::Unknown { method, params } => {
                 return Some((
                     method.clone(),
@@ -1420,6 +1516,83 @@ mod tests {
             assert_round_trips(Event::PostCompactContextInjected {
                 additional_context: "extra".into(),
             });
+            assert_round_trips(Event::Compaction(CompactionInfo {
+                trigger: "auto".into(),
+                outcome: "failed".into(),
+                reason: Some("summary_truncated".into()),
+                message: "Compaction failed.".into(),
+                window_source: "live".into(),
+                context_window: 1_000_000,
+                threshold: Some(800_000),
+                estimated_tokens: 810_000,
+                measured_tokens: Some(805_000),
+                messages_before: 312,
+                messages_after: 312,
+                tokens_before: 810_000,
+                tokens_after: 810_000,
+                tail_messages: 12,
+                tail_tokens: 20_000,
+                summary_allowance: Some(8_000),
+                retry_allowance: Some(16_000),
+                output_tokens: Some(24_000),
+                stop_reason: Some("max_tokens".into()),
+                attempts: 2,
+                duration_ms: 4_200,
+                abbreviated_tool_outputs: 3,
+                omitted_tool_outputs: 1,
+                omitted_messages: 0,
+                previewed_tail_results: 2,
+                checkpoint: Some("20261113T120000000Z.json".into()),
+            }));
+            assert_round_trips(Event::ContextWindow(ContextWindowInfo {
+                provider_id: Some("anthropic".into()),
+                model: "claude".into(),
+                context_window: 200_000,
+                source: "fallback".into(),
+                compaction_threshold: 160_000,
+            }));
+        }
+
+        #[test]
+        fn compaction_payloads_with_only_required_fields_parse() {
+            let event = Event::parse(
+                event_method::COMPACTION,
+                Some(&serde_json::json!({
+                    "trigger": "manual", "outcome": "not_compacted",
+                    "message": "Nothing to compact.", "windowSource": "catalog",
+                    "contextWindow": 200000, "estimatedTokens": 10,
+                    "messagesBefore": 4, "messagesAfter": 4, "tokensBefore": 10,
+                    "tokensAfter": 10, "tailMessages": 4, "tailTokens": 10,
+                    "attempts": 0, "durationMs": 1, "abbreviatedToolOutputs": 0,
+                    "omittedToolOutputs": 0, "omittedMessages": 0, "previewedTailResults": 0
+                })),
+            );
+            let Event::Compaction(info) = event else { panic!("not compaction: {event:?}") };
+            assert_eq!(info.trigger, "manual");
+            assert_eq!(info.context_window, 200_000);
+            assert_eq!(info.reason, None);
+            assert_eq!(info.checkpoint, None);
+
+            let event = Event::parse(
+                event_method::CONTEXT_WINDOW,
+                Some(&serde_json::json!({
+                    "model": "m", "contextWindow": 200000, "source": "fallback",
+                    "compactionThreshold": 160000
+                })),
+            );
+            let Event::ContextWindow(info) = event else { panic!("not contextWindow: {event:?}") };
+            assert_eq!(info.provider_id, None);
+            assert_eq!(info.source, "fallback");
+            assert_eq!(info.compaction_threshold, 160_000);
+        }
+
+        #[test]
+        fn compaction_payload_omits_absent_optionals() {
+            let (_, params) =
+                Event::Compaction(CompactionInfo::default()).to_notification().expect("encodes");
+            for key in ["reason", "threshold", "measuredTokens", "stopReason", "checkpoint"] {
+                assert!(params.get(key).is_none(), "{key} must be omitted, got {params}");
+            }
         }
 
         #[test]
@@ -1662,6 +1835,8 @@ mod tests {
                     Event::PostCompactContextInjected { additional_context: String::new() },
                     "event/postCompactContextInjected",
                 ),
+                (Event::Compaction(CompactionInfo::default()), "event/compaction"),
+                (Event::ContextWindow(ContextWindowInfo::default()), "event/contextWindow"),
             ];
             for (event, expected) in cases {
                 let (method, _) = event.to_notification().expect("encodes");
