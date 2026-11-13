@@ -6574,6 +6574,7 @@ impl ServeHost {
                 let mut committed = self.session.history.lock().expect("history poisoned");
                 if *committed == history {
                     *committed = compacted.clone();
+                    self.session.occupancy.invalidate();
                     let after = committed.len() as i64;
                     self.engine_state.session_changed("compact", self.active_session_id(), after);
                     committed_len = Some(after);
@@ -14300,6 +14301,36 @@ mod tests {
             .unwrap_or_else(|| panic!("no compaction record in {log}"));
         assert_eq!(record["trigger"], "manual", "{record}");
         assert_eq!(record["outcome"], "compacted", "{record}");
+    }
+
+    /// A compacted history can end with the same message at the same length,
+    /// so a manual compaction must drop the measured anchor itself.
+    #[tokio::test]
+    async fn manual_compaction_invalidates_the_occupancy_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = CountingClient::new(vec![summary_turn("## Next Move\nContinue.", "end_turn")]);
+        let (host, _rx) = compaction_host(dir.path(), client as Arc<dyn LlmClient>);
+        let history = vec![
+            Message::user("x".repeat(100_000)),
+            Message::assistant("answer one"),
+            Message::user("second"),
+            Message::assistant("answer two"),
+            Message::user("third"),
+            Message::assistant("answer three"),
+        ];
+        *host.session.history.lock().unwrap() = history.clone();
+        let usage = coda_llm::Usage { input_tokens: 30_000, ..Default::default() };
+        host.session.occupancy.record(&history, 7, &usage);
+
+        let r = host.session_compact(CompactParams { instructions: None }).await.unwrap();
+
+        assert_eq!(r["ok"], true, "{r}");
+        let after = host.session.history.lock().unwrap().clone();
+        assert_eq!(after.len(), history.len(), "the probe needs an equal length");
+        assert_eq!(after.last(), history.last());
+        let projection = host.session.occupancy.project(&after, 7, 0);
+        assert_eq!(projection.measured, None);
+        assert_eq!(projection.tokens, projection.full_estimate);
     }
 
     /// `session/setSystemPrompt` stores the text and it reaches the LLM.
