@@ -1,21 +1,26 @@
 //! Conversation compaction: summarise history to free context space.
 //!
-//! Matches C# `Compaction/CompactionService.cs`, `CompactionPrompts.cs`,
-//! `TokenEstimator.cs`.
+//! Matches C# `Compaction/CompactionService.cs`, `TokenEstimator.cs`.
+//! Tail selection lives in [`tail`], summariser input rendering in [`render`].
 //!
 //! # Invariants
-//! - The most recent exchange must survive compaction (tail-preservation).
+//! - The last two exchanges must survive compaction (tail-preservation).
 //! - Every `ToolUse` block must have a matching `ToolResult` block so the
 //!   provider does not reject the next request with an ordering error.
 //! - When the summariser call fails (empty reply), the original history is
 //!   returned unchanged — no silent data loss.
 
+pub mod render;
+pub mod tail;
+
 use std::sync::Arc;
 
-use coda_llm::{Content, Message, Role};
+use coda_llm::{Content, Message};
 use tokio_util::sync::CancellationToken;
 
 use crate::autonomy::ForkedAgent;
+
+pub use tail::compaction_tail_start;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Token estimator
@@ -42,85 +47,13 @@ impl TokenEstimator {
                     }
                     Content::Thinking { text, .. } => chars += text.len(),
                     Content::RedactedThinking { data } => chars += data.len(),
-                    Content::Image { .. } => chars += 64, // rough estimate
+                    // Providers bill an image at roughly 1,600 tokens; counting
+                    // only its placeholder would hide it from the trigger.
+                    Content::Image { .. } => chars += 6_400,
                 }
             }
         }
         chars / 4
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Compaction prompts
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Byte budget for a tool-result preview in the summariser transcript.
-const PREVIEW_BUDGET_BYTES: usize = 500;
-
-/// Truncates a tool result for the summariser transcript.
-///
-/// The budget is measured in **bytes**, not characters, and is deliberately
-/// kept that way: this text is assembled into a prompt whose size is what
-/// matters, and switching to `chars().take(500)` would silently retain up to
-/// four times as many bytes for non-Latin output — exactly the conversations
-/// most likely to be near the context limit already.
-///
-/// A plain `&content[..500]` **panics** when byte 500 falls inside a multi-byte
-/// character, which is what BUG 8 reported: a tool result of 499 ASCII bytes
-/// followed by `─` (U+2500, bytes 499..502) killed the summariser before it
-/// ever reached the provider. Auto-compaction then took the whole turn down
-/// with it. So the cut retreats to the nearest character boundary — at most
-/// three bytes for any valid `String` — and never splits a code point.
-fn truncate_preview(content: &str) -> String {
-    match coda_proto::history::truncate_text(content, PREVIEW_BUDGET_BYTES) {
-        (kept, Some(_)) => format!("{kept}\u{2026}"),
-        (kept, None) => kept,
-    }
-}
-
-pub struct CompactionPrompts;
-impl CompactionPrompts {
-    pub const SYSTEM_PROMPT: &'static str = "You summarize a software-engineering conversation \
-        so it can continue after older messages are dropped. Capture: the user's goal and task, \
-        key decisions and constraints, files and functions changed, what is done vs pending, \
-        errors hit and their fixes, and the immediate next step. Be dense and specific \
-        (file paths, names, commands). Output only the summary.";
-
-    pub const ACK_TEXT: &'static str = "Understood. I'll continue from the summary above.";
-
-    pub fn build_user_message(history: &[Message]) -> String {
-        let transcript = Self::render_transcript(history);
-        format!("Summarize the following conversation for continuation:\n\n{transcript}")
-    }
-
-    /// Render a conversation history as a plain-text transcript for the summariser.
-    pub fn render_transcript(history: &[Message]) -> String {
-        let mut out = String::new();
-        for msg in history {
-            let role = if msg.role == Role::User { "User" } else { "Assistant" };
-            for block in &msg.content {
-                match block {
-                    Content::Text(t) if !t.trim().is_empty() => {
-                        out.push_str(role);
-                        out.push_str(": ");
-                        out.push_str(t);
-                        out.push('\n');
-                    }
-                    Content::ToolUse { name, .. } => {
-                        out.push_str("[tool call: ");
-                        out.push_str(name);
-                        out.push_str("]\n");
-                    }
-                    Content::ToolResult { content, .. } => {
-                        out.push_str("[tool result: ");
-                        out.push_str(&truncate_preview(content));
-                        out.push_str("]\n");
-                    }
-                    _ => {}
-                }
-            }
-        }
-        out.trim_end().to_owned()
     }
 }
 
@@ -153,12 +86,14 @@ impl CompactionService {
     /// history and `summary = None`.
     ///
     /// Only the messages *before* [`compaction_tail_start`] are summarised. The
-    /// tail — the last complete exchange plus any trailing incomplete one —
-    /// is carried through verbatim, for two reasons. It holds the message the
-    /// user has just sent, which an auto-compaction fired mid-turn would
+    /// tail — the last two exchanges, plus older whole exchanges while they fit
+    /// the tail target — is carried through verbatim, for two reasons. It
+    /// holds the message the user has just sent together with the exchange
+    /// that gives it its meaning, which an auto-compaction fired mid-turn would
     /// otherwise discard before the model ever saw it; and it is the slice
     /// guaranteed to contain no unpaired `ToolUse`, so the provider is never
-    /// handed a tool call whose result was summarised away.
+    /// handed a tool call whose result was summarised away. A previous
+    /// checkpoint at the head is reconciled into the new one, never nested.
     pub async fn compact(
         &self,
         history: &[Message],
@@ -170,28 +105,34 @@ impl CompactionService {
         }
 
         let (head, tail) = history.split_at(compaction_tail_start(history));
+        let (previous, head) = render::split_previous_checkpoint(head);
         if head.is_empty() {
-            // Everything is tail: a single exchange has nothing before it to
-            // summarise. Replacing it with a summary of itself would shrink
-            // nothing and lose the exchange, so report "not compacted" and let
-            // the caller's suppression wait for more history.
+            // Everything is tail (or a previous checkpoint and its
+            // acknowledgement): nothing new to summarise. Replacing it with a
+            // summary of itself would shrink nothing and lose the exchange, so
+            // report "not compacted" and let the caller's suppression wait for
+            // more history.
             return (history.to_vec(), None);
         }
 
-        let system = instructions_override.unwrap_or(CompactionPrompts::SYSTEM_PROMPT);
-        let user_msg = CompactionPrompts::build_user_message(head);
-        let summary = match self.fork.run(system, vec![Message::user(user_msg)], cancel).await {
+        let system = instructions_override.unwrap_or(render::SYSTEM_PROMPT);
+        let Some(input) = render::render_summary_input(head, previous.as_deref(), usize::MAX)
+        else {
+            return (history.to_vec(), None);
+        };
+        let summary = match self
+            .fork
+            .run(system, vec![Message::user(input.user_message)], cancel)
+            .await
+        {
             Ok(s) if !s.trim().is_empty() => s,
             // Summariser failed or returned empty — preserve original history.
             _ => return (history.to_vec(), None),
         };
 
         let mut compacted = Vec::with_capacity(2 + tail.len());
-        compacted.push(Message::user(format!("Summary of the earlier conversation:\n\n{summary}")));
-        compacted.push(Message::new(
-            Role::Assistant,
-            vec![Content::Text(CompactionPrompts::ACK_TEXT.into())],
-        ));
+        compacted.push(render::checkpoint_message(&summary, None));
+        compacted.push(render::ack_message());
         compacted.extend_from_slice(tail);
         (compacted, Some(summary))
     }
@@ -384,78 +325,6 @@ impl CompactionPolicy {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Tail-preservation helper
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Returns a slice of `history` that must be preserved intact after compaction.
-///
-/// The tail is: the last complete user→assistant exchange plus any trailing
-/// incomplete exchange.  Every `ToolUse` block must be paired with its
-/// `ToolResult` so providers do not see an orphaned tool call.
-///
-/// # Invariant
-/// `history[tail_start..]` never contains an unpaired `ToolUse`.
-pub fn compaction_tail_start(history: &[Message]) -> usize {
-    if history.len() <= 2 {
-        return 0;
-    }
-
-    // Walk backward to find the last user turn that safely starts the tail.
-    // A user turn at idx is safe when:
-    //  1. history[idx..] has no unpaired ToolUse (all tool calls are resolved).
-    //  2. The immediately preceding assistant turn (history[idx-1], if it exists)
-    //     does NOT contain ToolUse blocks.  If it does, the exchange that started
-    //     it belongs to the tail as well, so we move the candidate start earlier.
-    let mut idx = history.len();
-    while idx > 0 {
-        idx -= 1;
-        if history[idx].role != Role::User {
-            continue;
-        }
-
-        // Condition 1: no unpaired ToolUse in the candidate tail.
-        if has_unpaired_tool_use(&history[idx..]) {
-            continue;
-        }
-
-        // Condition 2: the previous assistant turn (if present) must have no
-        // ToolUse blocks.  A preceding tool call means we need to include that
-        // turn so the ToolUse and ToolResult stay in the same slice.
-        if idx > 0 {
-            let prev = &history[idx - 1];
-            if prev.role == Role::Assistant {
-                let prev_has_tool_use =
-                    prev.content.iter().any(|b| matches!(b, Content::ToolUse { .. }));
-                if prev_has_tool_use {
-                    continue; // must include the preceding assistant + tool call
-                }
-            }
-        }
-
-        return idx;
-    }
-    // No safe cut point: keep everything.
-    0
-}
-
-/// Returns `true` when the slice contains a `ToolUse` with no matching
-/// `ToolResult` anywhere in the same slice.
-fn has_unpaired_tool_use(slice: &[Message]) -> bool {
-    use std::collections::HashSet;
-    let mut pending: HashSet<String> = HashSet::new();
-    for msg in slice {
-        for block in &msg.content {
-            match block {
-                Content::ToolUse { id, .. } => { pending.insert(id.clone()); }
-                Content::ToolResult { tool_use_id, .. } => { pending.remove(tool_use_id); }
-                _ => {}
-            }
-        }
-    }
-    !pending.is_empty()
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -463,6 +332,7 @@ fn has_unpaired_tool_use(slice: &[Message]) -> bool {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use coda_llm::Role;
     use std::sync::Mutex;
 
     // ── Helpers ──────────────────────────────────────────────────────────────
@@ -473,6 +343,12 @@ mod tests {
 
     fn assistant_msg(text: &str) -> Message {
         Message::assistant(text)
+    }
+
+    /// An old exchange too large (~20k tokens) to join the protected tail, so
+    /// the histories below have a head to summarise.
+    fn bulky_early_exchange() -> Vec<Message> {
+        vec![user_msg(&format!("early context {}", "e".repeat(80_000))), assistant_msg("noted")]
     }
 
     fn tool_use_msg(id: &str, name: &str) -> Message {
@@ -498,101 +374,6 @@ mod tests {
                 status: None,
             }],
         )
-    }
-
-    // ── BUG 8: byte-sliced previews panicked on valid Unicode ────────────────
-
-    /// The exact shape from the report: 499 ASCII bytes then `─`, whose bytes
-    /// straddle offset 500. `&content[..500]` panics here.
-    #[test]
-    fn tool_result_preview_does_not_split_utf8() {
-        let content = format!("{}\u{2500}tail", "a".repeat(499));
-        let history = vec![tool_result_msg("call-1", &content)];
-
-        let rendered = CompactionPrompts::render_transcript(&history);
-
-        assert_eq!(rendered, format!("[tool result: {}\u{2026}]", "a".repeat(499)));
-    }
-
-    /// The boundary matrix. Each case asserts the exact retained prefix, not
-    /// merely that nothing panicked — "did not panic" would pass for a
-    /// truncation that silently kept the wrong amount.
-    #[test]
-    fn the_preview_keeps_a_byte_budget_without_ever_splitting_a_character() {
-        let ascii = |n: usize| "a".repeat(n);
-
-        // Under or at budget: returned whole, with no ellipsis.
-        assert_eq!(truncate_preview(""), "");
-        assert_eq!(truncate_preview("héllo ─ 😀"), "héllo ─ 😀");
-        assert_eq!(truncate_preview(&ascii(500)), ascii(500));
-
-        // A multi-byte character ending exactly on the budget is kept whole
-        // and, being exactly 500 bytes, is not truncated at all.
-        let exact = format!("{}\u{2500}", ascii(497));
-        assert_eq!(exact.len(), 500);
-        assert_eq!(truncate_preview(&exact), exact);
-
-        // Over budget, pure ASCII: the first 500 bytes.
-        assert_eq!(truncate_preview(&ascii(600)), format!("{}\u{2026}", ascii(500)));
-
-        // Over budget with a character straddling the cut: retreat to the
-        // boundary before it. Two-, three- and four-byte characters each
-        // retreat by a different amount, so all three are covered.
-        for (prefix, ch) in [(499, '\u{00E9}'), (499, '\u{2500}'), (497, '\u{1F600}')] {
-            let content = format!("{}{ch}tail", ascii(prefix));
-            assert_eq!(
-                truncate_preview(&content),
-                format!("{}\u{2026}", ascii(prefix)),
-                "a {}-byte character at offset {prefix} must not be split",
-                ch.len_utf8(),
-            );
-        }
-
-        // The other interior boundary of a three-byte character.
-        let content = format!("{}\u{2500}tail", ascii(498));
-        assert_eq!(truncate_preview(&content), format!("{}\u{2026}", ascii(498)));
-
-        // A character that *ends* on the budget is retained in full.
-        for (prefix, ch) in [(497, '\u{2500}'), (496, '\u{1F600}')] {
-            let content = format!("{}{ch}tail", ascii(prefix));
-            assert_eq!(
-                truncate_preview(&content),
-                format!("{}{ch}\u{2026}", ascii(prefix)),
-                "a character ending exactly on the budget must be kept",
-            );
-        }
-    }
-
-    /// Invariants that must hold for *any* input, including the ones the
-    /// matrix above does not enumerate.
-    #[test]
-    fn every_preview_is_a_valid_prefix_within_budget() {
-        let ascii = "a".repeat(600);
-        for tail in ["", "\u{00E9}", "\u{2500}", "\u{1F600}", "日本語"] {
-            for cut in 490..=505 {
-                let content = format!("{}{tail}{tail}", &ascii[..cut]);
-                let preview = truncate_preview(&content);
-
-                let body = preview.strip_suffix('\u{2026}').unwrap_or(&preview);
-                assert!(
-                    body.len() <= PREVIEW_BUDGET_BYTES,
-                    "budget exceeded: {} bytes",
-                    body.len(),
-                );
-                assert!(content.starts_with(body), "the preview must be a prefix of the input");
-                // Exactly one ellipsis, and only when something was dropped.
-                // Asserted on length rather than on the rendered suffix: a
-                // tool result that legitimately *ends* in an ellipsis and fits
-                // the budget is returned verbatim, so `ends_with` is not a
-                // property of the function.
-                if content.len() > PREVIEW_BUDGET_BYTES {
-                    assert!(preview.ends_with('\u{2026}'), "truncated output must be marked");
-                    assert!(body.len() < content.len(), "something must have been dropped");
-                } else {
-                    assert_eq!(preview, content, "an in-budget preview is returned verbatim");
-                }
-            }
-        }
     }
 
     // ── Mock ForkedAgent ─────────────────────────────────────────────────────
@@ -656,76 +437,21 @@ mod tests {
         assert!(!policy.should_compact(&history));
     }
 
-    // ── Tail-preservation ────────────────────────────────────────────────────
-
-    /// Most recent exchange must survive: tail_start must point to or before
-    /// the last user message.
-    #[test]
-    fn tail_preservation_includes_last_exchange() {
-        let history = vec![
-            user_msg("question 1"),
-            assistant_msg("answer 1"),
-            user_msg("question 2"),
-            assistant_msg("answer 2"),
-        ];
-        let tail = compaction_tail_start(&history);
-        // The tail must include the last user message (index 2).
-        assert!(tail <= 2, "tail_start={tail} should be <= 2");
-        // No messages after tail_start should be cut.
-        assert_eq!(&history[tail..], &history[tail..]);
-    }
-
-    /// Critical: a tool_use block must always have its matching tool_result.
-    /// If the last exchange contains a tool_use, the tail must include the
-    /// preceding user message that started the exchange.
-    #[test]
-    fn tail_includes_tool_use_and_its_result() {
-        let history = vec![
-            user_msg("do something"),
-            tool_use_msg("c1", "read_file"),
-            tool_result_msg("c1", "file contents"),
-            assistant_msg("done"),
-        ];
-        let tail = compaction_tail_start(&history);
-        // The tail slice must contain both the tool_use and the tool_result.
-        let tail_slice = &history[tail..];
-        let has_use = tail_slice.iter().any(|m| {
-            m.content.iter().any(|b| matches!(b, Content::ToolUse { id, .. } if id == "c1"))
-        });
-        let has_result = tail_slice.iter().any(|m| {
-            m.content.iter().any(|b| matches!(b, Content::ToolResult { tool_use_id, .. } if tool_use_id == "c1"))
-        });
-        assert!(has_use, "tail must include the tool_use block");
-        assert!(has_result, "tail must include the matching tool_result");
-    }
-
-    /// An incomplete exchange (tool_use with no result) is entirely preserved.
-    #[test]
-    fn incomplete_exchange_is_fully_preserved() {
-        let history = vec![
-            user_msg("initial message"),
-            tool_use_msg("c1", "read_file"),
-            // no tool_result — dangling tool use
-        ];
-        // The tail must encompass the whole history (no valid cut point).
-        let tail = compaction_tail_start(&history);
-        assert_eq!(tail, 0, "incomplete exchange forces full preservation");
-    }
-
     // ── CompactionService ─────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn compaction_replaces_history_with_summary_ack() {
         let fork = MockFork::new(vec!["Summary text here."]);
         let svc = CompactionService::new(fork);
-        // Long enough to have something before the tail; a lone exchange is
-        // all tail and so has nothing to summarise.
-        let history = vec![
+        // Something must lie before the protected tail (the last two
+        // exchanges); a short history is all tail and has nothing to summarise.
+        let mut history = bulky_early_exchange();
+        history.extend([
             user_msg("what is 2+2?"),
             assistant_msg("4"),
             user_msg("and 3+3?"),
             assistant_msg("6"),
-        ];
+        ]);
         let cancel = CancellationToken::new();
         let (compacted, summary) = svc.compact(&history, None, cancel).await;
         assert!(compacted[0].role == Role::User);
@@ -752,11 +478,12 @@ mod tests {
     async fn compaction_keeps_the_newest_user_message_verbatim() {
         let fork = MockFork::new(vec!["Summary text here."]);
         let svc = CompactionService::new(fork);
-        let history = vec![
+        let mut history = bulky_early_exchange();
+        history.extend([
             user_msg("old question"),
             assistant_msg("old answer"),
             user_msg("the question I just asked"),
-        ];
+        ]);
         let (compacted, summary) = svc.compact(&history, None, CancellationToken::new()).await;
 
         assert!(summary.is_some(), "there was earlier history to summarise");
@@ -775,14 +502,18 @@ mod tests {
     async fn compaction_never_orphans_a_tool_call_from_its_result() {
         let fork = MockFork::new(vec!["Summary text here."]);
         let svc = CompactionService::new(fork);
-        let history = vec![
+        let mut history = bulky_early_exchange();
+        history.extend([
             user_msg("first"),
+            tool_use_msg("call-0", "read"),
+            tool_result_msg("call-0", "early"),
             assistant_msg("first answer"),
             user_msg("run the tool"),
             tool_use_msg("call-1", "grep"),
             tool_result_msg("call-1", "match"),
-        ];
-        let (compacted, _) = svc.compact(&history, None, CancellationToken::new()).await;
+        ]);
+        let (compacted, summary) = svc.compact(&history, None, CancellationToken::new()).await;
+        assert!(summary.is_some(), "the bulky head must have been summarised");
 
         let uses: Vec<&str> = compacted
             .iter()

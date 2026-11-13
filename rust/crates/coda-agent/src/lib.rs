@@ -36,9 +36,10 @@
 //! - **`hooks`**: `HookRunner`, `UserHook`, `HookScope`, `HookEventPolicy`,
 //!   `HookMatcher`, `HookContentHash`, `HookTrustStore`, `HookTrustGuard`,
 //!   and the decision result types.
-//! - **`compaction`**: `CompactionService`, `CompactionPrompts`,
-//!   `TokenEstimator`, `CompactionPolicy`, `CompactionTrigger`,
-//!   `compaction_tail_start`.
+//! - **`compaction`**: `CompactionService`, `TokenEstimator`,
+//!   `CompactionPolicy`, `CompactionTrigger`, `compaction_tail_start`;
+//!   `compaction::tail` (exchange-based protected tail) and
+//!   `compaction::render` (summariser input and checkpoint message).
 //! - **`output_styles`**: `OutputStyle`, `BuiltInOutputStyles`.
 
 pub mod agent;

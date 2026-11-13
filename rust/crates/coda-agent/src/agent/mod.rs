@@ -3460,9 +3460,11 @@ mod tests {
             .build();
 
         // Build a history that's large enough to exceed the tiny threshold,
-        // and long enough to have something ahead of the preserved tail: a
-        // lone exchange is all tail, so there would be nothing to summarise.
+        // and long enough to have something ahead of the protected tail (the
+        // last two exchanges): a bulky early exchange that cannot join it.
         let mut history = vec![
+            Message::user(format!("early context {}", "e".repeat(80_000))),
+            Message::assistant("noted"),
             Message::user("prompt"),
             Message::assistant("previous response that is long enough to trigger compaction"),
             Message::user("a second prompt"),
@@ -3503,23 +3505,29 @@ mod tests {
             .build();
 
         let mut history = vec![
-            Message::user("prompt"),
+            // Bulky enough that this exchange cannot join the protected tail,
+            // so the BUG 8 tool result below lands in the summarised head.
+            Message::user(format!("prompt {}", "e".repeat(80_000))),
             // The BUG 8 shape: a tool result whose multi-byte character
-            // straddles the preview's 500-byte cut. This is the end-to-end
-            // case — proactive compaction renders this history for the
-            // summariser, and a byte slice here panicked before any provider
-            // request was made, taking the whole turn down with it.
+            // straddles the summariser preview's 4,096-byte cut. This is the
+            // end-to-end case — proactive compaction renders this history for
+            // the summariser, and a byte slice here panicked before any
+            // provider request was made, taking the whole turn down with it.
             Message::new(
                 coda_llm::Role::User,
                 vec![coda_llm::Content::ToolResult {
                     tool_use_id: "call-1".into(),
-                    content: format!("{}\u{2500}tail", "a".repeat(499)),
+                    content: format!("{}\u{2500}tail", "a".repeat(4_095)),
                     is_error: false,
                     correlation: Default::default(),
                     status: None,
                 }],
             ),
             Message::assistant("previous response that is long enough to trigger compaction"),
+            Message::user("a second prompt"),
+            Message::assistant("a second response"),
+            Message::user("a third prompt"),
+            Message::assistant("a third response"),
         ];
 
         // No goal — this is the ordinary interactive path.
