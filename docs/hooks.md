@@ -526,7 +526,7 @@ the summarisation step.
 | Field | Type | Description |
 |-------|------|-------------|
 | `decision` | `"allow"\|"block"` | `block` cancels the compaction for this turn. |
-| `instructions` | `string` | Custom instructions passed to the summarisation model. Last-writer-wins. |
+| `instructions` | `string` | Custom instructions passed to the summarisation model. Last-writer-wins. They **replace** the built-in structured checkpoint prompt (Next Move, Pending Decisions & Open Questions, …) entirely rather than adding to it. |
 
 ---
 
@@ -549,11 +549,15 @@ compacted history.
 }
 ```
 
+`summary` may be an empty string for a **tail-only** compaction: when there is nothing older
+to summarise but the protected recent tool output is too large to fit, Coda shortens that
+output without calling the summariser.
+
 **Output fields** (`hookSpecificOutput`):
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `additionalContext` | `string` | Appended to the compacted history as a synthetic message. Concatenated across hooks. |
+| `additionalContext` | `string` | Appended to the compacted history as a synthetic user message prefixed with `[post-compact-context]` and a newline, so later compactions treat it as a runtime injection rather than something the operator said. Concatenated across hooks. The `PostCompactContextInjected` event carries the hook text without the prefix. |
 
 ---
 

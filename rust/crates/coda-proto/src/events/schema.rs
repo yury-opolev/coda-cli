@@ -47,5 +47,7 @@ pub(crate) fn documents() -> BTreeMap<&'static str, Value> {
         "SubagentResultModifiedEvent.json" => SubagentResultModifiedPayload,
         "CompactionCancelledEvent.json" => CompactionCancelledPayload,
         "PostCompactContextInjectedEvent.json" => PostCompactContextInjectedPayload,
+        "CompactionEvent.json" => CompactionInfo,
+        "ContextWindowEvent.json" => ContextWindowInfo,
     )
 }

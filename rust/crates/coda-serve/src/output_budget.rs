@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use coda_agent::{resolve_max_output_tokens, ModelBudget, OutputBudgetSource};
+use coda_agent::{resolve_max_output_tokens, ModelBudget, OutputBudgetSource, WindowSource};
 use serde_json::Value;
 
 use crate::catalog::ModelCatalog;
@@ -33,6 +33,8 @@ pub struct ResolvedBudget {
     pub budget: ModelBudget,
     pub source: OutputBudgetSource,
     pub model_output_limit: Option<u32>,
+    /// Where `budget.context_window` came from (`Fallback` when unknown).
+    pub context_source: WindowSource,
 }
 
 /// Reads the user's `maxOutputTokens` override for a model.
@@ -86,13 +88,20 @@ pub fn resolve(
     let user_override = max_output_tokens_from(settings, provider, model);
     let source = if user_override.is_some() { OutputBudgetSource::Setting } else { limit_source };
 
+    let (context_window, context_source) = match (live.context, catalog_context) {
+        (Some(n), _) => (Some(n as usize), WindowSource::Live),
+        (None, Some(n)) => (Some(n), WindowSource::Catalog),
+        (None, None) => (None, WindowSource::Fallback),
+    };
+
     ResolvedBudget {
         budget: ModelBudget {
             max_tokens: resolve_max_output_tokens(model_output_limit, user_override),
-            context_window: live.context.map(|n| n as usize).or(catalog_context),
+            context_window,
         },
         source,
         model_output_limit,
+        context_source,
     }
 }
 
@@ -144,6 +153,40 @@ mod tests {
         let r = resolve(&catalog(), &live, &json!({}), "github-copilot", "big");
         assert_eq!(r.budget, ModelBudget { max_tokens: 16_000, context_window: Some(168_000) });
         assert_eq!(r.source, OutputBudgetSource::Live);
+    }
+
+    #[test]
+    fn the_context_window_names_its_source() {
+        let mut live = LiveLimitMap::new();
+        live.insert(
+            live_key("github-copilot", "mystery-1m"),
+            LiveLimits { context: Some(1_000_000), output: Some(64_000) },
+        );
+        let r = resolve(&catalog(), &live, &json!({}), "github-copilot", "mystery-1m");
+        assert_eq!(r.budget.context_window, Some(1_000_000));
+        assert_eq!(r.context_source, WindowSource::Live);
+
+        let r = resolve(&catalog(), &live, &json!({}), "github-copilot", "big");
+        assert_eq!(r.budget.context_window, Some(200_000));
+        assert_eq!(r.context_source, WindowSource::Catalog);
+
+        let r = resolve(&catalog(), &live, &json!({}), "github-copilot", "mystery");
+        assert_eq!(r.budget.context_window, None);
+        assert_eq!(r.context_source, WindowSource::Fallback);
+    }
+
+    #[test]
+    fn a_dotted_copilot_alias_resolves_the_same_window() {
+        let mut live = LiveLimitMap::new();
+        live.insert(
+            live_key("github-copilot", "claude-opus-4.8"),
+            LiveLimits { context: Some(1_000_000), output: Some(64_000) },
+        );
+        let dashed = resolve(&catalog(), &live, &json!({}), "github-copilot", "claude-opus-4-8");
+        let dotted = resolve(&catalog(), &live, &json!({}), "github-copilot", "claude-opus-4.8");
+        assert_eq!(dashed, dotted);
+        assert_eq!(dashed.budget.context_window, Some(1_000_000));
+        assert_eq!(dashed.context_source, WindowSource::Live);
     }
 
     #[test]

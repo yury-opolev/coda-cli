@@ -1771,6 +1771,27 @@ impl UiState {
                     NoticeLevel::Warning,
                 );
             }
+            // `/compact` reports through its RPC result, so a manual event
+            // here would only duplicate it.
+            Event::Compaction(info) if info.trigger != "manual" => match info.outcome.as_str() {
+                "compacted" => self.notice(info.message, NoticeLevel::Info),
+                "failed" | "not_compacted" => self.notice(info.message, NoticeLevel::Warning),
+                _ => {}
+            },
+            Event::ContextWindow(info) if info.source == "fallback" => {
+                let window = crate::browsers::context_size(i64::try_from(info.context_window).ok());
+                let threshold =
+                    crate::browsers::context_size(i64::try_from(info.compaction_threshold).ok());
+                self.notice(
+                    format!(
+                        "Context window for {} is unknown; assuming {window} tokens (fallback). \
+                         Auto-compaction triggers at ~{threshold} tokens. \
+                         Set compactByModel in settings to override.",
+                        info.model
+                    ),
+                    NoticeLevel::Warning,
+                );
+            }
             Event::PostCompactContextInjected { .. } => {
                 // Informational: a hook added context after compaction. The
                 // content lands in the history rather than the transcript.
@@ -1794,6 +1815,9 @@ impl UiState {
             // A suspended task is not finished; it stays in `running_tasks`.
             | Event::TaskSuspended { .. }
             | Event::TaskResumed { .. }
+            // Manual compactions, cancellations and known context windows.
+            | Event::Compaction(_)
+            | Event::ContextWindow(_)
             | Event::Unknown { .. } => {}
             // When a display-mutating AgentResponse hook rewrites the assistant
             // response, replace the buffer with the hook's display content so
@@ -3653,6 +3677,98 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Every plain notice with its level.
+    fn leveled_notices(state: &UiState) -> Vec<(String, NoticeLevel)> {
+        state
+            .transcript
+            .blocks()
+            .iter()
+            .filter_map(|b| match b {
+                Block::Notice { text, level } => Some((text.clone(), *level)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn compaction(trigger: &str, outcome: &str, message: &str) -> Event {
+        Event::Compaction(coda_proto::events::CompactionInfo {
+            trigger: trigger.into(),
+            outcome: outcome.into(),
+            message: message.into(),
+            ..Default::default()
+        })
+    }
+
+    fn context_window(source: &str) -> Event {
+        Event::ContextWindow(coda_proto::events::ContextWindowInfo {
+            provider_id: None,
+            model: "mystery-model".into(),
+            context_window: 200_000,
+            source: source.into(),
+            compaction_threshold: 160_000,
+        })
+    }
+
+    #[test]
+    fn an_automatic_compaction_is_reported_as_info() {
+        let mut state = state();
+        state.apply(UiEvent::Engine(compaction(
+            "auto",
+            "compacted",
+            "Compacted the conversation.",
+        )));
+        assert_eq!(
+            leveled_notices(&state),
+            vec![("Compacted the conversation.".to_string(), NoticeLevel::Info)]
+        );
+    }
+
+    #[test]
+    fn a_failed_or_skipped_automatic_compaction_is_a_warning() {
+        let mut state = state();
+        state.apply(UiEvent::Engine(compaction("overflow", "failed", "Compaction failed.")));
+        state.apply(UiEvent::Engine(compaction("auto", "not_compacted", "Nothing to compact.")));
+        state.apply(UiEvent::Engine(compaction("auto", "cancelled", "Cancelled.")));
+        assert_eq!(
+            leveled_notices(&state),
+            vec![
+                ("Compaction failed.".to_string(), NoticeLevel::Warning),
+                ("Nothing to compact.".to_string(), NoticeLevel::Warning),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_manual_compaction_event_is_not_shown_twice() {
+        let mut state = state();
+        state.apply(UiEvent::Engine(compaction("manual", "compacted", "Compacted.")));
+        state.apply(UiEvent::Engine(compaction("manual", "failed", "Failed.")));
+        assert!(notice_texts(&state).is_empty());
+    }
+
+    #[test]
+    fn a_fallback_context_window_warns() {
+        let mut state = state();
+        state.apply(UiEvent::Engine(context_window("fallback")));
+        let notices = leveled_notices(&state);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        let (text, level) = &notices[0];
+        assert_eq!(*level, NoticeLevel::Warning);
+        assert!(text.contains("mystery-model"), "{text}");
+        assert!(text.contains("fallback"), "{text}");
+        assert!(text.contains("200K"), "{text}");
+        assert!(text.contains("160K"), "{text}");
+    }
+
+    #[test]
+    fn a_known_context_window_is_silent() {
+        let mut state = state();
+        for source in ["live", "catalog", "setting"] {
+            state.apply(UiEvent::Engine(context_window(source)));
+        }
+        assert!(notice_texts(&state).is_empty());
     }
 
     #[test]

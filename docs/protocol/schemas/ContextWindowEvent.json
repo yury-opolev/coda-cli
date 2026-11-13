@@ -1,0 +1,48 @@
+{
+  "type": "object",
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "engineInstanceId": {
+      "type": "string"
+    },
+    "providerId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "model": {
+      "type": "string"
+    },
+    "contextWindow": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0,
+      "description": "The effective window used for inference, compaction and display."
+    },
+    "source": {
+      "type": "string",
+      "description": "`\"live\"`, `\"catalog\"`, `\"setting\"` or `\"fallback\"`."
+    },
+    "compactionThreshold": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0,
+      "description": "Auto-compaction threshold resolved against this window."
+    }
+  },
+  "required": [
+    "seq",
+    "engineInstanceId",
+    "model",
+    "contextWindow",
+    "source",
+    "compactionThreshold"
+  ],
+  "description": "`event/contextWindow` payload: the effective context window for the\nsession's model. Content-free.",
+  "title": "ContextWindowEvent",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

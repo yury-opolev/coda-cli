@@ -13,11 +13,13 @@
 //! | `ToolQueued` | — | No proto event; silently dropped by the adapter. |
 //! | `ToolStatus` | — | No dedicated proto event; status rides on `ToolResult`. |
 //! | `Warning` | — | No proto event; silently dropped. |
+//! | `Compaction` | `Compaction(CompactionInfo)` | `structured` stays in diagnostics; `message` is the report's fixed sentence. |
+//! | `ContextWindow` | `ContextWindow(ContextWindowInfo)` | None. |
 //! | `Usage` | `Usage(UsagePair)` | None: uncached input, cache reads, cache writes per TTL and output all travel; see [`usage_pair`]. |
 //! | `ThinkingComplete` | `ThinkingComplete{elapsed_ms, thinking_tokens}` | `thinking_tokens` always `None`; Rust stream carries no per-burst token count. |
 use coda_llm::Usage;
 use coda_llm::Correlation as LlmCorrelation;
-use coda_proto::events::{Event as ProtoEvent};
+use coda_proto::events::{CompactionInfo, Event as ProtoEvent};
 use coda_proto::messages::Correlation as ProtoCorrelation;
 use coda_proto::state::UsagePair;
 
@@ -152,6 +154,12 @@ pub enum AgentEvent {
     PostCompactContextInjected { context: String },
     /// No proto event; silently dropped by the adapter.
     Warning { message: String },
+    /// One compaction attempt finished. Maps to `event/compaction`; the
+    /// display `message` is the report's fixed success/failure sentence.
+    Compaction { report: crate::compaction::CompactionReport },
+    /// The effective context window was resolved or changed. Maps to
+    /// `event/contextWindow` unchanged.
+    ContextWindow { info: coda_proto::events::ContextWindowInfo },
     /// Fired once per outer stream attempt, immediately before `client.stream()`
     /// is awaited (§ activity phase machine: this is the observable boundary
     /// between `preparing` and `waitingForModel`). No proto event — observed
@@ -348,10 +356,50 @@ pub fn to_proto_event(event: &AgentEvent) -> Option<ProtoEvent> {
             })
         }
         AgentEvent::Warning { .. } => None,
+        AgentEvent::Compaction { report } => Some(ProtoEvent::Compaction(compaction_info(report))),
+        AgentEvent::ContextWindow { info } => Some(ProtoEvent::ContextWindow(info.clone())),
         AgentEvent::ModelRequestStarted { .. } => None,
         AgentEvent::ModelRequestEnded { .. } => None,
         AgentEvent::ToolBatchStarted { .. } => None,
         AgentEvent::ToolBatchEnded { .. } => None,
+    }
+}
+
+/// The wire form of a [`crate::compaction::CompactionReport`]. `structured`
+/// stays diagnostics-only.
+fn compaction_info(report: &crate::compaction::CompactionReport) -> CompactionInfo {
+    let message = if report.outcome == "compacted" {
+        report.success_sentence()
+    } else {
+        report.failure_sentence()
+    };
+    CompactionInfo {
+        trigger: report.trigger.to_owned(),
+        outcome: report.outcome.to_owned(),
+        reason: report.reason.map(str::to_owned),
+        message,
+        window_source: report.window_source.to_owned(),
+        context_window: report.context_window,
+        threshold: report.threshold,
+        estimated_tokens: report.estimated_tokens,
+        measured_tokens: report.measured_tokens,
+        messages_before: report.messages_before,
+        messages_after: report.messages_after,
+        tokens_before: report.tokens_before,
+        tokens_after: report.tokens_after,
+        tail_messages: report.tail_messages,
+        tail_tokens: report.tail_tokens,
+        summary_allowance: report.summary_allowance,
+        retry_allowance: report.retry_allowance,
+        output_tokens: report.output_tokens,
+        stop_reason: report.stop_reason.map(str::to_owned),
+        attempts: report.attempts,
+        duration_ms: report.duration_ms,
+        abbreviated_tool_outputs: report.abbreviated_tool_outputs,
+        omitted_tool_outputs: report.omitted_tool_outputs,
+        omitted_messages: report.omitted_messages,
+        previewed_tail_results: report.previewed_tail_results,
+        checkpoint: report.checkpoint.clone(),
     }
 }
 
@@ -441,6 +489,63 @@ mod tests {
             correlation: LlmCorrelation::default(),
         });
         assert!(events.lock().unwrap().is_empty(), "ToolQueued should produce no proto event");
+    }
+
+    #[test]
+    fn compaction_maps_to_the_wire_with_the_reports_sentence() {
+        use crate::compaction::CompactionReport;
+        let compacted = CompactionReport {
+            trigger: "auto",
+            outcome: "compacted",
+            window_source: "live",
+            context_window: 1_000_000,
+            messages_before: 312,
+            messages_after: 14,
+            tokens_before: 181_234,
+            tokens_after: 23_100,
+            checkpoint: Some("20261113T120000000Z.json".into()),
+            ..CompactionReport::default()
+        };
+        let failed = CompactionReport {
+            trigger: "manual",
+            outcome: "failed",
+            reason: Some("summary_truncated"),
+            stop_reason: Some("max_tokens"),
+            attempts: 2,
+            ..CompactionReport::default()
+        };
+        for report in [compacted, failed] {
+            let proto = to_proto_event(&AgentEvent::Compaction { report: report.clone() })
+                .expect("compaction reaches the wire");
+            let (method, params) = proto.to_notification().unwrap();
+            assert_eq!(method, "event/compaction");
+            let expected = if report.outcome == "compacted" {
+                report.success_sentence()
+            } else {
+                report.failure_sentence()
+            };
+            assert_eq!(params["message"], expected.as_str());
+            assert_eq!(params["trigger"], report.trigger);
+            assert_eq!(params["outcome"], report.outcome);
+            assert_eq!(params["windowSource"], report.window_source);
+            assert_eq!(params["messagesBefore"], report.messages_before);
+            assert_eq!(params.get("reason").and_then(|v| v.as_str()), report.reason);
+            assert_eq!(params.get("stopReason").and_then(|v| v.as_str()), report.stop_reason);
+            assert_eq!(params.get("checkpoint").and_then(|v| v.as_str()), report.checkpoint.as_deref());
+        }
+    }
+
+    #[test]
+    fn context_window_maps_to_the_wire_unchanged() {
+        let info = coda_proto::events::ContextWindowInfo {
+            provider_id: None,
+            model: "m".into(),
+            context_window: 200_000,
+            source: "fallback".into(),
+            compaction_threshold: 160_000,
+        };
+        let proto = to_proto_event(&AgentEvent::ContextWindow { info: info.clone() });
+        assert!(matches!(proto, Some(ProtoEvent::ContextWindow(ref got)) if *got == info));
     }
 
     #[test]

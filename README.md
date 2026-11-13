@@ -1206,18 +1206,65 @@ control mechanism.
 
 ### Auto-compaction
 
-When the conversation grows past a threshold, a forked summariser replaces the older
-history with a summary and the session continues. The most recent exchange is carried
-through verbatim rather than summarised, so the message you just sent still reaches the
-model, and no tool call is ever separated from its result. The threshold defaults to **80% of
-the active model's context window**, so it scales with the model rather than being a
-fixed number that suits only one of them.
+When the conversation grows past a threshold, a dedicated summariser replaces the older
+history with a structured **checkpoint**, the most recent exchanges are kept verbatim, and
+the session continues the same task. The threshold defaults to **80% of the active model's
+context window**, so it scales with the model rather than being a fixed number that suits
+only one of them.
 
-Why 80% and not higher: the trigger is compared against an estimate of the *message
-history* only — it cannot see the system prompt, the tool definitions, or the MCP tool
-schemas, all of which are charged on every request and can run to tens of thousands of
-tokens. The estimate is therefore a lower bound on the real prompt, and the remaining
-20% is the margin that covers what it cannot measure.
+**What triggers it.** The trigger compares a projection of the **whole next request** —
+messages, system prompt and tool/MCP schemas — with the threshold. The projection is
+anchored on the token usage the provider measured for the last response, plus an estimate
+of whatever was appended since; a change of model, system prompt or tools (or a rewritten
+history) drops the anchor and re-estimates everything, so new overhead is never missed and
+nothing is counted twice. The window comes from the provider's live model list (fetched
+through `session/models`, which the TUI requests at startup and after every model switch),
+then the bundled catalogue; when neither knows the model, the engine assumes **200,000
+tokens** and says so with a visible warning (the status bar then shows no limit rather than
+a guess). A prompt never makes its own model-list request. Inference, compaction and
+the status bar all use this same window.
+
+**What is kept verbatim.** The last two exchanges (an exchange starts at a message you
+sent; runtime notices such as task completions do not start one) are always kept, so a
+short reply like "yes, proceed" keeps the question
+it answers. Older exchanges are added back whole while the kept tail stays within about
+16,000 tokens. A tool call is never separated from its result. Only if the next request
+would still not fit, oversized **tool results** inside the kept tail are shortened to their
+first 6 KiB and last 2 KiB with an explicit `[coda: N bytes of this tool output were omitted
+during compaction…]` marker pointing to the pre-compaction checkpoint file that keeps the
+complete output; your messages and the assistant's text are never shortened.
+
+**The summary.** The summariser gets an output allowance of 8,192 tokens; if it stops at
+that limit it is retried at most once with up to 32,768, both bounded by the model's output
+limit and the room left in the window. Only a summary that completed normally is installed;
+a truncated, empty, refused or failed summary leaves the history unchanged and shows a
+warning naming the reason. The checkpoint is asked for in fixed sections — *Next Move*,
+*Pending Decisions & Open Questions*, *Objective*, *Requirements & Constraints*,
+*Decisions*, *Work State*, *Relevant Files & Identifiers*, *Important Context* — preserving
+exact paths and identifiers. A later compaction reconciles the previous checkpoint with the
+newer history into **one** checkpoint rather than stacking summaries. An approval recorded in
+a checkpoint never authorises a new or broader action.
+
+**Pre-compaction checkpoint files.** Before history is replaced, the full pre-compaction
+history is saved to `.coda/sessions/<session-id>.compactions/<UTC timestamp>.json`
+(owner-only, written atomically; the newest 5 per session are kept). It uses the session
+transcript's own message format, so it holds nothing the transcript does not and has the
+same privacy as the transcript. Coda does not read it back automatically; it is kept for
+recovery. If it cannot be written, the compaction fails and the history stays unchanged.
+
+**Diagnostics.** Every attempt, whatever its outcome, emits an `event/compaction`
+notification and writes a `compaction` record to the diagnostics log; the resolved window
+is announced as `event/contextWindow` (see
+[serve-protocol](docs/serve-protocol.md#compaction-diagnostics-rust)). They carry only
+numbers and closed labels — trigger, outcome, reason, window source and size, threshold,
+estimated/measured tokens, messages and tokens before/after, tail size, summary allowances,
+output tokens, normalised stop reason, attempts, duration, how much input was abbreviated
+or omitted, and the checkpoint file name (on the wire) or whether it was saved (in the
+log) — never conversation content.
+
+**Failure suppression.** A failed or ineffective automatic compaction is not retried on
+every step: further automatic attempts wait until occupancy has grown by another full
+threshold.
 
 Configurable in `~/.coda/settings.json`:
 
@@ -1243,7 +1290,9 @@ reply (the [output budget](#output-budget) the turn requests). The cap matters o
 windows small enough that the percentage would not — an 8k window at 80% leaves 1.6k,
 which is not a reply, so with a 4,096-token budget the threshold drops to 3,904.
 
-`/compact` compacts on demand at any time, regardless of these settings.
+`/compact` compacts on demand at any time, regardless of these settings, with the same
+protected tail, summary rules and checkpoint file; when it cannot compact it reports the
+same failure reasons and leaves the history unchanged.
 
 ### Output budget
 

@@ -28,7 +28,7 @@ mod glyph {
 }
 
 /// Formats a context window as a compact token count, e.g. `200K`.
-fn context_size(limit: Option<i64>) -> String {
+pub(crate) fn context_size(limit: Option<i64>) -> String {
     match limit {
         Some(limit) if limit >= 1_000_000 => format!("{}M", limit / 1_000_000),
         Some(limit) if limit >= 1_000 => format!("{}K", limit / 1_000),

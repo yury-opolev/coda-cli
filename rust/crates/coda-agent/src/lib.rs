@@ -21,7 +21,8 @@
 //! - **`steering`**: `SteeringInbox`, `SteeringEntry`.
 //! - **`events`**: `AgentEvent`, `AgentSink`, `ProtoAdapter`, `NullSink`,
 //!   `CollectingSink`, `ToolCallStatus`.
-//! - **`agent`**: `AgentLoop`, `AgentLoopBuilder`, `AgentError`.
+//! - **`agent`**: `AgentLoop`, `AgentLoopBuilder`, `AgentError`, and the
+//!   compaction trigger's `OccupancyTracker` / `Projection`.
 //!
 //! ## Phase 3 — Built-in tools
 //!
@@ -36,9 +37,12 @@
 //! - **`hooks`**: `HookRunner`, `UserHook`, `HookScope`, `HookEventPolicy`,
 //!   `HookMatcher`, `HookContentHash`, `HookTrustStore`, `HookTrustGuard`,
 //!   and the decision result types.
-//! - **`compaction`**: `CompactionService`, `CompactionPrompts`,
-//!   `TokenEstimator`, `CompactionPolicy`, `CompactionTrigger`,
-//!   `compaction_tail_start`.
+//! - **`compaction`**: `CompactionService`, `CompactionRequest`,
+//!   `CompactionOutcome`, `CompactionReport`, `Summarizer`, `CheckpointSink`,
+//!   `CompactionLimits`, `TokenEstimator`, `CompactionPolicy`,
+//!   `CompactionTrigger`, `compaction_tail_start`;
+//!   `compaction::tail` (exchange-based protected tail) and
+//!   `compaction::render` (summariser input and checkpoint message).
 //! - **`output_styles`**: `OutputStyle`, `BuiltInOutputStyles`.
 
 pub mod agent;
@@ -61,12 +65,18 @@ pub mod tools;
 
 // Convenience re-exports — the most frequently used public surface.
 pub use agent::{AgentError, AgentLoop, AgentLoopBuilder, DEFAULT_MAX_TOKENS};
+pub use agent::occupancy::{
+    OccupancyTracker, Projection, request_fingerprint, request_overhead_tokens,
+};
 pub use agent::output_budget::{
     clamp_to_context_window, resolve_max_output_tokens, ModelBudget, OutputBudgetSource,
     FALLBACK_MAX_OUTPUT_TOKENS, MIN_MAX_OUTPUT_TOKENS,
 };
 pub use compaction::{
-    CompactionPolicy, CompactionService, CompactionTrigger, TokenEstimator, compaction_tail_start,
+    CheckpointMeta, CheckpointRef, CheckpointSink, CompactionLimits, CompactionOutcome,
+    CompactionPolicy, CompactionReport, CompactionRequest, CompactionService, CompactionTrigger,
+    CompactionTriggerKind, SummarizerError, Summarizer, SummaryRequest, SummaryResponse,
+    TokenEstimator, WindowSource, compaction_tail_start,
 };
 pub use events::{AgentEvent, AgentSink, CollectingSink, NullSink, ToolCallStatus};
 pub use autonomy::{
