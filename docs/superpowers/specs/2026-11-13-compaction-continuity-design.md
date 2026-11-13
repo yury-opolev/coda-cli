@@ -32,9 +32,9 @@ The owner is away; these were decided without consultation and are recorded here
 | D8 | Checkpoint store | One owner-only, atomically written JSON file per compaction under `.coda/sessions/<session-id>.compactions/`, newest 5 kept. Same message serialisation as the transcript, so it inherits the transcript's privacy policy exactly. |
 | D9 | Oversized protected payloads | Only *tool results* inside the tail may be shortened, and only when the reconstructed request would not fit: head 6 KiB + tail 2 KiB with an explicit marker naming the omission and the checkpoint. User and assistant text is never shortened. |
 | D10 | Failure suppression | A failed or ineffective automatic compaction suppresses further automatic attempts until occupancy has grown by another full threshold (the existing `blocked_compaction_at` rule, now also applied to failures). No loop can re-summarise on every iteration. |
-| D11 | Display for an unknown window | `contextLimit` stays `null` (honest), and a visible warning states the 200,000-token assumption, its source (`fallback`) and the resulting trigger. Emitted once per provider/model per engine process. |
+| D11 | Display for an unknown window | `contextLimit` stays `null` (honest), and a visible warning states the 200,000-token assumption, its source (`fallback`) and the resulting trigger. `AgentEvent::Warning` never reaches clients (the adapter drops it), so this travels as a new additive `event/contextWindow` notification (window, source, threshold), emitted at turn start whenever the resolved (model, window, source) differs from the last one announced; the TUI shows a warning notice only when `source = "fallback"`. |
 | D12 | Live limits not yet fetched | Before a turn whose model has neither a live nor a catalogue window, the host asks the client's (cached) model list once per provider/model per process, with a 5 s bound, so a live 1M window is found even if no client called `session/models`. |
-| D13 | Wire format | One additive notification, `event/compaction`, content-free. `session/compact`'s response shape is unchanged. |
+| D13 | Wire format | Two additive, content-free notifications: `event/compaction` and `event/contextWindow`. `session/compact`'s response shape is unchanged. |
 
 ## Approaches considered
 
