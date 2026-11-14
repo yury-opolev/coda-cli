@@ -417,6 +417,16 @@ impl Browser {
     }
 
     pub fn handle(&mut self, key: crossterm::event::KeyEvent) -> Intent {
+        self.handle_with_detail_limit(key, None)
+    }
+
+    /// Uses a renderer-provided last scroll offset for wrapped detail rows.
+    /// Without one, navigation retains its source-line semantics.
+    pub(crate) fn handle_with_detail_limit(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+        detail_limit: Option<usize>,
+    ) -> Intent {
         use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 
         if key.kind == KeyEventKind::Release {
@@ -449,6 +459,14 @@ impl Browser {
             return Intent::Ignored;
         }
 
+        if self.view == View::Detail {
+            if let Some(last) = detail_limit {
+                self.detail_scroll = self.detail_scroll.min(last);
+            }
+        }
+        let detail_last =
+            detail_limit.unwrap_or_else(|| self.detail_lines().len().saturating_sub(1));
+
         match (self.view, key.code) {
             // Closing and going back.
             (View::Detail, KeyCode::Esc | KeyCode::Char('q'))
@@ -470,7 +488,7 @@ impl Browser {
             }
             (_, KeyCode::Down | KeyCode::Char('j')) => {
                 if self.view == View::Detail {
-                    self.scroll_detail(1);
+                    self.scroll_detail(1, detail_last);
                 } else {
                     self.move_by(1);
                 }
@@ -486,7 +504,7 @@ impl Browser {
             }
             (_, KeyCode::PageDown) => {
                 if self.view == View::Detail {
-                    self.scroll_detail(PAGE_ROWS);
+                    self.scroll_detail(PAGE_ROWS, detail_last);
                 } else {
                     self.move_by(PAGE_ROWS as isize);
                 }
@@ -507,7 +525,7 @@ impl Browser {
                 Intent::Redraw
             }
             (View::Detail, KeyCode::End) => {
-                self.detail_scroll = self.detail_lines().len().saturating_sub(1);
+                self.detail_scroll = detail_last;
                 Intent::Redraw
             }
 
@@ -546,9 +564,8 @@ impl Browser {
         }
     }
 
-    fn scroll_detail(&mut self, by: usize) {
-        let last = self.detail_lines().len().saturating_sub(1);
-        self.detail_scroll = (self.detail_scroll + by).min(last);
+    fn scroll_detail(&mut self, by: usize, last: usize) {
+        self.detail_scroll = self.detail_scroll.saturating_add(by).min(last);
     }
 
     fn handle_filter(&mut self, code: crossterm::event::KeyCode) -> Intent {
