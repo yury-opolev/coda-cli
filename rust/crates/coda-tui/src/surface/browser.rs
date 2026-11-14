@@ -19,6 +19,7 @@ use coda_render::theme::{Role, Theme};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
+use std::cell::Cell;
 
 /// Which browser is open, so the host knows what an action refers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +152,8 @@ pub struct BrowserSurface {
     browser: Browser,
     kind: BrowserKind,
     actions: RowActions,
+    /// The last task-detail viewport's wrapped-row limit, not its natural size.
+    task_detail_limit: Cell<Option<usize>>,
 }
 
 impl BrowserSurface {
@@ -159,6 +162,7 @@ impl BrowserSurface {
             browser,
             kind,
             actions: RowActions::default(),
+            task_detail_limit: Cell::new(None),
         }
     }
 
@@ -184,6 +188,16 @@ impl BrowserSurface {
 
     pub fn browser_mut(&mut self) -> &mut Browser {
         &mut self.browser
+    }
+
+    fn wrapped_detail(&self, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+        let style = theme.style(Role::ComposerText);
+        self.browser
+            .detail_lines()
+            .iter()
+            .flat_map(|row| text::wrap_preformatted(&text::sanitize(row), width))
+            .map(|chunk| Line::from(Span::styled(chunk, style)))
+            .collect()
     }
 }
 
@@ -241,7 +255,12 @@ impl Surface for BrowserSurface {
                 };
             }
         }
-        let intent = self.browser.handle(key);
+        let intent = if self.kind == BrowserKind::Tasks {
+            self.browser
+                .handle_with_detail_limit(key, self.task_detail_limit.get())
+        } else {
+            self.browser.handle(key)
+        };
         match intent {
             Intent::Redraw => SurfaceOutcome::Handled,
             Intent::Ignored => SurfaceOutcome::Ignored,
@@ -261,7 +280,14 @@ impl Surface for BrowserSurface {
 
     fn desired_size(&self, max_width: u16, theme: &Theme) -> (u16, u16) {
         let probe = Rect::new(0, 0, max_width.max(1), u16::MAX / 2);
-        let natural = self.render(probe, theme).len() as u16;
+        let natural = if self.kind == BrowserKind::Tasks && self.browser.view() == View::Detail {
+            // Measure all sanitized, wrapped rows before applying the viewport.
+            self.wrapped_detail(probe.width as usize, theme)
+                .len()
+                .min(u16::MAX as usize) as u16
+        } else {
+            self.render(probe, theme).len() as u16
+        };
         // A short `/tasks` list gets a little room; a long one is exactly as
         // tall as its rows. The stack clamps either to the terminal.
         let height = if self.kind == BrowserKind::Tasks && self.browser.view() == View::List {
@@ -282,6 +308,13 @@ impl Surface for BrowserSurface {
         let mut lines: Vec<Line<'static>> = Vec::new();
 
         match self.browser.view() {
+            View::Detail if self.kind == BrowserKind::Tasks => {
+                let wrapped = self.wrapped_detail(width, theme);
+                let last = wrapped.len().saturating_sub(height);
+                self.task_detail_limit.set(Some(last));
+                let scroll = self.browser.detail_scroll().min(last);
+                lines.extend(wrapped.into_iter().skip(scroll).take(height));
+            }
             View::Detail => {
                 let style = theme.style(Role::ComposerText);
                 for row in self
@@ -374,6 +407,7 @@ impl Surface for BrowserSurface {
 mod tests {
     use super::*;
     use crate::overlay::{Column, Item};
+    use crate::surface::stack::SurfaceStack;
     use crossterm::event::{KeyCode, KeyModifiers};
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -436,6 +470,215 @@ mod tests {
         assert_eq!(s.desired_size(80, &Theme::default()), (80, 8));
         s.handle_key(key(KeyCode::Enter));
         assert!(s.desired_size(40, &Theme::default()).1 > 1);
+    }
+
+    fn task_surface(instructions: &str, output: &str) -> BrowserSurface {
+        let result = serde_json::from_value(serde_json::json!({
+            "sessionId": "s",
+            "tasks": [{
+                "id": "task-1", "kind": "subagent", "title": "Review",
+                "description": instructions, "status": "running", "mode": "background",
+                "outputTail": output,
+            }],
+        }))
+        .unwrap();
+        BrowserSurface::new(
+            BrowserKind::Tasks,
+            crate::browsers::tasks(&result, crate::browsers::TaskView::Active),
+        )
+    }
+
+    fn task_detail_stack(instructions: &str, output: &str) -> SurfaceStack {
+        let mut stack = SurfaceStack::default();
+        stack.push(Box::new(task_surface(instructions, output)));
+        stack.handle_key(key(KeyCode::Enter));
+        stack
+    }
+
+    fn full_task_detail(stack: &SurfaceStack, width: u16) -> Vec<String> {
+        stack
+            .top()
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BrowserSurface>()
+            .unwrap()
+            .browser()
+            .detail_lines()
+            .iter()
+            .flat_map(|row| text::wrap_preformatted(&text::sanitize(row), width as usize))
+            .collect()
+    }
+
+    #[test]
+    fn task_detail_outer_bounds_stay_fixed_while_scrolling_with_or_without_output() {
+        let theme = Theme::default();
+        let instructions = format!("{}Review the implementation.\x1b[0m", "\x1b[31m".repeat(60));
+        for output in ["", "first output\nsecond output\nlast output"] {
+            for area in [Rect::new(0, 0, 100, 40), Rect::new(3, 2, 46, 14)] {
+                let mut stack = task_detail_stack(&instructions, output);
+                let initial = stack.render(area, &theme).remove(0);
+                if area.height == 40 {
+                    assert_eq!(
+                        initial.content.height as usize,
+                        full_task_detail(&stack, initial.content.width).len(),
+                    );
+                }
+                for code in [
+                    KeyCode::Down,
+                    KeyCode::Char('j'),
+                    KeyCode::PageDown,
+                    KeyCode::End,
+                    KeyCode::Down,
+                    KeyCode::PageDown,
+                    KeyCode::End,
+                    KeyCode::Up,
+                    KeyCode::Char('k'),
+                    KeyCode::PageUp,
+                    KeyCode::Home,
+                ] {
+                    stack.handle_key(key(code));
+                    let rendered = stack.render(area, &theme).remove(0);
+                    assert_eq!(
+                        rendered.region, initial.region,
+                        "{code:?}, output={output:?}"
+                    );
+                    assert_eq!(rendered.content, initial.content);
+                    assert!(!rendered.lines.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn task_detail_scrolls_every_wrapped_row_including_the_final_source_line_tail() {
+        let theme = Theme::default();
+        let long = format!("{}TAIL", "\x1b[31mwrapped instruction\x1b[0m ".repeat(80));
+        for (instructions, output) in [(long.as_str(), ""), ("Review", long.as_str())] {
+            let mut stack = task_detail_stack(instructions, output);
+            let area = Rect::new(0, 0, 42, 16);
+            let initial = stack.render(area, &theme).remove(0);
+            let full = full_task_detail(&stack, initial.content.width);
+            let height = initial.content.height as usize;
+            assert!(full.len() > height + crate::overlay::PAGE_ROWS);
+            let last = full.len() - height;
+            let mut offset = 0;
+            let keys = (0..last)
+                .map(|i| {
+                    if i % 2 == 0 {
+                        KeyCode::Down
+                    } else {
+                        KeyCode::Char('j')
+                    }
+                })
+                .chain([
+                    KeyCode::Down,
+                    KeyCode::PageDown,
+                    KeyCode::End,
+                    KeyCode::Up,
+                    KeyCode::Char('k'),
+                    KeyCode::PageUp,
+                    KeyCode::Home,
+                    KeyCode::PageDown,
+                    KeyCode::End,
+                    KeyCode::End,
+                    KeyCode::Home,
+                ]);
+            for code in keys {
+                offset = match code {
+                    KeyCode::Down | KeyCode::Char('j') => (offset + 1).min(last),
+                    KeyCode::PageDown => (offset + crate::overlay::PAGE_ROWS).min(last),
+                    KeyCode::End => last,
+                    KeyCode::Up | KeyCode::Char('k') => offset.saturating_sub(1),
+                    KeyCode::PageUp => offset.saturating_sub(crate::overlay::PAGE_ROWS),
+                    KeyCode::Home => 0,
+                    _ => unreachable!(),
+                };
+                stack.handle_key(key(code));
+                let rendered = stack.render(area, &theme).remove(0);
+                let visible: Vec<_> = rendered.lines.iter().map(ToString::to_string).collect();
+                assert_eq!(
+                    visible,
+                    full[offset..offset + height],
+                    "{code:?} at {offset}"
+                );
+                assert_eq!(rendered.region, initial.region);
+            }
+        }
+    }
+
+    #[test]
+    fn task_detail_remeasures_and_clamps_after_terminal_or_content_changes() {
+        let theme = Theme::default();
+        let instructions = "instructions ".repeat(100);
+        let mut stack = task_detail_stack(&instructions, "");
+        let mut offset = 0;
+        for area in [
+            Rect::new(0, 0, 38, 12),
+            Rect::new(0, 0, 72, 22),
+            Rect::new(0, 0, 100, 60),
+            Rect::new(0, 0, 26, 9),
+        ] {
+            let rendered = stack.render(area, &theme).remove(0);
+            let fresh = task_detail_stack(&instructions, "")
+                .render(area, &theme)
+                .remove(0);
+            assert_eq!(rendered.region, fresh.region);
+            assert!(rendered.region.right() <= area.right());
+            assert!(rendered.region.bottom() <= area.bottom());
+            let full = full_task_detail(&stack, rendered.content.width);
+            let height = rendered.content.height as usize;
+            let last = full.len().saturating_sub(height);
+            offset = offset.min(last).saturating_sub(1);
+            stack.handle_key(key(KeyCode::Up));
+            let up = stack.render(area, &theme).remove(0);
+            assert_eq!(
+                up.lines.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                full[offset..(offset + height).min(full.len())],
+            );
+            stack.handle_key(key(KeyCode::End));
+            let bottom = stack.render(area, &theme).remove(0);
+            assert_eq!(
+                bottom
+                    .lines
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                full[last..],
+            );
+            offset = last;
+        }
+
+        let area = Rect::new(0, 0, 80, 60);
+        let mut short = task_surface("short", "");
+        short.browser_mut().restore_navigation_from(
+            stack
+                .top()
+                .unwrap()
+                .as_any()
+                .downcast_ref::<BrowserSurface>()
+                .unwrap()
+                .browser(),
+        );
+        stack.replace_top(Box::new(short));
+        let shrunk = stack.render(area, &theme).remove(0);
+        let fresh = task_detail_stack("short", "")
+            .render(area, &theme)
+            .remove(0);
+        assert_eq!(shrunk.region, fresh.region);
+        assert_eq!(shrunk.lines, fresh.lines);
+        let mut populated = task_surface("short", &"output\n".repeat(30));
+        populated.browser_mut().restore_navigation_from(
+            stack
+                .top()
+                .unwrap()
+                .as_any()
+                .downcast_ref::<BrowserSurface>()
+                .unwrap()
+                .browser(),
+        );
+        stack.replace_top(Box::new(populated));
+        let grown = stack.render(area, &theme).remove(0);
+        assert!(grown.region.height > shrunk.region.height);
     }
 
     #[test]
