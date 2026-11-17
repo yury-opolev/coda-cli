@@ -123,9 +123,13 @@ in the same atomic write as the messages. The checkpoint is one file, so the
 messages and their presentation metadata always come from the same commit.
 
 * A turn-end save writes both.
-* Accepting a record while idle, a rewind and a compaction write
-  `presentation` alone through `SessionTranscriptStore::save_presentation`
-  (read-modify-write of the same file under the store's single writer lock).
+* A rewind and a manual compaction write the rewritten conversation and the
+  timeline together.
+* Accepting a record while idle writes `presentation` alone through
+  `SessionTranscriptStore::save_presentation`, a read-modify-write of the same
+  file. All writes go through one persister that holds a single writer lock
+  and reads the timeline inside it, so an older timeline never overwrites a
+  newer one.
 * Saves that do not pass presentation keep the existing member, as usage
   already is.
 * A corrupt member loads as an empty timeline with `durability: "corrupt"`,
@@ -208,6 +212,22 @@ No bodies, labels or titles are logged.
 | Corrupt / truncated checkpoint | `store::a_corrupt_presentation_member_is_reported_not_emptied` |
 | Display-only recovery makes no requests | `app::serve` test: installing records makes zero engine requests |
 | Folds and expansion survive a refresh | `transcript::task_card_expansion_survives_rebuild_with_records` |
+
+## Implementation notes
+
+* A turn commit that rewrote earlier history (automatic compaction inside the
+  turn) now bumps `historyEpoch` and publishes `sessionChanged("compact")`,
+  like a manual compaction. Indices from before the rewrite no longer name
+  the same entries.
+* A client anchor taken during a turn resolves to the conversation's end in
+  whatever epoch the turn ended in, so a turn that compacted itself keeps its
+  own output at its end.
+* Task-card expansion for engine records is keyed by `(session, itemId)`, so
+  two cards whose task numbers collide across engine restarts fold
+  independently.
+* The turn-end save writes the timeline as it stands at that moment. When the
+  records of that turn resolve, the persister rewrites the file. A crash in
+  between restores those records at the start of the turn, not at its end.
 
 ## Deferred / limitations
 

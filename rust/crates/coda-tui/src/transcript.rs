@@ -832,12 +832,11 @@ impl Transcript {
         }
         for placement in &mut self.meta {
             if let Some(anchor) = placement.anchor_mut() {
-                if let Anchor::TurnEnd { epoch } = *anchor {
-                    *anchor = if epoch == fence.epoch {
-                        Anchor::Entries { epoch: Some(epoch), after: fence.committed }
-                    } else {
-                        Anchor::Historical
-                    };
+                // The turn ended where the conversation now ends, in whatever
+                // epoch it ended on: a turn that compacted itself moves the
+                // epoch, and its own output still belongs at its end.
+                if let Anchor::TurnEnd { .. } = *anchor {
+                    *anchor = Anchor::Entries { epoch: Some(fence.epoch), after: fence.committed };
                 }
             }
         }
@@ -1806,6 +1805,24 @@ mod tests {
             transcript.replace_conversation(blocks, Some(&layout(1, committed)), None);
             assert_eq!(shape(&transcript)[..5], ["q1", "a1", "q2", "a2", "notice during"]);
         }
+    }
+
+    #[test]
+    fn output_from_a_turn_that_compacted_itself_still_lands_at_its_end() {
+        let mut transcript = Transcript::new();
+        transcript.replace_conversation(vec![user_block("q1"), assistant_block("a1")], Some(&layout(1, 2)), None);
+        transcript.set_fence(Fence { epoch: 1, committed: 2, turn_running: true });
+        transcript.push(user_block("q2"));
+        transcript.push(Block::Notice { text: "during".into(), level: NoticeLevel::Info });
+        // The turn's commit rewrote history: a new epoch, a shorter history.
+        transcript.set_fence(Fence { epoch: 2, committed: 3, turn_running: true });
+        transcript.set_fence(Fence { epoch: 2, committed: 3, turn_running: false });
+        transcript.replace_conversation(
+            vec![user_block("summary"), user_block("q2"), assistant_block("a2")],
+            Some(&layout(2, 3)),
+            None,
+        );
+        assert_eq!(shape(&transcript), ["summary", "q2", "a2", "notice during"]);
     }
 
     #[test]

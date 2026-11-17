@@ -6608,7 +6608,14 @@ impl ServeHost {
 
         if committed_len.is_some() {
             // Records anchored in the replaced range are now `compacted`.
-            self.presentation.persist_now().await;
+            // The compacted conversation and those relations are saved in
+            // one write: pairing the new relations with the old messages
+            // still on disk would show every card as compacted after a
+            // restart, next to the very entries it belongs to.
+            let compacted = self.session.history.lock().expect("history poisoned").clone();
+            let session_id = self.active_session_id();
+            let usage = self.engine_state.stored_usage();
+            let _ = self.presentation.save_transcript(&session_id, &compacted, Some(&usage)).await;
         }
 
         let report = outcome.report_mut();
@@ -19484,6 +19491,15 @@ mod tests {
             let (_, records) = records(&host).await;
             assert_eq!(records.len(), 1);
             assert_eq!(records[0]["relation"], "compacted");
+
+            // The compacted conversation and the relation are saved together:
+            // a restart must not pair the old messages with `compacted`.
+            let stored = SessionTranscriptStore::new(dir.path())
+                .load_session(&host.active_session_id())
+                .await
+                .expect("the compaction saved the transcript");
+            assert_eq!(stored.messages, *host.session.history.lock().unwrap());
+            assert_eq!(stored.presentation.expect("timeline saved")["records"][0]["relation"], "compacted");
         }
 
         #[tokio::test]
