@@ -72,7 +72,7 @@ fn conpty_child() {
     stdout.flush().unwrap();
 
     let mut seen = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(50);
     while Instant::now() < deadline {
         match input.poll(Instant::now()).expect("console input") {
             Some(InputAction::Key(key)) if key.code == KeyCode::F(12) => break,
@@ -190,11 +190,19 @@ fn a_terminal_paste_through_a_real_console_host_is_one_transaction() {
         // A paste: raw text inside the brackets, split across two writes.
         send(b"\x1b[200~First line\r\nSecond li");
         send(b"ne\r\n\r\nFourth line\r\n\x1b[201~");
-        // Shift+Enter, then F12 to end the child.
+        // Shift+Enter.
         send(b"\x1b[13;28;13;1;16;1_\x1b[13;28;13;0;16;1_");
+        // A large paste must arrive whole and promptly, not drain at the
+        // speed of one console batch per poll.
+        let started = Instant::now();
+        send(format!("\x1b[200~{}\x1b[201~", large_paste().replace('\n', "\r\n")).as_bytes());
+        // F12 ends the child.
         send(b"\x1b[123;88;0;1;0;1_\x1b[123;88;0;0;0;1_");
 
-        assert_eq!(WaitForSingleObject(process.hProcess, 20_000), 0, "the child did not finish");
+        assert_eq!(WaitForSingleObject(process.hProcess, 60_000), 0, "the child did not finish");
+        let drained = started.elapsed();
+        eprintln!("large paste delivered and child finished in {drained:?}");
+        assert!(drained < Duration::from_secs(20), "a 20 KB paste took {drained:?}");
         ClosePseudoConsole(console);
         CloseHandle(process.hProcess);
         CloseHandle(process.hThread);
@@ -212,10 +220,26 @@ fn a_terminal_paste_through_a_real_console_host_is_one_transaction() {
             txn: 1,
         }
     );
+    let large = format!(
+        "{:?}",
+        InputAction::PasteText {
+            text: large_paste(),
+            source: coda_tui::input::PasteSource::Terminal,
+            txn: 2,
+        }
+    );
     let lines: Vec<&str> = actions.lines().filter(|line| !line.starts_with("Resize")).collect();
+    assert_eq!(lines.len(), 6, "what the application received: {:?}", &lines[..lines.len().min(4)]);
     assert_eq!(
-        lines,
+        &lines[..4],
         [x.as_str(), "PasteStarted { txn: 1 }", paste.as_str(), shift_enter.as_str()],
         "what the application received"
     );
+    assert_eq!(lines[4], "PasteStarted { txn: 2 }");
+    assert!(lines[5] == large, "the large paste was not delivered whole");
+}
+
+/// About 20 KB of code-like lines.
+fn large_paste() -> String {
+    (0..400).map(|line| format!("    let value_{line} = compute({line}); // some code\n")).collect()
 }

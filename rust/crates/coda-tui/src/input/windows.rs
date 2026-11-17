@@ -35,6 +35,8 @@ const BATCH: usize = 128;
 /// ConPTY does not always post a buffer-size record, so the window size is
 /// also checked this often.
 const SIZE_CHECK: Duration = Duration::from_millis(250);
+/// The longest one poll keeps reading before handing control back.
+const READ_BUDGET: Duration = Duration::from_millis(20);
 
 pub struct WindowsVtInput {
     handle: HANDLE,
@@ -127,6 +129,12 @@ impl WindowsVtInput {
 
     /// The next decoded action, reading whatever the console has queued.
     /// Never blocks.
+    ///
+    /// Keeps reading while records are queued and nothing has been decoded
+    /// yet, for at most [`READ_BUDGET`]: a paste produces no action until its
+    /// end marker, and in win32-input-mode every pasted character arrives as
+    /// a few dozen records, so reading one batch per poll would drain a large
+    /// paste at a crawl.
     pub fn poll(&mut self, now: Instant) -> io::Result<Option<InputAction>> {
         if let Some(action) = self.decoder.next_action() {
             return Ok(Some(action));
@@ -134,12 +142,9 @@ impl WindowsVtInput {
         if !self.active {
             return Ok(None);
         }
-        let mut available = 0;
-        // SAFETY: `handle` is an open console input handle owned by `self`.
-        if unsafe { GetNumberOfConsoleInputEvents(self.handle, &mut available) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if available > 0 {
+        let started = Instant::now();
+        let top = window_top();
+        while self.queued_records()? > 0 {
             // SAFETY: INPUT_RECORD is plain data; all-zero is a valid value.
             let mut records: [INPUT_RECORD; BATCH] = unsafe { std::mem::zeroed() };
             let mut read = 0;
@@ -147,16 +152,33 @@ impl WindowsVtInput {
             if unsafe { ReadConsoleInputW(self.handle, records.as_mut_ptr(), BATCH as u32, &mut read) } == 0 {
                 return Err(io::Error::last_os_error());
             }
-            let top = window_top();
             for record in &records[..read as usize] {
                 if let Some(record) = self.convert(record, top) {
                     self.decoder.feed(record, now);
                 }
             }
+            if self.decoder.has_action() || started.elapsed() >= READ_BUDGET {
+                break;
+            }
         }
         self.decoder.tick(now);
         self.check_size(now);
         Ok(self.decoder.next_action())
+    }
+
+    /// Whether the console still holds unread records, so the caller should
+    /// poll again at once rather than sleep.
+    pub fn has_queued_input(&self) -> bool {
+        self.active && self.queued_records().is_ok_and(|count| count > 0)
+    }
+
+    fn queued_records(&self) -> io::Result<u32> {
+        let mut available = 0;
+        // SAFETY: `handle` is an open console input handle owned by `self`.
+        if unsafe { GetNumberOfConsoleInputEvents(self.handle, &mut available) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(available)
     }
 
     fn convert(&mut self, record: &INPUT_RECORD, top: i16) -> Option<Record> {

@@ -303,6 +303,11 @@ impl Decoder {
         self.queue.pop_front()
     }
 
+    /// Whether an action is ready for [`next_action`](Self::next_action).
+    pub fn has_action(&self) -> bool {
+        !self.queue.is_empty()
+    }
+
     pub fn in_paste(&self) -> bool {
         matches!(self.inner, Inner::Paste(_))
     }

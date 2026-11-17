@@ -144,19 +144,23 @@ pub fn input_status() -> Option<BackendStatus> {
 }
 
 /// One step of the input owner: a queued or newly available action, never
-/// blocking. No lock is held across an `.await`.
-fn poll_input() -> io::Result<Option<InputAction>> {
+/// blocking, and whether more input is already waiting. No lock is held
+/// across an `.await`.
+fn poll_input() -> io::Result<(Option<InputAction>, bool)> {
     let mut slot = input_lock();
     let state = slot.get_or_insert_with(|| crossterm_state(crossterm_status()));
     match &mut state.backend {
         #[cfg(windows)]
-        Backend::Vt(vt) => vt.poll(Instant::now()),
+        Backend::Vt(vt) => {
+            let action = vt.poll(Instant::now())?;
+            Ok((action, vt.has_queued_input()))
+        }
         Backend::Crossterm { next_txn, queue } => {
             if queue.is_empty() && crossterm::event::poll(std::time::Duration::ZERO)? {
                 let event = crossterm::event::read()?;
                 queue.extend(crate::input::from_crossterm(event, next_txn));
             }
-            Ok(queue.pop_front())
+            Ok((queue.pop_front(), false))
         }
     }
 }
@@ -168,10 +172,13 @@ fn poll_input() -> io::Result<Option<InputAction>> {
 /// was decoded but not yet returned stays queued in the owner.
 pub(crate) async fn read_input() -> io::Result<InputAction> {
     loop {
-        if let Some(action) = poll_input()? {
-            return Ok(action);
+        match poll_input()? {
+            (Some(action), _) => return Ok(action),
+            // A large paste is still being read: let the rest of the loop run,
+            // then carry on at once.
+            (None, true) => tokio::task::yield_now().await,
+            (None, false) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
         }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
 
