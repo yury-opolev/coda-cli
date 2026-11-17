@@ -1270,6 +1270,9 @@ pub struct ServeHost {
     /// agree. Runtime handles (`client`, `config_commit`, `session_services`)
     /// stay above, as inputs `EngineState` mirrors only derived scalars from.
     engine_state: Arc<EngineState>,
+    /// The single writer of this session's transcript: turn-end saves and
+    /// presentation-timeline writes both go through it.
+    presentation: Arc<crate::presentation_persist::PresentationPersister>,
     /// Bridges `session.steering`'s synchronous observer hook to
     /// `engine_state`; also tracks which turn is currently delivering so
     /// `event/steeringOutcome` can tag `delivered` with the owning `turnId`.
@@ -1653,7 +1656,12 @@ impl ServeHost {
         task_manager.set_completion_listener(coda_agent::tasks::MainInboxCompletionPush::new(&message_bus));
         // Phase 3: clients see every task start, its (throttled) output and
         // its end, with the agent that owns it.
-        task_manager.set_event_observer(crate::task_events::TaskEventPublisher::new(Arc::clone(&bus)));
+        let task_publisher = crate::task_events::TaskEventPublisher::new(Arc::clone(&bus));
+        // Main-agent background completions become presentation records.
+        task_publisher.set_presentation(&engine_state);
+        task_manager.set_event_observer(task_publisher);
+        let presentation =
+            crate::presentation_persist::PresentationPersister::install(working_dir.clone(), &engine_state);
         let steering_observer = SteeringStateObserver::new(Arc::clone(&engine_state));
         // The registry publishes pending/resolved transitions through
         // `EngineState`, which owns the transaction (and therefore the
@@ -1720,6 +1728,7 @@ impl ServeHost {
             provider_context: std::sync::OnceLock::new(),
             diagnostics,
             engine_state,
+            presentation,
             steering_observer,
             restart_prep: Mutex::new(RestartPrep::Idle),
             restart_capture: Mutex::new(None),
@@ -3022,10 +3031,18 @@ impl ServeHost {
                     .map(|_| ())
                     .map_err(|e| format!("{e:?}"))
             } else {
-                self.message_bus
+                // The republication is the saved message, not a new one: its
+                // presentation record keeps the saved id.
+                self.engine_state.alias_next_notification(m.id.clone());
+                let outcome = self
+                    .message_bus
                     .publish_user(&source, m.text, m.context, m.idempotency_key)
                     .map(|_| ())
-                    .map_err(|e| format!("{e:?}"))
+                    .map_err(|e| format!("{e:?}"));
+                // Never left for an unrelated publication (refused, or
+                // deduplicated without reaching the observer).
+                self.engine_state.take_notification_alias();
+                outcome
             };
             if let Err(error) = outcome {
                 tracing::warn!(%error, "a restored message could not be re-published");
@@ -3736,6 +3753,7 @@ impl Drop for TurnGuard<'_> {
             }),
             history_length: None,
             wire: None,
+            history_rewritten: false,
         });
         self.observer.set_current_turn(None);
         // I1: the runtime flag is cleared *before* `ready` is published, and
@@ -3831,9 +3849,21 @@ impl ServeBackend for ServeHost {
             let valid_restart = matches!(restart, Some((_, RestartFileCheck::Valid(_))));
             // A valid restart file stands in for a missing transcript: the
             // session restarts empty under its id.
-            let (messages, usage) = match stored {
-                Some(stored) => (stored.messages, stored.usage),
-                None if valid_restart => (Vec::new(), None),
+            let (messages, usage, presentation) = match stored {
+                Some(stored) => {
+                    // Judged against the conversation it was saved with.
+                    let presentation = crate::state::presentation::PresentationStore::from_persisted(
+                        stored.presentation.as_ref(),
+                        stored.messages.len() as i64,
+                        Uuid::new_v4().to_string(),
+                    );
+                    (stored.messages, stored.usage, presentation)
+                }
+                None if valid_restart => (
+                    Vec::new(),
+                    None,
+                    crate::state::presentation::PresentationStore::new(Uuid::new_v4().to_string()),
+                ),
                 // Session not found in the working directory.
                 None => return Err(RpcError::session_not_found()),
             };
@@ -3846,7 +3876,7 @@ impl ServeBackend for ServeHost {
                 }
                 _ => {}
             }
-            loaded = Some((req_id.clone(), store, messages, usage));
+            loaded = Some((req_id.clone(), store, messages, usage, presentation));
         }
 
         // Wire an explicitly provided API key; otherwise leave client as-is
@@ -3900,7 +3930,7 @@ impl ServeBackend for ServeHost {
         // Nothing below refuses the handshake (short of a racing shutdown),
         // so the restore commits here.
         let mut restart_file = None;
-        if let Some((req_id, store, mut messages, usage)) = loaded {
+        if let Some((req_id, _store, mut messages, usage, presentation)) = loaded {
             if let Some((path, file)) = restart_to_apply {
                 // Consumed before anything is applied, so a restore can
                 // never happen twice.
@@ -3936,6 +3966,9 @@ impl ServeBackend for ServeHost {
                 // resumed session's totals. A transcript saved before
                 // accounting existed resumes with partial totals.
                 self.engine_state.usage_restored(usage, restored > 0);
+                // The timeline saved with the session, before the reset is
+                // announced: a client re-reads both together.
+                self.engine_state.install_presentation(presentation);
                 self.engine_state.session_changed("resume", req_id.clone(), restored);
                 restart_file.is_some().then(|| committed.clone())
             };
@@ -3944,7 +3977,7 @@ impl ServeBackend for ServeHost {
             if let Some(history) = persisted {
                 let usage = self.engine_state.stored_usage();
                 if let Err(error) =
-                    store.save_with_usage(&req_id, &history, None, Some(&usage)).await
+                    self.presentation.save_transcript(&req_id, &history, Some(&usage)).await
                 {
                     tracing::warn!(%error, "cannot persist the restored conversation");
                 }
@@ -4901,6 +4934,7 @@ impl ServeBackend for ServeHost {
             error: result.as_ref().err().map(|e| safe_engine_error(e.code)),
             history_length: Some(self.session.history.lock().expect("history poisoned").len() as i64),
             wire: None,
+            history_rewritten: false,
         });
         result
     }
@@ -4923,6 +4957,7 @@ impl ServeBackend for ServeHost {
             // `session_changed` already re-fenced `historyLength`.
             history_length: None,
             wire: None,
+            history_rewritten: false,
         });
         result
     }
@@ -4941,6 +4976,7 @@ impl ServeBackend for ServeHost {
             error: result.as_ref().err().map(|e| safe_engine_error(e.code)),
             history_length: None,
             wire: None,
+            history_rewritten: false,
         });
         result
     }
@@ -5000,14 +5036,22 @@ impl ServeBackend for ServeHost {
                     ));
                 }
                 let store = SessionTranscriptStore::new(&self.working_dir);
-                let Some(messages) = store.load(&id).await else {
+                let Some(stored) = store.load_session(&id).await else {
                     return Err(RpcError::session_not_found());
                 };
+                // The stored records, judged against the stored conversation.
+                let presentation = crate::state::presentation::PresentationStore::from_persisted(
+                    stored.presentation.as_ref(),
+                    stored.messages.len() as i64,
+                    Uuid::new_v4().to_string(),
+                )
+                .snapshot();
                 crate::history::build_saved_result(
                     &p,
                     &id,
                     self.engine_state.bus_ref().engine_instance_id(),
-                    &messages,
+                    &stored.messages,
+                    Some(presentation),
                 )?
             }
             _ => {
@@ -5649,9 +5693,12 @@ impl ServeHost {
         let new_id = fork_session(&self.working_dir, Some(&source_id), &history, None).await;
         // The fork shares the parent's history, so it starts from the
         // parent's accounting; the two then diverge independently.
-        let _ = SessionTranscriptStore::new(&self.working_dir)
-            .save_usage(&new_id, &self.engine_state.stored_usage())
-            .await;
+        {
+            let _writer = self.presentation.lock_writer().await;
+            let _ = SessionTranscriptStore::new(&self.working_dir)
+                .save_usage(&new_id, &self.engine_state.stored_usage())
+                .await;
+        }
 
         // Adopt the new id so future turns write to the forked session.
         *self.current_session_id.lock().expect("session_id poisoned") = new_id.clone();
@@ -5668,6 +5715,8 @@ impl ServeHost {
             let committed = self.session.history.lock().expect("history poisoned");
             self.engine_state.session_changed("fork", new_id.clone(), committed.len() as i64);
         }
+        // The fork starts a new, empty timeline of its own.
+        self.presentation.persist_now().await;
 
         let resp = ForkResponse { ok: true, new_session_id: new_id };
         serde_json::to_value(&resp).map_err(|e| RpcError::internal(e.to_string()))
@@ -5683,9 +5732,9 @@ impl ServeHost {
         // Persist the rewound history before it becomes the committed view,
         // so no snapshot can see a fence the transcript does not back.
         let session_id = self.active_session_id();
-        let store = SessionTranscriptStore::new(&self.working_dir);
-        let _ = store
-            .save_with_usage(&session_id, &history, None, Some(&self.engine_state.stored_usage()))
+        let _ = self
+            .presentation
+            .save_transcript(&session_id, &history, Some(&self.engine_state.stored_usage()))
             .await;
 
         // F2: rewind used to be silent. F3 (review): replacement and
@@ -5695,6 +5744,8 @@ impl ServeHost {
             *committed = history;
             self.engine_state.session_changed("rewind", session_id, committed.len() as i64);
         }
+        // Records past the new end are now `rewound`.
+        self.presentation.persist_now().await;
 
         let resp = RewindResponse { ok: true, removed, remaining };
         serde_json::to_value(&resp).map_err(|e| RpcError::internal(e.to_string()))
@@ -6039,6 +6090,7 @@ impl ServeHost {
                 error: Some(safe_engine_error(e.code)),
                 history_length: None,
                 wire: None,
+                history_rewritten: false,
             });
         }
         result.map_err(PromptRunFailure::Failed)
@@ -6421,11 +6473,11 @@ impl ServeHost {
         // "best-effort seam".
         {
             let session_id = self.active_session_id();
-            let store = SessionTranscriptStore::new(&self.working_dir);
             // The accounting travels with the conversation it measured, so a
             // resumed session continues its totals instead of restarting.
             let usage = self.engine_state.stored_usage();
-            let _ = store.save_with_usage(&session_id, &history, None, Some(&usage)).await;
+            // The presentation timeline rides in the same atomic write.
+            let _ = self.presentation.save_transcript(&session_id, &history, Some(&usage)).await;
         }
 
         // The terminal outcome, as one transaction: the committed length, the
@@ -6447,6 +6499,10 @@ impl ServeHost {
         .to_notification();
         {
             let mut committed = self.session.history.lock().expect("history poisoned");
+            // An automatic compaction inside the turn rewrites earlier
+            // entries rather than appending to them.
+            let history_rewritten = history.len() < committed.len()
+                || history[..committed.len()] != committed[..];
             *committed = history.clone();
             let history_length = committed.len() as i64;
             self.engine_state.end_turn(TurnEnd {
@@ -6456,6 +6512,7 @@ impl ServeHost {
                 error: run_result.as_ref().err().and_then(safe_turn_error),
                 history_length: Some(history_length),
                 wire: turn_complete,
+                history_rewritten,
             });
         }
         self.steering_observer.set_current_turn(None);
@@ -6547,6 +6604,11 @@ impl ServeHost {
                     committed_len = Some(after);
                 }
             }
+        }
+
+        if committed_len.is_some() {
+            // Records anchored in the replaced range are now `compacted`.
+            self.presentation.persist_now().await;
         }
 
         let report = outcome.report_mut();
@@ -19286,6 +19348,240 @@ mod tests {
             })
             .await;
             assert_eq!(status(&inner), Some(TaskRunStatus::Completed));
+        }
+    }
+
+    // ── Presentation timeline (task cards, passive notifications) ────────
+
+    mod presentation_timeline {
+        use super::*;
+        use coda_agent::tasks::{TaskExecutionMode, TaskKind};
+
+        fn host_in(dir: &std::path::Path, client: Arc<dyn LlmClient>) -> (Arc<ServeHost>, mpsc::UnboundedReceiver<Vec<u8>>) {
+            let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            let sink = Arc::new(ServeSink::new(tx.clone()));
+            let ch = Arc::new(PromptChannel::new(tx));
+            (ServeHost::new_with_client(client, sink, ch, dir.to_string_lossy().into_owned()), rx)
+        }
+
+        /// Seeds `messages` as the committed conversation, as a resume would.
+        fn seed(host: &ServeHost, messages: Vec<Message>) {
+            let mut committed = host.session.history.lock().unwrap();
+            *committed = messages;
+            host.engine_state.session_changed("resume", host.active_session_id(), committed.len() as i64);
+        }
+
+        fn exchange(n: usize) -> Vec<Message> {
+            (0..n)
+                .flat_map(|i| [Message::user(format!("q{i}")), Message::assistant(format!("a{i}"))])
+                .collect()
+        }
+
+        async fn records(host: &ServeHost) -> (Value, Vec<Value>) {
+            let history = host.session_get_history(GetHistoryParams::default()).await.unwrap();
+            let presentation = history["presentation"].clone();
+            let records = presentation["records"].as_array().cloned().unwrap_or_default();
+            (presentation, records)
+        }
+
+        fn methods(rx: &mut mpsc::UnboundedReceiver<Vec<u8>>) -> Vec<(String, Value)> {
+            let mut out = Vec::new();
+            while let Ok(frame) = rx.try_recv() {
+                let text = String::from_utf8(frame).unwrap();
+                let body = text.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+                let msg: Value = serde_json::from_str(&text[body..]).unwrap();
+                out.push((msg["method"].as_str().unwrap_or_default().to_owned(), msg["params"].clone()));
+            }
+            out
+        }
+
+        async fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
+            for _ in 0..200 {
+                if ready() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("timed out waiting for {what}");
+        }
+
+        #[tokio::test]
+        async fn an_idle_notification_is_served_with_history_at_the_committed_fence() {
+            let dir = tempfile::tempdir().unwrap();
+            let (host, mut rx) = host_in(dir.path(), ScriptedClient::new(vec![]));
+            seed(&host, exchange(2));
+            methods(&mut rx);
+
+            let receipt = host
+                .message_bus
+                .publish_user(&coda_agent::MessageSource::Main, "build is green", None, None)
+                .unwrap();
+
+            let (presentation, records) = records(&host).await;
+            assert_eq!(presentation["schemaVersion"], 1);
+            assert_eq!(records.len(), 1, "{presentation}");
+            assert_eq!(records[0]["itemId"], format!("notification:{}", receipt.id));
+            assert_eq!(records[0]["anchor"]["afterEntries"], 4);
+            assert_eq!(records[0]["relation"], "active");
+            assert_eq!(records[0]["payload"]["text"], "build is green");
+            let seen = methods(&mut rx);
+            assert!(seen.iter().any(|(m, p)| m == "event/presentationRecord" && p["itemId"] == records[0]["itemId"]));
+        }
+
+        #[tokio::test]
+        async fn only_a_main_agent_background_completion_becomes_a_card() {
+            let dir = tempfile::tempdir().unwrap();
+            let (host, _rx) = host_in(dir.path(), ScriptedClient::new(vec![]));
+            seed(&host, exchange(1));
+            let background = host
+                .task_manager
+                .register(TaskKind::Subagent, "deep review", "Review it", None, TaskExecutionMode::Background)
+                .unwrap();
+            let foreground = host
+                .task_manager
+                .register(TaskKind::Shell, "build", "cargo build", None, TaskExecutionMode::Foreground)
+                .unwrap();
+            host.task_manager.complete(&foreground.id, None);
+            host.task_manager.complete(&background.id, Some("all good".into()));
+
+            let (_, records) = records(&host).await;
+            assert_eq!(records.len(), 1, "{records:?}");
+            let engine = host.engine_state.bus_ref().engine_instance_id().to_owned();
+            assert_eq!(records[0]["itemId"], format!("task:{engine}:{}", background.id));
+            assert_eq!(records[0]["payload"]["kind"], "taskCompletion");
+            assert_eq!(records[0]["payload"]["title"], "deep review");
+            assert_eq!(records[0]["anchor"]["afterEntries"], 2);
+        }
+
+        #[tokio::test]
+        async fn a_rewind_marks_records_past_the_new_end_rewound() {
+            let dir = tempfile::tempdir().unwrap();
+            let (host, _rx) = host_in(dir.path(), ScriptedClient::new(vec![]));
+            seed(&host, exchange(1));
+            host.message_bus.publish_user(&coda_agent::MessageSource::Main, "early", None, None).unwrap();
+            seed(&host, exchange(2));
+            host.message_bus.publish_user(&coda_agent::MessageSource::Main, "late", None, None).unwrap();
+
+            host.session_rewind(RewindParams { n: Some(1) }).await.unwrap();
+
+            let (_, records) = records(&host).await;
+            assert_eq!(records[0]["relation"], "active");
+            assert_eq!(records[0]["anchor"]["afterEntries"], 2);
+            assert_eq!(records[1]["relation"], "rewound");
+        }
+
+        #[tokio::test]
+        async fn a_compaction_marks_earlier_records_compacted() {
+            let dir = tempfile::tempdir().unwrap();
+            let client = CountingClient::new(vec![summary_turn("## Next Move\nContinue.", "end_turn")]);
+            let (host, _rx) = compaction_host(dir.path(), client as Arc<dyn LlmClient>);
+            seed(&host, compactable_history());
+            host.message_bus.publish_user(&coda_agent::MessageSource::Main, "before", None, None).unwrap();
+
+            let r = host.session_compact(CompactParams { instructions: None }).await.unwrap();
+            assert!(r.get("error").is_none_or(Value::is_null), "{r}");
+
+            let (_, records) = records(&host).await;
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0]["relation"], "compacted");
+        }
+
+        #[tokio::test]
+        async fn records_persist_with_the_transcript_and_resume_unchanged_and_silent() {
+            use coda_llm::anthropic::StreamEvent;
+            let dir = tempfile::tempdir().unwrap();
+            let client = ScriptedClient::new(vec![vec![
+                StreamEvent::TextDelta("reply".into()),
+                StreamEvent::Done { stop_reason: Some("end_turn".into()), usage: coda_llm::Usage::ZERO },
+            ]]);
+            let (host, _rx) = host_in(dir.path(), client);
+            host.session_prompt(PromptParams { text: Some("hello".into()), images: None }).await.unwrap();
+            let session_id = host.active_session_id();
+
+            let receipt = host
+                .message_bus
+                .publish_user(&coda_agent::MessageSource::Main, "deploy finished", None, None)
+                .unwrap();
+            let item_id = format!("notification:{}", receipt.id);
+            let (_, live) = records(&host).await;
+            assert_eq!(live[0]["anchor"]["afterEntries"], 2);
+
+            let store = SessionTranscriptStore::new(dir.path());
+            let mut saved = None;
+            for _ in 0..200 {
+                saved = store.load_session(&session_id).await.and_then(|s| s.presentation);
+                if saved.as_ref().is_some_and(|p| p["records"].as_array().is_some_and(|r| !r.is_empty())) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let saved = saved.expect("the transcript carries the timeline");
+            assert_eq!(saved["records"][0]["itemId"], item_id.as_str());
+            wait_until("the timeline to be durable", || {
+                host.engine_state.presentation_snapshot().durability == "durable"
+            })
+            .await;
+
+            let (host2, mut rx2) = host_in(dir.path(), ScriptedClient::new(vec![]));
+            host2.engine_state.bus_ref().enable_state_events();
+            host2
+                .initialize(InitParams {
+                    protocol_version: "1".into(),
+                    session_id: Some(session_id.clone()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            host2.after_initialize_response();
+
+            let (presentation, resumed) = records(&host2).await;
+            assert_eq!(presentation["durability"], "durable");
+            assert_eq!(resumed.len(), 1);
+            assert_eq!(resumed[0]["itemId"], item_id.as_str());
+            assert_eq!(resumed[0]["positionSeq"], live[0]["positionSeq"]);
+            assert_eq!(resumed[0]["anchor"], live[0]["anchor"]);
+            assert_eq!(resumed[0]["relation"], "active");
+            let seen = methods(&mut rx2);
+            assert!(
+                !seen.iter().any(|(m, _)| m == "event/presentationRecord" || m == "event/agentMessage"),
+                "restoring a record publishes nothing: {:?}",
+                seen.iter().map(|(m, _)| m.as_str()).collect::<Vec<_>>()
+            );
+
+            // The saved transcript serves the same records when read by id.
+            let (host3, _rx3) = host_in(dir.path(), ScriptedClient::new(vec![]));
+            let saved_read = host3
+                .session_get_history(GetHistoryParams { session_id: Some(session_id), ..Default::default() })
+                .await
+                .unwrap();
+            assert_eq!(saved_read["presentation"]["records"][0]["itemId"], item_id.as_str());
+        }
+
+        #[tokio::test]
+        async fn a_restored_notification_republished_twice_is_one_record() {
+            let dir = tempfile::tempdir().unwrap();
+            let (host, _rx) = host_in(dir.path(), ScriptedClient::new(vec![]));
+            let saved = crate::restart::SavedMessage {
+                channel: "user".into(),
+                cursor: 3,
+                id: "saved-message-1".into(),
+                source: "main".into(),
+                label: "main".into(),
+                text: "deploy finished".into(),
+                context: None,
+                task_id: None,
+                schedule_definition_id: None,
+                schedule_name: None,
+                idempotency_key: None,
+            };
+            for _ in 0..2 {
+                host.restored_messages.lock().unwrap().push(saved.clone());
+                host.after_initialize_response();
+            }
+            let (_, records) = records(&host).await;
+            assert_eq!(records.len(), 1, "{records:?}");
+            assert_eq!(records[0]["itemId"], "notification:saved-message-1");
+            assert!(host.engine_state.take_notification_alias().is_none());
         }
     }
 }

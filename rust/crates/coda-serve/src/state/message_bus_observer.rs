@@ -33,6 +33,7 @@
 use std::sync::Arc;
 
 use coda_agent::message::{MainMessage, MessageBusObserver, UserMessage};
+use coda_proto::presentation::PresentationPayload;
 use serde_json::json;
 
 use super::{EngineState, MainMessagesDeliveredOutcome};
@@ -67,6 +68,21 @@ impl MessageBusObserver for MessageBusEventBridge {
                 "scheduleDefinitionId": msg.schedule_definition_id,
             }),
             false,
+        );
+        // The presentation record: a restored publication keeps the saved
+        // message's identity, so it is the same item, not a new one.
+        let message_id = self.state.take_notification_alias().unwrap_or_else(|| msg.id.clone());
+        self.state.accept_presentation(
+            format!("notification:{message_id}"),
+            PresentationPayload::Notification {
+                message_id,
+                label: msg.label.clone(),
+                text: msg.body.clone(),
+                context: msg.context.clone(),
+                source: msg.source_kind.to_owned(),
+                task_id: msg.task_id.clone(),
+                schedule_definition_id: msg.schedule_definition_id.clone(),
+            },
         );
     }
 
@@ -158,6 +174,48 @@ mod tests {
         assert_eq!(value["method"], "event/agentMessage");
         assert_eq!(value["params"]["text"], "hello");
         assert_eq!(value["params"]["source"], "main");
+    }
+
+    #[test]
+    fn publish_also_accepts_a_presentation_record_after_the_legacy_frame() {
+        let (state, mut rx) = state_and_rx();
+        let (bridge, _wake) = bridge(&state);
+        let msg_bus = MessageBus::with_observer(Some(bridge as Arc<dyn MessageBusObserver>));
+
+        let receipt = msg_bus.publish_user(&MessageSource::Main, "hello", None, None).unwrap();
+
+        let legacy = decode(&rx.try_recv().unwrap());
+        assert_eq!(legacy["method"], "event/agentMessage");
+        let record = decode(&rx.try_recv().expect("a presentation record follows"));
+        assert_eq!(record["method"], "event/presentationRecord");
+        assert_eq!(record["params"]["itemId"], format!("notification:{}", receipt.id));
+        assert_eq!(record["params"]["anchor"]["afterEntries"], 0);
+        assert_eq!(record["params"]["relation"], "active");
+        assert_eq!(record["params"]["payload"]["kind"], "notification");
+        assert_eq!(record["params"]["payload"]["text"], "hello");
+        let snapshot = state.presentation_snapshot();
+        assert_eq!(snapshot.records.len(), 1);
+    }
+
+    #[test]
+    fn a_restored_republication_keeps_the_saved_identity_and_is_idempotent() {
+        let (state, mut rx) = state_and_rx();
+        let (bridge, _wake) = bridge(&state);
+        let msg_bus = MessageBus::with_observer(Some(bridge as Arc<dyn MessageBusObserver>));
+
+        state.alias_next_notification("saved-1".into());
+        msg_bus.publish_user(&MessageSource::Main, "hello", None, None).unwrap();
+        let frames: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).map(|f| decode(&f)).collect();
+        assert_eq!(frames[1]["params"]["itemId"], "notification:saved-1");
+
+        // The same saved message republished again: no second record, no frame.
+        state.alias_next_notification("saved-1".into());
+        msg_bus.publish_user(&MessageSource::Main, "hello", None, None).unwrap();
+        let frames: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).map(|f| decode(&f)).collect();
+        assert_eq!(frames.len(), 1, "only the legacy frame: {frames:?}");
+        assert_eq!(frames[0]["method"], "event/agentMessage");
+        assert_eq!(state.presentation_snapshot().records.len(), 1);
+        assert!(state.take_notification_alias().is_none(), "the alias is consumed");
     }
 
     #[tokio::test]

@@ -305,6 +305,12 @@ pub struct GetHistoryResult {
     pub live_truncated: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_omitted_bytes: Option<i64>,
+    /// The session's presentation timeline (capability
+    /// `presentationTimeline`), read together with this page so the records
+    /// and the conversation describe one generation. Absent from engines
+    /// without the capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation: Option<crate::presentation::PresentationTimeline>,
 }
 
 /// Truncates `text` to `max_bytes` on a UTF-8 boundary, returning the

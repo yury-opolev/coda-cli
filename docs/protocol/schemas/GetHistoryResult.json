@@ -73,6 +73,17 @@
         "null"
       ],
       "format": "int64"
+    },
+    "presentation": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PresentationTimeline"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The session's presentation timeline (capability\n`presentationTimeline`), read together with this page so the records\nand the conversation describe one generation. Absent from engines\nwithout the capability."
     }
   },
   "required": [
@@ -358,6 +369,247 @@
         }
       ],
       "description": "One block of content within a [`HistoryEntry`].\n\nEvery variant that can carry capped free text also carries the pair\n(`omittedReason`, `fullLength`). They are present **exactly** when the\nprojection retained less than the original, so a client can always tell a\ncomplete value from a shortened one. Both are omitted — never `null`,\nnever a fabricated length — when nothing was dropped."
+    },
+    "PresentationTimeline": {
+      "type": "object",
+      "properties": {
+        "schemaVersion": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "timelineId": {
+          "type": "string",
+          "description": "Stable identity of the timeline; a fork starts a new one."
+        },
+        "changeSeq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "The highest change applied, for ordering live updates after a read."
+        },
+        "records": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PresentationRecord"
+          },
+          "description": "Retained records in `positionSeq` order."
+        },
+        "evictedBeforeSeq": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0,
+          "description": "Records with a smaller `positionSeq` were evicted by the retention\nbound and are not shown."
+        },
+        "durability": {
+          "type": "string",
+          "description": "`durable` (persisted with the session), `memory` (not yet persisted,\nor persistence failed) or `corrupt` (the stored timeline could not be\nread; what is shown starts after that point)."
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "timelineId",
+        "changeSeq",
+        "records",
+        "durability"
+      ],
+      "description": "The records of one session timeline, as of one read."
+    },
+    "PresentationRecord": {
+      "type": "object",
+      "properties": {
+        "itemId": {
+          "type": "string",
+          "description": "Stable identity of the occurrence, the same live, in snapshots and\nafter a restart. Never derived from a label or from text."
+        },
+        "positionSeq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "Immutable acceptance order within the timeline."
+        },
+        "revision": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "description": "Content version; a newer revision replaces an older one in place."
+        },
+        "changeSeq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "The timeline change that last touched this record (a separate\nnamespace from `positionSeq`)."
+        },
+        "occurredAt": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "When the engine accepted it (RFC 3339). Explanatory, never a sort key."
+        },
+        "anchor": {
+          "$ref": "#/$defs/PresentationAnchor"
+        },
+        "relation": {
+          "$ref": "#/$defs/PresentationRelation",
+          "default": "active"
+        },
+        "payload": {
+          "$ref": "#/$defs/PresentationPayload"
+        }
+      },
+      "required": [
+        "itemId",
+        "positionSeq",
+        "revision",
+        "changeSeq",
+        "anchor",
+        "payload"
+      ],
+      "description": "One user-visible occurrence."
+    },
+    "PresentationAnchor": {
+      "type": "object",
+      "properties": {
+        "afterEntries": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The record follows the first `afterEntries` committed entries of the\nsession's current conversation (history generation). `0` means before\nevery entry."
+        },
+        "turnId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Set while the turn the record occurred in is still running: the\nrecord belongs at that turn's end, which is resolved when the turn\ncommits. A record never sits inside a streaming reply."
+        }
+      },
+      "required": [
+        "afterEntries"
+      ],
+      "description": "Where a record sits relative to the committed conversation."
+    },
+    "PresentationRelation": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "active",
+          "description": "The anchor names entries of the current conversation."
+        },
+        {
+          "type": "string",
+          "const": "compacted",
+          "description": "The entries around the anchor were replaced by a compaction summary."
+        },
+        {
+          "type": "string",
+          "const": "rewound",
+          "description": "The entries around the anchor were removed by a rewind."
+        },
+        {
+          "type": "string",
+          "const": "unknown",
+          "description": "The anchor does not fit the conversation the record was restored with."
+        }
+      ],
+      "description": "How a record's anchor relates to the conversation as it is now."
+    },
+    "PresentationPayload": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "taskId": {
+              "type": "string",
+              "description": "The task id as the engine that ran it named it (process-local)."
+            },
+            "status": {
+              "type": "string",
+              "description": "`completed` | `failed` | `stopped`."
+            },
+            "taskKind": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "instructions": {
+              "type": "string",
+              "description": "The task's prompt, capped."
+            },
+            "kind": {
+              "type": "string",
+              "const": "taskCompletion"
+            }
+          },
+          "required": [
+            "kind",
+            "taskId",
+            "status",
+            "instructions"
+          ],
+          "description": "A main-agent background task reached a terminal state."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "messageId": {
+              "type": "string",
+              "description": "The message-bus id of the original publication."
+            },
+            "label": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "context": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "description": "`scheduledTask` | `subagent` | `main` | `taskCompletion`."
+            },
+            "taskId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "scheduleDefinitionId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "notification"
+            }
+          },
+          "required": [
+            "kind",
+            "messageId",
+            "label",
+            "text",
+            "source"
+          ],
+          "description": "A passive `notify_user` notification."
+        }
+      ],
+      "description": "Bounded, UI-safe content of one record."
     }
   }
 }

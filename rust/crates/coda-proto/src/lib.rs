@@ -11,6 +11,7 @@ pub mod goal_budget;
 pub mod history;
 pub mod jsonrpc;
 pub mod mcp;
+pub mod presentation;
 pub mod messages;
 pub mod requests;
 pub mod responses;

@@ -1435,6 +1435,7 @@ impl UiState {
 
     fn apply_engine(&mut self, event: Event, now: std::time::Instant) {
         match event {
+            Event::PresentationRecord(record) => self.apply_presentation_record(*record),
             Event::AssistantText { delta } => {
                 if delta.is_empty() {
                     return;
@@ -1898,6 +1899,8 @@ impl UiState {
         }
         None
     }
+
+    fn apply_presentation_record(&mut self, _record: coda_proto::presentation::PresentationRecord) {}
 
     fn notice(&mut self, text: impl Into<String>, level: NoticeLevel) {
         self.transcript.push_notice(text.into(), level);

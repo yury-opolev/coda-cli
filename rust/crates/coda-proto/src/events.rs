@@ -120,6 +120,12 @@ pub mod event_method {
     /// the denominator a client needs to show how full the window is and
     /// which no other event reports.
     pub const USAGE_UPDATED: &str = "event/usageUpdated";
+    /// A presentation record was accepted or changed (capability
+    /// `presentationTimeline`). The params are the
+    /// [`PresentationRecord`](crate::presentation::PresentationRecord)
+    /// itself. Display-only: applying it never runs, schedules or delivers
+    /// anything.
+    pub const PRESENTATION_RECORD: &str = "event/presentationRecord";
 }
 
 #[cfg(feature = "schema")]
@@ -363,6 +369,9 @@ pub enum Event {
     /// The effective context window was resolved or changed; see
     /// [`ContextWindowInfo`].
     ContextWindow(ContextWindowInfo),
+    /// A presentation record was accepted or changed; see
+    /// [`event_method::PRESENTATION_RECORD`].
+    PresentationRecord(Box<crate::presentation::PresentationRecord>),
     /// An event this build does not model. Kept so newer engines still work.
     Unknown { method: String, params: Option<Value> },
 }
@@ -1144,6 +1153,15 @@ impl Event {
             }
             m::COMPACTION => Event::Compaction(parse(params)),
             m::CONTEXT_WINDOW => Event::ContextWindow(parse(params)),
+            m::PRESENTATION_RECORD => match params
+                .cloned()
+                .map(serde_json::from_value::<crate::presentation::PresentationRecord>)
+            {
+                Some(Ok(record)) => Event::PresentationRecord(Box::new(record)),
+                // A malformed record is not guessed at: it stays visible as
+                // an unknown event rather than becoming a default record.
+                _ => Event::Unknown { method: method.to_string(), params: params.cloned() },
+            },
             other => Event::Unknown {
                 method: other.to_string(),
                 params: params.cloned(),
@@ -1437,6 +1455,10 @@ impl Event {
             Event::ContextWindow(info) => (
                 m::CONTEXT_WINDOW,
                 serde_json::to_value(info).unwrap_or(Value::Null),
+            ),
+            Event::PresentationRecord(record) => (
+                m::PRESENTATION_RECORD,
+                serde_json::to_value(record).unwrap_or(Value::Null),
             ),
             Event::Unknown { method, params } => {
                 return Some((

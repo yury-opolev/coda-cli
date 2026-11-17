@@ -115,6 +115,17 @@ pub fn capability_catalog() -> HashMap<String, CapabilityEntry> {
     // `initialize { restore }` (or `coda serve --restore`) applies.
     m.insert("session.plannedRestart".into(), CapabilityEntry::supported());
 
+    // ── Presentation timeline ────────────────────────────────────────────
+    // Task completions and passive notifications as engine-owned records
+    // anchored to the committed conversation: `session/getHistory`
+    // `presentation`, live `event/presentationRecord`, persisted with the
+    // session transcript. Versioned by the record schema. The key is the
+    // protocol-level name `coda_proto` declares, shared with clients.
+    m.insert(
+        coda_proto::presentation::PRESENTATION_CAPABILITY.into(),
+        CapabilityEntry::supported_version(coda_proto::presentation::PRESENTATION_SCHEMA_VERSION),
+    );
+
     // ── Accepted-but-unimplemented surfaces, declared rather than silently
     // ignored. `session/getState` rejects `sections` outright instead of
     // answering a different question than the client asked. ──────────────
@@ -236,10 +247,24 @@ mod tests {
     }
 
     #[test]
+    fn the_presentation_timeline_is_advertised_with_its_schema_version() {
+        let entry = &capability_catalog()[coda_proto::presentation::PRESENTATION_CAPABILITY];
+        assert!(entry.supported);
+        assert_eq!(entry.version, Some(coda_proto::presentation::PRESENTATION_SCHEMA_VERSION));
+        let value = serde_json::to_value(entry).unwrap();
+        assert_eq!(value["version"], 1);
+    }
+
+    #[test]
     fn every_capability_key_is_a_dotted_lower_camel_path() {
         // A catalog whose keys drift in shape is a catalog a client cannot
         // match on. Two segments, `area.feature`, lowerCamel on both sides.
+        // The presentation timeline's key is a single protocol-level name
+        // defined in `coda_proto` and shared with clients.
         for name in capability_catalog().keys() {
+            if name == coda_proto::presentation::PRESENTATION_CAPABILITY {
+                continue;
+            }
             let segments: Vec<&str> = name.split('.').collect();
             assert_eq!(segments.len(), 2, "{name} must be `area.feature`");
             for segment in segments {

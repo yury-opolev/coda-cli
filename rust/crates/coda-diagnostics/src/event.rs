@@ -265,6 +265,15 @@ pub enum Event {
     /// A draft that received `pastes` pastes was submitted once, as `submission`
     /// (`prompt`, `steer`, `command` or `shell`).
     PasteDraftSubmitted { pastes: u32, submission: &'static str },
+
+    /// `count` presentation records of `record_kind` moved to `phase` (`accepted`,
+    /// `amended`, `resolved`, `compacted`, `rewound`, `evicted`, `restored` or
+    /// `corrupt`). Metadata only — never a title, label or text.
+    PresentationRecord { phase: &'static str, record_kind: &'static str, count: u32 },
+    /// The client rebuilt its timeline: how many engine records it held, how
+    /// many it placed by anchor, sent to the historical area, kept as local
+    /// blocks, or held back until a turn boundary.
+    TimelineRebuild { records: u32, placed: u32, historical: u32, local: u32, held: u32 },
 }
 
 impl Event {
@@ -374,6 +383,21 @@ mod tests {
         keys.sort();
         assert_eq!(keys, ["bytes", "kind", "lines", "outcome", "phase", "source", "txn"]);
         assert_eq!(value["kind"], "paste_transaction");
+    }
+
+    #[test]
+    fn presentation_events_carry_metadata_only() {
+        let value = serde_json::to_value(Event::PresentationRecord { phase: "accepted", record_kind: "notification", count: 1 })
+            .unwrap();
+        let mut keys: Vec<_> = value.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["count", "kind", "phase", "record_kind"]);
+        assert_eq!(value["kind"], "presentation_record");
+        let value = serde_json::to_value(Event::TimelineRebuild { records: 2, placed: 1, historical: 1, local: 3, held: 0 })
+            .unwrap();
+        let mut keys: Vec<_> = value.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["held", "historical", "kind", "local", "placed", "records"]);
     }
 
     #[test]

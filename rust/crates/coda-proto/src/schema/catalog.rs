@@ -116,7 +116,7 @@ pub(super) fn document() -> Value {
         e::PERMISSIONS_UPDATED, e::SUBAGENT_BLOCKED, e::SUBAGENT_RESULT_MODIFIED,
         e::COMPACTION_CANCELLED, e::POST_COMPACT_CONTEXT_INJECTED, e::COMPACTION,
         e::CONTEXT_WINDOW, e::AGENT_MESSAGE,
-        e::AGENT_MESSAGE_DELIVERED,
+        e::AGENT_MESSAGE_DELIVERED, e::PRESENTATION_RECORD,
     ].into_iter().map(|method| event(method, false)).collect();
     events.extend([
         e::ACTIVITY, e::TURN_ENDED, e::LIFECYCLE, e::CONFIG_CHANGED, e::STEERING_QUEUE,
