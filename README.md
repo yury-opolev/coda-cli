@@ -285,6 +285,31 @@ paste events carry text only. Use `/image <path>` to attach a file. Images are c
 at 5 MiB before base64 encoding. Removing a placeholder excludes that image from
 the next prompt; drafts with images must wait until the current turn finishes.
 
+**Pasting text:** a paste is text for the box that has focus, never a key press. A
+multi-line paste becomes one draft, including blank lines, indentation, a trailing
+newline and text that looks like a `/command`. Nothing is sent until you press
+`Enter`. Then the whole draft goes as one message, or as one steering message
+while a turn is running. A paste into a permission prompt cannot answer it. If a
+dialog opens while a paste is still arriving, the paste is discarded with a
+warning. Pastes larger than 1 MiB are refused whole.
+
+On Windows, Coda reads console input itself so it can see where a terminal paste
+begins and ends: it turns on virtual-terminal input and win32-input-mode, and
+decodes the bracketed paste. crossterm's Windows reader cannot do this. Support
+by host:
+
+| Host | Terminal paste (`Ctrl+V`, right-click, `Ctrl+Shift+V`) |
+| --- | --- |
+| Windows Terminal | Supported; checked against a real ConPTY console host (`tests/conpty_paste.rs`) |
+| VS Code and other ConPTY terminals with bracketed paste | Expected to work through the same console host; not exercised interactively |
+| Classic console window (conhost) | Keys work. Paste framing depends on the Windows build; use `Alt+V` |
+| Legacy console mode (no virtual-terminal input) | Not supported. Coda says so at startup; use `Alt+V` |
+| Unix terminals with bracketed paste | Supported (unchanged) |
+
+`Alt+V` always reads the clipboard directly and inserts the same single draft.
+Coda never guesses paste boundaries from typing speed, so a terminal that sends a
+paste without brackets looks like typing.
+
 **Questions:** when the agent asks a question (`ask_user_question`), a large modal shows the whole question and
 every option word-wrapped. On a small terminal, scroll with `PgUp`/`PgDn` or the mouse wheel. The footer lists
 the keys for the part that has focus. In the option list, `↑`/`↓` move. For a single-choice question, `Enter`

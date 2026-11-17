@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use coda_client::{ClientError, Connection, Engine, EngineCommand, Inbound};
 use coda_proto::messages::{self, method};
 use coda_render::{RenderLine, Theme};
-use crossterm::event::{Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{KeyCode, KeyEvent};
 use futures::future::OptionFuture;
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -26,10 +26,13 @@ mod effort;
 mod engine;
 mod identity;
 mod image;
+mod input;
 mod interrupt;
 mod layout;
 mod link;
 mod models;
+#[cfg(test)]
+mod paste_tests;
 mod queue;
 mod serve;
 mod settings;
@@ -242,6 +245,12 @@ pub struct App {
     restarted: Option<(Engine, mpsc::UnboundedReceiver<Inbound>)>,
     /// Images staged by `/image`/clipboard paste; identified by marker, not position.
     staged_images: Vec<image::StagedImage>,
+    /// The editor an open terminal paste was aimed at when it began, keyed by
+    /// its transaction, so its text never lands anywhere else.
+    paste_target: Option<(u64, clipboard::PasteTarget)>,
+    /// Pastes applied to the current draft, reported (as a count) when it is
+    /// submitted.
+    pastes_since_submit: u32,
     /// The active drag-selection over the transcript, if any.
     selection: crate::selection::TranscriptSelection,
     /// Screen row where the transcript area starts, captured at draw time.
@@ -387,6 +396,7 @@ impl App {
         // Says nothing at all when this profile already has a credential, and
         // nothing ever for an engine this client did not start.
         self.preflight().await;
+        self.warn_if_paste_is_unframed(crate::terminal::input_status());
         self.redraw(guard)?;
 
         loop {
@@ -421,8 +431,8 @@ impl App {
                 Some(reply) = aside_replies.recv() => self.on_aside_reply(reply),
 
                 // Terminal input.
-                event = crate::terminal::read_event() => match event {
-                    Ok(event) => self.on_terminal(event, guard).await?,
+                action = crate::terminal::read_input() => match action {
+                    Ok(action) => self.on_input(action, guard).await?,
                     Err(error) => return Err(error).context("terminal input failed"),
                 },
 
@@ -545,38 +555,6 @@ impl App {
     }
 
     // -- Terminal input -----------------------------------------------------
-
-    async fn on_terminal(
-        &mut self,
-        event: TerminalEvent,
-        guard: &mut TerminalGuard,
-    ) -> Result<()> {
-        match event {
-            // Windows reports key *release* (and repeat) events as well as
-            // presses. Acting on a release is wrong for every binding, but it
-            // is actively broken for the two-press chords: the release of the
-            // first Ctrl+C disarms the chord immediately, so the second press
-            // only ever re-arms and the app can never be exited from the
-            // keyboard. Repeats are kept so held keys still autorepeat.
-            TerminalEvent::Key(key)
-                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
-            {
-                self.on_key(key).await
-            }
-            TerminalEvent::Key(_) => {}
-            TerminalEvent::Paste(text) => self.on_paste(text),
-            TerminalEvent::Resize(..) => {
-                // Force a relayout; cached rows were wrapped for the old width.
-                self.laid_out_width = 0;
-                self.dirty = true;
-                guard.terminal().autoresize()?;
-            }
-            TerminalEvent::Mouse(mouse) => self.on_mouse(mouse).await,
-            TerminalEvent::FocusGained | TerminalEvent::FocusLost => {}
-        }
-        Ok(())
-    }
-
 
     async fn on_key(&mut self, key: KeyEvent) {
         // Open surfaces own the keyboard, topmost first. A key the top surface
@@ -803,8 +781,18 @@ impl App {
             self.staged_images.clear();
             return;
         }
+        let pastes = std::mem::take(&mut self.pastes_since_submit);
+        let record_paste = |submission: &'static str| {
+            if pastes > 0 {
+                coda_diagnostics::record(coda_diagnostics::Event::PasteDraftSubmitted {
+                    pastes,
+                    submission,
+                });
+            }
+        };
 
         if let Some(invocation) = commands::parse(&text) {
+            record_paste("command");
             // Commands are dispatched without consuming staged images; the images
             // remain for the next real user turn.
             self.run_command(invocation).await;
@@ -815,6 +803,7 @@ impl App {
         // model round-trip. Checked after slash commands only because the two
         // prefixes cannot collide; neither order would change behaviour.
         if let Some(command) = shell::parse(&text) {
+            record_paste("shell");
             shell::run_and_report(self, command).await;
             return;
         }
@@ -839,6 +828,7 @@ impl App {
                 self.notice("Images cannot be steered into a running turn. Send this draft after it finishes.", NoticeLevel::Warning);
                 return;
             }
+            record_paste("steer");
             self.steer(text).await;
             return;
         }
@@ -863,6 +853,7 @@ impl App {
         };
         match self.connection.send_request(method::PROMPT, Some(params)) {
             Ok(receiver) => {
+                record_paste("prompt");
                 self.staged_images.clear();
                 self.apply(UiEvent::Submitted { text: display });
                 self.turn = Some(receiver);

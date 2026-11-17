@@ -13,6 +13,7 @@ pub mod coverage;
 pub mod diagnostics;
 pub mod exit;
 pub mod hint;
+pub mod input;
 pub mod keymap;
 pub mod local;
 pub mod render;

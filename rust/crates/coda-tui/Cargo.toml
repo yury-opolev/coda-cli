@@ -46,6 +46,11 @@ chrono.workspace = true
 time.workspace = true
 uuid.workspace = true
 
+# Console input on Windows: Coda reads console records itself so it can see
+# bracketed-paste framing (see src/input/windows.rs).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_Storage_FileSystem", "Win32_Security"] }
+
 [dev-dependencies]
 insta.workspace = true
 pretty_assertions.workspace = true
@@ -58,3 +63,7 @@ coda-llm.workspace = true
 # terminal front-end contains no in-process agent execution path.
 coda-agent.workspace = true
 
+
+# The ConPTY paste test drives a real console host (tests/conpty_paste.rs).
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Pipes", "Win32_System_Threading", "Win32_Storage_FileSystem", "Win32_Security"] }

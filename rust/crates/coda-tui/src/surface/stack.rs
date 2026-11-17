@@ -41,11 +41,20 @@ pub struct RenderedSurface {
 #[derive(Default)]
 pub struct SurfaceStack {
     surfaces: Vec<Box<dyn Surface>>,
+    /// Bumped on every push, pop, replacement or clear, so a caller can tell
+    /// whether the surface it captured is still the one on top.
+    generation: u64,
 }
 
 impl SurfaceStack {
     pub fn len(&self) -> usize {
         self.surfaces.len()
+    }
+
+    /// Identifies the current arrangement of surfaces. Any change to the stack
+    /// produces a new value.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn is_empty(&self) -> bool {
@@ -75,11 +84,13 @@ impl SurfaceStack {
         if self.top_is_exclusive() {
             return false;
         }
+        self.generation += 1;
         self.surfaces.push(surface);
         true
     }
 
     pub fn pop(&mut self) -> Option<Box<dyn Surface>> {
+        self.generation += 1;
         self.surfaces.pop()
     }
 
@@ -95,6 +106,7 @@ impl SurfaceStack {
         match self.surfaces.last_mut() {
             Some(top) => {
                 *top = surface;
+                self.generation += 1;
                 true
             }
             None => false,
@@ -102,6 +114,7 @@ impl SurfaceStack {
     }
 
     pub fn clear(&mut self) {
+        self.generation += 1;
         self.surfaces.clear();
     }
 
@@ -120,6 +133,7 @@ impl SurfaceStack {
         match surface.handle_key(key) {
             SurfaceOutcome::Handled => StackOutcome::Handled,
             SurfaceOutcome::Close => {
+                self.generation += 1;
                 self.surfaces.pop();
                 StackOutcome::Handled
             }
@@ -129,6 +143,7 @@ impl SurfaceStack {
                 StackOutcome::Handled
             }
             SurfaceOutcome::Replace(next) => {
+                self.generation += 1;
                 self.surfaces.pop();
                 self.surfaces.push(next);
                 StackOutcome::Handled
@@ -137,6 +152,7 @@ impl SurfaceStack {
             // surface blocks the turn and must be answered, not dismissed.
             SurfaceOutcome::Ignored => {
                 if key.code == KeyCode::Esc && !self.top_is_exclusive() {
+                    self.generation += 1;
                     self.surfaces.pop();
                     StackOutcome::Handled
                 } else {
@@ -161,6 +177,7 @@ impl SurfaceStack {
         match surface.handle_mouse(event, content) {
             SurfaceOutcome::Handled => StackOutcome::Handled,
             SurfaceOutcome::Close => {
+                self.generation += 1;
                 self.surfaces.pop();
                 StackOutcome::Handled
             }
@@ -170,6 +187,7 @@ impl SurfaceStack {
                 StackOutcome::Handled
             }
             SurfaceOutcome::Replace(next) => {
+                self.generation += 1;
                 self.surfaces.pop();
                 self.surfaces.push(next);
                 StackOutcome::Handled
