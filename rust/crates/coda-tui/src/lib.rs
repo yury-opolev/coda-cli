@@ -28,6 +28,7 @@ pub mod startup;
 pub mod state;
 pub mod surface;
 pub mod terminal;
+pub mod timeline;
 pub mod transcript;
 pub mod viewport;
 pub mod widgets;

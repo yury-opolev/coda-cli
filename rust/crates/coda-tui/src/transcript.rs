@@ -11,6 +11,22 @@ use coda_render::tool::{CallStatus, ToolActivity, ToolDisplayMode, ToolSummary};
 use coda_render::{markdown, Gutter, RenderLine, MARKER_CELLS};
 
 use crate::render::glyphs;
+use crate::timeline::{self, Anchor, ConversationLayout, Fence, Order, Placement, RecordPlacement, Slot};
+
+/// Heads the historical area: records and local output whose place in the
+/// conversation is not in the loaded history.
+pub const HISTORICAL_MARKER: &str = "Earlier activity: its original place in the conversation is \
+     not in the loaded history (compacted, rewound, restored or not loaded), so it is shown here \
+     rather than as new.";
+
+/// What a rebuild did with the blocks it kept, for diagnostics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RebuildStats {
+    pub records: u32,
+    pub placed: u32,
+    pub historical: u32,
+    pub local: u32,
+}
 
 /// Identifies a batch of tool calls within a turn.
 ///
@@ -732,6 +748,13 @@ fn render_permission(
 #[derive(Debug, Default)]
 pub struct Transcript {
     blocks: Vec<Block>,
+    /// Where each block belongs, parallel to `blocks`: what a rebuild keeps
+    /// and where it puts it back.
+    meta: Vec<Placement>,
+    /// The conversation position new local blocks are anchored to.
+    fence: Fence,
+    /// Creation order of retained blocks on this client.
+    next_seq: u64,
     expanded_tool_groups: std::collections::BTreeSet<usize>,
     tool_group_boundaries: std::collections::BTreeSet<usize>,
     /// Expanded task cards by `(session id, task id)`, not by index, so the
@@ -785,7 +808,151 @@ impl Transcript {
     }
 
     pub fn push(&mut self, block: Block) {
+        let placement = self.classify(&block);
         self.blocks.push(block);
+        self.meta.push(placement);
+    }
+
+    /// Where each block belongs; parallel to [`Self::blocks`].
+    pub fn placements(&self) -> &[Placement] {
+        &self.meta
+    }
+
+    pub fn fence(&self) -> Fence {
+        self.fence
+    }
+
+    /// Records what the client knows about the conversation now. When a turn
+    /// is no longer running, blocks anchored to "the end of the running turn"
+    /// learn where that end is.
+    pub fn set_fence(&mut self, fence: Fence) {
+        self.fence = fence;
+        if fence.turn_running {
+            return;
+        }
+        for placement in &mut self.meta {
+            if let Some(anchor) = placement.anchor_mut() {
+                if let Anchor::TurnEnd { epoch } = *anchor {
+                    *anchor = if epoch == fence.epoch {
+                        Anchor::Entries { epoch: Some(epoch), after: fence.committed }
+                    } else {
+                        Anchor::Historical
+                    };
+                }
+            }
+        }
+    }
+
+    /// The position a block created now belongs to.
+    fn current_anchor(&self) -> Anchor {
+        if self.fence.turn_running {
+            Anchor::TurnEnd { epoch: self.fence.epoch }
+        } else if !self.meta.iter().any(|m| *m == Placement::Conversation) {
+            // Nothing of the conversation has been shown yet: whatever is on
+            // screen precedes it, as the user saw it.
+            Anchor::Start
+        } else {
+            Anchor::Entries { epoch: Some(self.fence.epoch), after: self.fence.committed }
+        }
+    }
+
+    fn next_order(&mut self) -> Order {
+        self.next_seq += 1;
+        Order { seq: self.next_seq, seen: self.max_record_position() }
+    }
+
+    fn max_record_position(&self) -> u64 {
+        self.meta
+            .iter()
+            .filter_map(|m| match m {
+                Placement::Record(RecordPlacement { position_seq: Some(p), .. }) => Some(*p),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Classifies a block appended by the live reducer.
+    fn classify(&mut self, block: &Block) -> Placement {
+        match block {
+            Block::User { .. } | Block::Assistant { .. } | Block::Thinking { .. } | Block::Tools { .. } => {
+                Placement::Conversation
+            }
+            Block::HistoryNotice { .. } => Placement::View,
+            Block::TaskCompletion { session_id, task_id, .. } => {
+                let item_id = format!("legacy-task:{}:{task_id}", session_id.as_deref().unwrap_or(""));
+                self.legacy_record(item_id)
+            }
+            Block::AgentMessage { id, .. } => self.legacy_record(format!("notification:{id}")),
+            _ => {
+                let anchor = self.current_anchor();
+                Placement::Local { anchor, order: self.next_order() }
+            }
+        }
+    }
+
+    /// A record from an engine without presentation records: anchored by this
+    /// client when it arrived.
+    fn legacy_record(&mut self, item_id: String) -> Placement {
+        let anchor = self.current_anchor();
+        Placement::Record(RecordPlacement {
+            item_id,
+            position_seq: None,
+            revision: 0,
+            relation: coda_proto::presentation::PresentationRelation::Active,
+            anchor,
+            order: self.next_order(),
+        })
+    }
+
+    /// The index of the record with this identity.
+    pub fn find_record(&self, item_id: &str) -> Option<usize> {
+        self.meta.iter().position(|m| matches!(m, Placement::Record(r) if r.item_id == item_id))
+    }
+
+    /// The placement of the record at `index`, if it is one.
+    pub fn record_at(&self, index: usize) -> Option<&RecordPlacement> {
+        match self.meta.get(index) {
+            Some(Placement::Record(record)) => Some(record),
+            _ => None,
+        }
+    }
+
+    /// Adds an engine record at the current end of the conversation (before a
+    /// streaming tail), or updates the one with the same identity in place.
+    ///
+    /// An update never moves a record, and a revision that is not newer than
+    /// the one shown changes nothing.
+    pub fn upsert_record(&mut self, block: Block, mut record: RecordPlacement) -> bool {
+        if let Some(index) = self.find_record(&record.item_id) {
+            let Some(existing) = self.record_at(index) else { return false };
+            let engine_newer = match (existing.position_seq, record.position_seq) {
+                (Some(_), Some(_)) => record.revision > existing.revision,
+                // An engine record supersedes this client's own guess.
+                (None, Some(_)) => true,
+                _ => false,
+            };
+            if !engine_newer {
+                // Same or older revision: only a resolved anchor or a changed
+                // relation is taken, never content or position.
+                if let Placement::Record(shown) = &mut self.meta[index] {
+                    if shown.position_seq.is_some() && record.revision == shown.revision {
+                        shown.anchor = record.anchor;
+                        shown.relation = record.relation;
+                    }
+                }
+                return false;
+            }
+            record.order = existing.order;
+            self.blocks[index] = block;
+            self.meta[index] = Placement::Record(record);
+            return true;
+        }
+        record.order = self.next_order();
+        let index = self.blocks.len() - usize::from(self.blocks.last().is_some_and(Block::is_open));
+        self.blocks.insert(index, block);
+        self.meta.insert(index, Placement::Record(record));
+        true
     }
 
     /// Shows a local notice immediately without hiding the streaming tail.
@@ -795,7 +962,9 @@ impl Transcript {
 
     fn insert_before_open_tail(&mut self, block: Block) {
         let index = self.blocks.len() - usize::from(self.blocks.last().is_some_and(Block::is_open));
+        let placement = self.classify(&block);
         self.blocks.insert(index, block);
+        self.meta.insert(index, placement);
     }
 
     /// Shows a task card, replacing the card for the same session and task
@@ -835,32 +1004,42 @@ impl Transcript {
 
     pub fn clear(&mut self) {
         self.blocks.clear();
+        self.meta.clear();
         self.expanded_tool_groups.clear();
         self.tool_group_boundaries.clear();
         self.expanded_task_cards.clear();
     }
 
     /// Replaces the conversation with the engine's authoritative version,
-    /// keeping the blocks that are this client's own.
+    /// putting every block that is not the conversation back where it
+    /// belongs.
     ///
-    /// The engine owns what the conversation *is*; it does not own the
-    /// startup banner, the launch notices, `/help` output or a `/diff`, none
-    /// of which any history read could ever return. Clearing everything threw
-    /// those away on every resume, gap and compaction — and an empty
-    /// authoritative history did it while adding nothing back.
+    /// The engine owns what the conversation *is*. It does not own the
+    /// startup banner, the launch notices, `/help` output or a `/diff`, and
+    /// the cards and notifications it does own are not model history. Each
+    /// of those carries a [`Placement`] naming the conversation position it
+    /// was created at. A rebuild resolves that position against `layout`
+    /// and puts it back there. Anything whose position is not in the loaded
+    /// conversation (an earlier history epoch, a compacted or rewound range,
+    /// a page that is not loaded) goes into the historical area at the top,
+    /// under [`HISTORICAL_MARKER`]. Nothing is ever re-appended after the
+    /// newest content, so a refresh can neither move an old record nor make
+    /// it look new.
     ///
-    /// Position is preserved as far as it can honestly be: client blocks that
-    /// preceded the whole conversation still precede it, and the rest keep
-    /// their order after it, but before a still-streaming tail so subsequent
-    /// deltas can reach it. Where they sat *within* a conversation that has
-    /// just been rebuilt is no longer knowable.
+    /// `records` is the engine's authoritative record set when it keeps one:
+    /// it replaces every record shown before. With `None` (an engine
+    /// without presentation records) the records already shown are kept with
+    /// the anchors this client gave them.
     ///
-    /// Fold and group state is dropped with the old blocks, exactly as
-    /// [`Self::clear`] does: both are recorded by block index, and carrying
-    /// them over would expand or fold whichever blocks happen to land on
-    /// those indices next. Task cards are the exception: their expansion is
-    /// keyed by session and task id, and the cards themselves are kept.
-    pub fn replace_conversation(&mut self, conversation: Vec<Block>) {
+    /// Tool-group folds are dropped with the old blocks, as [`Self::clear`]
+    /// does: they are recorded by block index. Task-card expansion is keyed
+    /// by session and task id and survives.
+    pub fn replace_conversation(
+        &mut self,
+        conversation: Vec<Block>,
+        layout: Option<&ConversationLayout>,
+        records: Option<Vec<(Block, RecordPlacement)>>,
+    ) -> RebuildStats {
         let mut conversation = conversation;
         let streaming_tail = if matches!(
             conversation.last(),
@@ -874,25 +1053,94 @@ impl Transcript {
             }
             None
         };
-        let previous = std::mem::take(&mut self.blocks);
-        let first_conversation = previous.iter().position(|block| !block.is_client_owned());
-        let split = first_conversation.unwrap_or(previous.len());
-        let mut rebuilt: Vec<Block> = Vec::with_capacity(previous.len() + conversation.len());
-        let mut trailing: Vec<Block> = Vec::new();
-        for (index, block) in previous.into_iter().enumerate() {
-            if index < split {
-                rebuilt.push(block);
-            } else if block.is_client_owned() {
-                trailing.push(block);
+        let authoritative = records.is_some();
+        let previous_blocks = std::mem::take(&mut self.blocks);
+        let previous_meta = std::mem::take(&mut self.meta);
+        let mut retained: Vec<(Block, Placement)> = previous_blocks
+            .into_iter()
+            .zip(previous_meta)
+            .filter(|(_, placement)| match placement {
+                Placement::Local { .. } => true,
+                Placement::Record(_) => !authoritative,
+                Placement::Conversation | Placement::View => false,
+            })
+            .collect();
+        if let Some(records) = records {
+            retained.extend(records.into_iter().map(|(block, record)| (block, Placement::Record(record))));
+        }
+
+        let length = conversation.len();
+        let mut stats = RebuildStats::default();
+        let mut top = Vec::new();
+        let mut historical = Vec::new();
+        let mut at: std::collections::BTreeMap<usize, Vec<(Block, Placement)>> = Default::default();
+        for (block, placement) in retained {
+            match &placement {
+                Placement::Record(_) => stats.records += 1,
+                _ => stats.local += 1,
+            }
+            match timeline::slot(&placement, layout, length) {
+                Slot::Top => top.push((block, placement)),
+                Slot::Historical => {
+                    stats.historical += 1;
+                    historical.push((block, placement));
+                }
+                Slot::At(index) => {
+                    stats.placed += 1;
+                    at.entry(index).or_default().push((block, placement));
+                }
             }
         }
-        rebuilt.extend(conversation);
-        rebuilt.extend(trailing);
-        rebuilt.extend(streaming_tail);
+        let by_order = |a: &(Block, Placement), b: &(Block, Placement)| a.1.order_key().cmp(&b.1.order_key());
+        top.sort_by(by_order);
+        historical.sort_by(by_order);
+        for items in at.values_mut() {
+            items.sort_by(by_order);
+        }
 
-        self.blocks = rebuilt;
+        let mut blocks = Vec::with_capacity(length + top.len() + historical.len() + 2);
+        let mut meta = Vec::with_capacity(blocks.capacity());
+        let mut emit = |block: Block, placement: Placement| {
+            blocks.push(block);
+            meta.push(placement);
+        };
+        for (block, placement) in top {
+            emit(block, placement);
+        }
+        if !historical.is_empty() {
+            emit(
+                Block::HistoryNotice { text: HISTORICAL_MARKER.to_string(), level: NoticeLevel::Info },
+                Placement::View,
+            );
+            for (block, placement) in historical {
+                emit(block, placement);
+            }
+        }
+        for (index, block) in conversation.into_iter().enumerate() {
+            for (retained, placement) in at.remove(&index).unwrap_or_default() {
+                emit(retained, placement);
+            }
+            let placement = if matches!(block, Block::HistoryNotice { .. }) {
+                Placement::View
+            } else {
+                Placement::Conversation
+            };
+            emit(block, placement);
+        }
+        for (_, items) in at {
+            for (retained, placement) in items {
+                emit(retained, placement);
+            }
+        }
+        if let Some(tail) = streaming_tail {
+            emit(tail, Placement::Conversation);
+        }
+
+        self.blocks = blocks;
+        self.meta = meta;
         self.expanded_tool_groups.clear();
         self.tool_group_boundaries.clear();
+        stats
     }
 
     /// The trailing block if it is still open, so streamed content can be
@@ -938,6 +1186,10 @@ impl Transcript {
         let mut new_index = 0;
         let mut expanded = std::collections::BTreeSet::new();
         let mut boundaries = std::collections::BTreeSet::new();
+        let keep: Vec<bool> =
+            self.blocks.iter().map(|block| !matches!(block, Block::User { pending: true, .. })).collect();
+        let mut flags = keep.iter();
+        self.meta.retain(|_| flags.next().copied().unwrap_or(true));
         self.blocks.retain(|block| {
             if self.tool_group_boundaries.contains(&old_index) {
                 boundaries.insert(new_index);
@@ -1302,10 +1554,15 @@ mod tests {
         transcript.push(Block::Notice { text: "Forked from abc".into(), level: NoticeLevel::Info });
         transcript.push(user_block("old question"));
         transcript.push(assistant_block("old answer"));
+        transcript.set_fence(Fence { epoch: 0, committed: 2, turn_running: false });
         transcript.push(Block::CommandOutput { text: "/help".into() });
         transcript.push(Block::Diff { raw: "diff --git a b".into() });
 
-        transcript.replace_conversation(vec![user_block("new question"), assistant_block("new answer")]);
+        transcript.replace_conversation(
+            vec![user_block("new question"), assistant_block("new answer")],
+            Some(&layout(0, 2)),
+            None,
+        );
 
         let shape: Vec<&str> = transcript
             .blocks()
@@ -1344,7 +1601,7 @@ mod tests {
         transcript.push(user_block("old question"));
         transcript.push(assistant_block("old answer"));
 
-        transcript.replace_conversation(Vec::new());
+        transcript.replace_conversation(Vec::new(), Some(&layout(0, 0)), None);
 
         assert_eq!(transcript.len(), 1, "{:?}", transcript.blocks());
         assert!(matches!(transcript.blocks()[0], Block::Banner { .. }));
@@ -1361,10 +1618,14 @@ mod tests {
         assert!(transcript.toggle_tool_group(0), "the group is foldable to begin with");
         transcript.end_tool_group();
 
-        transcript.replace_conversation(vec![
-            completed_tool("edit", CallStatus::Succeeded, "next", None),
-            completed_tool("bash", CallStatus::Succeeded, "next", None),
-        ]);
+        transcript.replace_conversation(
+            vec![
+                completed_tool("edit", CallStatus::Succeeded, "next", None),
+                completed_tool("bash", CallStatus::Succeeded, "next", None),
+            ],
+            None,
+            None,
+        );
 
         let rows = transcript.render(80, ToolDisplayMode::Summary);
         assert_eq!(
@@ -1394,7 +1655,7 @@ mod tests {
             answer: Some("main".into()),
         });
 
-        transcript.replace_conversation(vec![user_block("new question")]);
+        transcript.replace_conversation(vec![user_block("new question")], None, None);
 
         assert!(
             transcript.blocks().iter().any(|b| matches!(
@@ -1420,6 +1681,197 @@ mod tests {
             "the conversation itself must still be replaced: {:?}",
             transcript.blocks()
         );
+    }
+
+    /// A rebuilt conversation of `committed` one-block entries in `epoch`.
+    fn layout(epoch: i64, committed: i64) -> ConversationLayout {
+        ConversationLayout {
+            epoch,
+            committed,
+            first_index: 0,
+            entry_ends: (0..committed).map(|index| (index, index as usize + 1)).collect(),
+            live_start: committed as usize,
+        }
+    }
+
+    fn shape(transcript: &Transcript) -> Vec<String> {
+        transcript
+            .blocks()
+            .iter()
+            .map(|block| match block {
+                Block::User { text, .. } | Block::Assistant { text, .. } => text.clone(),
+                Block::TaskCompletion { task_id, .. } => format!("card {task_id}"),
+                Block::AgentMessage { id, .. } => format!("message {id}"),
+                Block::CommandOutput { text } => format!("output {text}"),
+                Block::Notice { text, .. } => format!("notice {text}"),
+                Block::HistoryNotice { text, .. } if text == HISTORICAL_MARKER => "earlier".into(),
+                Block::HistoryNotice { text, .. } => format!("view {text}"),
+                Block::Banner { .. } => "banner".into(),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    fn engine_card(task: &str, position: u64, revision: u32, after: i64, title: &str) -> (Block, RecordPlacement) {
+        (
+            Block::TaskCompletion {
+                session_id: Some("s1".into()),
+                task_id: task.into(),
+                status: "completed".into(),
+                kind: None,
+                title: Some(title.into()),
+                instructions: "do it".into(),
+            },
+            RecordPlacement {
+                item_id: format!("task:e1:{task}"),
+                position_seq: Some(position),
+                revision,
+                relation: coda_proto::presentation::PresentationRelation::Active,
+                anchor: Anchor::Entries { epoch: None, after },
+                order: Order::default(),
+            },
+        )
+    }
+
+    /// The request's reproduction: an old completion, a newer exchange, and
+    /// repeated refreshes. The card stays where it happened, exactly once.
+    #[test]
+    fn an_old_completion_stays_where_it_happened_across_refreshes() {
+        let mut transcript = Transcript::new();
+        let conversation = |n: usize| -> Vec<Block> {
+            ["background check please", "started it", "unrelated work", "unrelated answer", "more", "more answer"]
+                [..n]
+                .iter()
+                .enumerate()
+                .map(|(i, text)| if i % 2 == 0 { user_block(text) } else { assistant_block(text) })
+                .collect()
+        };
+        for committed in [2, 4, 4, 6, 6] {
+            transcript.replace_conversation(
+                conversation(committed),
+                Some(&layout(1, committed as i64)),
+                Some(vec![engine_card("t1", 1, 1, 2, "background check")]),
+            );
+            let shape = shape(&transcript);
+            assert_eq!(&shape[..3], ["background check please", "started it", "card t1"], "{shape:?}");
+            assert_eq!(shape.iter().filter(|s| s.starts_with("card")).count(), 1, "{shape:?}");
+            assert_eq!(shape.len(), committed + 1);
+        }
+    }
+
+    #[test]
+    fn local_output_keeps_its_place_between_entries_across_refreshes() {
+        let mut transcript = Transcript::new();
+        transcript.push(Block::Banner { wordmark: vec![], details: vec![] });
+        transcript.replace_conversation(vec![user_block("q1"), assistant_block("a1")], Some(&layout(1, 2)), None);
+        transcript.set_fence(Fence { epoch: 1, committed: 2, turn_running: false });
+        transcript.push(Block::CommandOutput { text: "/status".into() });
+        for _ in 0..3 {
+            transcript.replace_conversation(
+                vec![user_block("q1"), assistant_block("a1"), user_block("q2"), assistant_block("a2")],
+                Some(&layout(1, 4)),
+                None,
+            );
+        }
+        assert_eq!(shape(&transcript), ["banner", "q1", "a1", "output /status", "q2", "a2"]);
+    }
+
+    #[test]
+    fn output_from_a_running_turn_lands_at_that_turns_end_and_then_stays() {
+        let mut transcript = Transcript::new();
+        transcript.replace_conversation(vec![user_block("q1"), assistant_block("a1")], Some(&layout(1, 2)), None);
+        transcript.set_fence(Fence { epoch: 1, committed: 2, turn_running: true });
+        transcript.push(user_block("q2"));
+        transcript.push(Block::Notice { text: "during".into(), level: NoticeLevel::Info });
+        transcript.push(assistant_block("a2"));
+        transcript.set_fence(Fence { epoch: 1, committed: 4, turn_running: false });
+        for committed in [4, 6] {
+            let mut blocks = vec![user_block("q1"), assistant_block("a1"), user_block("q2"), assistant_block("a2")];
+            if committed == 6 {
+                blocks.extend([user_block("q3"), assistant_block("a3")]);
+            }
+            transcript.replace_conversation(blocks, Some(&layout(1, committed)), None);
+            assert_eq!(shape(&transcript)[..5], ["q1", "a1", "q2", "a2", "notice during"]);
+        }
+    }
+
+    #[test]
+    fn an_anchor_outside_the_loaded_page_is_historical_not_fresh() {
+        let mut transcript = Transcript::new();
+        let mut paged = layout(2, 10);
+        paged.first_index = 8;
+        paged.entry_ends = vec![(8, 1), (9, 2)];
+        paged.live_start = 2;
+        transcript.replace_conversation(
+            vec![user_block("q5"), assistant_block("a5")],
+            Some(&paged),
+            Some(vec![engine_card("t1", 1, 1, 3, "old")]),
+        );
+        assert_eq!(shape(&transcript), ["earlier", "card t1", "q5", "a5"]);
+    }
+
+    #[test]
+    fn compacted_records_go_to_the_historical_area() {
+        let mut transcript = Transcript::new();
+        let (block, mut record) = engine_card("t1", 1, 1, 2, "old");
+        record.relation = coda_proto::presentation::PresentationRelation::Compacted;
+        transcript.replace_conversation(
+            vec![user_block("summary"), user_block("q"), assistant_block("a")],
+            Some(&layout(3, 3)),
+            Some(vec![(block, record)]),
+        );
+        assert_eq!(shape(&transcript), ["earlier", "card t1", "summary", "q", "a"]);
+    }
+
+    #[test]
+    fn an_older_revision_never_rolls_back_or_moves_a_record() {
+        let mut transcript = Transcript::new();
+        transcript.replace_conversation(
+            vec![user_block("q1"), assistant_block("a1"), user_block("q2")],
+            Some(&layout(1, 3)),
+            Some(vec![engine_card("t1", 1, 2, 2, "newer")]),
+        );
+        let (block, record) = engine_card("t1", 1, 1, 3, "older");
+        assert!(!transcript.upsert_record(block, record));
+        assert_eq!(shape(&transcript), ["q1", "a1", "card t1", "q2"]);
+        assert!(matches!(&transcript.blocks()[2], Block::TaskCompletion { title: Some(t), .. } if t == "newer"));
+        // A newer revision updates in place.
+        let (block, record) = engine_card("t1", 1, 3, 2, "newest");
+        assert!(transcript.upsert_record(block, record));
+        assert_eq!(shape(&transcript), ["q1", "a1", "card t1", "q2"]);
+        assert!(matches!(&transcript.blocks()[2], Block::TaskCompletion { title: Some(t), .. } if t == "newest"));
+    }
+
+    #[test]
+    fn identical_titles_from_different_runs_stay_distinct() {
+        let mut transcript = Transcript::new();
+        transcript.replace_conversation(
+            vec![user_block("q1"), assistant_block("a1")],
+            Some(&layout(1, 2)),
+            Some(vec![engine_card("t1", 1, 1, 1, "nightly"), engine_card("t2", 2, 1, 2, "nightly")]),
+        );
+        assert_eq!(shape(&transcript), ["q1", "card t1", "a1", "card t2"]);
+    }
+
+    #[test]
+    fn task_card_expansion_survives_a_rebuild_with_records() {
+        let mut transcript = Transcript::new();
+        let rebuild = |t: &mut Transcript| {
+            t.replace_conversation(
+                vec![user_block("q1"), assistant_block("a1")],
+                Some(&layout(1, 2)),
+                Some(vec![engine_card("t1", 1, 1, 1, "kept")]),
+            )
+        };
+        rebuild(&mut transcript);
+        assert!(transcript.toggle_task_card(1));
+        rebuild(&mut transcript);
+        let all = joined_rows(&transcript.render(60, ToolDisplayMode::Summary));
+        assert!(all.contains("do it"), "the card is still expanded: {all}");
+    }
+
+    fn joined_rows(lines: &[RenderLine]) -> String {
+        lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n")
     }
 
     fn texts(lines: &[RenderLine]) -> Vec<String> {
@@ -2502,7 +2954,7 @@ mod tests {
             t.push(with_id(card(Some("Same title"), "second"), "task-00000008"));
             assert!(t.is_task_card(0) && t.is_task_card(1));
             assert!(t.toggle_task_card(0));
-            t.replace_conversation(vec![Block::Assistant { text: "hi".into(), complete: true }]);
+            t.replace_conversation(vec![Block::Assistant { text: "hi".into(), complete: true }], None, None);
             let all = joined(&t.render(60, ToolDisplayMode::Summary));
             assert!(all.contains("first"), "first card stays expanded after rehydration: {all}");
             assert!(!all.contains("second"), "the other card with the same title stays collapsed");
