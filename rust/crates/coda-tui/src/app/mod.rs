@@ -33,6 +33,8 @@ mod link;
 mod models;
 #[cfg(test)]
 mod paste_tests;
+#[cfg(test)]
+mod timeline_tests;
 mod queue;
 mod serve;
 mod settings;

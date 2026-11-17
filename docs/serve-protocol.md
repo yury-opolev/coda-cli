@@ -882,6 +882,57 @@ started. `description` stays the full, unchanged prompt or command.
 `session/listTasks` rows) and omitted when absent: only tasks restored from older checkpoints
 may lack one. Clients must handle its absence by falling back to `description`.
 
+### Presentation timeline (Rust) — `presentationTimeline` capability
+
+Task-completion cards and passive `notify_user` notifications are user-visible records that are
+**not** part of the model conversation. Earlier, a client that rebuilt its transcript from
+`session/getHistory` could only guess where they went, and appended them after the newest
+content. Engines that advertise `presentationTimeline` (`initialize.capabilities`, `version: 1`)
+keep them as a bounded, engine-owned read model instead:
+
+- **Identity.** `itemId` is stable live, in snapshots and after a restart.
+  - Task completions are `task:<engineInstanceId>:<taskId>`, so a task number reused by a
+    restarted engine is a different item.
+  - Notifications are `notification:<messageId>`. A planned restart that re-publishes a saved
+    notification maps it back to the original id, so it does not count as a new publication.
+- **Position.**
+  - `positionSeq` is the immutable acceptance order.
+  - `anchor.afterEntries` places the record after that many committed entries of the current
+    conversation.
+  - A record that happens during a turn carries `anchor.turnId` until the turn commits, and then
+    resolves to the end of that turn. A record never sits inside a streaming reply.
+- **Change.**
+  - Accepting the same `itemId` again is idempotent.
+  - Different content bumps `revision` and `changeSeq`, but keeps the position.
+  - `relation` becomes `compacted` (the anchored range was replaced by a compaction, manual or
+    automatic), `rewound` (removed by `session/rewind`) or `unknown` (the anchor does not fit the
+    conversation the record was restored with).
+  - `session/fork` starts a new, empty timeline: running work, records and freshness are not
+    inherited.
+- **Reads.** `session/getHistory` returns `presentation`
+  (`schemaVersion`, `timelineId`, `changeSeq`, `records`, `evictedBeforeSeq?`, `durability`). It
+  is read under the same lock as the page, so the records and the conversation describe one
+  generation. `event/presentationRecord` carries each accepted or changed record, in the same
+  state transaction as the change.
+- **Retention and durability.**
+  - At most 256 records and 256 KiB of payload. The oldest records are evicted first, and
+    `evictedBeforeSeq` says so.
+  - Records are persisted inside the session transcript file (`presentation` member), in the same
+    atomic write as the messages at turn end.
+  - `durability` is `durable`, `memory` (not yet persisted, or the write failed) or `corrupt` (the
+    stored member could not be read; what is shown starts from scratch).
+  - Older builds that rewrite a transcript drop the member.
+- **Authority.** Displaying or recovering a record never runs a task, recreates a schedule,
+  publishes a message or delivers anything to the model.
+
+A turn commit that rewrote earlier history (an automatic compaction inside the turn) now bumps
+`historyEpoch` and publishes `event/sessionChanged` with `reason: "compact"`, exactly like a
+manual compaction: indices from before the rewrite no longer name the same entries.
+
+Capable clients take cards and notifications only from records, never also from
+`event/taskCompleted` / `event/agentMessage`; those legacy events are unchanged for older
+clients.
+
 ### `session/askAside` — side questions (`/btw`)
 
 `{ question }` → `{ ok, answer?, reason?, error? }`. One separate, **tool-less** model

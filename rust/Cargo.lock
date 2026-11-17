@@ -869,6 +869,7 @@ dependencies = [
  "coda-mcp",
  "coda-proto",
  "coda-render",
+ "coda-serve",
  "crossterm",
  "directories",
  "futures",

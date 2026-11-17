@@ -274,6 +274,16 @@ new work. Cleanup failures and forced engine stops are reported after restoring
 the terminal, rather than followed by a success summary. See the
 [shutdown and Windows acceptance notes](rust/README.md#interactive-shutdown).
 
+**Transcript order:** completion cards, notifications and this terminal's own output
+(command output, notices, permission decisions) stay where they happened. A history
+refresh, a reconnect or a resume puts them back between the same messages and never
+moves them below newer content or shows them as new. Something that happens while a
+reply is streaming shows a short hint at once. Its card appears at the end of that
+turn, so the reply is never split. If the place where something happened is no longer
+in the loaded conversation (compacted, rewound, or before the loaded page), it is
+listed under an **Earlier activity** marker at the top rather than guessed. Cards and
+notifications are saved with the session, so they come back after a restart.
+
 **Mouse:** in the **transcript**, **left-drag** selects text; `Ctrl+C` **or a right-click** copies the
 selection (the role markers and tree connectors in the gutter are never copied). A selection is kept if
 the clipboard is unavailable, so you can retry. In the **composer**, **left-drag** selects text; when a

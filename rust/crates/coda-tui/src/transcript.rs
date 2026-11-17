@@ -847,7 +847,7 @@ impl Transcript {
     fn current_anchor(&self) -> Anchor {
         if self.fence.turn_running {
             Anchor::TurnEnd { epoch: self.fence.epoch }
-        } else if !self.meta.iter().any(|m| *m == Placement::Conversation) {
+        } else if !self.meta.contains(&Placement::Conversation) {
             // Nothing of the conversation has been shown yet: whatever is on
             // screen precedes it, as the user saw it.
             Anchor::Start
@@ -977,13 +977,26 @@ impl Transcript {
         }
     }
 
+    /// The expansion key of the task card at `index`: session and task id,
+    /// or the engine's item id when there is one, because a restarted engine
+    /// reuses task numbers and two such cards must not fold together.
+    fn card_key(&self, index: usize) -> Option<(String, String)> {
+        let (session, task) = self.blocks.get(index)?.task_card_key()?;
+        match self.meta.get(index) {
+            Some(Placement::Record(RecordPlacement { position_seq: Some(_), item_id, .. })) => {
+                Some((session, item_id.clone()))
+            }
+            _ => Some((session, task)),
+        }
+    }
+
     pub fn is_task_card(&self, index: usize) -> bool {
         matches!(self.blocks.get(index), Some(Block::TaskCompletion { .. }))
     }
 
     /// Toggles the task card at `index`, reporting whether it was one.
     pub fn toggle_task_card(&mut self, index: usize) -> bool {
-        let Some(key) = self.blocks.get(index).and_then(Block::task_card_key) else {
+        let Some(key) = self.card_key(index) else {
             return false;
         };
         if !self.expanded_task_cards.remove(&key) {
@@ -1392,7 +1405,7 @@ impl Transcript {
                     continue;
                 }
             }
-            let block_rows = match block.task_card_key() {
+            let block_rows = match self.card_key(index) {
                 Some(key) => block.render_card(width, self.expanded_task_cards.contains(&key)),
                 None => block.render(width, mode),
             };

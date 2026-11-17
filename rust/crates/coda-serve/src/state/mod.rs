@@ -1354,6 +1354,13 @@ impl EngineState {
             if let Some(len) = end.history_length {
                 s.history_length = len;
             }
+            // A commit that rewrote earlier history (an automatic compaction
+            // inside the turn) is a new projection: an index from before it
+            // no longer names the same entry, so the epoch moves exactly as a
+            // manual compaction moves it.
+            if end.history_rewritten {
+                s.history_epoch += 1;
+            }
             let was_stale = s.last_response_stale();
             s.turn = None;
 
@@ -1381,6 +1388,17 @@ impl EngineState {
                     tools_truncated: s.tools_evicted,
                 }),
             ));
+            if end.history_rewritten {
+                events.push(gated(
+                    coda_proto::events::event_method::SESSION_CHANGED,
+                    serde_json::json!(wire::SessionChangedEvent {
+                        reason: "compact".to_owned(),
+                        session_id: s.session_id.clone(),
+                        history_epoch: s.history_epoch,
+                        history_length: s.history_length,
+                    }),
+                ));
+            }
             // A model switched mid-turn takes effect for the context only now
             // that the turn's own model is no longer the current one.
             if s.last_response_stale() != was_stale {
@@ -3053,6 +3071,24 @@ pub(crate) mod tests {
     }
 
     // ── C3: a turn end must finalise its in-flight calls ──────────────────
+    #[test]
+    fn a_turn_commit_that_rewrote_history_moves_the_epoch() {
+        let state = test_state();
+        let before = state.history_view().history_epoch;
+        state.begin_turn("t1", "go", active_config(), ActivityPhase::Preparing);
+        state.end_turn(TurnEnd {
+            turn_id: "t1".into(),
+            history_length: Some(3),
+            history_rewritten: true,
+            ..Default::default()
+        });
+        assert_eq!(state.history_view().history_epoch, before + 1);
+
+        state.begin_turn("t2", "again", active_config(), ActivityPhase::Preparing);
+        state.end_turn(TurnEnd { turn_id: "t2".into(), history_length: Some(5), ..Default::default() });
+        assert_eq!(state.history_view().history_epoch, before + 1, "a pure append keeps the epoch");
+    }
+
     #[test]
     fn an_interrupted_turn_cancels_its_in_flight_tool_calls_instead_of_leaving_them_running() {
         let state = test_state();
