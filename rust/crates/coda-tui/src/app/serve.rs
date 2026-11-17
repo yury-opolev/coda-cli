@@ -1528,6 +1528,8 @@ impl App {
             engine_command: command,
             restarted: None,
             staged_images: Vec::new(),
+            paste_target: None,
+            pastes_since_submit: 0,
             selection: crate::selection::TranscriptSelection::new(),
             transcript_origin: (0, 0),
             hovered_link: None,
@@ -2501,7 +2503,8 @@ pub(in crate::app) mod tests {
         let message = harness.next_inbound().await;
         harness.app.on_inbound(message);
 
-        harness.app.on_paste("hello".into());
+        harness.app.begin_paste(1);
+        harness.app.apply_paste_text("hello".into(), crate::input::PasteSource::Terminal, 1);
         assert!(harness.app.composer.is_empty(), "{:?}", harness.app.composer.text());
 
         harness.app.on_key(enter()).await;

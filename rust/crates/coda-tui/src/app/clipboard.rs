@@ -8,6 +8,8 @@
 use arboard;
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
+use crate::input::{PasteAbort, PasteSource};
+
 use coda_boot::browser::LinkOpenMode;
 
 use super::{App, PointerAction, WHEEL_ROWS};
@@ -436,8 +438,7 @@ impl App {
                 self.dirty = true;
             }
             ClipboardPaste::Text(text) => {
-                self.composer.insert(&text);
-                self.dirty = true;
+                self.apply_paste_text(text, PasteSource::Clipboard, 0)
             }
             ClipboardPaste::Empty => {}
             ClipboardPaste::Problem(message) => self.notice(message, NoticeLevel::Warning),
@@ -457,22 +458,115 @@ impl App {
         self.dirty = true;
     }
 
-    /// Bracketed paste from the terminal.
-    pub(super) fn on_paste(&mut self, text: String) {
-        self.dirty = true;
+    /// Which editor would receive a paste right now.
+    fn current_paste_target(&self) -> PasteTarget {
         if self.surfaces.is_empty() {
-            self.composer.insert(&text);
+            PasteTarget::Composer
+        } else {
+            PasteTarget::Surface(self.surfaces.generation())
+        }
+    }
+
+    /// A terminal paste began: its text belongs to whatever editor has focus
+    /// now, and nowhere else.
+    pub(super) fn begin_paste(&mut self, txn: u64) {
+        let target = self.current_paste_target();
+        self.paste_target = Some((txn, target));
+        record_paste(PastePhase::Begin, PasteSource::Terminal, txn, None, "open");
+    }
+
+    /// Applies pasted text as one edit of one editor.
+    ///
+    /// The only text-paste entry point: terminal (bracketed) pastes and
+    /// Coda's own clipboard reads both come through here. It inserts, and
+    /// never submits, steers, runs a command, accepts a completion or answers
+    /// a prompt; sending stays a separate, explicit action.
+    pub(super) fn apply_paste_text(&mut self, text: String, source: PasteSource, txn: u64) {
+        self.dirty = true;
+        let current = self.current_paste_target();
+        let target = match source {
+            PasteSource::Clipboard => Some(current),
+            PasteSource::Terminal => match self.paste_target.take() {
+                Some((open, target)) if open == txn => Some(target),
+                _ => None,
+            },
+        };
+        if text.len() > crate::input::decoder::MAX_PASTE_BYTES {
+            self.abort_paste(txn, PasteAbort::TooLarge, text.len());
             return;
         }
-        // The composer is hidden behind an open surface, so a paste goes to
-        // the surface or nowhere. Some terminals send an empty bracketed
-        // paste when the clipboard holds an image, so an open question reads
-        // the clipboard itself then.
-        if text.is_empty() {
-            self.paste_into_question();
-            return;
+        let outcome = match target {
+            Some(target) if target != current => {
+                self.notice(
+                    "The paste was discarded because a different dialog took focus while it \
+                     arrived. Nothing was inserted or sent; paste again.",
+                    NoticeLevel::Warning,
+                );
+                "target_changed"
+            }
+            None => {
+                self.notice(
+                    "The paste arrived without its start marker and was discarded. Nothing was \
+                     inserted or sent; paste again.",
+                    NoticeLevel::Warning,
+                );
+                "no_target"
+            }
+            Some(PasteTarget::Composer) => {
+                self.composer.insert(&text);
+                self.pastes_since_submit = self.pastes_since_submit.saturating_add(1);
+                self.refresh_completions();
+                "inserted"
+            }
+            Some(PasteTarget::Surface(_)) => {
+                // Some terminals send an empty bracketed paste when the
+                // clipboard holds an image, so an open question reads the
+                // clipboard itself then.
+                if text.is_empty() && source == PasteSource::Terminal {
+                    self.paste_into_question();
+                    "image_lookup"
+                } else if self.surfaces.handle_paste(&text) {
+                    "inserted"
+                } else {
+                    self.hint("This dialog does not accept pasted text; nothing was pasted.");
+                    "declined"
+                }
+            }
+        };
+        record_paste(PastePhase::End, source, txn, Some(&text), outcome);
+    }
+
+    /// A terminal paste could not be completed: nothing of it is inserted or
+    /// replayed as keys, and the user is told why.
+    pub(super) fn abort_paste(&mut self, txn: u64, reason: PasteAbort, bytes: usize) {
+        self.dirty = true;
+        if self.paste_target.as_ref().is_some_and(|(open, _)| *open == txn) {
+            self.paste_target = None;
         }
-        self.surfaces.handle_paste(&text);
+        let why = match reason {
+            PasteAbort::TooLarge => format!(
+                "it is larger than the {} MiB paste limit ({} bytes)",
+                crate::input::decoder::MAX_PASTE_BYTES >> 20,
+                bytes
+            ),
+            PasteAbort::Incomplete => "the terminal never finished sending it".to_string(),
+            PasteAbort::Cancelled => "the terminal was handed to another program".to_string(),
+        };
+        self.notice(
+            format!(
+                "The paste was discarded because {why}. Nothing was inserted or sent. \
+                 Alt+V pastes from the clipboard directly."
+            ),
+            NoticeLevel::Warning,
+        );
+        coda_diagnostics::record(coda_diagnostics::Event::PasteTransaction {
+            phase: "cancel",
+            source: PasteSource::Terminal.as_str(),
+            txn,
+            bytes,
+            lines: 0,
+            outcome: reason.as_str(),
+        });
     }
 
     /// Right-click paste: delegates to the unified clipboard paste which
@@ -965,4 +1059,34 @@ mod fold_tests {
             "a chrome row must never resolve to a foldable header"
         );
     }
+}
+
+/// Which editor a paste was aimed at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PasteTarget {
+    /// The message composer (no surface open).
+    Composer,
+    /// The top surface, as of this stack generation.
+    Surface(u64),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PastePhase {
+    Begin,
+    End,
+}
+
+/// Paste metadata for diagnostics: sizes and outcome, never the text.
+fn record_paste(phase: PastePhase, source: PasteSource, txn: u64, text: Option<&str>, outcome: &'static str) {
+    coda_diagnostics::record(coda_diagnostics::Event::PasteTransaction {
+        phase: match phase {
+            PastePhase::Begin => "begin",
+            PastePhase::End => "end",
+        },
+        source: source.as_str(),
+        txn,
+        bytes: text.map_or(0, str::len),
+        lines: text.map_or(0, |text| text.lines().count()),
+        outcome,
+    });
 }

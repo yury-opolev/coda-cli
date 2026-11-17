@@ -197,6 +197,12 @@ No pasted text, clipboard contents or prompt text is recorded.
   nothing inserted; abort → nothing inserted, no request; ordinary typing +
   Enter still sends one prompt.
 * `terminal.rs` restore ordering test extended with the input step.
+* `tests/conpty_paste.rs` (Windows only): the test binary starts a real
+  pseudo console, runs `WindowsVtInput` inside it as the application, and
+  writes exactly what Windows Terminal sends (win32-input-mode keys, a raw
+  bracketed paste split across two writes, Shift+Enter). It asserts the
+  application receives `x`, one paste transaction with the normalised
+  multi-line text, and Shift+Enter, and that win32-input-mode was requested.
 
 Live interactive verification in a real Windows Terminal window was not
 possible in the automated environment; the ConPTY probe exercised the console
@@ -208,3 +214,8 @@ host layer only.
   get an explicit warning and the `Alt+V` route, never a heuristic.
 * A terminal that sends a paste without brackets (bracketed paste disabled in
   its settings) is indistinguishable from typing.
+* win32-input-mode wrappers are decoded inside an open paste, because that is
+  how the console host delivers paste content in that mode. Pasted text that
+  is itself exactly the shape `ESC [ n;n;n;n;n;n _` therefore reads as the
+  character it encodes. Ordinary text cannot contain the leading ESC.
+* Repeat counts above one produce one key press, as before.

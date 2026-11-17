@@ -5,8 +5,12 @@
 //! would leave the user's shell unusable. [`TerminalGuard`] ties restoration to
 //! a value's lifetime, and [`install_panic_hook`] covers the panicking path.
 
+use std::collections::VecDeque;
 use std::io::{self, Stdout, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+#[cfg(windows)]
+use std::time::Instant;
 
 use crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
@@ -19,6 +23,7 @@ use crossterm::{cursor, execute};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
+use crate::input::{BackendStatus, InputAction};
 use crate::render::backend::StableBackend;
 
 /// Tracks whether the terminal is currently in raw/alternate mode, so the panic
@@ -27,14 +32,163 @@ static TERMINAL_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 pub type Tui = Terminal<StableBackend<CrosstermBackend<Stdout>>>;
 
-/// Poll on the owning async task, without EventStream's detached reader thread.
-/// Cancellation therefore leaves no reader competing with the returned shell.
-pub(crate) async fn read_event() -> io::Result<crossterm::event::Event> {
+/// Whether crossterm's mouse capture is on (the panic hook needs to know
+/// without a guard). On Windows the input backend captures the mouse itself.
+static CROSSTERM_MOUSE: AtomicBool = AtomicBool::new(false);
+
+/// The single owner of terminal input. Every reader goes through
+/// [`read_input`], so there is never a second reader racing for input.
+static INPUT: Mutex<Option<InputState>> = Mutex::new(None);
+
+struct InputState {
+    backend: Backend,
+    status: BackendStatus,
+}
+
+enum Backend {
+    #[cfg(windows)]
+    Vt(crate::input::windows::WindowsVtInput),
+    Crossterm {
+        next_txn: u64,
+        queue: VecDeque<InputAction>,
+    },
+}
+
+fn input_lock() -> std::sync::MutexGuard<'static, Option<InputState>> {
+    INPUT.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn crossterm_state(status: BackendStatus) -> InputState {
+    InputState {
+        backend: Backend::Crossterm { next_txn: 0, queue: VecDeque::new() },
+        status,
+    }
+}
+
+fn crossterm_status() -> BackendStatus {
+    BackendStatus {
+        backend: "crossterm",
+        paste_framing: !cfg!(windows),
+        key_encoding: if cfg!(windows) { "native-records" } else { "vt" },
+    }
+}
+
+/// Takes over terminal input for a terminal that was just set up. On Windows
+/// this is the VT backend; if the console refuses VT input it falls back to
+/// crossterm's native reader, which cannot see paste boundaries. Returns
+/// whether crossterm's mouse capture must be used.
+fn activate_input(capture_mouse: bool) -> bool {
+    let mut slot = input_lock();
+    // An earlier owner (a preflight screen) gives the console back first.
+    *slot = None;
+    #[cfg(windows)]
+    {
+        match crate::input::windows::WindowsVtInput::activate(capture_mouse) {
+            Ok(vt) => {
+                let status = BackendStatus {
+                    backend: "windows-vt",
+                    paste_framing: true,
+                    key_encoding: "win32-input-mode",
+                };
+                record_backend(status);
+                *slot = Some(InputState { backend: Backend::Vt(vt), status });
+                false
+            }
+            Err(_) => {
+                let status = BackendStatus { backend: "crossterm-native", ..crossterm_status() };
+                record_backend(status);
+                *slot = Some(crossterm_state(status));
+                capture_mouse
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let status = crossterm_status();
+        record_backend(status);
+        *slot = Some(crossterm_state(status));
+        capture_mouse
+    }
+}
+
+fn record_backend(status: BackendStatus) {
+    coda_diagnostics::record(coda_diagnostics::Event::InputBackend {
+        backend: status.backend,
+        paste_framing: status.paste_framing,
+        key_encoding: status.key_encoding,
+    });
+}
+
+/// Gives console input back (console modes restored, an open paste
+/// cancelled) without forgetting the backend, so [`resume_input`] can retake
+/// it after an external program.
+fn suspend_input() -> io::Result<()> {
+    #[cfg(windows)]
+    if let Some(InputState { backend: Backend::Vt(vt), .. }) = input_lock().as_mut() {
+        return vt.deactivate();
+    }
+    Ok(())
+}
+
+fn resume_input() -> io::Result<()> {
+    #[cfg(windows)]
+    if let Some(InputState { backend: Backend::Vt(vt), .. }) = input_lock().as_mut() {
+        return vt.reactivate();
+    }
+    Ok(())
+}
+
+/// The active input backend, once a terminal has been set up.
+pub fn input_status() -> Option<BackendStatus> {
+    input_lock().as_ref().map(|state| state.status)
+}
+
+/// One step of the input owner: a queued or newly available action, never
+/// blocking. No lock is held across an `.await`.
+fn poll_input() -> io::Result<Option<InputAction>> {
+    let mut slot = input_lock();
+    let state = slot.get_or_insert_with(|| crossterm_state(crossterm_status()));
+    match &mut state.backend {
+        #[cfg(windows)]
+        Backend::Vt(vt) => vt.poll(Instant::now()),
+        Backend::Crossterm { next_txn, queue } => {
+            if queue.is_empty() && crossterm::event::poll(std::time::Duration::ZERO)? {
+                let event = crossterm::event::read()?;
+                queue.extend(crate::input::from_crossterm(event, next_txn));
+            }
+            Ok(queue.pop_front())
+        }
+    }
+}
+
+/// The next terminal input action.
+///
+/// Polled on the owning async task, without a detached reader thread, so a
+/// cancelled read leaves no reader competing with a returned shell; whatever
+/// was decoded but not yet returned stays queued in the owner.
+pub(crate) async fn read_input() -> io::Result<InputAction> {
     loop {
-        if crossterm::event::poll(std::time::Duration::ZERO)? {
-            return crossterm::event::read();
+        if let Some(action) = poll_input()? {
+            return Ok(action);
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// [`read_input`] as crossterm events, for the screens that only need keys
+/// (preflight, shutdown). A paste becomes one `Event::Paste`; transaction
+/// bookkeeping and aborted pastes are not events there.
+pub(crate) async fn read_event() -> io::Result<crossterm::event::Event> {
+    loop {
+        match read_input().await? {
+            InputAction::Key(key) => return Ok(crossterm::event::Event::Key(key)),
+            InputAction::Mouse(mouse) => return Ok(crossterm::event::Event::Mouse(mouse)),
+            InputAction::Resize(cols, rows) => return Ok(crossterm::event::Event::Resize(cols, rows)),
+            InputAction::FocusGained => return Ok(crossterm::event::Event::FocusGained),
+            InputAction::FocusLost => return Ok(crossterm::event::Event::FocusLost),
+            InputAction::PasteText { text, .. } => return Ok(crossterm::event::Event::Paste(text)),
+            InputAction::PasteStarted { .. } | InputAction::PasteAborted { .. } => {}
+        }
     }
 }
 
@@ -68,8 +222,10 @@ impl TerminalGuard {
                 EnableFocusChange,
                 cursor::Hide
             )?;
-            if capture_mouse {
+            let crossterm_mouse = activate_input(capture_mouse);
+            if crossterm_mouse {
                 execute!(stdout, EnableMouseCapture)?;
+                CROSSTERM_MOUSE.store(true, Ordering::SeqCst);
             }
 
             let mut terminal = Terminal::new(StableBackend::new(CrosstermBackend::new(io::stdout())))?;
@@ -77,13 +233,13 @@ impl TerminalGuard {
 
             Ok(Self {
                 terminal,
-                mouse_captured: capture_mouse,
+                mouse_captured: crossterm_mouse,
             })
         })();
         match result {
             Ok(guard) => Ok(guard),
             Err(error) => {
-                let restoration = restore(capture_mouse);
+                let restoration = restore(CROSSTERM_MOUSE.load(Ordering::SeqCst));
                 TERMINAL_ACTIVE.store(false, Ordering::SeqCst);
                 match restoration {
                     Ok(()) => Err(error),
@@ -119,7 +275,9 @@ impl TerminalGuard {
         )?;
         if self.mouse_captured {
             execute!(stdout, EnableMouseCapture)?;
+            CROSSTERM_MOUSE.store(true, Ordering::SeqCst);
         }
+        resume_input()?;
         self.terminal.clear()?;
 
         result
@@ -142,7 +300,11 @@ fn restore(mouse_captured: bool) -> io::Result<()> {
     let started = std::time::Instant::now();
     let mut stdout = io::stdout();
     let result = restore_with(mouse_captured, |step| match step {
-        RestoreStep::Mouse => execute!(stdout, DisableMouseCapture),
+        RestoreStep::Input => suspend_input(),
+        RestoreStep::Mouse => {
+            CROSSTERM_MOUSE.store(false, Ordering::SeqCst);
+            execute!(stdout, DisableMouseCapture)
+        }
         RestoreStep::Focus => execute!(stdout, DisableFocusChange),
         RestoreStep::Paste => execute!(stdout, DisableBracketedPaste),
         RestoreStep::Screen => execute!(stdout, LeaveAlternateScreen),
@@ -164,6 +326,7 @@ fn restore(mouse_captured: bool) -> io::Result<()> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RestoreStep {
+    Input,
     Mouse,
     Focus,
     Paste,
@@ -179,6 +342,7 @@ fn restore_with(
 ) -> io::Result<()> {
     let mut errors = Vec::new();
     for action in [
+        RestoreStep::Input,
         RestoreStep::Mouse,
         RestoreStep::Focus,
         RestoreStep::Paste,
@@ -214,9 +378,7 @@ pub fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         if TERMINAL_ACTIVE.swap(false, Ordering::SeqCst) {
-            // Mouse capture is disabled unconditionally here: we cannot know
-            // whether it was on, and disabling it when it is off is harmless.
-            if let Err(error) = restore(true) {
+            if let Err(error) = restore(CROSSTERM_MOUSE.load(Ordering::SeqCst)) {
                 let _ = writeln!(
                     io::stderr(),
                     "failed to restore the terminal after panic: {error}"
@@ -263,6 +425,11 @@ mod tests {
         });
         assert!(attempted.contains(&RestoreStep::Raw));
         assert!(attempted.contains(&RestoreStep::Flush));
+        assert_eq!(
+            attempted.first(),
+            Some(&RestoreStep::Input),
+            "console input is handed back before anything else is undone"
+        );
         let message = result.unwrap_err().to_string();
         assert!(message.contains("Mouse failed"));
         assert!(message.contains("Screen failed"));

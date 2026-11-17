@@ -244,6 +244,27 @@ pub enum Event {
         duration_ms: u64,
         outcome: &'static str,
     },
+
+    /// The terminal input backend chosen when the terminal was set up:
+    /// whether paste boundaries can be seen at all, and how keys arrive.
+    InputBackend {
+        backend: &'static str,
+        paste_framing: bool,
+        key_encoding: &'static str,
+    },
+    /// One paste transaction moved to `phase` (`begin`, `end` or `cancel`).
+    /// Sizes only — the pasted text itself is never recorded.
+    PasteTransaction {
+        phase: &'static str,
+        source: &'static str,
+        txn: u64,
+        bytes: usize,
+        lines: usize,
+        outcome: &'static str,
+    },
+    /// A draft that received `pastes` pastes was submitted once, as `submission`
+    /// (`prompt`, `steer`, `command` or `shell`).
+    PasteDraftSubmitted { pastes: u32, submission: &'static str },
 }
 
 impl Event {
@@ -336,6 +357,23 @@ mod tests {
         assert_eq!(value["kind"], "turn_failed");
         assert_eq!(value["category"], "transport");
         assert!(value.get("message").is_none());
+    }
+
+    #[test]
+    fn paste_events_carry_sizes_and_never_text() {
+        let event = Event::PasteTransaction {
+            phase: "end",
+            source: "terminal",
+            txn: 3,
+            bytes: 42,
+            lines: 4,
+            outcome: "inserted",
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        let mut keys: Vec<_> = value.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["bytes", "kind", "lines", "outcome", "phase", "source", "txn"]);
+        assert_eq!(value["kind"], "paste_transaction");
     }
 
     #[test]
