@@ -161,6 +161,7 @@ fn read(length: i64) -> GetHistoryResult {
         live_entries: None,
         live_truncated: None,
         live_omitted_bytes: None,
+        presentation: None,
     }
 }
 
@@ -334,7 +335,7 @@ fn a_delivery_belonging_to_a_conversation_already_rebuilt_is_not_shown_twice() {
             },
         ],
         notices: Vec::new(),
-        coverage: None,
+        coverage: None, layout: None, presentation: None,
     });
     state.apply(UiEvent::Snapshot(Box::new(delivery_snapshot())));
     state.apply(UiEvent::Engine(Event::SteeringDelivered {
@@ -426,7 +427,7 @@ fn stranded_after_rebuild(coverage: Option<HistoryCoverage>) -> UiState {
     state.apply(UiEvent::Rehydrated {
         blocks: committed_conversation(),
         notices: Vec::new(),
-        coverage,
+        coverage, layout: None, presentation: None,
     });
     state
 }
@@ -502,7 +503,7 @@ fn one_identical_message_already_committed_and_one_just_delivered_are_two_messag
     state.apply(UiEvent::Rehydrated {
         blocks: committed_conversation(),
         notices: Vec::new(),
-        coverage: Some(HistoryCoverage::of_read(&read(4))),
+        coverage: Some(HistoryCoverage::of_read(&read(4))), layout: None, presentation: None,
     });
 
     let steering = SteeringQueueState {
@@ -544,7 +545,7 @@ fn a_delivery_into_the_running_turn_is_never_covered_by_an_older_committed_read(
             Block::Assistant { text: "answer".into(), complete: true },
         ],
         notices: Vec::new(),
-        coverage: Some(HistoryCoverage::of_read(&read(2))),
+        coverage: Some(HistoryCoverage::of_read(&read(2))), layout: None, presentation: None,
     });
 
     let steering =
@@ -626,7 +627,7 @@ fn a_rebuild_of_unknown_provenance_withdraws_the_previous_claim() {
     state.apply(UiEvent::Rehydrated {
         blocks: committed_conversation(),
         notices: Vec::new(),
-        coverage: None,
+        coverage: None, layout: None, presentation: None,
     });
 
     let steering =
@@ -766,7 +767,7 @@ fn a_delivered_message_the_live_view_had_no_room_for_survives_a_rebuild() {
             Block::Assistant { text: "answer".into(), complete: false },
         ],
         notices: vec!["The running turn's view is shortened.".into()],
-        coverage: Some(HistoryCoverage::of_read(&budgeted)),
+        coverage: Some(HistoryCoverage::of_read(&budgeted)), layout: None, presentation: None,
     });
 
     assert!(state.unsent.is_empty(), "it was delivered; it is not an unsent draft");
@@ -813,7 +814,7 @@ fn a_rebuild_that_shows_the_delivered_message_keeps_no_second_copy_of_it() {
             },
         ],
         notices: Vec::new(),
-        coverage: Some(HistoryCoverage::of_read(&read(2))),
+        coverage: Some(HistoryCoverage::of_read(&read(2))), layout: None, presentation: None,
     });
     state.apply(UiEvent::TurnFinished { interrupted: false, error: None });
 
@@ -1025,7 +1026,7 @@ fn a_committed_queue_is_not_re_appended_when_the_conversation_is_rebuilt() {
     state.apply(UiEvent::Rehydrated {
         blocks,
         notices: Vec::new(),
-        coverage: Some(HistoryCoverage::of_read(&read(committed))),
+        coverage: Some(HistoryCoverage::of_read(&read(committed))), layout: None, presentation: None,
     });
 
     // And the snapshot still reports every delivery, because the outcome ring

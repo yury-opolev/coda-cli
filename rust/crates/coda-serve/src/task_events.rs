@@ -23,6 +23,8 @@ use tokio::sync::Notify;
 use tokio::time::Instant;
 
 use crate::bus::{EventBus, OutboundHealth};
+use crate::state::EngineState;
+use coda_proto::presentation::PresentationPayload;
 
 /// Most `event/taskOutput` frames per task per second.
 pub const OUTPUT_FRAMES_PER_SECOND: u32 = 4;
@@ -51,6 +53,8 @@ pub struct TaskEventPublisher {
     wake: Arc<Notify>,
     flusher: OnceLock<()>,
     self_ref: OnceLock<Weak<TaskEventPublisher>>,
+    /// Where main-agent background completions become presentation records.
+    presentation: OnceLock<Weak<EngineState>>,
 }
 
 impl TaskEventPublisher {
@@ -63,9 +67,41 @@ impl TaskEventPublisher {
             wake: Arc::new(Notify::new()),
             flusher: OnceLock::new(),
             self_ref: OnceLock::new(),
+            presentation: OnceLock::new(),
         });
         let _ = publisher.self_ref.set(Arc::downgrade(&publisher));
         publisher
+    }
+
+    /// Completions of the main agent's background tasks are also accepted
+    /// into `state`'s presentation timeline (set once, by the host).
+    pub fn set_presentation(&self, state: &Arc<EngineState>) {
+        let _ = self.presentation.set(Arc::downgrade(state));
+    }
+
+    /// A card for a main-agent background task: the same filter the TUI
+    /// applies to legacy completions (no foreground task, no owner).
+    fn accept_completion(&self, task: &ManagedTask, status: TaskRunStatus, mode: &str) {
+        if mode == "foreground" || task.parent_id.is_some() {
+            return;
+        }
+        let Some(state) = self.presentation.get().and_then(Weak::upgrade) else { return };
+        let engine = state.bus_ref().engine_instance_id().to_owned();
+        state.accept_presentation(
+            format!("task:{engine}:{}", task.id),
+            PresentationPayload::TaskCompletion {
+                task_id: task.id.clone(),
+                status: status.as_str().to_owned(),
+                task_kind: Some(task.kind.as_str().to_owned()),
+                title: task
+                    .title
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_owned),
+                instructions: task.description.clone(),
+            },
+        );
     }
 
     fn publish(&self, event: Event) {
@@ -217,6 +253,8 @@ impl TaskEventObserver for TaskEventPublisher {
             kind: Some(task.kind.as_str().to_owned()),
             mode: Some(snapshot.mode.as_str().to_owned()),
         });
+        drop(outputs);
+        self.accept_completion(task, status, snapshot.mode.as_str());
     }
 
     fn on_suspended(&self, task: &TaskSnapshot, reason: &str) {
@@ -456,6 +494,51 @@ mod tests {
         assert_eq!(seen[1].1["taskId"], restored.id.as_str());
         assert_eq!(seen[1].1["resumed"], true);
         f.manager.stop(&restored.id);
+    }
+
+    #[tokio::test]
+    async fn only_main_agent_background_completions_become_presentation_records() {
+        let mut f = fixture();
+        let state = Arc::new(EngineState::new(
+            Arc::clone(&f.bus),
+            "s1",
+            "/work",
+            std::collections::HashMap::new(),
+            crate::state::tests::active_config(),
+        ));
+        f.publisher.set_presentation(&state);
+        let main_bg = f
+            .manager
+            .register(TaskKind::Subagent, "deep review", "Review it in depth", None, TaskExecutionMode::Background)
+            .unwrap();
+        let owned = f
+            .manager
+            .register(TaskKind::Shell, "ls", "ls", Some(&main_bg.id), TaskExecutionMode::Background)
+            .unwrap();
+        let foreground =
+            f.manager.register(TaskKind::Shell, "build", "build", None, TaskExecutionMode::Foreground).unwrap();
+        f.manager.complete(&owned.id, None);
+        f.manager.complete(&foreground.id, None);
+        f.manager.complete(&main_bg.id, Some("done".into()));
+
+        let records = state.presentation_snapshot().records;
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].item_id, format!("task:engine-1:{}", main_bg.id));
+        match &records[0].payload {
+            PresentationPayload::TaskCompletion { task_id, status, task_kind, title, instructions } => {
+                assert_eq!(task_id, &main_bg.id);
+                assert_eq!(status, "completed");
+                assert_eq!(task_kind.as_deref(), Some("subagent"));
+                assert_eq!(title.as_deref(), Some("deep review"));
+                assert_eq!(instructions, "Review it in depth");
+            }
+            other => panic!("{other:?}"),
+        }
+        let methods: Vec<String> = frames(&mut f.rx).into_iter().map(|(m, _)| m).collect();
+        assert_eq!(methods.last().map(String::as_str), Some("event/presentationRecord"));
+        assert_eq!(methods.iter().filter(|m| *m == "event/presentationRecord").count(), 1);
+        let completed = methods.iter().rposition(|m| m == "event/taskCompleted").unwrap();
+        assert_eq!(completed + 1, methods.len() - 1, "the record follows the legacy completion: {methods:?}");
     }
 
     #[tokio::test]

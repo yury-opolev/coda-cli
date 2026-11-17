@@ -19,6 +19,8 @@
 //!   `event/taskCompleted` (non-blocking runtime, Phase 3)
 //! - `aside`      — `session/askAside` side questions (Phase 3)
 //! - `restart`    — the planned-restart file (`session/prepareRestart`)
+//! - `presentation_persist` — writes the presentation timeline into the
+//!   session transcript, off the observers' call paths
 
 pub mod aside;
 pub mod catalog;
@@ -33,6 +35,7 @@ mod mcp;
 pub mod mcp_list;
 pub mod output_budget;
 pub mod plugins;
+pub mod presentation_persist;
 pub mod prompts;
 pub mod recovery_executor;
 pub mod restart;

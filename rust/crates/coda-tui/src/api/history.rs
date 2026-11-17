@@ -44,6 +44,10 @@ pub struct Hydration {
     /// live turn. Rendered as notices so an incomplete replay says so instead
     /// of looking complete.
     pub notices: Vec<String>,
+    /// Where each committed entry ends among `blocks`, so blocks that are
+    /// not the conversation can be put back between the right entries. The
+    /// caller fills in `epoch` and `committed` from the read's own fences.
+    pub layout: crate::timeline::ConversationLayout,
 }
 
 /// The identity of a single tool call.
@@ -78,7 +82,10 @@ pub fn hydrate(entries: &[HistoryEntry], live: &[HistoryEntry], live_truncated: 
 
     for entry in entries {
         push_entry(entry, &mut out, &mut registry, false);
+        out.layout.entry_ends.push((entry.index, out.blocks.len()));
     }
+    out.layout.first_index = entries.first().map_or(0, |entry| entry.index);
+    out.layout.live_start = out.blocks.len();
     // Only the *last* live entry can still be receiving content, and within
     // it only the last block. Everything before is finished by the fact that
     // something followed it.

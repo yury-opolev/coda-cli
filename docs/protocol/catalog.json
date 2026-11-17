@@ -699,6 +699,12 @@
       "paramsContract": "clientReaderWithRustMetadata"
     },
     {
+      "method": "event/presentationRecord",
+      "paramsSchema": "schemas/PresentationRecordEvent.json",
+      "requiresStateEvents": false,
+      "paramsContract": "clientReaderWithRustMetadata"
+    },
+    {
       "method": "event/activity",
       "paramsSchema": "schemas/ActivityEvent.json",
       "requiresStateEvents": true,

@@ -174,6 +174,8 @@ pub struct ServeView {
     /// The largest history page this engine will serve, as it advertises it.
     /// `0` = not yet known.
     max_history_page: i64,
+    /// The engine advertised `presentationTimeline`.
+    presentation_capable: bool,
 }
 
 impl Default for ServeView {
@@ -196,6 +198,7 @@ impl ServeView {
             resets: 0,
             dropped: 0,
             max_history_page: 0,
+            presentation_capable: false,
         }
     }
 
@@ -264,6 +267,21 @@ impl ServeView {
     /// `initialize` returned. Taking it here rather than assuming `0` is what
     /// makes a resumed session's already-burned seqs not look like a gap.
     pub fn on_initialize(&mut self, result: &InitializeResult) {
+        let capable = result.capabilities.as_ref().is_some_and(|capabilities| {
+            capabilities
+                .get(coda_proto::presentation::PRESENTATION_CAPABILITY)
+                .is_some_and(|entry| entry.supported)
+        });
+        self.on_initialize_inner(result);
+        self.presentation_capable = capable;
+    }
+
+    /// Whether the engine keeps presentation records.
+    pub fn presentation_capable(&self) -> bool {
+        self.presentation_capable
+    }
+
+    fn on_initialize_inner(&mut self, result: &InitializeResult) {
         let instance = result.engine_instance_id.clone();
         if instance.is_none() {
             // Legacy engine: no fence to keep. Everything applies unfenced.

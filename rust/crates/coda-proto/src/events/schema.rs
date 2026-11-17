@@ -49,5 +49,6 @@ pub(crate) fn documents() -> BTreeMap<&'static str, Value> {
         "PostCompactContextInjectedEvent.json" => PostCompactContextInjectedPayload,
         "CompactionEvent.json" => CompactionInfo,
         "ContextWindowEvent.json" => ContextWindowInfo,
+        "PresentationRecordEvent.json" => crate::presentation::PresentationRecord,
     )
 }

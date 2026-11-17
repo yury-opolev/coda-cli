@@ -83,6 +83,15 @@
             "string",
             "null"
           ]
+        },
+        "version": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "The version of a versioned capability (e.g. the presentation timeline\nrecord schema). Absent for unversioned ones."
         }
       },
       "required": [

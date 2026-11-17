@@ -213,6 +213,7 @@ mod tests {
             live_entries: None,
             live_truncated: None,
             live_omitted_bytes: None,
+            presentation: None,
         }
     }
 

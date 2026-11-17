@@ -413,10 +413,18 @@ pub enum UiEvent {
     /// claim (a legacy engine, or a caller that is not a history read), and
     /// any previous claim is dropped rather than left to describe a
     /// conversation it no longer matches.
+    ///
+    /// `layout` says where each committed entry ends among `blocks`, so
+    /// records and this client's own blocks go back between the right
+    /// entries. `presentation` is the engine's record set from the same read
+    /// (capability `presentationTimeline`); `None` keeps the records already
+    /// shown, with the anchors this client gave them.
     Rehydrated {
         blocks: Vec<Block>,
         notices: Vec<String>,
         coverage: Option<HistoryCoverage>,
+        layout: Option<crate::timeline::ConversationLayout>,
+        presentation: Option<coda_proto::presentation::PresentationTimeline>,
     },
     /// No engine is answering any more — a sign-out, an engine that went
     /// away, or a replacement that did not start.
@@ -677,6 +685,20 @@ pub struct UiState {
     /// engine instance is replaced (see `serve.rs::adopt_engine`), so a new
     /// process's ids are never compared against the previous one's.
     agent_message_ids: std::collections::HashSet<String>,
+    /// The engine keeps presentation records (capability
+    /// `presentationTimeline`): cards and notifications come only from them,
+    /// never also from the legacy events describing the same occurrence.
+    pub presentation_capable: bool,
+    /// Records that occurred during the running turn. They belong at that
+    /// turn's end and are shown there when it ends, so a notification never
+    /// splits a streaming reply.
+    held_records: Vec<coda_proto::presentation::PresentationRecord>,
+    /// Record ids this client has already been told about, so only a genuinely
+    /// new live record raises a hint. Bounded.
+    seen_records: crate::timeline::SeenItems,
+    /// A record arrived whose place is not the current end of the
+    /// conversation; only an authoritative rebuild can place it.
+    pub timeline_refresh_needed: bool,
 }
 
 impl Default for UiState {
@@ -719,6 +741,10 @@ impl UiState {
             active_model: None,
             model_labels: ModelLabelCache::default(),
             agent_message_ids: std::collections::HashSet::new(),
+            presentation_capable: false,
+            held_records: Vec::new(),
+            seen_records: Default::default(),
+            timeline_refresh_needed: false,
         }
     }
 
@@ -1237,6 +1263,7 @@ impl UiState {
             UiEvent::TurnFinished { interrupted, error } => {
                 self.transcript.end_tool_group();
                 self.close_open_and_flush();
+                self.release_held_records();
                 self.transcript.finalize_activities(None);
                 self.strand_unsent_queue();
                 self.settle_after_turn();
@@ -1374,7 +1401,7 @@ impl UiState {
             UiEvent::CoreLifecycle(lifecycle) => self.apply_lifecycle(lifecycle, now),
             UiEvent::CoreActivity(phase) => self.apply_activity_phase(phase, now, None),
             UiEvent::Snapshot(snapshot) => self.reconcile(&snapshot, now),
-            UiEvent::Rehydrated { mut blocks, notices, coverage } => {
+            UiEvent::Rehydrated { mut blocks, notices, coverage, layout, presentation } => {
                 // The engine owns what the *conversation* is. Anything the UI
                 // had of it is a projection of an older answer to the same
                 // question, so it is replaced outright — but the banner, the
@@ -1402,7 +1429,16 @@ impl UiState {
                 blocks.splice(notice_index..notice_index, notices.into_iter().map(|text| {
                     Block::HistoryNotice { text, level: NoticeLevel::Warning }
                 }));
-                self.transcript.replace_conversation(blocks);
+                let records = presentation.map(|timeline| self.records_for_rebuild(timeline));
+                let held = self.held_records.len() as u32;
+                let stats = self.transcript.replace_conversation(blocks, layout.as_ref(), records);
+                coda_diagnostics::record(coda_diagnostics::Event::TimelineRebuild {
+                    records: stats.records,
+                    placed: stats.placed,
+                    historical: stats.historical,
+                    local: stats.local,
+                    held,
+                });
                 self.restore_live_thinking(carried, now);
                 // A notification parked behind the block this rebuild just
                 // replaced has no engine-side history to fall back on
@@ -1435,6 +1471,7 @@ impl UiState {
 
     fn apply_engine(&mut self, event: Event, now: std::time::Instant) {
         match event {
+            Event::PresentationRecord(record) => self.apply_presentation_record(*record, now),
             Event::AssistantText { delta } => {
                 if delta.is_empty() {
                     return;
@@ -1719,8 +1756,13 @@ impl UiState {
                 self.running_tasks.remove(&task_id);
                 // Announced only for the main agent's background work: a
                 // foreground task's end is already its tool result, and a
-                // subagent's own tasks are reported to that subagent.
-                if mode.as_deref() == Some("foreground") || owner_task_id.is_some() {
+                // subagent's own tasks are reported to that subagent. An
+                // engine that keeps presentation records sends the card as a
+                // record; a second card from this event would duplicate it.
+                if mode.as_deref() == Some("foreground")
+                    || owner_task_id.is_some()
+                    || self.presentation_capable
+                {
                     return;
                 }
                 self.transcript.upsert_task_card(Block::TaskCompletion {
@@ -1733,7 +1775,10 @@ impl UiState {
                 });
             }
             Event::AgentMessage { id, label, text, context, source, task_id, schedule_definition_id, .. } => {
-                self.push_agent_message(id, label, text, context, source, task_id, schedule_definition_id);
+                // A capable engine describes the same occurrence as a record.
+                if !self.presentation_capable {
+                    self.push_agent_message(id, label, text, context, source, task_id, schedule_definition_id);
+                }
             }
             Event::PromptRewritten { hook_command, .. } => {
                 self.notice(
@@ -1897,6 +1942,147 @@ impl UiState {
             }
         }
         None
+    }
+
+    /// A record accepted or changed by the engine, live.
+    ///
+    /// * During the running turn it is held and shown at the turn's end; the
+    ///   first time it is seen a transient hint says it happened.
+    /// * A record already shown is updated in place, never moved, and only
+    ///   by a newer revision.
+    /// * A new record belonging at the current end of the conversation is
+    ///   shown there. One whose place is earlier (missed while
+    ///   disconnected, or changed after a compaction) is left to the next
+    ///   authoritative rebuild, which can place it; it is never appended as
+    ///   if it had just happened.
+    fn apply_presentation_record(
+        &mut self,
+        record: coda_proto::presentation::PresentationRecord,
+        now: std::time::Instant,
+    ) {
+        let fresh = self.seen_records.insert(&record.item_id);
+        if record.anchor.turn_id.is_some() {
+            match self.held_records.iter_mut().find(|held| held.item_id == record.item_id) {
+                Some(held) if held.revision <= record.revision => *held = record,
+                Some(_) => {}
+                None => {
+                    if fresh {
+                        self.hint_record(&record, now);
+                    }
+                    self.held_records.push(record);
+                }
+            }
+            return;
+        }
+        if let Some(index) = self.held_records.iter().position(|held| held.item_id == record.item_id) {
+            self.held_records.remove(index);
+        }
+        if self.transcript.find_record(&record.item_id).is_some() {
+            let (block, placement) = self.record_block(record);
+            self.transcript.upsert_record(block, placement);
+            return;
+        }
+        let current = record.relation == coda_proto::presentation::PresentationRelation::Active
+            && record.anchor.after_entries >= self.transcript.fence().committed;
+        if !current {
+            self.timeline_refresh_needed = true;
+            return;
+        }
+        if fresh {
+            self.hint_record(&record, now);
+        }
+        let (block, placement) = self.record_block(record);
+        self.transcript.upsert_record(block, placement);
+    }
+
+    fn hint_record(&mut self, record: &coda_proto::presentation::PresentationRecord, now: std::time::Instant) {
+        use coda_proto::presentation::PresentationPayload;
+        let text = match &record.payload {
+            PresentationPayload::TaskCompletion { status, title, task_id, .. } => {
+                format!("Task {status}: {}", title.as_deref().unwrap_or(task_id))
+            }
+            PresentationPayload::Notification { label, .. } => format!("Notification from {label}"),
+        };
+        self.hints.push_transient(coda_render::text::sanitize(&text), now);
+    }
+
+    /// Shows the records held for the turn that just ended, at its end.
+    fn release_held_records(&mut self) {
+        for record in std::mem::take(&mut self.held_records) {
+            let (block, placement) = self.record_block(record);
+            self.transcript.upsert_record(block, placement);
+        }
+    }
+
+    /// The engine's authoritative record set for a rebuild. Records of the
+    /// running turn are held for its end instead of being placed.
+    fn records_for_rebuild(
+        &mut self,
+        timeline: coda_proto::presentation::PresentationTimeline,
+    ) -> Vec<(Block, crate::timeline::RecordPlacement)> {
+        let mut placed = Vec::new();
+        for record in timeline.records {
+            // Known now: a snapshot never raises a hint for it later.
+            self.seen_records.insert(&record.item_id);
+            if record.anchor.turn_id.is_some() && self.is_busy() {
+                if !self.held_records.iter().any(|held| held.item_id == record.item_id) {
+                    self.held_records.push(record);
+                }
+                continue;
+            }
+            self.held_records.retain(|held| held.item_id != record.item_id);
+            placed.push(self.record_block(record));
+        }
+        placed
+    }
+
+    /// The block and placement for an engine record.
+    fn record_block(
+        &mut self,
+        record: coda_proto::presentation::PresentationRecord,
+    ) -> (Block, crate::timeline::RecordPlacement) {
+        use coda_proto::presentation::PresentationPayload;
+        let placement = crate::timeline::RecordPlacement {
+            item_id: record.item_id.clone(),
+            position_seq: Some(record.position_seq),
+            revision: record.revision,
+            relation: record.relation,
+            anchor: crate::timeline::Anchor::from_engine(&record.anchor, self.transcript.fence()),
+            order: Default::default(),
+        };
+        let block = match record.payload {
+            PresentationPayload::TaskCompletion { task_id, status, task_kind, title, instructions } => {
+                Block::TaskCompletion {
+                    session_id: self.session_id.clone(),
+                    task_id,
+                    status,
+                    kind: task_kind,
+                    title: title.filter(|t| !t.trim().is_empty()),
+                    instructions,
+                }
+            }
+            PresentationPayload::Notification {
+                message_id,
+                label,
+                text,
+                context,
+                source,
+                task_id,
+                schedule_definition_id,
+            } => {
+                self.agent_message_ids.insert(message_id.clone());
+                Block::AgentMessage {
+                    id: message_id,
+                    label,
+                    text,
+                    context,
+                    source,
+                    task_id,
+                    schedule_definition_id,
+                }
+            }
+        };
+        (block, placement)
     }
 
     fn notice(&mut self, text: impl Into<String>, level: NoticeLevel) {
@@ -2789,7 +2975,7 @@ mod tests {
                 state.apply(UiEvent::Rehydrated {
                     blocks: hydration.blocks,
                     notices: if with_notices { vec!["history notice".into()] } else { vec![] },
-                    coverage: None,
+                    coverage: None, layout: None, presentation: None,
                 });
                 state.apply(UiEvent::Engine(Event::AssistantText { delta: suffix.into() }));
                 state.apply(UiEvent::Engine(Event::AssistantTextComplete));
@@ -3628,7 +3814,7 @@ mod tests {
         state.apply(UiEvent::Rehydrated {
             blocks: vec![Block::Assistant { text: "hi".into(), complete: true }],
             notices: vec!["A stored tool result for call call-A has no matching call.".into()],
-            coverage: None,
+            coverage: None, layout: None, presentation: None,
         });
         assert!(
             notice_texts(&state).iter().any(|t| t.contains("no matching call")),
@@ -3639,7 +3825,7 @@ mod tests {
         state.apply(UiEvent::Rehydrated {
             blocks: vec![Block::Assistant { text: "hi".into(), complete: true }],
             notices: vec!["A stored tool result for call call-A has no matching call.".into()],
-            coverage: None,
+            coverage: None, layout: None, presentation: None,
         });
         assert_eq!(
             notice_texts(&state).iter().filter(|t| t.contains("no matching call")).count(),
@@ -3651,7 +3837,7 @@ mod tests {
         state.apply(UiEvent::Rehydrated {
             blocks: vec![Block::Assistant { text: "hi".into(), complete: true }],
             notices: vec![],
-            coverage: None,
+            coverage: None, layout: None, presentation: None,
         });
         let texts = notice_texts(&state);
         assert!(
@@ -4522,7 +4708,7 @@ mod tests {
         state.apply(UiEvent::Rehydrated {
             blocks: vec![Block::Assistant { text: "hi".into(), complete: true }],
             notices: vec![],
-            coverage: None,
+            coverage: None, layout: None, presentation: None,
         });
         assert_eq!(task_cards(&state).len(), 3);
         let text = rendered(&state);
@@ -5165,7 +5351,7 @@ mod tests {
                         done_at: None,
                     }],
                     notices: Vec::new(),
-                    coverage: None,
+                    coverage: None, layout: None, presentation: None,
                 },
                 now + Duration::from_secs(4),
             );
@@ -5195,7 +5381,7 @@ mod tests {
                         done_at: None,
                     }],
                     notices: Vec::new(),
-                    coverage: None,
+                    coverage: None, layout: None, presentation: None,
                 },
                 now,
             );
@@ -5594,7 +5780,7 @@ mod tests {
                     Block::Assistant { text: "answered".into(), complete: true },
                 ],
                 notices: Vec::new(),
-                coverage: None,
+                coverage: None, layout: None, presentation: None,
             });
             assert_eq!(state.transcript.len(), 2);
             match &state.transcript.blocks()[0] {
@@ -5630,7 +5816,7 @@ mod tests {
                     Block::Assistant { text: "answered".into(), complete: true },
                 ],
                 notices: Vec::new(),
-                coverage: None,
+                coverage: None, layout: None, presentation: None,
             });
 
             let blocks = state.transcript.blocks();
@@ -5674,7 +5860,7 @@ mod tests {
             state.apply(UiEvent::Rehydrated {
                 blocks: Vec::new(),
                 notices: Vec::new(),
-                coverage: None,
+                coverage: None, layout: None, presentation: None,
             });
 
             assert!(!state.has_conversation(), "{:?}", state.transcript.blocks());
@@ -5694,7 +5880,7 @@ mod tests {
             state.apply(UiEvent::Rehydrated {
                 blocks: vec![Block::Assistant { text: "from history".into(), complete: true }],
                 notices: Vec::new(),
-                coverage: None,
+                coverage: None, layout: None, presentation: None,
             });
 
             assert_eq!(state.queued.len(), 1, "the queued message was lost with the transcript");
@@ -5723,7 +5909,7 @@ mod tests {
             state.apply(UiEvent::Rehydrated {
                 blocks: vec![Block::Assistant { text: "from history".into(), complete: true }],
                 notices: Vec::new(),
-                coverage: None,
+                coverage: None, layout: None, presentation: None,
             });
 
             assert!(
@@ -5785,7 +5971,7 @@ mod tests {
                     done_at: None,
                 }],
                 notices: Vec::new(),
-                coverage: None,
+                coverage: None, layout: None, presentation: None,
             });
 
             let thinking_blocks: Vec<_> = state
@@ -5881,7 +6067,7 @@ mod tests {
                     done_at: None,
                 }],
                 notices: Vec::new(),
-                coverage: None,
+                coverage: None, layout: None, presentation: None,
             });
 
             // No further `Thinking` delta ever arrives — the turn simply
@@ -5940,7 +6126,7 @@ mod tests {
                     }],
                 }],
                 notices: Vec::new(),
-                coverage: None,
+                coverage: None, layout: None, presentation: None,
             });
 
             let live = Correlation {

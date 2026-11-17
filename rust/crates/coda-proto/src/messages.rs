@@ -199,14 +199,21 @@ pub struct CapabilityEntry {
     pub supported: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// The version of a versioned capability (e.g. the presentation timeline
+    /// record schema). Absent for unversioned ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
 }
 
 impl CapabilityEntry {
     pub fn supported() -> Self {
-        Self { supported: true, reason: None }
+        Self { supported: true, reason: None, version: None }
+    }
+    pub fn supported_version(version: u32) -> Self {
+        Self { supported: true, reason: None, version: Some(version) }
     }
     pub fn unsupported(reason: impl Into<String>) -> Self {
-        Self { supported: false, reason: Some(reason.into()) }
+        Self { supported: false, reason: Some(reason.into()), version: None }
     }
 }
 

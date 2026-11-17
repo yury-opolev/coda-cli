@@ -33,6 +33,8 @@ mod link;
 mod models;
 #[cfg(test)]
 mod paste_tests;
+#[cfg(test)]
+mod timeline_tests;
 mod queue;
 mod serve;
 mod settings;
@@ -992,7 +994,9 @@ impl App {
         } else {
             self.dirty = true;
         }
+        self.sync_timeline();
         self.state.apply(event);
+        self.sync_timeline();
         self.laid_out_width = 0;
 
         // Keep the prompt surface in lockstep with the reducer. The engine can

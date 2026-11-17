@@ -158,6 +158,7 @@ the same structured projection regardless of that hint.
 | `event/eventsDropped` | **Gated:** explicit loss of retained event coverage; obtain an authoritative snapshot/history instead of guessing missing deltas. |
 | `event/agentMessage` | A background context (a scheduled run, a subagent, or trusted main) published a passive notification via `notify_user`. See [Background notifications](#background-notifications-notify_user). |
 | `event/agentMessageDelivered` | The trusted main conversation's own inbox (`ask_main`) delivered one or more accepted requests into the running turn's live history. Metadata only — see [Main inbox](#main-inbox-ask_main). |
+| `event/presentationRecord` | A presentation record (task completion card or passive notification) was accepted or changed. Params are the record itself. See [Presentation timeline](#presentation-timeline). |
 
 `request/permission`, `request/question` and `request/planApproval` are
 server-initiated JSON-RPC requests, not notifications. Reply using their RPC
@@ -252,6 +253,40 @@ or crashes loses them. Do not build resumption on top of
 next run) in the restart file and `initialize { restore }` re-creates them,
 moving a recurring slot missed during the restart to the next one (no catch-up
 burst) — see [Planned restart](../serve-protocol.md#planned-restart-rust).
+
+## Presentation timeline
+
+`presentationTimeline` (see `initialize.capabilities`; `version` is the record
+schema version, currently `1`) means the engine owns the user-visible records
+that are not part of the model conversation: main-agent background task
+completions (`taskCompletion`) and passive `notify_user` notifications
+(`notification`). Each record has a stable `itemId`
+(`task:<engineInstanceId>:<taskId>` or `notification:<messageId>`), an
+immutable `positionSeq`, a content `revision` and `changeSeq`, and an `anchor`
+`{ afterEntries, turnId? }`: the record follows the first `afterEntries`
+committed conversation entries. While the turn it occurred in runs, `turnId`
+names that turn and the anchor resolves to that turn's committed end when it
+finishes, so a record never splits a streaming reply. `relation` is `active`,
+`compacted`, `rewound` or `unknown` (the anchor does not fit the conversation
+the record was restored with).
+
+- `session/getHistory` returns `presentation` (`schemaVersion`, `timelineId`,
+  `changeSeq`, every retained `records` entry in `positionSeq` order,
+  `evictedBeforeSeq`, `durability`) read together with the page. Saved
+  transcripts return their stored records.
+- `event/presentationRecord` carries a record whenever it is accepted or
+  changed (anchor resolution, compaction, rewind), in the same state
+  transaction. Accepting identical content again changes nothing.
+- At most 256 records and 256 KiB of payload are retained; the oldest go
+  first and `evictedBeforeSeq` says so.
+- Records persist in the session transcript (`presentation` member).
+  `durability` is `durable` once written, `memory` before that (or after a
+  failed write), and `corrupt` when the stored member could not be read — an
+  empty record list is then not an empty history.
+- A fork starts a new, empty timeline. A planned-restart republication of a
+  saved notification keeps the saved message id, so it is the same item.
+- `event/taskCompleted` and `event/agentMessage` are unchanged. A client that
+  uses records must not also build cards from those legacy events.
 
 ## Background notifications (`notify_user`)
 

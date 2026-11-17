@@ -745,6 +745,12 @@ impl App {
             history.live_entries.as_deref().unwrap_or(&[]),
             history.live_truncated.unwrap_or(false),
         );
+        let mut layout = hydrated.layout;
+        layout.epoch = history.history_epoch.unwrap_or_else(|| self.view.history_epoch());
+        layout.committed = history.history_length;
+        if history.entries.is_empty() {
+            layout.first_index = history.history_length;
+        }
         let mut notices = hydrated.notices;
         let omitted = history.total_known - history.entries.len() as i64;
         if omitted > 0 {
@@ -783,7 +789,28 @@ impl App {
         // fences rather than from the view's current numbers: what it vouches
         // for is the committed prefix this read actually returned.
         let coverage = Some(crate::coverage::HistoryCoverage::of_read(&history));
-        self.apply(UiEvent::Rehydrated { blocks: hydrated.blocks, notices, coverage });
+        self.apply(UiEvent::Rehydrated {
+            blocks: hydrated.blocks,
+            notices,
+            coverage,
+            layout: Some(layout),
+            presentation: history.presentation,
+        });
+    }
+
+    /// Tells the reducer what the engine's fences say about the conversation
+    /// now, so blocks created next are anchored to the right place, and asks
+    /// for a rebuild when a record could only be placed by one.
+    pub(in crate::app) fn sync_timeline(&mut self) {
+        self.state.presentation_capable = self.view.presentation_capable();
+        self.state.transcript.set_fence(crate::timeline::Fence {
+            epoch: self.view.history_epoch(),
+            committed: self.view.history_length(),
+            turn_running: self.state.is_busy(),
+        });
+        if std::mem::take(&mut self.state.timeline_refresh_needed) {
+            self.needs_rehydrate = true;
+        }
     }
 
     /// The window of the conversation this client asks for.
@@ -5114,7 +5141,7 @@ pub(in crate::app) mod tests {
                 queue_id: None,
             }],
             notices: Vec::new(),
-            coverage: None,
+            coverage: None, layout: None, presentation: None,
         });
         app.view.note_history_read(10);
         app.dispatch_frame(Frame::new("event/steeringDelivered", Some(json!({
@@ -5158,7 +5185,7 @@ pub(in crate::app) mod tests {
                 queue_id: None,
             }],
             notices: Vec::new(),
-            coverage: None,
+            coverage: None, layout: None, presentation: None,
         });
         app.view.note_history_read(10);
 

@@ -36,6 +36,7 @@
 
 pub mod live;
 pub mod message_bus_observer;
+pub mod presentation;
 pub mod requests;
 pub mod steering_observer;
 
@@ -50,6 +51,9 @@ use serde_json::Value;
 
 use coda_agent::message::MainMessage;
 use coda_proto::messages::CapabilityEntry;
+use coda_proto::presentation::{
+    PresentationAnchor, PresentationPayload, PresentationRecord, PresentationTimeline,
+};
 use coda_proto::responses::{AgentMessageDeliveredDto, AgentMessageDeliveredItemDto};
 use coda_proto::state_events as wire;
 use coda_proto::state::{
@@ -98,6 +102,40 @@ pub struct HistoryView {
     pub history_length: i64,
     pub cursor: i64,
     pub live: Option<LiveView>,
+    /// The presentation timeline as of the same read.
+    pub presentation: PresentationTimeline,
+}
+
+/// What the presentation persister writes, read in one go.
+pub struct PresentationCheckpoint {
+    pub session_id: String,
+    pub timeline_id: String,
+    pub value: Value,
+    pub change_seq: u64,
+    /// The newest change is already on disk; nothing needs writing.
+    pub persisted: bool,
+}
+
+fn presentation_event(record: &PresentationRecord) -> PendingEvent {
+    (
+        coda_proto::events::event_method::PRESENTATION_RECORD.to_string(),
+        serde_json::to_value(record).unwrap_or(Value::Null),
+        false,
+    )
+}
+
+/// Metadata-only diagnostics: one event per record kind.
+fn record_presentation_diagnostics(phase: &'static str, records: &[PresentationRecord]) {
+    for kind in ["taskCompletion", "notification"] {
+        let count = records.iter().filter(|r| r.payload.kind() == kind).count() as u32;
+        if count > 0 {
+            coda_diagnostics::record(coda_diagnostics::Event::PresentationRecord {
+                phase,
+                record_kind: kind,
+                count,
+            });
+        }
+    }
 }
 
 pub struct LiveView {
@@ -161,6 +199,10 @@ pub struct TurnEnd {
     /// inside the same transaction, so no client can observe a state that
     /// disagrees with the events it has received.
     pub wire: Option<(String, Value)>,
+    /// The commit was not a pure append of the turn's entries (an automatic
+    /// compaction inside the turn rewrote earlier history), so earlier
+    /// presentation anchors no longer name the same entries.
+    pub history_rewritten: bool,
 }
 
 /// Per-turn tracking. Deliberately **not** a cached wire `TurnState`: the
@@ -239,6 +281,9 @@ pub(crate) struct StateInner {
     /// Set once a planned-restart drain has begun; never cleared (the engine
     /// does not return to `ready`/`busy` after draining).
     drain: Option<DrainInfo>,
+    /// Task completions and passive notifications, anchored to the committed
+    /// conversation. Copied on write like the rest of this state.
+    presentation: Arc<presentation::PresentationStore>,
 }
 
 /// The engine-side record behind `StateSnapshot.drain`. `remaining_ms` is
@@ -827,6 +872,12 @@ impl StateInner {
 pub struct EngineState {
     inner: Mutex<Arc<StateInner>>,
     bus: Arc<EventBus>,
+    /// The saved message id the next passive publication re-publishes (a
+    /// planned-restart restore), so it stays the same presentation item.
+    notification_alias: Mutex<Option<String>>,
+    /// Called (outside every lock) when the presentation timeline changed
+    /// while no turn is running, so the host can persist it.
+    presentation_hook: std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl EngineState {
@@ -862,8 +913,16 @@ impl EngineState {
             capabilities,
             next_config,
             drain: None,
+            presentation: Arc::new(presentation::PresentationStore::new(
+                uuid::Uuid::new_v4().to_string(),
+            )),
         };
-        Self { inner: Mutex::new(Arc::new(inner)), bus }
+        Self {
+            inner: Mutex::new(Arc::new(inner)),
+            bus,
+            notification_alias: Mutex::new(None),
+            presentation_hook: std::sync::OnceLock::new(),
+        }
     }
 
     /// One atomic transaction: mutate the CoW `StateInner` and publish every
@@ -985,6 +1044,8 @@ impl EngineState {
         history_length: i64,
     ) {
         let session_id = session_id.into();
+        let mut changed = Vec::new();
+        let changed_out = &mut changed;
         self.transact(move |s| {
             s.session_id = session_id.clone();
             s.history_epoch += 1;
@@ -1003,8 +1064,26 @@ impl EngineState {
                 s.usage.last_response_stale = true;
                 events.extend(s.usage_event());
             }
+            // Resume installs its loaded timeline separately
+            // (`install_presentation`); a client re-reads after this event.
+            *changed_out = match reason {
+                "compact" => Arc::make_mut(&mut s.presentation).compacted(),
+                "rewind" => Arc::make_mut(&mut s.presentation).rewound(history_length),
+                "fork" => {
+                    s.presentation =
+                        Arc::new(s.presentation.fork(uuid::Uuid::new_v4().to_string()));
+                    Vec::new()
+                }
+                _ => Vec::new(),
+            };
+            events.extend(changed_out.iter().map(presentation_event));
             events
         });
+        match reason {
+            "compact" => record_presentation_diagnostics("compacted", &changed),
+            "rewind" => record_presentation_diagnostics("rewound", &changed),
+            _ => {}
+        }
     }
 
     // ── Turn / activity phase machine ────────────────────────────────────
@@ -1255,11 +1334,14 @@ impl EngineState {
     pub fn end_turn(&self, end: TurnEnd) -> bool {
         let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = Arc::clone(&ended);
+        let mut resolved = Vec::new();
+        let resolved_out = &mut resolved;
         self.transact(move |s| {
             if s.current_turn_id() != Some(end.turn_id.as_str()) {
                 return Vec::new();
             }
             flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            let record_turn_id = end.turn_id.clone();
             let finalized = s.finalise_tools_for_turn(&end.turn_id, end.interrupted, end.error.is_some());
             let ended_at = now_rfc3339();
             s.last_turn_outcome = Some(LastTurnOutcome {
@@ -1271,6 +1353,13 @@ impl EngineState {
             });
             if let Some(len) = end.history_length {
                 s.history_length = len;
+            }
+            // A commit that rewrote earlier history (an automatic compaction
+            // inside the turn) is a new projection: an index from before it
+            // no longer names the same entry, so the epoch moves exactly as a
+            // manual compaction moves it.
+            if end.history_rewritten {
+                s.history_epoch += 1;
             }
             let was_stale = s.last_response_stale();
             s.turn = None;
@@ -1299,13 +1388,39 @@ impl EngineState {
                     tools_truncated: s.tools_evicted,
                 }),
             ));
+            if end.history_rewritten {
+                events.push(gated(
+                    coda_proto::events::event_method::SESSION_CHANGED,
+                    serde_json::json!(wire::SessionChangedEvent {
+                        reason: "compact".to_owned(),
+                        session_id: s.session_id.clone(),
+                        history_epoch: s.history_epoch,
+                        history_length: s.history_length,
+                    }),
+                ));
+            }
             // A model switched mid-turn takes effect for the context only now
             // that the turn's own model is no longer the current one.
             if s.last_response_stale() != was_stale {
                 events.extend(s.usage_event());
             }
+            // Records that occurred during the turn belong at its end; a
+            // commit that rewrote history leaves earlier anchors behind.
+            if s.presentation.would_resolve(&record_turn_id, end.history_rewritten) {
+                let history_length = s.history_length;
+                *resolved_out = Arc::make_mut(&mut s.presentation).resolve_turn(
+                    &record_turn_id,
+                    history_length,
+                    end.history_rewritten,
+                );
+                events.extend(resolved_out.iter().map(presentation_event));
+            }
             events
         });
+        if !resolved.is_empty() {
+            record_presentation_diagnostics("resolved", &resolved);
+            self.presentation_changed_while_idle();
+        }
         ended.load(std::sync::atomic::Ordering::SeqCst)
     }
 
@@ -1585,7 +1700,145 @@ impl EngineState {
                 truncated: t.live.truncated,
                 omitted_bytes: t.live.omitted_bytes,
             }),
+            presentation: inner.presentation.snapshot(),
         }
+    }
+
+    // ── Presentation timeline ─────────────────────────────────────────────
+
+    /// Accepts a task completion or passive notification into the timeline
+    /// and announces it as `event/presentationRecord` in the same
+    /// transaction. The anchor is the committed fence and, while a turn runs,
+    /// that turn (the record belongs at its end). Returns the record when
+    /// anything changed; a repeat of identical content returns `None`.
+    pub fn accept_presentation(
+        &self,
+        item_id: String,
+        payload: PresentationPayload,
+    ) -> Option<PresentationRecord> {
+        let mut out = None;
+        let mut idle = false;
+        let mut amended = false;
+        let mut evicted = 0;
+        let kind = payload.kind();
+        self.transact(|s| {
+            let anchor = PresentationAnchor {
+                after_entries: s.history_length,
+                turn_id: s.current_turn_id().map(String::from),
+            };
+            idle = s.turn.is_none();
+            let accepted = Arc::make_mut(&mut s.presentation).accept_counting(
+                item_id,
+                payload,
+                anchor,
+                now_rfc3339(),
+            );
+            amended = accepted.amended;
+            evicted = accepted.evicted;
+            let Some(record) = accepted.record else { return Vec::new() };
+            let event = presentation_event(&record);
+            out = Some(record);
+            vec![event]
+        });
+        if let Some(record) = &out {
+            record_presentation_diagnostics(
+                if amended { "amended" } else { "accepted" },
+                std::slice::from_ref(record),
+            );
+            if evicted > 0 {
+                coda_diagnostics::record(coda_diagnostics::Event::PresentationRecord {
+                    phase: "evicted",
+                    record_kind: kind,
+                    count: evicted,
+                });
+            }
+            if idle {
+                self.presentation_changed_while_idle();
+            }
+        }
+        out
+    }
+
+    /// Replaces the timeline with one loaded with a resumed session. Clients
+    /// re-read history after the `event/sessionChanged` that follows.
+    pub fn install_presentation(&self, store: presentation::PresentationStore) {
+        let phase = match store.durability() {
+            presentation::DURABILITY_CORRUPT => Some("corrupt"),
+            _ if !store.is_empty() => Some("restored"),
+            _ => None,
+        };
+        let count = store.len() as u32;
+        self.transact(move |s| {
+            s.presentation = Arc::new(store);
+            Vec::new()
+        });
+        if let Some(phase) = phase {
+            coda_diagnostics::record(coda_diagnostics::Event::PresentationRecord {
+                phase,
+                record_kind: "timeline",
+                count,
+            });
+        }
+    }
+
+    pub fn presentation_snapshot(&self) -> PresentationTimeline {
+        let inner = Arc::clone(&self.inner.lock().unwrap_or_else(|p| p.into_inner()));
+        inner.presentation.snapshot()
+    }
+
+    /// What the persister writes: the timeline in its stored form, for the
+    /// session it belongs to.
+    pub fn presentation_checkpoint(&self) -> PresentationCheckpoint {
+        let inner = Arc::clone(&self.inner.lock().unwrap_or_else(|p| p.into_inner()));
+        PresentationCheckpoint {
+            session_id: inner.session_id.clone(),
+            timeline_id: inner.presentation.timeline_id().to_owned(),
+            value: inner.presentation.to_persisted(),
+            change_seq: inner.presentation.change_seq(),
+            persisted: inner.presentation.is_persisted(),
+        }
+    }
+
+    /// The write of `checkpoint` succeeded. Ignored when the timeline has
+    /// been replaced since (fork, resume).
+    pub fn mark_presentation_durable(&self, checkpoint: &PresentationCheckpoint) {
+        self.transact(|s| {
+            if s.presentation.timeline_id() == checkpoint.timeline_id {
+                Arc::make_mut(&mut s.presentation).mark_durable(checkpoint.change_seq);
+            }
+            Vec::new()
+        });
+    }
+
+    /// The write of `checkpoint` failed: what is shown lives in memory only.
+    pub fn mark_presentation_persist_failed(&self, checkpoint: &PresentationCheckpoint) {
+        self.transact(|s| {
+            if s.presentation.timeline_id() == checkpoint.timeline_id {
+                Arc::make_mut(&mut s.presentation).mark_persist_failed();
+            }
+            Vec::new()
+        });
+    }
+
+    /// Installs the persistence hook (once). See `presentation_hook`.
+    pub fn set_presentation_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        let _ = self.presentation_hook.set(hook);
+    }
+
+    fn presentation_changed_while_idle(&self) {
+        if let Some(hook) = self.presentation_hook.get() {
+            hook();
+        }
+    }
+
+    /// The next passive publication re-publishes the saved message
+    /// `original_message_id`, so its record keeps that message's identity.
+    pub fn alias_next_notification(&self, original_message_id: String) {
+        *self.notification_alias.lock().unwrap_or_else(|p| p.into_inner()) = Some(original_message_id);
+    }
+
+    pub fn take_notification_alias(&self) -> Option<String> {
+        self.notification_alias.lock().unwrap_or_else(|p| p.into_inner()).take()
     }
 
     // ── Pending reverse requests (§2.7) ──────────────────────────────────
@@ -2819,6 +3072,24 @@ pub(crate) mod tests {
 
     // ── C3: a turn end must finalise its in-flight calls ──────────────────
     #[test]
+    fn a_turn_commit_that_rewrote_history_moves_the_epoch() {
+        let state = test_state();
+        let before = state.history_view().history_epoch;
+        state.begin_turn("t1", "go", active_config(), ActivityPhase::Preparing);
+        state.end_turn(TurnEnd {
+            turn_id: "t1".into(),
+            history_length: Some(3),
+            history_rewritten: true,
+            ..Default::default()
+        });
+        assert_eq!(state.history_view().history_epoch, before + 1);
+
+        state.begin_turn("t2", "again", active_config(), ActivityPhase::Preparing);
+        state.end_turn(TurnEnd { turn_id: "t2".into(), history_length: Some(5), ..Default::default() });
+        assert_eq!(state.history_view().history_epoch, before + 1, "a pure append keeps the epoch");
+    }
+
+    #[test]
     fn an_interrupted_turn_cancels_its_in_flight_tool_calls_instead_of_leaving_them_running() {
         let state = test_state();
         state.begin_turn("t1", "go", active_config(), ActivityPhase::Preparing);
@@ -3555,5 +3826,127 @@ pub(crate) mod tests {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    // ── Presentation timeline ────────────────────────────────────────────
+
+    fn state_with_frames() -> (Arc<EngineState>, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let bus = Arc::new(EventBus::new(tx, "engine-1"));
+        let state = Arc::new(EngineState::new(bus, "s1", "/work", HashMap::new(), active_config()));
+        (state, rx)
+    }
+
+    fn methods(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) -> Vec<(String, Value)> {
+        let mut out = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            let text = String::from_utf8(frame).unwrap();
+            let body = &text[text.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0)..];
+            let value: Value = serde_json::from_str(body).unwrap();
+            out.push((value["method"].as_str().unwrap_or_default().to_owned(), value["params"].clone()));
+        }
+        out
+    }
+
+    fn notification(id: &str) -> PresentationPayload {
+        PresentationPayload::Notification {
+            message_id: id.into(),
+            label: "worker".into(),
+            text: "done".into(),
+            context: None,
+            source: "subagent".into(),
+            task_id: None,
+            schedule_definition_id: None,
+        }
+    }
+
+    #[test]
+    fn an_idle_record_is_anchored_at_the_fence_and_announced_with_the_change() {
+        let (state, mut rx) = state_with_frames();
+        state.session_changed("resume", "s1", 4);
+        let hooked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&hooked);
+        state.set_presentation_hook(Arc::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        methods(&mut rx);
+
+        let record = state.accept_presentation("notification:m1".into(), notification("m1")).unwrap();
+        assert_eq!(record.anchor, PresentationAnchor { after_entries: 4, turn_id: None });
+        let seen = methods(&mut rx);
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "event/presentationRecord");
+        assert_eq!(seen[0].1["itemId"], "notification:m1");
+        assert_eq!(hooked.load(std::sync::atomic::Ordering::SeqCst), 1, "an idle change asks to persist");
+
+        assert!(state.accept_presentation("notification:m1".into(), notification("m1")).is_none());
+        assert!(methods(&mut rx).is_empty(), "a repeat publishes nothing");
+        assert_eq!(hooked.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let view = state.history_view();
+        assert_eq!(view.presentation.records.len(), 1);
+        assert_eq!(view.presentation.durability, "memory");
+    }
+
+    #[test]
+    fn a_record_during_a_turn_belongs_at_the_turns_end() {
+        let (state, mut rx) = state_with_frames();
+        state.bus_ref().enable_state_events();
+        state.session_changed("resume", "s1", 2);
+        assert!(state.begin_turn("t1", "hi", active_config(), ActivityPhase::Preparing));
+        let record = state.accept_presentation("notification:m1".into(), notification("m1")).unwrap();
+        assert_eq!(record.anchor, PresentationAnchor { after_entries: 2, turn_id: Some("t1".into()) });
+        methods(&mut rx);
+
+        state.end_turn(TurnEnd { history_length: Some(5), ..ended("t1") });
+        let seen = methods(&mut rx);
+        let names: Vec<&str> = seen.iter().map(|(m, _)| m.as_str()).collect();
+        let ended_at = names.iter().position(|m| *m == "event/turnEnded").unwrap();
+        let record_at = names.iter().position(|m| *m == "event/presentationRecord").unwrap();
+        assert!(ended_at < record_at, "{names:?}");
+        assert_eq!(seen[record_at].1["anchor"]["afterEntries"], 5);
+        assert!(seen[record_at].1["anchor"].get("turnId").is_none());
+        let snap = state.presentation_snapshot();
+        assert_eq!(snap.records[0].anchor, PresentationAnchor { after_entries: 5, turn_id: None });
+    }
+
+    #[test]
+    fn a_turn_that_rewrote_history_compacts_earlier_records() {
+        let (state, _rx) = state_with_frames();
+        state.session_changed("resume", "s1", 6);
+        state.accept_presentation("notification:old".into(), notification("old")).unwrap();
+        assert!(state.begin_turn("t1", "hi", active_config(), ActivityPhase::Preparing));
+        state.accept_presentation("notification:new".into(), notification("new")).unwrap();
+        state.end_turn(TurnEnd { history_length: Some(3), history_rewritten: true, ..ended("t1") });
+        let snap = state.presentation_snapshot();
+        assert_eq!(snap.records[0].relation, coda_proto::presentation::PresentationRelation::Compacted);
+        assert_eq!(snap.records[1].relation, coda_proto::presentation::PresentationRelation::Active);
+        assert_eq!(snap.records[1].anchor.after_entries, 3);
+    }
+
+    #[test]
+    fn session_resets_relate_records_to_the_new_conversation() {
+        use coda_proto::presentation::PresentationRelation;
+        let (state, mut rx) = state_with_frames();
+        state.session_changed("resume", "s1", 2);
+        state.accept_presentation("notification:a".into(), notification("a")).unwrap();
+        state.session_changed("resume", "s1", 6);
+        state.accept_presentation("notification:b".into(), notification("b")).unwrap();
+        methods(&mut rx);
+
+        state.session_changed("rewind", "s1", 4);
+        let seen = methods(&mut rx);
+        assert_eq!(seen.iter().filter(|(m, _)| m == "event/presentationRecord").count(), 1);
+        let snap = state.presentation_snapshot();
+        assert_eq!(snap.records[0].relation, PresentationRelation::Active);
+        assert_eq!(snap.records[1].relation, PresentationRelation::Rewound);
+
+        state.session_changed("compact", "s1", 2);
+        assert_eq!(state.presentation_snapshot().records[0].relation, PresentationRelation::Compacted);
+
+        let before = state.presentation_snapshot().timeline_id;
+        state.session_changed("fork", "s2", 2);
+        let forked = state.presentation_snapshot();
+        assert_ne!(forked.timeline_id, before);
+        assert!(forked.records.is_empty());
     }
 }

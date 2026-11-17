@@ -62,6 +62,11 @@ coda-llm.workspace = true
 # assertion in `tests/conventions.rs`, and it is what guarantees the shipped
 # terminal front-end contains no in-process agent execution path.
 coda-agent.workspace = true
+# Test fixtures only: the timeline tests drive the real engine state and its
+# `session/getHistory` projection into this client\'s reducer (src/app/timeline_tests.rs).
+coda-serve.workspace = true
+# Test fixtures only: the timeline tests drive the real engine state and its
+# `session/getHistory` projection into this client's reducer (src/app/timeline_tests.rs).-serve.workspace = true
 
 
 # The ConPTY paste test drives a real console host (tests/conpty_paste.rs).

@@ -1,0 +1,206 @@
+{
+  "type": "object",
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "engineInstanceId": {
+      "type": "string"
+    },
+    "itemId": {
+      "type": "string",
+      "description": "Stable identity of the occurrence, the same live, in snapshots and\nafter a restart. Never derived from a label or from text."
+    },
+    "positionSeq": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0,
+      "description": "Immutable acceptance order within the timeline."
+    },
+    "revision": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0,
+      "description": "Content version; a newer revision replaces an older one in place."
+    },
+    "changeSeq": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0,
+      "description": "The timeline change that last touched this record (a separate\nnamespace from `positionSeq`)."
+    },
+    "occurredAt": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "When the engine accepted it (RFC 3339). Explanatory, never a sort key."
+    },
+    "anchor": {
+      "$ref": "#/$defs/PresentationAnchor"
+    },
+    "relation": {
+      "$ref": "#/$defs/PresentationRelation",
+      "default": "active"
+    },
+    "payload": {
+      "$ref": "#/$defs/PresentationPayload"
+    }
+  },
+  "required": [
+    "seq",
+    "engineInstanceId",
+    "itemId",
+    "positionSeq",
+    "revision",
+    "changeSeq",
+    "anchor",
+    "payload"
+  ],
+  "description": "One user-visible occurrence.",
+  "title": "PresentationRecordEvent",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "PresentationAnchor": {
+      "type": "object",
+      "properties": {
+        "afterEntries": {
+          "type": "integer",
+          "format": "int64",
+          "description": "The record follows the first `afterEntries` committed entries of the\nsession's current conversation (history generation). `0` means before\nevery entry."
+        },
+        "turnId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Set while the turn the record occurred in is still running: the\nrecord belongs at that turn's end, which is resolved when the turn\ncommits. A record never sits inside a streaming reply."
+        }
+      },
+      "required": [
+        "afterEntries"
+      ],
+      "description": "Where a record sits relative to the committed conversation."
+    },
+    "PresentationRelation": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "active",
+          "description": "The anchor names entries of the current conversation."
+        },
+        {
+          "type": "string",
+          "const": "compacted",
+          "description": "The entries around the anchor were replaced by a compaction summary."
+        },
+        {
+          "type": "string",
+          "const": "rewound",
+          "description": "The entries around the anchor were removed by a rewind."
+        },
+        {
+          "type": "string",
+          "const": "unknown",
+          "description": "The anchor does not fit the conversation the record was restored with."
+        }
+      ],
+      "description": "How a record's anchor relates to the conversation as it is now."
+    },
+    "PresentationPayload": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "taskId": {
+              "type": "string",
+              "description": "The task id as the engine that ran it named it (process-local)."
+            },
+            "status": {
+              "type": "string",
+              "description": "`completed` | `failed` | `stopped`."
+            },
+            "taskKind": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "instructions": {
+              "type": "string",
+              "description": "The task's prompt, capped."
+            },
+            "kind": {
+              "type": "string",
+              "const": "taskCompletion"
+            }
+          },
+          "required": [
+            "kind",
+            "taskId",
+            "status",
+            "instructions"
+          ],
+          "description": "A main-agent background task reached a terminal state."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "messageId": {
+              "type": "string",
+              "description": "The message-bus id of the original publication."
+            },
+            "label": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "context": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "description": "`scheduledTask` | `subagent` | `main` | `taskCompletion`."
+            },
+            "taskId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "scheduleDefinitionId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "notification"
+            }
+          },
+          "required": [
+            "kind",
+            "messageId",
+            "label",
+            "text",
+            "source"
+          ],
+          "description": "A passive `notify_user` notification."
+        }
+      ],
+      "description": "Bounded, UI-safe content of one record."
+    }
+  }
+}

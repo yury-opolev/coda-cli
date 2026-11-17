@@ -4,7 +4,9 @@
 //! - on-disk location
 //! - JSON format (`{id, createdUtc, messages, systemPromptOverride?}`), plus an
 //!   optional `usage` accounting record ([`StoredUsage`]) that older readers
-//!   ignore and whose absence means "historical usage unknown"
+//!   ignore and whose absence means "historical usage unknown", and an
+//!   optional `presentation` member (the engine's presentation timeline),
+//!   preserved by every save that does not pass one
 //! - atomic write (temp-then-rename; stray `.tmp` removed on failure)
 //! - corrupt-tolerant load (returns `None`, never panics)
 //! - `createdUtc` is preserved across incremental saves
@@ -36,6 +38,10 @@ pub struct StoredSession {
     /// whose record is unreadable): its historical usage is **unknown**, which
     /// a reader must not present as a measured zero.
     pub usage: Option<StoredUsage>,
+    /// The session's presentation timeline (task completion cards, passive
+    /// notifications), exactly as stored: the engine owns its format and
+    /// decides whether it is readable. `None` when the transcript has none.
+    pub presentation: Option<Value>,
 }
 
 /// Usage accounting persisted with a session (the transcript's `usage` key),
@@ -199,6 +205,22 @@ impl SessionTranscriptStore {
         system_prompt_override: Option<&str>,
         usage: Option<&StoredUsage>,
     ) -> std::io::Result<()> {
+        self.save_with_presentation(session_id, messages, system_prompt_override, usage, None).await
+    }
+
+    /// [`Self::save_with_usage`], also recording the presentation timeline in
+    /// the same atomic write, so the messages and the records that are
+    /// anchored to them always come from one commit.
+    ///
+    /// `presentation: None` keeps whatever member the file already holds.
+    pub async fn save_with_presentation(
+        &self,
+        session_id: &str,
+        messages: &[Message],
+        system_prompt_override: Option<&str>,
+        usage: Option<&StoredUsage>,
+        presentation: Option<&Value>,
+    ) -> std::io::Result<()> {
         if messages.is_empty() || !ids::is_valid(session_id) {
             return Ok(());
         }
@@ -231,6 +253,14 @@ impl SessionTranscriptStore {
             root["usage"] = usage;
         }
 
+        let presentation = match presentation {
+            Some(presentation) => Some(presentation.clone()),
+            None => existing.as_ref().and_then(|v| v.get("presentation")).cloned(),
+        };
+        if let Some(presentation) = presentation {
+            root["presentation"] = presentation;
+        }
+
         let text = serde_json::to_string(&root)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
@@ -257,6 +287,28 @@ impl SessionTranscriptStore {
         let text = serde_json::to_string(&root)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         write_atomic(&path, &text).await
+    }
+
+    /// Records the presentation timeline on an **existing** transcript,
+    /// leaving the conversation and every other field as they are. Returns
+    /// whether anything was written: a session without a (readable)
+    /// transcript is left alone, as with [`Self::save_usage`].
+    pub async fn save_presentation(&self, session_id: &str, presentation: &Value) -> std::io::Result<bool> {
+        if !ids::is_valid(session_id) {
+            return Ok(false);
+        }
+        let path = self.file_path(session_id);
+        let Some(mut root) = read_root(&path).await else {
+            return Ok(false);
+        };
+        if !root.is_object() || root.get("messages").is_none() {
+            return Ok(false);
+        }
+        root["presentation"] = presentation.clone();
+        let text = serde_json::to_string(&root)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        write_atomic(&path, &text).await?;
+        Ok(true)
     }
 
     // ── Read ──────────────────────────────────────────────────────────────────
@@ -370,7 +422,8 @@ pub(super) async fn load_session_from_path(path: &Path) -> Option<StoredSession>
     let usage = root
         .get("usage")
         .and_then(|v| serde_json::from_value::<StoredUsage>(v.clone()).ok());
-    Some(StoredSession { messages, system_prompt_override, usage })
+    let presentation = root.get("presentation").cloned();
+    Some(StoredSession { messages, system_prompt_override, usage, presentation })
 }
 
 fn read_summary_from_path(path: &Path) -> Option<SessionSummary> {
@@ -680,6 +733,56 @@ mod tests {
         tokio::fs::write(&path, root.to_string()).await.unwrap();
         let stored = store.load_session(id).await.unwrap();
         assert_eq!(stored.usage, None);
+        assert_eq!(stored.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_presentation_member_round_trips_and_survives_saves_that_omit_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(&dir);
+        let id = "abc123456789";
+        let timeline = json!({ "format": 1, "timelineId": "tl", "records": [] });
+        assert!(!store.save_presentation(id, &timeline).await.unwrap(), "no transcript is invented");
+        assert!(store.load_session(id).await.is_none());
+
+        store
+            .save_with_presentation(id, &[Message::user("hi")], None, Some(&accounting()), Some(&timeline))
+            .await
+            .unwrap();
+        assert_eq!(store.load_session(id).await.unwrap().presentation, Some(timeline.clone()));
+
+        store
+            .save_with_usage(id, &[Message::user("hi"), Message::assistant("yo")], None, Some(&accounting()))
+            .await
+            .unwrap();
+        store.save_usage(id, &accounting()).await.unwrap();
+        let stored = store.load_session(id).await.unwrap();
+        assert_eq!(stored.messages.len(), 2);
+        assert_eq!(stored.presentation, Some(timeline));
+
+        let newer = json!({ "format": 1, "timelineId": "tl", "changeSeq": 4, "records": [] });
+        assert!(store.save_presentation(id, &newer).await.unwrap());
+        let stored = store.load_session(id).await.unwrap();
+        assert_eq!(stored.presentation, Some(newer));
+        assert_eq!(stored.messages.len(), 2, "only the member is rewritten");
+        assert_eq!(stored.usage, Some(accounting()));
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_presentation_member_is_reported_not_emptied() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(&dir);
+        let id = "abc123456789";
+        store.save(id, &[Message::user("hi")], None).await.unwrap();
+        assert_eq!(store.load_session(id).await.unwrap().presentation, None);
+
+        let path = dir.path().join(".coda").join("sessions").join(format!("{id}.json"));
+        let mut root: Value =
+            serde_json::from_str(&tokio::fs::read_to_string(&path).await.unwrap()).unwrap();
+        root["presentation"] = json!("garbage");
+        tokio::fs::write(&path, root.to_string()).await.unwrap();
+        let stored = store.load_session(id).await.unwrap();
+        assert_eq!(stored.presentation, Some(json!("garbage")), "returned as stored; the engine judges it");
         assert_eq!(stored.messages.len(), 1);
     }
 

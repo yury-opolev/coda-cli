@@ -305,6 +305,12 @@ async fn a_resumed_session_renders_the_old_conversation_not_a_count() {
         // What this very read proves about the committed prefix, exactly as
         // the client records it in production.
         coverage: Some(coda_tui::coverage::HistoryCoverage::of_read(&history)),
+        layout: Some(coda_tui::timeline::ConversationLayout {
+            epoch: history.history_epoch.unwrap_or(0),
+            committed: history.history_length,
+            ..hydrated.layout
+        }),
+        presentation: history.presentation.clone(),
     });
 
     let user: Vec<&str> = state

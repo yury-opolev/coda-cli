@@ -336,6 +336,7 @@ pub fn build_live_result(
         live_entries: live.map(|l| l.entries.clone()),
         live_truncated: live.map(|l| l.truncated),
         live_omitted_bytes: live.map(|l| l.omitted_bytes),
+        presentation: Some(view.presentation.clone()),
     })
 }
 
@@ -353,6 +354,7 @@ pub fn build_saved_result(
     session_id: &str,
     engine_instance_id: &str,
     messages: &[Message],
+    presentation: Option<coda_proto::presentation::PresentationTimeline>,
 ) -> Result<GetHistoryResult, RpcError> {
     if p.history_epoch.is_some() {
         return Err(RpcError::invalid_params(
@@ -384,6 +386,7 @@ pub fn build_saved_result(
         live_entries: None,
         live_truncated: None,
         live_omitted_bytes: None,
+        presentation,
     })
 }
 
@@ -856,6 +859,7 @@ mod tests {
             history_length: committed.len() as i64,
             cursor: 42,
             live,
+            presentation: Default::default(),
         }
     }
 
@@ -1001,7 +1005,7 @@ mod tests {
     #[test]
     fn a_saved_transcript_has_no_epoch_or_cursor_of_its_own() {
         let saved = conversation(3);
-        let r = build_saved_result(&GetHistoryParams::default(), "old-1", "engine-a", &saved).unwrap();
+        let r = build_saved_result(&GetHistoryParams::default(), "old-1", "engine-a", &saved, None).unwrap();
         assert!(!r.is_live_session);
         assert!(r.history_epoch.is_none(), "a stored file has no epoch — absent, not 0");
         assert!(r.cursor.is_none());
@@ -1013,16 +1017,16 @@ mod tests {
     fn asking_a_saved_transcript_for_live_state_is_refused_rather_than_answered_emptily() {
         let saved = conversation(1);
         let p = GetHistoryParams { include_live: Some(true), ..Default::default() };
-        assert!(build_saved_result(&p, "old-1", "engine-a", &saved).is_err());
+        assert!(build_saved_result(&p, "old-1", "engine-a", &saved, None).is_err());
         let p = GetHistoryParams { history_epoch: Some(0), ..Default::default() };
-        assert!(build_saved_result(&p, "old-1", "engine-a", &saved).is_err());
+        assert!(build_saved_result(&p, "old-1", "engine-a", &saved, None).is_err());
     }
 
     #[test]
     fn a_saved_transcript_pages_with_the_same_bounds() {
         let saved = conversation(9);
         let p = GetHistoryParams { limit: Some(4), since_index: Some(4), ..Default::default() };
-        let r = build_saved_result(&p, "old-1", "engine-a", &saved).unwrap();
+        let r = build_saved_result(&p, "old-1", "engine-a", &saved, None).unwrap();
         assert_eq!(r.entries.iter().map(|e| e.index).collect::<Vec<_>>(), vec![4, 5, 6, 7]);
         assert!(r.truncated);
         assert_eq!(r.next_index, 8);
