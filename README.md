@@ -509,6 +509,17 @@ configuration changes to its live MCP connections.
   explicitly. `/effort <level>` applies and saves directly; `auto` clears the
   explicit preference. In the model browser, `e` activates the highlighted model
   and opens its effort picker. `--effort <level>` is a session-only startup override.
+  **How a level reaches the provider** depends on the model's thinking contract,
+  resolved once per request from live model metadata (Copilot's
+  `adaptive_thinking`) or Anthropic's documented model table: adaptive-thinking
+  Claude models (Opus/Sonnet 4.6+, Haiku 5.5, every Claude 5 family) receive
+  `thinking: {type: "adaptive"}` plus `output_config.effort: <level>`; older
+  manual-thinking models receive `thinking: {type: "enabled", budget_tokens}`;
+  OpenAI Responses models receive `reasoning.effort`. `auto` sends no explicit
+  thinking or effort field, so the **provider's default** applies — which on
+  some models (e.g. Opus 4.8) means thinking off, and on Claude 5 models means
+  adaptive thinking at the model's default effort. See
+  [docs/design/thinking-and-context-tiers.md](docs/design/thinking-and-context-tiers.md).
 - **`/context`** shows how full the model's context window is: the **last request's
   whole input** — uncached input plus cache reads plus cache writes, since cached
   input still occupies the window — against the active model's window, with a bar,

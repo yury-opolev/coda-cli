@@ -15,6 +15,7 @@ pub mod message;
 pub mod reasoning;
 pub mod retry;
 pub mod sse;
+pub mod thinking;
 pub(crate) mod pump;
 
 pub use client::{CompletedResponse, LlmClient, ResponseStream};
@@ -27,3 +28,4 @@ pub use message::{
     ChatRequest, Content, Correlation, Effort, Message, ModelInfo, Role, ToolDefinition, Usage,
 };
 pub use sse::{SseDecoder, SseEvent};
+pub use thinking::{ThinkingMode, ThinkingPolicy, ThinkingSource, ThinkingSupport};

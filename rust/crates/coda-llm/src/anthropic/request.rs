@@ -13,6 +13,7 @@
 use serde_json::{json, Map, Value};
 
 use crate::message::{ChatRequest, Content, Effort, Role};
+use crate::thinking::{ThinkingMode, ThinkingPolicy};
 
 /// Anthropic allows at most four cache breakpoints per request.
 pub const MAX_BREAKPOINTS: usize = 4;
@@ -20,8 +21,17 @@ pub const MAX_BREAKPOINTS: usize = 4;
 /// Below this the cache costs more than it saves, so no marker is placed.
 const MIN_CACHEABLE_CHARS: usize = 2048;
 
-/// Serialises a request into the Anthropic Messages wire format.
+/// Serialises a request into the Anthropic Messages wire format, resolving
+/// its thinking contract from the compatibility table when the caller did not.
 pub fn build(request: &ChatRequest) -> Value {
+    let thinking = request
+        .thinking
+        .unwrap_or_else(|| crate::thinking::resolve(&request.model, None));
+    build_with_thinking(request, thinking)
+}
+
+/// Serialises a request with an already-resolved thinking contract.
+pub fn build_with_thinking(request: &ChatRequest, thinking: ThinkingPolicy) -> Value {
     let mut body = Map::new();
     body.insert("model".into(), json!(request.model));
     body.insert("max_tokens".into(), json!(request.max_tokens));
@@ -39,15 +49,27 @@ pub fn build(request: &ChatRequest) -> Value {
         body.insert("tool_choice".into(), json!({ "type": choice }));
     }
 
-    // Extended thinking is expressed as a token budget, not a level. Below the
-    // provider's 1024 minimum there is no room for both reasoning and an
-    // answer, so the feature is omitted rather than requested invalidly.
+    // The thinking contract is a property of the model: adaptive models take
+    // the level natively and reject a manual budget; manual models take a
+    // budget and reject adaptive. `auto` (no effort) sends neither, leaving
+    // the provider's default in force.
     if let Some(effort) = request.effort {
-        if let Some(budget) = thinking_budget(effort, request.max_tokens) {
-            body.insert(
-                "thinking".into(),
-                json!({ "type": "enabled", "budget_tokens": budget }),
-            );
+        match thinking.mode {
+            ThinkingMode::Adaptive => {
+                body.insert("thinking".into(), json!({ "type": "adaptive" }));
+                body.insert("output_config".into(), json!({ "effort": effort.as_str() }));
+            }
+            // Below the provider's 1024 minimum there is no room for both
+            // reasoning and an answer, so the feature is omitted rather than
+            // requested invalidly.
+            ThinkingMode::Manual => {
+                if let Some(budget) = thinking_budget(effort, request.max_tokens, thinking) {
+                    body.insert(
+                        "thinking".into(),
+                        json!({ "type": "enabled", "budget_tokens": budget }),
+                    );
+                }
+            }
         }
     }
 
@@ -116,12 +138,13 @@ fn cache_control(one_hour: bool) -> Value {
     }
 }
 
-/// Reasoning budget for an effort level, bounded by the response limit.
+/// Reasoning budget for an effort level, bounded by the response limit and by
+/// the minimum and maximum the model advertised, when it did.
 ///
 /// The budget must leave room for the answer itself and the provider requires
-/// at least 1024 tokens, so a response limit too small to satisfy both yields
-/// no budget at all.
-fn thinking_budget(effort: Effort, max_tokens: u32) -> Option<u32> {
+/// at least 1024 tokens (or the advertised minimum, if higher), so a response
+/// limit too small to satisfy both yields no budget at all.
+fn thinking_budget(effort: Effort, max_tokens: u32, policy: ThinkingPolicy) -> Option<u32> {
     const MINIMUM: u32 = 1024;
 
     let requested = match effort {
@@ -132,12 +155,15 @@ fn thinking_budget(effort: Effort, max_tokens: u32) -> Option<u32> {
         Effort::Max => 32_768,
     };
 
+    let floor = policy.min_budget.unwrap_or(MINIMUM).max(MINIMUM);
     // Strictly below max_tokens, so the answer always has room.
-    let ceiling = max_tokens.saturating_sub(MINIMUM);
-    if ceiling < MINIMUM {
+    let ceiling = max_tokens
+        .saturating_sub(MINIMUM)
+        .min(policy.max_budget.unwrap_or(u32::MAX));
+    if ceiling < floor {
         return None;
     }
-    Some(requested.min(ceiling))
+    Some(requested.clamp(floor, ceiling))
 }
 
 /// Serialises the conversation, placing the final cache markers.
@@ -652,8 +678,16 @@ mod tests {
         assert_eq!(body["system"][0]["cache_control"]["ttl"], "1h");
     }
 
+    /// A model that only accepts manual (budgeted) extended thinking.
+    fn manual_request(messages: Vec<Message>) -> ChatRequest {
+        ChatRequest::new("claude-sonnet-4-5-20250929", messages)
+    }
+
+    const ALL_EFFORTS: [Effort; 5] =
+        [Effort::Low, Effort::Medium, Effort::High, Effort::Xhigh, Effort::Max];
+
     #[test]
-    fn effort_becomes_a_thinking_budget() {
+    fn effort_becomes_a_thinking_budget_on_a_manual_model() {
         for (effort, expected) in [
             (Effort::Low, 2048),
             (Effort::Medium, 8192),
@@ -661,19 +695,146 @@ mod tests {
             (Effort::Xhigh, 24576),
             (Effort::Max, 32768),
         ] {
-            let request = request_with(vec![Message::user("hi")])
+            let request = manual_request(vec![Message::user("hi")])
                 .with_max_tokens(64_000)
                 .with_effort(Some(effort));
             let body = build(&request);
 
             assert_eq!(body["thinking"]["type"], "enabled");
             assert_eq!(body["thinking"]["budget_tokens"], expected, "{effort:?}");
+            assert!(body.get("output_config").is_none(), "manual models get no adaptive fields");
         }
+    }
+
+    /// The reported failure: an adaptive-only model rejects
+    /// `thinking.type: enabled`, so every explicit level must travel as the
+    /// native effort with adaptive thinking and no budget.
+    #[test]
+    fn effort_on_an_adaptive_model_is_sent_as_native_effort_without_a_budget() {
+        for model in ["claude-opus-5.5", "claude-sonnet-5.5", "claude-haiku-5.5", "claude-opus-4-8"] {
+            for effort in ALL_EFFORTS {
+                let request = ChatRequest::new(model, vec![Message::user("hi")])
+                    .with_max_tokens(32_000)
+                    .with_effort(Some(effort));
+                let body = build(&request);
+
+                assert_eq!(body["thinking"], json!({ "type": "adaptive" }), "{model} {effort:?}");
+                assert_eq!(body["output_config"]["effort"], effort.as_str(), "{model} {effort:?}");
+                assert!(body["thinking"].get("budget_tokens").is_none());
+                assert_eq!(body["max_tokens"], 32_000, "the output limit is unchanged");
+            }
+        }
+    }
+
+    /// A small output limit cannot fit a manual budget, but adaptive effort
+    /// has no minimum, so the user's level is still honoured.
+    #[test]
+    fn adaptive_effort_survives_a_small_output_limit() {
+        let request = ChatRequest::new("claude-opus-5.5", vec![Message::user("hi")])
+            .with_max_tokens(1024)
+            .with_effort(Some(Effort::High));
+        let body = build(&request);
+        assert_eq!(body["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn auto_effort_omits_every_thinking_field_on_both_modes() {
+        for model in ["claude-opus-5.5", "claude-sonnet-4-5-20250929"] {
+            let body = build(&ChatRequest::new(model, vec![Message::user("hi")]).with_max_tokens(32_000));
+            assert!(body.get("thinking").is_none(), "{model}");
+            assert!(body.get("output_config").is_none(), "{model}");
+        }
+    }
+
+    /// A policy resolved before serialization (from live model metadata)
+    /// overrides the compatibility table.
+    #[test]
+    fn a_resolved_policy_on_the_request_decides_the_mode() {
+        use crate::thinking::{ThinkingMode, ThinkingPolicy, ThinkingSource};
+        let adaptive = ChatRequest::new("some-unknown-model", vec![Message::user("hi")])
+            .with_max_tokens(32_000)
+            .with_effort(Some(Effort::Medium))
+            .with_thinking(Some(ThinkingPolicy {
+                mode: ThinkingMode::Adaptive,
+                source: ThinkingSource::ModelMetadata,
+                min_budget: None,
+                max_budget: None,
+            }));
+        let body = build(&adaptive);
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["output_config"]["effort"], "medium");
+
+        let manual = ChatRequest::new("claude-opus-5.5", vec![Message::user("hi")])
+            .with_max_tokens(64_000)
+            .with_effort(Some(Effort::Max))
+            .with_thinking(Some(ThinkingPolicy {
+                mode: ThinkingMode::Manual,
+                source: ThinkingSource::ModelMetadata,
+                min_budget: None,
+                max_budget: Some(32_000),
+            }));
+        let body = build(&manual);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 32_000, "clamped to the advertised maximum");
+        assert!(body.get("output_config").is_none());
+    }
+
+    /// An advertised minimum above the 1024 default is honoured; when the
+    /// output limit cannot fit it, thinking is omitted rather than sent invalid.
+    #[test]
+    fn an_advertised_minimum_budget_is_respected() {
+        use crate::thinking::{ThinkingMode, ThinkingPolicy, ThinkingSource};
+        let policy = Some(ThinkingPolicy {
+            mode: ThinkingMode::Manual,
+            source: ThinkingSource::ModelMetadata,
+            min_budget: Some(4096),
+            max_budget: Some(32_000),
+        });
+        let low = manual_request(vec![Message::user("hi")])
+            .with_max_tokens(64_000)
+            .with_effort(Some(Effort::Low))
+            .with_thinking(policy);
+        assert_eq!(build(&low)["thinking"]["budget_tokens"], 4096, "raised to the advertised minimum");
+
+        let cramped = manual_request(vec![Message::user("hi")])
+            .with_max_tokens(4096)
+            .with_effort(Some(Effort::High))
+            .with_thinking(policy);
+        assert!(build(&cramped).get("thinking").is_none());
+    }
+
+    /// Signed thinking replays unchanged under adaptive thinking, and a prior
+    /// assistant turn without any thinking block is equally valid.
+    #[test]
+    fn adaptive_requests_replay_signed_thinking_and_accept_turns_without_it() {
+        let history = vec![
+            Message::user("one"),
+            Message::new(
+                Role::Assistant,
+                vec![
+                    Content::Thinking { text: String::new(), signature: Some("sig-1".into()) },
+                    Content::text("first"),
+                ],
+            ),
+            Message::user("two"),
+            Message::assistant("second, no thinking"),
+            Message::user("three"),
+        ];
+        let body = build(
+            &ChatRequest::new("claude-opus-5.5", history)
+                .with_max_tokens(32_000)
+                .with_effort(Some(Effort::High)),
+        );
+        let replayed = &body["messages"][1]["content"][0];
+        assert_eq!(replayed["type"], "thinking");
+        assert_eq!(replayed["signature"], "sig-1");
+        assert_eq!(body["messages"][3]["content"][0]["type"], "text");
+        assert_eq!(body["output_config"]["effort"], "high");
     }
 
     #[test]
     fn the_thinking_budget_leaves_room_for_the_answer() {
-        let request = request_with(vec![Message::user("hi")])
+        let request = manual_request(vec![Message::user("hi")])
             .with_max_tokens(4096)
             .with_effort(Some(Effort::Max));
         let body = build(&request);
@@ -691,7 +852,7 @@ mod tests {
         // Below twice the 1024 minimum there is no room for both reasoning and
         // an answer, and asking anyway is a 400.
         for max_tokens in [200u32, 1024, 2047] {
-            let request = request_with(vec![Message::user("hi")])
+            let request = manual_request(vec![Message::user("hi")])
                 .with_max_tokens(max_tokens)
                 .with_effort(Some(Effort::High));
             let body = build(&request);
@@ -707,7 +868,7 @@ mod tests {
     fn a_requested_thinking_budget_is_always_below_the_response_limit() {
         for max_tokens in [2048u32, 4096, 8192, 64_000] {
             for effort in [Effort::Low, Effort::Medium, Effort::High, Effort::Xhigh, Effort::Max] {
-                let request = request_with(vec![Message::user("hi")])
+                let request = manual_request(vec![Message::user("hi")])
                     .with_max_tokens(max_tokens)
                     .with_effort(Some(effort));
                 let body = build(&request);

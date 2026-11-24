@@ -225,7 +225,7 @@ mod tests {
     /// about a conversation that was perfectly intact on disk.
     #[test]
     fn a_tool_skipped_before_it_started_keeps_its_declaration() {
-        let mut h = harness();
+        let h = harness();
         h.state.begin_turn("turn-1", "go", active_config(), ActivityPhase::Preparing);
 
         let correlation = coda_llm::Correlation {
@@ -281,7 +281,7 @@ mod tests {
     /// queue as well as on start must not double-declare.
     #[test]
     fn a_normally_executed_tool_is_declared_exactly_once() {
-        let mut h = harness();
+        let h = harness();
         h.state.begin_turn("turn-1", "go", active_config(), ActivityPhase::Preparing);
 
         let correlation = coda_llm::Correlation {

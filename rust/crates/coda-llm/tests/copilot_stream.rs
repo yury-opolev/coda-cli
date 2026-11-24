@@ -897,3 +897,222 @@ async fn full_log_privacy_scan_finds_no_prompt_tool_or_message_canaries() {
     let shape = diag_lines(&ctx).into_iter().find(|line| line["kind"] == "request_shape").unwrap();
     assert_eq!(shape["system_present"], true, "the chat system-role item was not reported");
 }
+
+// ─── Thinking-contract request capture ───────────────────────────────────────
+
+/// One captured HTTP request: the request line and the JSON body (if any).
+#[derive(Debug, Clone)]
+struct Captured {
+    line: String,
+    body: serde_json::Value,
+}
+
+/// Reads one full HTTP request (headers plus `content-length` body).
+async fn read_request(socket: &mut tokio::net::TcpStream) -> Captured {
+    let mut buf = Vec::new();
+    let mut chunk = vec![0u8; 8192];
+    loop {
+        let n = socket.read(&mut chunk).await.unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        let text = String::from_utf8_lossy(&buf).to_string();
+        if let Some(end) = text.find("\r\n\r\n") {
+            let length = text[..end]
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.trim().eq_ignore_ascii_case("content-length").then(|| v.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            if buf.len() >= end + 4 + length {
+                let body = &buf[end + 4..end + 4 + length];
+                return Captured {
+                    line: text.lines().next().unwrap_or_default().to_owned(),
+                    body: serde_json::from_slice(body).unwrap_or(serde_json::Value::Null),
+                };
+            }
+        }
+    }
+    Captured { line: String::new(), body: serde_json::Value::Null }
+}
+
+/// Like [`serve_n`], but records every request it answered.
+async fn serve_capture(
+    responses: Vec<(u16, &'static str, Vec<String>)>,
+) -> (String, Arc<std::sync::Mutex<Vec<Captured>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&captured);
+    tokio::spawn(async move {
+        for (status, headers, body) in responses {
+            let Ok((mut socket, _)) = listener.accept().await else { return };
+            let request = read_request(&mut socket).await;
+            sink.lock().unwrap().push(request);
+            let reason = if status == 200 { "OK" } else { "Error" };
+            let head = format!("HTTP/1.1 {status} {reason}\r\n{headers}\r\n");
+            if socket.write_all(head.as_bytes()).await.is_err() {
+                return;
+            }
+            for chunk in body {
+                if socket.write_all(chunk.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+            let _ = socket.shutdown().await;
+        }
+    });
+    (format!("http://127.0.0.1:{port}"), captured)
+}
+
+/// The live Copilot `/models` rows (2026-11-24) for the three thinking shapes.
+fn thinking_models_json() -> String {
+    serde_json::json!({ "data": [
+        { "id": "claude-opus-5.5", "capabilities": { "type": "chat", "supports": {
+            "adaptive_thinking": true, "reasoning_effort": ["low","medium","high","xhigh","max"] } },
+          "supported_endpoints": ["/v1/messages", "/chat/completions"] },
+        { "id": "claude-haiku-4.5", "capabilities": { "type": "chat", "supports": {
+            "min_thinking_budget": 1024, "max_thinking_budget": 32000 } },
+          "supported_endpoints": ["/chat/completions", "/v1/messages"] },
+        { "id": "gpt-6-sol", "capabilities": { "type": "chat", "supports": {
+            "reasoning_effort": ["low","medium","high","xhigh"] } },
+          "supported_endpoints": ["/responses"] },
+        { "id": "gpt-4o", "capabilities": { "type": "chat" }, "supported_endpoints": ["/chat/completions"] },
+    ]})
+    .to_string()
+}
+
+/// A Messages stream that opens with a signed (display-omitted) thinking
+/// block, as adaptive models send it.
+fn anthropic_reply_with_thinking(text: &str) -> Vec<String> {
+    vec![
+        anthropic_event("content_block_start", serde_json::json!({ "type": "content_block_start", "index": 0,
+            "content_block": { "type": "thinking", "thinking": "" } })),
+        anthropic_event("content_block_delta", serde_json::json!({ "type": "content_block_delta", "index": 0,
+            "delta": { "type": "signature_delta", "signature": "sig-abc" } })),
+        anthropic_event("content_block_stop", serde_json::json!({ "type": "content_block_stop", "index": 0 })),
+        anthropic_event("content_block_start", serde_json::json!({ "type": "content_block_start", "index": 1,
+            "content_block": { "type": "text", "text": "" } })),
+        anthropic_event("content_block_delta", serde_json::json!({ "type": "content_block_delta", "index": 1,
+            "delta": { "type": "text_delta", "text": text } })),
+        anthropic_event("content_block_stop", serde_json::json!({ "type": "content_block_stop", "index": 1 })),
+        anthropic_event("message_delta", serde_json::json!({ "type": "message_delta",
+            "delta": { "stop_reason": "end_turn" }, "usage": { "output_tokens": 3 } })),
+        anthropic_message_stop(),
+        "data: [DONE]\n\n".to_owned(),
+    ]
+}
+
+/// A Messages stream with no thinking block at all — adaptive models may
+/// skip thinking on a trivial prompt.
+fn anthropic_reply_without_thinking(text: &str) -> Vec<String> {
+    anthropic_reply_with_thinking(text).split_off(3)
+}
+
+/// The reported bug, end to end: every advertised level on an adaptive-only
+/// model reaches the wire as native effort with adaptive thinking, the
+/// stream completes with or without a thinking block, and the model list is
+/// fetched once for all five prompts.
+#[tokio::test]
+async fn adaptive_model_sends_native_effort_for_every_level_and_reuses_cached_metadata() {
+    use coda_llm::Effort;
+    let levels = [Effort::Low, Effort::Medium, Effort::High, Effort::Xhigh, Effort::Max];
+    let mut responses = vec![(200, json_headers(), vec![thinking_models_json()])];
+    for (i, _) in levels.iter().enumerate() {
+        let reply = if i % 2 == 0 { anthropic_reply_with_thinking("hello") } else { anthropic_reply_without_thinking("hello") };
+        responses.push((200, sse_headers(), reply));
+    }
+    let (url, captured) = serve_capture(responses).await;
+    coda_llm::copilot::models::cache_invalidate(&url);
+    let c = client(url);
+
+    for (i, effort) in levels.iter().enumerate() {
+        let request = ChatRequest::new("claude-opus-5.5", vec![Message::user("hello")])
+            .with_max_tokens(32_000)
+            .with_effort(Some(*effort));
+        let response = c.stream(request).await.expect("stream").collect().await.expect("complete");
+        assert_eq!(response.text, "hello");
+        let thinking = response.blocks.iter().any(|b| matches!(b, Content::Thinking { signature: Some(_), .. }));
+        assert_eq!(thinking, i % 2 == 0, "a reply without a thinking block is accepted");
+    }
+
+    let captured = captured.lock().unwrap().clone();
+    let model_fetches = captured.iter().filter(|r| r.line.starts_with("GET ") && r.line.contains("/models")).count();
+    assert_eq!(model_fetches, 1, "metadata is cached, not fetched per prompt: {captured:?}");
+    let posts: Vec<_> = captured.iter().filter(|r| r.line.starts_with("POST ")).collect();
+    assert_eq!(posts.len(), levels.len());
+    for (post, effort) in posts.iter().zip(levels) {
+        assert!(post.line.contains("/v1/messages"), "{}", post.line);
+        assert_eq!(post.body["thinking"], serde_json::json!({ "type": "adaptive" }), "{effort:?}");
+        assert_eq!(post.body["output_config"]["effort"], effort.as_str());
+        assert!(post.body["thinking"].get("budget_tokens").is_none(), "no legacy budget");
+        assert_eq!(post.body["max_tokens"], 32_000);
+    }
+}
+
+/// A manual-only model keeps a bounded budget (clamped to its advertised
+/// maximum) and never receives adaptive fields; the OpenAI routes keep their
+/// own native effort formats.
+#[tokio::test]
+async fn manual_and_openai_routes_keep_their_native_effort_formats() {
+    use coda_llm::Effort;
+    let (url, captured) = serve_capture(vec![
+        (200, json_headers(), vec![thinking_models_json()]),
+        (200, sse_headers(), anthropic_reply_without_thinking("manual")),
+        (200, sse_headers(), vec![responses_text_delta("responses"), responses_completed(5, 3)]),
+        (200, sse_headers(), vec![chat_text_chunk("chat"), chat_done_chunk("stop")]),
+    ])
+    .await;
+    coda_llm::copilot::models::cache_invalidate(&url);
+    let c = client(url);
+    for model in ["claude-haiku-4.5", "gpt-6-sol", "gpt-4o"] {
+        let request = ChatRequest::new(model, vec![Message::user("hi")])
+            .with_max_tokens(64_000)
+            .with_effort(Some(Effort::Max));
+        c.stream(request).await.expect("stream").collect().await.expect("complete");
+    }
+
+    let captured = captured.lock().unwrap().clone();
+    let posts: Vec<_> = captured.iter().filter(|r| r.line.starts_with("POST ")).collect();
+    let manual = &posts[0].body;
+    assert_eq!(manual["thinking"]["type"], "enabled");
+    assert_eq!(manual["thinking"]["budget_tokens"], 32_000, "clamped to max_thinking_budget");
+    assert!(manual.get("output_config").is_none());
+
+    let responses = &posts[1].body;
+    assert_eq!(responses["reasoning"]["effort"], "max");
+    assert!(responses.get("thinking").is_none() && responses.get("output_config").is_none());
+
+    let chat = &posts[2].body;
+    assert!(chat.get("thinking").is_none() && chat.get("output_config").is_none());
+}
+
+/// Diagnostics name the thinking mode, effort and provenance as allowlisted
+/// enums and never the prompt.
+#[tokio::test]
+async fn diagnostics_record_thinking_mode_effort_and_source_without_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = diag_ctx(dir.path());
+    let (url, _captured) = serve_capture(vec![
+        (200, json_headers(), vec![thinking_models_json()]),
+        (200, sse_headers(), anthropic_reply_without_thinking("ok")),
+    ])
+    .await;
+    coda_llm::copilot::models::cache_invalidate(&url);
+    coda_diagnostics::scope(ctx.clone(), async {
+        let request = ChatRequest::new("claude-opus-5.5", vec![Message::user("PROMPT-CANARY")])
+            .with_max_tokens(32_000)
+            .with_effort(Some(coda_llm::Effort::High));
+        client(url).stream(request).await.expect("stream").collect().await.expect("complete");
+    })
+    .await;
+    let lines = diag_lines(&ctx);
+    let shape = lines.iter().find(|l| l["kind"] == "request_shape").expect("shape");
+    assert_eq!(shape["thinking_type"], "adaptive");
+    assert_eq!(shape["effort_value"], "high");
+    assert_eq!(shape["thinking_source"], "model_metadata");
+    assert!(shape.get("thinking_budget_value").is_none());
+    assert!(!serde_json::to_string(&lines).unwrap().contains("PROMPT-CANARY"));
+}

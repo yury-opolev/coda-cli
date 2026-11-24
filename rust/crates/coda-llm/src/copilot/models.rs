@@ -89,7 +89,7 @@ pub fn resolve_endpoint_with_source(
 /// `claude-opus-4-8` → `claude-opus-4.8`. Only the final `-N-N` tail of a
 /// `claude-<word>-<digits>-<digits>` pattern is rewritten; everything else is
 /// left unchanged so non-Claude models and already-dotted ids pass through.
-pub fn normalize_model_id(id: &str) -> std::borrow::Cow<str> {
+pub fn normalize_model_id(id: &str) -> std::borrow::Cow<'_, str> {
     if !id.starts_with("claude-") {
         return std::borrow::Cow::Borrowed(id);
     }
@@ -251,6 +251,13 @@ pub fn parse_models(value: &Value) -> Vec<ModelInfo> {
             })
             .unwrap_or_default();
 
+        let supports = item.get("capabilities").and_then(|c| c.get("supports"));
+        let thinking = crate::thinking::ThinkingSupport::from_advertised(
+            supports.and_then(|s| s.get("adaptive_thinking")).and_then(Value::as_bool),
+            supports.and_then(|s| s.get("min_thinking_budget")).and_then(Value::as_u64),
+            supports.and_then(|s| s.get("max_thinking_budget")).and_then(Value::as_u64),
+        );
+
         models.push(ModelInfo {
             id,
             display_name,
@@ -258,6 +265,7 @@ pub fn parse_models(value: &Value) -> Vec<ModelInfo> {
             output_limit,
             supported_endpoints,
             reasoning_levels,
+            thinking,
         });
     }
 
@@ -399,6 +407,30 @@ mod tests {
             }]
         });
         assert_eq!(parse_models(&value)[0].output_limit, Some(64_000));
+    }
+
+    /// Shapes copied from Copilot's live `/models` (2026-11-24): adaptive-only
+    /// Opus 5.5, Sonnet 5 advertising both, and manual-only Haiku 4.5.
+    #[test]
+    fn parse_models_reads_thinking_support() {
+        let value = json!({ "data": [
+            { "id": "claude-opus-5.5", "capabilities": { "supports": {
+                "adaptive_thinking": true, "reasoning_effort": ["low","medium","high","xhigh","max"] } } },
+            { "id": "claude-sonnet-5", "capabilities": { "supports": {
+                "adaptive_thinking": true, "min_thinking_budget": 1024, "max_thinking_budget": 32000 } } },
+            { "id": "claude-haiku-4.5", "capabilities": { "supports": {
+                "min_thinking_budget": 1024, "max_thinking_budget": 32000 } } },
+            { "id": "gpt-6-sol" },
+        ]});
+        let models = parse_models(&value);
+        use crate::thinking::{resolve, ThinkingMode, ThinkingSource};
+        let policy = |i: usize| resolve(&models[i].id, Some(&models[i].thinking));
+        assert_eq!(policy(0).mode, ThinkingMode::Adaptive);
+        assert_eq!(policy(0).source, ThinkingSource::ModelMetadata);
+        assert_eq!(policy(1).mode, ThinkingMode::Adaptive);
+        assert_eq!(models[1].thinking.max_budget, Some(32_000));
+        assert_eq!(policy(2).mode, ThinkingMode::Manual);
+        assert_eq!(models[3].thinking, crate::thinking::ThinkingSupport::default());
     }
 
     #[test]
