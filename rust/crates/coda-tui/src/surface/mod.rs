@@ -215,6 +215,12 @@ pub enum SurfaceAction {
     /// model), never a silent edit of a different model.
     OpenEffortPickerForModel(String),
 
+    /// Switch to the given model, then show its context tiers.
+    ///
+    /// Raised by the model browser's `t` key, so the tier report always
+    /// describes the model the user highlighted.
+    ShowContextTiersForModel(String),
+
     /// Adjust the highlighted model without activating it.
     AdjustModelEffort { model: String, direction: i32 },
 

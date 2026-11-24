@@ -727,15 +727,44 @@ the engine, and `checkpoint` is a bare file name, never a path. Older clients ig
 | `checkpoint?` | File name of the pre-compaction checkpoint saved under `.coda/sessions/<session-id>.compactions/`. |
 
 **`event/contextWindow`** — the effective context window was resolved, sent at turn start
-whenever the (model, window, source) differs from the last one announced:
+(and after `session/setContextTier`) whenever the model, window, source or tier state differs
+from the last one announced:
 
 | Field | Meaning |
 |---|---|
 | `providerId?` | The provider serving the model. |
 | `model` | The model id. |
 | `contextWindow` | The effective window used for inference, compaction and display. |
-| `source` | `live`, `catalog`, `setting` or `fallback`. With `fallback` the window is an assumption (200,000 tokens) and `usage.contextLimit` stays `null`. |
+| `source` | `live`, `catalog`, `setting`, `tier` (the selected context tier's window) or `fallback`. With `fallback` the window is an assumption (200,000 tokens) and `usage.contextLimit` stays `null`. |
 | `compactionThreshold` | The auto-compaction threshold resolved against this window. |
+| `requestedTier?` | The requested context tier (`default`/`long_context`), absent when unset. |
+| `effectiveTier?` | The tier the effective window belongs to, when known. |
+| `tierNote?` | Why `requestedTier` is not in effect: `single_window`, `tier_unavailable` or `capability_unknown`. |
+
+### Context tiers (Rust)
+
+`model/contextCapability` (no params) and `session/setContextTier { tier, expectedModel?,
+expectedProvider? }` both return a `ContextCapabilityResult`:
+`{ ok, state, tiers[{tier, contextWindow}], preferredTier?, requested?, requestedSource?,
+effective?, effectiveWindow?, windowSource, note?, disclosure?, model?, providerId? }`.
+
+- **Provenance.** Tiers come from the provider's model metadata (Copilot
+  `billing.token_prices.{default,long_context}.context_max`). `state` is `unknown` when no
+  metadata is known for the model (never fetched, or the fetch failed — the capability call
+  fetches the cached model list once), `single` when the model exposes one fixed window, and
+  `tiered` otherwise.
+- **No wire negotiation.** The provider documents no request field or header for a tier: its
+  long-context pricing applies by input size. A tier therefore selects the window Coda budgets
+  against (fit checks, occupancy, compaction threshold, summary budget); the inference request
+  itself is unchanged.
+- **Precedence.** A `--context` launch flag (applied through `session/setContextTier` after
+  `initialize`) > the resumed session's recorded tier > the saved `contextTierByModel`
+  preference > unset (the provider-reported window, exactly as before tiers existed).
+- **Failure semantics.** An unknown/unsupported tier, an unparseable value or a stale guard
+  returns `ok: false` with `note`, and leaves the requested tier unchanged. `auto` clears the
+  session request. Requested and effective are always reported separately.
+- **Older engines** answer both methods with `-32601` (method not found); clients should
+  treat that as "tiers unsupported", not as an error in the session.
 
 ### Failure reporting and retention (Rust)
 

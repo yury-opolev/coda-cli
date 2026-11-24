@@ -22,6 +22,7 @@ mod auth;
 mod browsers;
 mod slash;
 mod clipboard;
+mod context_tier;
 mod effort;
 mod engine;
 mod identity;
@@ -1533,6 +1534,10 @@ impl App {
                 // open the picker for it. Switching closes the browser.
                 self.switch_model(&model).await;
                 self.open_effort_for_model(None, Some(&model)).await;
+            }
+            SurfaceAction::ShowContextTiersForModel(model) => {
+                self.switch_model(&model).await;
+                self.cmd_context(&["tier"]).await;
             }
             SurfaceAction::AdjustModelEffort { model, direction } => {
                 self.adjust_model_effort(model, direction).await;

@@ -72,8 +72,8 @@ pub fn models(models: &[WireModel], current: Option<&str>, source: &str) -> Brow
             Column::new("effort", 12),
         ],
     )
-    .with_footer("↑/↓ k/j move · Left/Right save effort · Enter select model · e effort picker · r reload · / filter · Esc q close")
-    .with_extra_keys(&['e'])
+    .with_footer("↑/↓ k/j move · Left/Right save effort · Enter select model · e effort picker · t context tier · r reload · / filter · Esc q close")
+    .with_extra_keys(&['e', 't'])
     .without_detail();
 
     browser.set_items(

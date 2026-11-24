@@ -543,6 +543,7 @@ mod tests {
             context_window: 200_000,
             source: "fallback".into(),
             compaction_threshold: 160_000,
+            ..Default::default()
         };
         let proto = to_proto_event(&AgentEvent::ContextWindow { info: info.clone() });
         assert!(matches!(proto, Some(ProtoEvent::ContextWindow(ref got)) if *got == info));

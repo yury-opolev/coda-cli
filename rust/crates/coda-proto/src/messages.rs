@@ -38,6 +38,10 @@ pub mod method {
     pub const SET_PERMISSION_MODE: &str = "session/setPermissionMode";
     pub const SET_SYSTEM_PROMPT: &str = "session/setSystemPrompt";
     pub const REASONING_CAPABILITY: &str = "model/reasoningCapability";
+    /// The active model's context tiers and the requested/effective tier.
+    pub const CONTEXT_CAPABILITY: &str = "model/contextCapability";
+    /// Requests a context tier for the active model (session-only).
+    pub const SET_CONTEXT_TIER: &str = "session/setContextTier";
 
     pub const SCHEDULE_LIST: &str = "session/scheduleList";
     pub const SCHEDULE_CREATE: &str = "session/scheduleCreate";
@@ -886,6 +890,87 @@ pub struct ReasoningCapabilityResult {
     /// The provider that model is served by, paired with `model` to form the
     /// canonical `(provider, model)` identity the picker persists against.
     #[serde(default)]
+    pub provider_id: Option<String>,
+}
+
+/// Parameters for `session/setContextTier`.
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SetContextTierParams {
+    /// `"default"`, `"long_context"`, or `"auto"`/`None` to clear the session
+    /// request (falling back to the saved preference, then the provider
+    /// default window).
+    pub tier: Option<String>,
+    /// Guard: the model the caller believed was active. A mismatch is refused
+    /// without mutating anything.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_model: Option<String>,
+    /// Guard: the provider the caller believed was connected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_provider: Option<String>,
+}
+
+/// One selectable context tier of a model.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ContextTierOption {
+    /// `"default"` or `"long_context"`.
+    pub tier: String,
+    /// The tier's context window in tokens, from provider metadata.
+    pub context_window: u64,
+}
+
+/// Result of `model/contextCapability` and `session/setContextTier`.
+///
+/// Keeps the requested tier, the effective tier and the effective window
+/// apart: a request the model cannot honour is reported as requested with no
+/// effective tier and a `note`, never as success.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ContextCapabilityResult {
+    /// For `session/setContextTier`: whether the request was applied.
+    /// Always `true` for `model/contextCapability`.
+    #[serde(default)]
+    pub ok: bool,
+    /// `"unknown"` (no provider metadata yet), `"single"` (one fixed window)
+    /// or `"tiered"`.
+    #[serde(default)]
+    pub state: String,
+    /// The tiers the model offers, smallest first. Empty unless known.
+    #[serde(default)]
+    pub tiers: Vec<ContextTierOption>,
+    /// The tier the provider's catalog marks as preferred, when it does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_tier: Option<String>,
+    /// The tier requested for this model (session, then saved preference).
+    /// `None` means unset: the provider's reported window is used as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested: Option<String>,
+    /// Where `requested` came from: `"session"` or `"saved"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_source: Option<String>,
+    /// The tier the effective window belongs to, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective: Option<String>,
+    /// The context window used for budgeting, fit checks and compaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_window: Option<u64>,
+    /// Where the effective window came from (`live`, `catalog`, `tier`, …).
+    #[serde(default)]
+    pub window_source: String,
+    /// Why the request is not in effect, or why a set was refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Cost/availability disclosure for tiered models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disclosure: Option<String>,
+    /// Canonical model id described.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
 }
 

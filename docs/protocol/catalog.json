@@ -131,6 +131,24 @@
       "availability": "reusable"
     },
     {
+      "method": "model/contextCapability",
+      "paramsSchema": null,
+      "resultSchema": "schemas/ContextCapabilityResult.json",
+      "paramsContract": null,
+      "resultContract": "clientReader",
+      "requiresInitialize": false,
+      "availability": "reusable"
+    },
+    {
+      "method": "session/setContextTier",
+      "paramsSchema": "schemas/SetContextTierParams.json",
+      "resultSchema": "schemas/ContextCapabilityResult.json",
+      "paramsContract": "clientWriter",
+      "resultContract": "clientReader",
+      "requiresInitialize": false,
+      "availability": "reusable"
+    },
+    {
       "method": "session/setPermissionMode",
       "paramsSchema": "schemas/SetPermissionModeParams.json",
       "resultSchema": "schemas/SetPermissionModeResult.json",

@@ -129,6 +129,24 @@ pub struct Usage {
     pub cost: Option<CostEstimate>,
     /// Per-model share of the totals.
     pub by_model: Vec<ModelUsage>,
+    /// The context tier line from the last `event/contextWindow`: effective
+    /// tier, plus the requested one when it is not in effect. `None` when the
+    /// engine reported no tier (or predates tiers).
+    pub context_tier: Option<String>,
+}
+
+/// The `/context` tier line for a context-window announcement.
+pub fn context_tier_label(info: &coda_proto::events::ContextWindowInfo) -> Option<String> {
+    match (&info.effective_tier, &info.requested_tier, &info.tier_note) {
+        (_, Some(requested), Some(note)) => Some(format!(
+            "{} (requested {requested} not in effect: {})",
+            info.effective_tier.as_deref().unwrap_or("provider window"),
+            note.replace('_', " ")
+        )),
+        (Some(effective), Some(_), None) => Some(format!("{effective} (selected)")),
+        (Some(effective), None, _) => Some(format!("{effective} (provider window; not selected)")),
+        _ => None,
+    }
 }
 
 /// How the context occupancy may be described.
@@ -1824,6 +1842,7 @@ impl UiState {
                 _ => {}
             },
             Event::ContextWindow(info) if info.source == "fallback" => {
+                self.usage.context_tier = context_tier_label(&info);
                 let window = crate::browsers::context_size(i64::try_from(info.context_window).ok());
                 let threshold =
                     crate::browsers::context_size(i64::try_from(info.compaction_threshold).ok());
@@ -1837,6 +1856,7 @@ impl UiState {
                     NoticeLevel::Warning,
                 );
             }
+            Event::ContextWindow(info) => self.usage.context_tier = context_tier_label(&info),
             Event::PostCompactContextInjected { .. } => {
                 // Informational: a hook added context after compaction. The
                 // content lands in the history rather than the transcript.
@@ -1860,9 +1880,8 @@ impl UiState {
             // A suspended task is not finished; it stays in `running_tasks`.
             | Event::TaskSuspended { .. }
             | Event::TaskResumed { .. }
-            // Manual compactions, cancellations and known context windows.
+            // Manual compactions and cancellations.
             | Event::Compaction(_)
-            | Event::ContextWindow(_)
             | Event::Unknown { .. } => {}
             // When a display-mutating AgentResponse hook rewrites the assistant
             // response, replace the buffer with the hook's display content so
@@ -3894,6 +3913,7 @@ mod tests {
             context_window: 200_000,
             source: source.into(),
             compaction_threshold: 160_000,
+            ..Default::default()
         })
     }
 

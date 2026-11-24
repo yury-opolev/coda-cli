@@ -1,7 +1,6 @@
 # Thinking modes and context tiers
 
-Status: thinking-mode selection shipped in 0.1.185. Context tiers follow in a
-separate change and are documented in their own section when they land.
+Status: thinking-mode selection shipped in 0.1.185; context tiers in 0.1.186.
 
 ## Problem
 
@@ -120,6 +119,92 @@ through the Copilot proxy was not established.
 `model/reasoningCapability` (`current`) and the setter results. No raw bodies,
 prompts, tool payloads or thinking text are logged.
 
+## Context tiers
+
+### Provider contract (established 2026-11-24)
+
+- Copilot `GET /models` exposes, per model, **one** window in
+  `capabilities.limits` (`max_context_window_tokens`, `max_prompt_tokens`) and,
+  separately, pricing tiers in `billing.token_prices`: `default.context_max`,
+  optionally `long_context.context_max`, and an optional `preferred_tier`.
+  Observed: Claude Sonnet 5.5 default 200,000 / long 936,000; Haiku 5.5
+  100,000 / 936,000 (preferred `long_context`); Opus 5.5 200,000 / 1,000,000;
+  GPT-5.3-Codex default only (272,000); MAI Code 2 no tier data.
+- GitHub's pricing docs define the long-context tier by an **input-token
+  threshold** ("≤ 200K" default, "> 200K" long context) and say the user can
+  "choose between the default context size or the extended context". Copilot
+  CLI documents `--context default|long_context` / `contextTier` "for
+  tiered-pricing models", defaulting to the catalog's preferred tier.
+- **No documented request header or body property negotiates a tier.** None
+  was invented. A tier is therefore implemented as what the contract supports:
+  the effective window Coda budgets against. Selecting `default` keeps the
+  conversation within the default tier's size (compacting earlier, so requests
+  stay at default pricing); `long_context` lets it grow to the long tier's size.
+  A host test proves the inference request is the same under either tier
+  (model, `max_tokens`, effort, thinking, tools, system); only budgeting moves.
+
+### Model
+
+| Value | Where | Meaning |
+|---|---|---|
+| Requested tier | session override, resumed session, `contextTierByModel` | What the user chose; `None` = unset |
+| Effective tier | `ContextResolution.effective` | The tier the effective window belongs to, when known |
+| Effective window | `ModelBudget.context_window` | Used for fit checks, occupancy, compaction threshold, summary budget, status |
+| Compaction trigger | `compactAtPercent`/`compactByModel` | Unchanged; resolved against the effective window |
+| Output limit | `maxOutputTokens*` / model limit | Independent of the tier |
+
+Capability is `unknown` (no live row: never fetched, or the fetch failed),
+`single` (a row with no tier data, or a default-only tier) or `tiered`. Unknown
+is never treated as single, and neither is treated as supporting a tier.
+Windows from metadata are bounded (1,024–10,000,000) and a "long" tier that is
+not larger than the default is dropped rather than offered.
+
+### Resolution and precedence
+
+`output_budget::resolve_with_tier` is the single resolver (turns, manual and
+automatic compaction, subagents, display). Requested tier:
+
+1. `--context` launch flag (applied via `session/setContextTier` after
+   `initialize`, so it overrides everything below);
+2. the resumed session's recorded tier (`<sessions>/<id>.context.json`,
+   written when a turn's requested tier changes, restored on resume as a
+   session request);
+3. the saved `contextTierByModel["provider/model"]`;
+4. unset — the provider-reported window exactly as before (backward
+   compatible; the reported effective tier is the one that window falls in).
+
+Session requests are keyed by model, so a model or provider switch resolves the
+new model's own request; a metadata refresh can only change the effective
+window at the next resolution. Each turn resolves once at its start, so a
+mid-turn change applies to the next turn, never to the request in flight. A
+change republishes the effective window (`usage.contextLimit`,
+`event/contextWindow`), which rebases the occupancy display.
+
+Migration: sessions saved before 0.1.186 have no tier record and resolve from
+the saved preference, i.e. unset unless the user saved one — the same window as
+before. A refused or invalid saved/session tier leaves the window unchanged and
+is reported with a `tierNote`.
+
+### Surfaces
+
+CLI `--context default|long_context|auto` (interactive and `coda run`); TUI
+`/context tier [tier] [--session]`, a `tier` line in `/context`, and `t` in the
+model browser; serve `model/contextCapability` and `session/setContextTier`
+(older engines answer `-32601`, which clients report as "tiers unsupported");
+`event/contextWindow` gains `requestedTier`, `effectiveTier`, `tierNote`.
+Discovery uses the cached model list and fetches it at most once for an
+unknown model; nothing is fetched per prompt.
+
+### Trade-offs
+
+- A client-side tier cannot *force* the provider to price a request as
+  default; it keeps requests below the threshold by budgeting. That is exactly
+  what the documented threshold pricing makes meaningful.
+- `preferred_tier` is reported but not applied to unset sessions, to keep
+  existing sessions' windows unchanged.
+- Subagents resolve their own model's request (session override, then saved);
+  there is no separate subagent tier setting.
+
 ## Threat / abuse review
 
 - **Untrusted metadata.** `adaptive_thinking` is only read as a boolean;
@@ -133,3 +218,15 @@ prompts, tool payloads or thinking text are logged.
 - **Secret-free logs.** New diagnostic fields are fixed enums; unknown values are
   recorded as `other`, never copied.
 - **Cost.** Higher effort spends more output tokens; that is unchanged.
+- **Tier metadata is untrusted.** Context windows are bounded and validated
+  before use; an inverted or absurd long tier is dropped. Unknown capability
+  refuses a tier instead of guessing a window.
+- **Tier failures are explicit.** Unsupported, unknown or malformed tier
+  requests return `ok: false` with a reason and change nothing; a saved or
+  resumed tier the model no longer offers is reported via `tierNote`.
+- **Tier cost/availability disclosure.** `model/contextCapability` and
+  `/context tier` state that input above the default tier's size is billed at
+  the long-context rate.
+- **Bounded refresh.** Tier discovery reuses the cached model list and fetches
+  at most once per unknown model; the session sidecar holds only a model id
+  and a tier enum.

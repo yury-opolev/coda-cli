@@ -1,0 +1,117 @@
+{
+  "type": "object",
+  "properties": {
+    "ok": {
+      "type": "boolean",
+      "description": "For `session/setContextTier`: whether the request was applied.\nAlways `true` for `model/contextCapability`.",
+      "default": false
+    },
+    "state": {
+      "type": "string",
+      "description": "`\"unknown\"` (no provider metadata yet), `\"single\"` (one fixed window)\nor `\"tiered\"`.",
+      "default": ""
+    },
+    "tiers": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ContextTierOption"
+      },
+      "description": "The tiers the model offers, smallest first. Empty unless known.",
+      "default": []
+    },
+    "preferredTier": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The tier the provider's catalog marks as preferred, when it does."
+    },
+    "requested": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The tier requested for this model (session, then saved preference).\n`None` means unset: the provider's reported window is used as before."
+    },
+    "requestedSource": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Where `requested` came from: `\"session\"` or `\"saved\"`."
+    },
+    "effective": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The tier the effective window belongs to, when known."
+    },
+    "effectiveWindow": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0,
+      "description": "The context window used for budgeting, fit checks and compaction."
+    },
+    "windowSource": {
+      "type": "string",
+      "description": "Where the effective window came from (`live`, `catalog`, `tier`, …).",
+      "default": ""
+    },
+    "note": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Why the request is not in effect, or why a set was refused."
+    },
+    "disclosure": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Cost/availability disclosure for tiered models."
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Canonical model id described."
+    },
+    "providerId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "description": "Result of `model/contextCapability` and `session/setContextTier`.\n\nKeeps the requested tier, the effective tier and the effective window\napart: a request the model cannot honour is reported as requested with no\neffective tier and a `note`, never as success.",
+  "title": "ContextCapabilityResult",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "ContextTierOption": {
+      "type": "object",
+      "properties": {
+        "tier": {
+          "type": "string",
+          "description": "`\"default\"` or `\"long_context\"`."
+        },
+        "contextWindow": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "The tier's context window in tokens, from provider metadata."
+        }
+      },
+      "required": [
+        "tier",
+        "contextWindow"
+      ],
+      "description": "One selectable context tier of a model."
+    }
+  }
+}

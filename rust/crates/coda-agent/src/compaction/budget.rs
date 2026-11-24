@@ -16,6 +16,8 @@ pub enum WindowSource {
     Live,
     Catalog,
     Setting,
+    /// The window of a selected context tier (provider tier metadata).
+    Tier,
     #[default]
     Fallback,
 }
@@ -26,6 +28,7 @@ impl WindowSource {
             WindowSource::Live => "live",
             WindowSource::Catalog => "catalog",
             WindowSource::Setting => "setting",
+            WindowSource::Tier => "tier",
             WindowSource::Fallback => "fallback",
         }
     }

@@ -328,6 +328,8 @@ pub fn parse_models(value: &serde_json::Value) -> Vec<ModelInfo> {
                         reasoning_levels: Vec::new(),
                         // Nor a thinking mode: the compatibility table decides.
                         thinking: Default::default(),
+                        // Anthropic's model list carries no tier metadata.
+                        context_tiers: None,
                         id,
                     })
                 })

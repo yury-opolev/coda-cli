@@ -25,13 +25,34 @@
     },
     "source": {
       "type": "string",
-      "description": "`\"live\"`, `\"catalog\"`, `\"setting\"` or `\"fallback\"`."
+      "description": "`\"live\"`, `\"catalog\"`, `\"setting\"`, `\"tier\"` or `\"fallback\"`."
     },
     "compactionThreshold": {
       "type": "integer",
       "format": "uint64",
       "minimum": 0,
       "description": "Auto-compaction threshold resolved against this window."
+    },
+    "requestedTier": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The requested context tier (`\"default\"`/`\"long_context\"`); absent when\nunset. Older engines never send it."
+    },
+    "effectiveTier": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The tier the effective window belongs to, when known."
+    },
+    "tierNote": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Why the requested tier is not in effect (`single_window`,\n`tier_unavailable`, `capability_unknown`)."
     }
   },
   "required": [

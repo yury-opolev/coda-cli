@@ -30,6 +30,9 @@ const BAR_CELLS: usize = 40;
 pub(super) fn context_report(usage: &Usage, model: Option<&str>) -> String {
     let mut out = String::from("Context usage\n");
     out.push_str(&format!("  model    {}\n", model.unwrap_or("(unknown)")));
+    if let Some(tier) = &usage.context_tier {
+        out.push_str(&format!("  tier     {tier}  (/context tier to view or change)\n"));
+    }
 
     let used = usage.last_input_tokens;
     match (usage.context(), usage.context_limit) {
