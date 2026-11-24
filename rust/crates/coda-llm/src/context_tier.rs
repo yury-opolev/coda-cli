@@ -26,7 +26,7 @@ impl ContextTier {
     pub fn parse(raw: &str) -> Option<ContextTier> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "default" => Some(ContextTier::Default),
-            "long_context" | "long-context" | "long" => Some(ContextTier::LongContext),
+            "long_context" | "long-context" => Some(ContextTier::LongContext),
             _ => None,
         }
     }

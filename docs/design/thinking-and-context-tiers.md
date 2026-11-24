@@ -166,19 +166,32 @@ automatic compaction, subagents, display). Requested tier:
 
 1. `--context` launch flag (applied via `session/setContextTier` after
    `initialize`, so it overrides everything below);
-2. the resumed session's recorded tier (`<sessions>/<id>.context.json`,
-   written when a turn's requested tier changes, restored on resume as a
-   session request);
+2. the resumed session's recorded tier (`<sessions>/<id>.context-tier`, a
+   non-`.json` file so the session list never mistakes it for a transcript;
+   written atomically when the tier is set and when a turn's requested tier
+   changes; restored on resume as a session request);
 3. the saved `contextTierByModel["provider/model"]`;
 4. unset — the provider-reported window exactly as before (backward
    compatible; the reported effective tier is the one that window falls in).
 
-Session requests are keyed by model, so a model or provider switch resolves the
-new model's own request; a metadata refresh can only change the effective
-window at the next resolution. Each turn resolves once at its start, so a
-mid-turn change applies to the next turn, never to the request in flight. A
-change republishes the effective window (`usage.contextLimit`,
-`event/contextWindow`), which rebases the occupancy display.
+Session requests are keyed by provider and model, so a model or provider
+switch resolves the new pair's own request; a metadata refresh can only change
+the effective window at the next resolution. Each agent run resolves once at
+its own start: a turn captures its budget when it begins, and a subagent when
+it is spawned. A change made while a turn runs therefore applies from the next
+turn (and to subagents spawned after it), never to a request already in
+flight; the setter says so and defers republishing the window until then.
+Outside a turn a change republishes the effective window
+(`usage.contextLimit`, `event/contextWindow`), which rebases the occupancy
+display.
+
+When a requested tier is not in effect (unknown capability, or a tier the
+model no longer offers) the window **fails open** to the provider-reported
+window — the larger one on tiered models — because no smaller window can be
+confirmed. This is never silent: `event/contextWindow` carries `tierNote`, the
+TUI warns once, and `/context tier` explains. A requested tier on the turn
+path triggers the one-time discovery below, so headless runs honour saved and
+resumed tiers.
 
 Migration: sessions saved before 0.1.186 have no tier record and resolve from
 the saved preference, i.e. unset unless the user saved one — the same window as
@@ -192,8 +205,11 @@ CLI `--context default|long_context|auto` (interactive and `coda run`); TUI
 model browser; serve `model/contextCapability` and `session/setContextTier`
 (older engines answer `-32601`, which clients report as "tiers unsupported");
 `event/contextWindow` gains `requestedTier`, `effectiveTier`, `tierNote`.
-Discovery uses the cached model list and fetches it at most once for an
-unknown model; nothing is fetched per prompt.
+Discovery fetches the model list at most once per `(provider, model)` per
+process — on `model/contextCapability`, `session/setContextTier` or a turn
+that requests a tier — outside the configuration lock and served from the
+client's cache where it has one; `/models --refresh` re-fetches explicitly.
+Nothing is fetched per prompt.
 
 ### Trade-offs
 
@@ -204,6 +220,10 @@ unknown model; nothing is fetched per prompt.
   existing sessions' windows unchanged.
 - Subagents resolve their own model's request (session override, then saved);
   there is no separate subagent tier setting.
+- A `default` request on a model with one fixed window is accepted as that
+  window (its only tier); `long_context` there is refused.
+- Forking a session does not copy its tier record; the fork resolves from the
+  saved preference until it records its own.
 
 ## Threat / abuse review
 
@@ -227,6 +247,6 @@ unknown model; nothing is fetched per prompt.
 - **Tier cost/availability disclosure.** `model/contextCapability` and
   `/context tier` state that input above the default tier's size is billed at
   the long-context rate.
-- **Bounded refresh.** Tier discovery reuses the cached model list and fetches
-  at most once per unknown model; the session sidecar holds only a model id
-  and a tier enum.
+- **Bounded refresh.** Tier discovery fetches at most once per
+  `(provider, model)` per process; the session record holds only a provider
+  id, a model id and a tier enum.

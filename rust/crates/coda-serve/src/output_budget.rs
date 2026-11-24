@@ -39,17 +39,6 @@ impl ContextCapability {
             ContextCapability::Tiered(_) => "tiered",
         }
     }
-
-    /// Whether `tier` can be honoured.
-    pub fn supports(&self, tier: coda_llm::ContextTier) -> bool {
-        match self {
-            ContextCapability::Unknown => false,
-            ContextCapability::Single { tiers } => {
-                tier == coda_llm::ContextTier::Default && tiers.is_some()
-            }
-            ContextCapability::Tiered(tiers) => tiers.window(tier).is_some(),
-        }
-    }
 }
 
 /// Why a requested tier is not in effect — a fixed, closed set.
@@ -254,12 +243,16 @@ fn resolve_tier(
     let resolution = |effective, note| ContextResolution { requested, effective, capability, note };
     let Some(tier) = requested else {
         let effective = match capability {
-            ContextCapability::Tiered(tiers) => Some(match legacy_window {
-                Some(window) if window <= tiers.default_window as usize => ContextTier::Default,
-                _ => ContextTier::LongContext,
+            ContextCapability::Tiered(tiers) => legacy_window.map(|window| {
+                if window <= tiers.default_window as usize {
+                    ContextTier::Default
+                } else {
+                    // Past the default tier's size: long-context pricing applies.
+                    ContextTier::LongContext
+                }
             }),
-            ContextCapability::Single { tiers: Some(_) } => Some(ContextTier::Default),
-            _ => None,
+            ContextCapability::Single { .. } => Some(ContextTier::Default),
+            ContextCapability::Unknown => None,
         };
         return (legacy_window, legacy_source, resolution(effective, None));
     };
@@ -269,7 +262,8 @@ fn resolve_tier(
             let window = legacy_window.map_or(tier_window, |legacy| legacy.min(tier_window));
             (Some(window), WindowSource::Tier, resolution(Some(tier), None))
         }
-        ContextCapability::Single { tiers: Some(_) } if tier == ContextTier::Default => {
+        // A single fixed window is the model's default (and only) tier.
+        ContextCapability::Single { .. } if tier == ContextTier::Default => {
             (legacy_window, legacy_source, resolution(Some(tier), None))
         }
         ContextCapability::Tiered(_) | ContextCapability::Single { tiers: Some(_) } => {
@@ -476,8 +470,11 @@ mod tests {
         assert!(matches!(r.context.capability, ContextCapability::Single { .. }));
 
         let no_billing = tiered(Some(ContextTier::Default), "mai-code-2");
-        assert_eq!(no_billing.context.note, Some(TierNote::SingleWindow));
+        assert_eq!(no_billing.context.note, None, "a single window is the model's default tier");
+        assert_eq!(no_billing.context.effective, Some(ContextTier::Default));
         assert_eq!(no_billing.budget.context_window, Some(1_050_000));
+        let no_billing_long = tiered(Some(ContextTier::LongContext), "mai-code-2");
+        assert_eq!(no_billing_long.context.note, Some(TierNote::SingleWindow));
     }
 
     /// No live row at all: capability unknown (never fetched, or the fetch

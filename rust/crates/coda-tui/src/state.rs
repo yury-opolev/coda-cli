@@ -1856,7 +1856,20 @@ impl UiState {
                     NoticeLevel::Warning,
                 );
             }
-            Event::ContextWindow(info) => self.usage.context_tier = context_tier_label(&info),
+            Event::ContextWindow(info) => {
+                self.usage.context_tier = context_tier_label(&info);
+                // Announced only on change, so this does not repeat per turn.
+                if let (Some(requested), Some(note)) = (&info.requested_tier, &info.tier_note) {
+                    self.notice(
+                        format!(
+                            "Context tier {requested} is not in effect ({}); using the provider \
+                             window. See /context tier.",
+                            note.replace('_', " ")
+                        ),
+                        NoticeLevel::Warning,
+                    );
+                }
+            }
             Event::PostCompactContextInjected { .. } => {
                 // Informational: a hook added context after compaction. The
                 // content lands in the history rather than the transcript.
@@ -3975,6 +3988,38 @@ mod tests {
             state.apply(UiEvent::Engine(context_window(source)));
         }
         assert!(notice_texts(&state).is_empty());
+    }
+
+    /// A requested tier that is not in effect is said once, as a warning, and
+    /// the `/context` tier line keeps requested and effective apart.
+    #[test]
+    fn a_context_tier_not_in_effect_is_reported() {
+        let mut state = state();
+        state.apply(UiEvent::Engine(Event::ContextWindow(coda_proto::events::ContextWindowInfo {
+            model: "m".into(),
+            context_window: 1_000_000,
+            source: "live".into(),
+            requested_tier: Some("default".into()),
+            tier_note: Some("capability_unknown".into()),
+            ..Default::default()
+        })));
+        let notices = leveled_notices(&state);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_eq!(notices[0].1, NoticeLevel::Warning);
+        assert!(notices[0].0.contains("default is not in effect"), "{}", notices[0].0);
+        let label = state.usage.context_tier.clone().unwrap();
+        assert!(label.contains("requested default not in effect"), "{label}");
+
+        state.apply(UiEvent::Engine(Event::ContextWindow(coda_proto::events::ContextWindowInfo {
+            model: "m".into(),
+            context_window: 200_000,
+            source: "tier".into(),
+            requested_tier: Some("default".into()),
+            effective_tier: Some("default".into()),
+            ..Default::default()
+        })));
+        assert_eq!(state.usage.context_tier.as_deref(), Some("default (selected)"));
+        assert_eq!(leveled_notices(&state).len(), 1, "a tier in effect is silent");
     }
 
     #[test]

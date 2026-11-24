@@ -762,7 +762,11 @@ effective?, effectiveWindow?, windowSource, note?, disclosure?, model?, provider
   preference > unset (the provider-reported window, exactly as before tiers existed).
 - **Failure semantics.** An unknown/unsupported tier, an unparseable value or a stale guard
   returns `ok: false` with `note`, and leaves the requested tier unchanged. `auto` clears the
-  session request. Requested and effective are always reported separately.
+  session request. Requested and effective are always reported separately. A saved or resumed
+  tier that cannot be applied leaves the provider-reported window in force (fail-open toward
+  the larger window, since no smaller one can be confirmed) and is reported through
+  `event/contextWindow.tierNote`. A change made during a running turn applies from the next turn
+  (the result's `note` says so).
 - **Older engines** answer both methods with `-32601` (method not found); clients should
   treat that as "tiers unsupported", not as an error in the session.
 
