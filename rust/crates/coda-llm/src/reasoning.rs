@@ -153,6 +153,12 @@ mod tests {
         assert!(!resolve_anthropic("claude-sonnet-4-5-20250929").supported);
     }
 
+    #[test]
+    fn gateway_prefixed_ids_keep_their_levels() {
+        assert_eq!(resolve_anthropic("anthropic/claude-opus-4-8").levels, ANTHROPIC_OPUS_LEVELS);
+        assert_eq!(resolve_anthropic("us.anthropic.claude-sonnet-4-6-v1:0").levels, ANTHROPIC_MAX_WITHOUT_XHIGH_LEVELS);
+    }
+
     /// For Copilot, having no advertised levels means "not declared". The
     /// caller must not treat that as a positive statement of support.
     #[test]

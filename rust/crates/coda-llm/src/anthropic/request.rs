@@ -63,7 +63,7 @@ pub fn build_with_thinking(request: &ChatRequest, thinking: ThinkingPolicy) -> V
             // reasoning and an answer, so the feature is omitted rather than
             // requested invalidly.
             ThinkingMode::Manual => {
-                if let Some(budget) = thinking_budget(effort, request.max_tokens, thinking.max_budget) {
+                if let Some(budget) = thinking_budget(effort, request.max_tokens, thinking) {
                     body.insert(
                         "thinking".into(),
                         json!({ "type": "enabled", "budget_tokens": budget }),
@@ -138,13 +138,13 @@ fn cache_control(one_hour: bool) -> Value {
     }
 }
 
-/// Reasoning budget for an effort level, bounded by the response limit and,
-/// when the model advertised one, its maximum thinking budget.
+/// Reasoning budget for an effort level, bounded by the response limit and by
+/// the minimum and maximum the model advertised, when it did.
 ///
 /// The budget must leave room for the answer itself and the provider requires
-/// at least 1024 tokens, so a response limit too small to satisfy both yields
-/// no budget at all.
-fn thinking_budget(effort: Effort, max_tokens: u32, advertised_max: Option<u32>) -> Option<u32> {
+/// at least 1024 tokens (or the advertised minimum, if higher), so a response
+/// limit too small to satisfy both yields no budget at all.
+fn thinking_budget(effort: Effort, max_tokens: u32, policy: ThinkingPolicy) -> Option<u32> {
     const MINIMUM: u32 = 1024;
 
     let requested = match effort {
@@ -155,14 +155,15 @@ fn thinking_budget(effort: Effort, max_tokens: u32, advertised_max: Option<u32>)
         Effort::Max => 32_768,
     };
 
+    let floor = policy.min_budget.unwrap_or(MINIMUM).max(MINIMUM);
     // Strictly below max_tokens, so the answer always has room.
     let ceiling = max_tokens
         .saturating_sub(MINIMUM)
-        .min(advertised_max.unwrap_or(u32::MAX));
-    if ceiling < MINIMUM {
+        .min(policy.max_budget.unwrap_or(u32::MAX));
+    if ceiling < floor {
         return None;
     }
-    Some(requested.min(ceiling))
+    Some(requested.clamp(floor, ceiling))
 }
 
 /// Serialises the conversation, placing the final cache markers.
@@ -756,6 +757,7 @@ mod tests {
             .with_thinking(Some(ThinkingPolicy {
                 mode: ThinkingMode::Adaptive,
                 source: ThinkingSource::ModelMetadata,
+                min_budget: None,
                 max_budget: None,
             }));
         let body = build(&adaptive);
@@ -768,12 +770,37 @@ mod tests {
             .with_thinking(Some(ThinkingPolicy {
                 mode: ThinkingMode::Manual,
                 source: ThinkingSource::ModelMetadata,
+                min_budget: None,
                 max_budget: Some(32_000),
             }));
         let body = build(&manual);
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["thinking"]["budget_tokens"], 32_000, "clamped to the advertised maximum");
         assert!(body.get("output_config").is_none());
+    }
+
+    /// An advertised minimum above the 1024 default is honoured; when the
+    /// output limit cannot fit it, thinking is omitted rather than sent invalid.
+    #[test]
+    fn an_advertised_minimum_budget_is_respected() {
+        use crate::thinking::{ThinkingMode, ThinkingPolicy, ThinkingSource};
+        let policy = Some(ThinkingPolicy {
+            mode: ThinkingMode::Manual,
+            source: ThinkingSource::ModelMetadata,
+            min_budget: Some(4096),
+            max_budget: Some(32_000),
+        });
+        let low = manual_request(vec![Message::user("hi")])
+            .with_max_tokens(64_000)
+            .with_effort(Some(Effort::Low))
+            .with_thinking(policy);
+        assert_eq!(build(&low)["thinking"]["budget_tokens"], 4096, "raised to the advertised minimum");
+
+        let cramped = manual_request(vec![Message::user("hi")])
+            .with_max_tokens(4096)
+            .with_effort(Some(Effort::High))
+            .with_thinking(policy);
+        assert!(build(&cramped).get("thinking").is_none());
     }
 
     /// Signed thinking replays unchanged under adaptive thinking, and a prior

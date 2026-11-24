@@ -68,8 +68,9 @@ Serialization (`anthropic::request::build_with_thinking`):
 | `auto` | nothing | nothing |
 
 Manual budgets keep the historical mapping (2048…32768), stay strictly below
-`max_tokens`, respect the 1024 minimum, and are additionally clamped to the
-advertised `max_thinking_budget`. `max_tokens` is unchanged in both modes (for
+`max_tokens`, and are clamped into the advertised `min/max_thinking_budget`
+range (with a floor of 1024); if `max_tokens` cannot fit the minimum, thinking
+is omitted rather than sent invalid. `max_tokens` is unchanged in both modes (for
 adaptive it is the hard cap on thinking plus answer). OpenAI Responses
 (`reasoning.effort`) and Chat Completions (no effort field) are unchanged.
 
@@ -85,6 +86,19 @@ Opus 4.6 / Sonnet 4.6 offer `max` but not `xhigh` (previously Sonnet was given
 offer all five. Unsupported explicit levels are refused, or reported as the
 effective value, by the existing resolver; nothing is sent that the model does
 not advertise.
+
+Deliberate behavior changes for the **direct Anthropic** provider (Copilot
+models follow their live metadata and are unaffected):
+
+- Opus 4.6 / Sonnet 4.6 move from manual budgets to adaptive thinking, because
+  Anthropic deprecated manual thinking there.
+- A saved `xhigh` for Opus/Sonnet 4.6 no longer applies (the model rejects it);
+  `model/reasoningCapability` reports `current: null` (automatic) and an
+  explicit `--effort xhigh` is refused at startup with a reason. It is not
+  silently upgraded to `max` or downgraded to `high` — consistent with the
+  existing rule that `xhigh` is never faked as `high`.
+- Model ids with a gateway prefix (`anthropic/claude-…`,
+  `us.anthropic.claude-…`) resolve like bare ids.
 
 Unchanged: signed thinking blocks replay verbatim (including display-omitted
 blocks with empty text), unsigned ones are still dropped, a reply with no

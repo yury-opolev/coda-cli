@@ -68,6 +68,8 @@ impl ThinkingSource {
 pub struct ThinkingPolicy {
     pub mode: ThinkingMode,
     pub source: ThinkingSource,
+    /// The smallest manual budget the model advertised, when it did.
+    pub min_budget: Option<u32>,
     /// The largest manual budget the model advertised, when it did.
     pub max_budget: Option<u32>,
 }
@@ -108,8 +110,8 @@ impl ThinkingSupport {
 /// Resolves the thinking policy for `model`, given what its metadata row
 /// advertised (if anything). See the module docs for the precedence.
 pub fn resolve(model: &str, support: Option<&ThinkingSupport>) -> ThinkingPolicy {
-    let max_budget = support.and_then(|s| s.max_budget);
-    let policy = |mode, source| ThinkingPolicy { mode, source, max_budget };
+    let (min_budget, max_budget) = (support.and_then(|s| s.min_budget), support.and_then(|s| s.max_budget));
+    let policy = |mode, source| ThinkingPolicy { mode, source, min_budget, max_budget };
 
     if let Some(adaptive) = support.and_then(|s| s.adaptive) {
         let mode = if adaptive { ThinkingMode::Adaptive } else { ThinkingMode::Manual };
@@ -134,6 +136,7 @@ pub fn compatibility_mode(model: &str) -> Option<ThinkingMode> {
     let adaptive = match family {
         "fable" | "mythos" => true,
         "opus" | "sonnet" => version >= (4, 6),
+        // Haiku's first adaptive release is 5.5; there is no Haiku 5.0.
         "haiku" => version >= (5, 0),
         _ => return None,
     };
@@ -146,7 +149,9 @@ pub fn compatibility_mode(model: &str) -> Option<ThinkingMode> {
 /// version found after it, which is none, so they parse as `(0, 0)`.
 pub(crate) fn claude_family_version(model: &str) -> Option<(&'static str, (u32, u32))> {
     let lower = model.to_ascii_lowercase();
-    let rest = lower.strip_prefix("claude-")?;
+    // Gateways prefix the id (`anthropic/claude-…`, `us.anthropic.claude-…`).
+    let start = lower.find("claude-")?;
+    let rest = &lower[start + "claude-".len()..];
     let mut parts = rest.split(['-', '.']);
     let family = match parts.next()? {
         "opus" => "opus",
@@ -196,6 +201,13 @@ mod tests {
     fn non_claude_models_are_not_in_the_table() {
         assert_eq!(mode("gpt-6-sol"), None);
         assert_eq!(mode("claude-3-7-sonnet-latest"), None);
+    }
+
+    #[test]
+    fn gateway_prefixed_ids_resolve_like_bare_ids() {
+        assert_eq!(mode("anthropic/claude-opus-4-8"), Some(ThinkingMode::Adaptive));
+        assert_eq!(mode("us.anthropic.claude-opus-4-8-v1:0"), Some(ThinkingMode::Adaptive));
+        assert_eq!(mode("us.anthropic.claude-sonnet-4-5-20250929-v1:0"), Some(ThinkingMode::Manual));
     }
 
     #[test]
