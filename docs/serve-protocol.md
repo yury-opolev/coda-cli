@@ -394,6 +394,15 @@ list — so an absent or snapshot `allowedValues` is still actionable. `model` p
 happen to be known, because they are per-model and re-resolved on `session/setModel`. A key with
 a genuinely closed set (`permissionMode`) carries no pointer.
 
+**An accepted effort is intent, not a wire field.** `session/setEffort` returning `ok: true`
+means the level is valid for the model; the provider client then serialises it per the model's
+thinking contract on every inference request (foreground turns, subagents, compaction summaries):
+adaptive Claude models get `thinking.type: adaptive` + `output_config.effort`, manual Claude
+models get `thinking.type: enabled` + `budget_tokens`, Responses models get `reasoning.effort`.
+`auto` (`null`) sends none of these, leaving the provider default in force. The `request_shape`
+diagnostic records the result as allowlisted enums (`thinking_type`, `effort_value`,
+`thinking_source`). See [design/thinking-and-context-tiers.md](design/thinking-and-context-tiers.md).
+
 **`PendingRequestDto.callId` is reserved and always omitted.** The permission, question and
 plan-approval seams inside the engine do not carry the provider tool-call id, so there is
 nothing truthful to put there and nothing is invented. The capability

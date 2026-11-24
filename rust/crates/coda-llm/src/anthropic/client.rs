@@ -203,7 +203,11 @@ impl AnthropicClient {
     ///
     /// The shared `crate::retry::send_with_retry` handles the retry loop so the
     /// Anthropic and Copilot clients do not duplicate that logic.
-    async fn send_with_retry(&self, body: &serde_json::Value) -> Result<reqwest::Response, LlmError> {
+    async fn send_with_retry(
+        &self,
+        body: &serde_json::Value,
+        thinking: crate::thinking::ThinkingPolicy,
+    ) -> Result<reqwest::Response, LlmError> {
         let url = self.endpoint();
 
         // Fetch dynamic auth headers once per request (before the retry loop) so
@@ -220,7 +224,8 @@ impl AnthropicClient {
             1,
             coda_diagnostics::detail::Protocol::AnthropicMessages.as_str(),
             coda_diagnostics::detail::RouteSource::FixedProviderDefault,
-            coda_diagnostics::detail::RequestShape::from_wire_json(body),
+            coda_diagnostics::detail::RequestShape::from_wire_json(body)
+                .with_thinking_source(thinking.source.as_str()),
             || self.request_builder_with_auth(&url, dynamic_auth.as_deref()).json(body),
         )
         .await
@@ -234,8 +239,11 @@ impl LlmClient for AnthropicClient {
     }
 
     async fn stream(&self, request: ChatRequest) -> Result<ResponseStream, LlmError> {
-        let body = request::build(&request);
-        let response = self.send_with_retry(&body).await?;
+        let thinking = request
+            .thinking
+            .unwrap_or_else(|| crate::thinking::resolve(&request.model, None));
+        let body = request::build_with_thinking(&request, thinking);
+        let response = self.send_with_retry(&body, thinking).await?;
         // Headers/2xx already accepted: any failure from here on is
         // post-headers (an inline SSE error, a truncated stream), never the
         // provider rejecting the request outright.
@@ -318,6 +326,8 @@ pub fn parse_models(value: &serde_json::Value) -> Vec<ModelInfo> {
                         // Anthropic does not advertise reasoning levels; the
                         // capability is derived from static rules on the id.
                         reasoning_levels: Vec::new(),
+                        // Nor a thinking mode: the compatibility table decides.
+                        thinking: Default::default(),
                         id,
                     })
                 })

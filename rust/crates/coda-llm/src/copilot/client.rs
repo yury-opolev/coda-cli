@@ -133,6 +133,20 @@ impl CopilotClient {
         models::resolve_endpoint_with_source(model)
     }
 
+    /// The request's thinking contract: the caller's, if it resolved one, or
+    /// else resolved from the cached model row. Reads only the metadata
+    /// cache, so it adds no round trip.
+    fn thinking_policy(&self, request: &ChatRequest) -> crate::thinking::ThinkingPolicy {
+        if let Some(policy) = request.thinking {
+            return policy;
+        }
+        let models = models::cache_get(&self.config.base_url);
+        let row = models
+            .as_deref()
+            .and_then(|ms| ms.iter().find(|m| m.id.eq_ignore_ascii_case(&request.model)));
+        crate::thinking::resolve(&request.model, row.map(|m| &m.thinking))
+    }
+
     /// Build a POST request applying auth headers.
     ///
     /// `dynamic_auth` (from the credential source) overrides the static `token`
@@ -213,6 +227,7 @@ impl CopilotClient {
         dispatch: u32,
         route_source: coda_diagnostics::detail::RouteSource,
         body: &serde_json::Value,
+        thinking: Option<crate::thinking::ThinkingPolicy>,
         dynamic_auth: Option<&[(String, String)]>,
     ) -> Result<reqwest::Response, LlmError> {
         // Delegate to the shared retry loop so the Anthropic and Copilot clients
@@ -223,7 +238,13 @@ impl CopilotClient {
             dispatch,
             endpoint.protocol().as_str(),
             route_source,
-            coda_diagnostics::detail::RequestShape::from_wire_json(body),
+            {
+                let shape = coda_diagnostics::detail::RequestShape::from_wire_json(body);
+                match thinking {
+                    Some(policy) => shape.with_thinking_source(policy.source.as_str()),
+                    None => shape,
+                }
+            },
             || self.auth_post_with_auth(url, endpoint, dynamic_auth).json(body),
         )
         .await
@@ -250,9 +271,11 @@ impl CopilotClient {
 
         let (endpoint, route_source) = self.endpoint_for_with_source(&request.model);
         let url = self.endpoint_url(endpoint);
-        let body = build_body(request, endpoint);
+        let policy = self.thinking_policy(request);
+        let thinking = (endpoint == CopilotEndpoint::Messages).then_some(policy);
+        let body = build_body(request, endpoint, policy);
 
-        match self.send_with_retry(&url, endpoint, 1, route_source, &body, dynamic_auth).await {
+        match self.send_with_retry(&url, endpoint, 1, route_source, &body, thinking, dynamic_auth).await {
             Ok(r) => Ok((endpoint, route_source, r)),
             Err(err) if endpoint == CopilotEndpoint::ChatCompletions && is_chat_mismatch(&err) => {
                 // The model rejected /chat/completions. Refresh metadata and retry on the
@@ -267,10 +290,12 @@ impl CopilotClient {
                 }
 
                 let new_url = self.endpoint_url(new_endpoint);
-                let new_body = build_body(request, new_endpoint);
+                let policy = self.thinking_policy(request);
+                let new_thinking = (new_endpoint == CopilotEndpoint::Messages).then_some(policy);
+                let new_body = build_body(request, new_endpoint, policy);
                 let reroute_source = coda_diagnostics::detail::RouteSource::RerouteAfterMismatch;
                 let r = self
-                    .send_with_retry(&new_url, new_endpoint, 2, reroute_source, &new_body, dynamic_auth)
+                    .send_with_retry(&new_url, new_endpoint, 2, reroute_source, &new_body, new_thinking, dynamic_auth)
                     .await?;
                 Ok((new_endpoint, reroute_source, r))
             }
@@ -333,9 +358,13 @@ impl LlmClient for CopilotClient {
     }
 }
 
-fn build_body(request: &ChatRequest, endpoint: CopilotEndpoint) -> serde_json::Value {
+fn build_body(
+    request: &ChatRequest,
+    endpoint: CopilotEndpoint,
+    thinking: crate::thinking::ThinkingPolicy,
+) -> serde_json::Value {
     match endpoint {
-        CopilotEndpoint::Messages => crate::anthropic::request::build(request),
+        CopilotEndpoint::Messages => crate::anthropic::request::build_with_thinking(request, thinking),
         CopilotEndpoint::Responses => super::responses::build(request),
         CopilotEndpoint::ChatCompletions => super::chat::build(request),
     }

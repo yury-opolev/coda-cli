@@ -99,6 +99,18 @@ pub struct RequestShape {
     /// The Anthropic `thinking.budget_tokens` actually sent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_budget_value: Option<u32>,
+    /// The Anthropic `thinking.type` sent, as an allowlisted enum
+    /// (`adaptive`/`enabled`/`disabled`, anything else `other`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_type: Option<&'static str>,
+    /// The effort level sent (`output_config.effort` or `reasoning.effort`),
+    /// as an allowlisted enum; anything else is `other`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort_value: Option<&'static str>,
+    /// Where the thinking mode was resolved from, when the client resolved
+    /// one (`model_metadata`/`compatibility_table`/`legacy_default`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_source: Option<&'static str>,
     pub temperature_present: bool,
     pub tool_choice_present: bool,
     pub parallel_tool_calls_present: bool,
@@ -124,6 +136,15 @@ impl RequestShape {
             .find_map(|key| body.get(*key).and_then(as_u32));
         let thinking_budget_value =
             body.get("thinking").and_then(|t| t.get("budget_tokens")).and_then(as_u32);
+        let thinking_type = body
+            .get("thinking")
+            .and_then(|t| t.get("type"))
+            .map(|v| allowlisted(v, THINKING_TYPE_ALLOWLIST));
+        let effort_value = body
+            .get("output_config")
+            .and_then(|c| c.get("effort"))
+            .or_else(|| body.get("reasoning").and_then(|r| r.get("effort")))
+            .map(|v| allowlisted(v, EFFORT_ALLOWLIST));
 
         Self {
             message_count: bounded_count(message_count),
@@ -142,12 +163,36 @@ impl RequestShape {
             max_completion_tokens_present: body.get("max_completion_tokens").is_some(),
             max_tokens_value,
             thinking_budget_value,
+            thinking_type,
+            effort_value,
+            thinking_source: None,
             temperature_present: body.get("temperature").is_some(),
             tool_choice_present: body.get("tool_choice").is_some(),
             parallel_tool_calls_present: body.get("parallel_tool_calls").is_some(),
             response_format_present: body.get("response_format").is_some(),
         }
     }
+
+    /// Records where the thinking mode came from (allowlisted).
+    pub fn with_thinking_source(mut self, source: &str) -> Self {
+        self.thinking_source = Some(allowlisted_str(source, THINKING_SOURCE_ALLOWLIST));
+        self
+    }
+}
+
+/// `thinking.type` values safe to record verbatim.
+pub const THINKING_TYPE_ALLOWLIST: &[&str] = &["adaptive", "enabled", "disabled"];
+/// Effort levels safe to record verbatim.
+pub const EFFORT_ALLOWLIST: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+/// Thinking-mode provenance values safe to record verbatim.
+pub const THINKING_SOURCE_ALLOWLIST: &[&str] = &["model_metadata", "compatibility_table", "legacy_default"];
+
+fn allowlisted(value: &serde_json::Value, allowlist: &[&'static str]) -> &'static str {
+    value.as_str().map_or("other", |s| allowlisted_str(s, allowlist))
+}
+
+fn allowlisted_str(value: &str, allowlist: &[&'static str]) -> &'static str {
+    allowlist.iter().copied().find(|allowed| *allowed == value).unwrap_or("other")
 }
 
 
@@ -416,6 +461,35 @@ mod tests {
         assert_eq!(responses.thinking_budget_value, None);
 
         assert_eq!(RequestShape::from_wire_json(&json!({})).max_tokens_value, None);
+    }
+
+    #[test]
+    fn request_shape_records_thinking_type_and_effort_as_allowlisted_enums() {
+        let adaptive = RequestShape::from_wire_json(&json!({
+            "thinking": { "type": "adaptive" },
+            "output_config": { "effort": "xhigh" },
+        }));
+        assert_eq!(adaptive.thinking_type, Some("adaptive"));
+        assert_eq!(adaptive.effort_value, Some("xhigh"));
+        assert_eq!(adaptive.thinking_budget_value, None);
+
+        let manual = RequestShape::from_wire_json(&json!({ "thinking": { "type": "enabled", "budget_tokens": 2048 } }));
+        assert_eq!((manual.thinking_type, manual.effort_value), (Some("enabled"), None));
+
+        let responses = RequestShape::from_wire_json(&json!({ "reasoning": { "effort": "high", "summary": "auto" } }));
+        assert_eq!((responses.thinking_type, responses.effort_value), (None, Some("high")));
+
+        // Anything off the allowlist is reported as "other", never copied.
+        let odd = RequestShape::from_wire_json(&json!({
+            "thinking": { "type": "secret-canary" },
+            "output_config": { "effort": "secret-canary" },
+        }));
+        assert_eq!((odd.thinking_type, odd.effort_value), (Some("other"), Some("other")));
+        assert!(!serde_json::to_string(&odd).unwrap().contains("canary"));
+
+        let sourced = adaptive.with_thinking_source("model_metadata");
+        assert_eq!(sourced.thinking_source, Some("model_metadata"));
+        assert_eq!(adaptive.with_thinking_source("nonsense").thinking_source, Some("other"));
     }
 
     #[test]

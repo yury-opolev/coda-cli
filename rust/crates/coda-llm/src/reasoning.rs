@@ -37,29 +37,34 @@ impl ReasoningCapability {
     }
 }
 
-/// Levels available on Anthropic Opus models.
+/// Every documented level (Anthropic's effort table): Opus 4.7+, Sonnet 5+,
+/// Haiku 5.5+, and the Fable/Mythos families.
 const ANTHROPIC_OPUS_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
-/// Sonnet stops short of `max`; requesting it clamps to `high`.
-const ANTHROPIC_SONNET_LEVELS: &[&str] = &["low", "medium", "high", "xhigh"];
+/// Opus 4.6, Sonnet 4.6 and Mythos Preview offer `max` but not `xhigh`.
+const ANTHROPIC_MAX_WITHOUT_XHIGH_LEVELS: &[&str] = &["low", "medium", "high", "max"];
 
 /// The Copilot provider id, matched case-insensitively.
 pub const COPILOT_PROVIDER_ID: &str = "github-copilot";
 
-/// Resolves capability from static Anthropic rules.
-///
-/// Matching is on normalised substrings because the same family appears as
-/// both `opus-4-8` and `opus-4.8` depending on the surface.
+/// Resolves capability from static Anthropic rules, keyed on the model family
+/// and version so `opus-4-8` and `opus-4.8` agree. Source:
+/// <https://platform.claude.com/docs/en/build-with-claude/effort#effort-levels>.
+/// Older models (4.5 and earlier) are reported unsupported, as before.
 pub fn resolve_anthropic(model: &str) -> ReasoningCapability {
-    let m = model.to_ascii_lowercase();
-    let has = |needle: &str| m.contains(needle);
-
-    if has("opus-4-8") || has("opus-4.8") || has("opus-4-6") || has("opus-4.6") || has("opus-5") {
-        return ReasoningCapability::with_levels(ANTHROPIC_OPUS_LEVELS);
-    }
-    if has("sonnet-4-6") || has("sonnet-4.6") || has("sonnet-5") {
-        return ReasoningCapability::with_levels(ANTHROPIC_SONNET_LEVELS);
-    }
-    ReasoningCapability::unsupported()
+    let Some((family, version)) = crate::thinking::claude_family_version(model) else {
+        return ReasoningCapability::unsupported();
+    };
+    let preview = model.to_ascii_lowercase().contains("preview");
+    let levels = match family {
+        "mythos" if preview => ANTHROPIC_MAX_WITHOUT_XHIGH_LEVELS,
+        "fable" | "mythos" => ANTHROPIC_OPUS_LEVELS,
+        "opus" if version >= (4, 7) => ANTHROPIC_OPUS_LEVELS,
+        "sonnet" if version >= (5, 0) => ANTHROPIC_OPUS_LEVELS,
+        "haiku" if version >= (5, 5) => ANTHROPIC_OPUS_LEVELS,
+        "opus" | "sonnet" if version == (4, 6) => ANTHROPIC_MAX_WITHOUT_XHIGH_LEVELS,
+        _ => return ReasoningCapability::unsupported(),
+    };
+    ReasoningCapability::with_levels(levels)
 }
 
 /// Resolves capability from levels a Copilot model advertised.
@@ -120,26 +125,32 @@ mod tests {
 
     #[test]
     fn opus_models_expose_the_full_level_set() {
-        for model in ["claude-opus-4.8", "claude-opus-4-6", "claude-opus-5"] {
+        for model in ["claude-opus-4.8", "claude-opus-4-7", "claude-opus-5", "claude-opus-5.5", "claude-sonnet-5.5",
+            "claude-sonnet-5", "claude-haiku-5.5", "claude-fable-5-2"] {
             let cap = resolve_anthropic(model);
             assert!(cap.supported, "{model} should support reasoning");
-            assert_eq!(cap.levels, ANTHROPIC_OPUS_LEVELS);
+            assert_eq!(cap.levels, ANTHROPIC_OPUS_LEVELS, "{model}");
             assert!(cap.supports_auto);
         }
     }
 
+    /// Anthropic's effort table: Opus 4.6 and Sonnet 4.6 offer `max` but not
+    /// `xhigh`, so `xhigh` must not be advertised (it would be a 400).
     #[test]
-    fn sonnet_models_stop_short_of_max() {
-        let cap = resolve_anthropic("claude-sonnet-4.6");
-        assert!(cap.supported);
-        assert!(!cap.levels.iter().any(|l| l == "max"), "sonnet must not advertise max");
-        // xhigh IS in the Sonnet level set.
-        assert!(cap.levels.iter().any(|l| l == "xhigh"), "sonnet must advertise xhigh");
+    fn four_six_models_offer_max_but_not_xhigh() {
+        for model in ["claude-sonnet-4.6", "claude-opus-4-6"] {
+            let cap = resolve_anthropic(model);
+            assert!(cap.supported);
+            assert_eq!(cap.levels, ANTHROPIC_MAX_WITHOUT_XHIGH_LEVELS, "{model}");
+            assert_eq!(resolve_applied_level(&cap, Some("max")).as_deref(), Some("max"));
+            assert_eq!(resolve_applied_level(&cap, Some("xhigh")), None, "{model}");
+        }
     }
 
     #[test]
     fn an_unknown_anthropic_model_is_unsupported() {
         assert!(!resolve_anthropic("claude-haiku-4.5").supported);
+        assert!(!resolve_anthropic("claude-sonnet-4-5-20250929").supported);
     }
 
     /// For Copilot, having no advertised levels means "not declared". The
@@ -179,11 +190,12 @@ mod tests {
     }
 
     /// `max` on a model that stops at `high` clamps rather than failing, so a
-    /// globally configured `max` does not break every Sonnet request.
+    /// globally configured `max` does not break every request on that model.
     #[test]
     fn max_clamps_to_high_where_max_is_unavailable() {
-        let sonnet = resolve_anthropic("claude-sonnet-4.6");
-        assert_eq!(resolve_applied_level(&sonnet, Some("max")).as_deref(), Some("high"));
+        let levels = vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()];
+        let high_only = resolve_copilot(Some(&levels));
+        assert_eq!(resolve_applied_level(&high_only, Some("max")).as_deref(), Some("high"));
 
         let opus = resolve_anthropic("claude-opus-4.8");
         assert_eq!(resolve_applied_level(&opus, Some("max")).as_deref(), Some("max"));
@@ -196,11 +208,11 @@ mod tests {
         assert_eq!(resolve_applied_level(&cap, Some("xhigh")), None);
     }
 
-    /// xhigh is a valid Anthropic level for Opus and Sonnet; it must not be
-    /// rejected as unknown.
+    /// xhigh is a valid Anthropic level for Opus 4.8 and Sonnet 5; it must not
+    /// be rejected as unknown.
     #[test]
     fn xhigh_resolves_on_anthropic_opus_and_sonnet() {
-        for model in ["claude-opus-4.8", "claude-sonnet-4.6"] {
+        for model in ["claude-opus-4.8", "claude-sonnet-5"] {
             let cap = resolve_anthropic(model);
             assert_eq!(
                 resolve_applied_level(&cap, Some("xhigh")).as_deref(),

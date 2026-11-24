@@ -11196,9 +11196,10 @@ mod tests {
 
     #[test]
     fn effective_effort_clamps_max_to_high_where_max_is_unavailable() {
-        let sonnet = resolve_reasoning("anthropic", "claude-sonnet-4.6", None);
+        let levels = vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()];
+        let high_only = resolve_reasoning("github-copilot", "some-model", Some(&levels));
         assert_eq!(
-            resolve_effective_effort(&sonnet, false, Some(Effort::Max)),
+            resolve_effective_effort(&high_only, false, Some(Effort::Max)),
             Some(Effort::High),
             "max must clamp to high, matching the documented fallback"
         );
@@ -14664,18 +14665,19 @@ mod tests {
         assert_eq!(host.current_effort(), Some(Effort::High));
     }
 
+    /// Sonnet 4.6 offers `max` but not `xhigh` (Anthropic's effort table), so
+    /// a startup `xhigh` is refused explicitly against the connected model
+    /// rather than being sent as a level the model rejects.
     #[tokio::test]
     async fn startup_effort_is_resolved_against_the_connected_model_on_initialize() {
         let opts = StartupOptions {
             model: Some("claude-sonnet-4.6".into()),
-            effort: StartupEffort::Level(Effort::Max),
+            effort: StartupEffort::Level(Effort::Xhigh),
             ..StartupOptions::default()
         };
         let (host, _) = make_capturing_host_with_options(opts);
-        host.initialize(InitParams::default()).await.unwrap();
-        assert_eq!(host.current_effort(), Some(Effort::High));
-        assert!(host.pending_startup_effort.lock().unwrap().is_none());
-        assert_eq!(host.model_reasoning_capability().await.unwrap()["current"], "high");
+        let error = host.initialize(InitParams::default()).await.unwrap_err();
+        assert!(error.message.contains("xhigh not supported"), "{}", error.message);
     }
 
     #[tokio::test]

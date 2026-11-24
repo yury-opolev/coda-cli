@@ -208,6 +208,12 @@ pub struct ChatRequest {
     pub tool_choice: Option<String>,
     /// Request the one-hour cache TTL rather than the default five minutes.
     pub use_one_hour_ttl: bool,
+    /// The thinking contract resolved for this model before serialization.
+    ///
+    /// `None` lets the Anthropic serializer resolve it from the documented
+    /// compatibility table; a provider with live model metadata (Copilot)
+    /// stamps it from that metadata first. See [`crate::thinking`].
+    pub thinking: Option<crate::thinking::ThinkingPolicy>,
 }
 
 impl ChatRequest {
@@ -222,6 +228,7 @@ impl ChatRequest {
             tools_volatile: false,
             tool_choice: None,
             use_one_hour_ttl: false,
+            thinking: None,
         }
     }
 
@@ -242,6 +249,11 @@ impl ChatRequest {
 
     pub fn with_effort(mut self, effort: Option<Effort>) -> Self {
         self.effort = effort;
+        self
+    }
+
+    pub fn with_thinking(mut self, thinking: Option<crate::thinking::ThinkingPolicy>) -> Self {
+        self.thinking = thinking;
         self
     }
 }
@@ -321,6 +333,9 @@ pub struct ModelInfo {
     /// caller must not conclude a model lacks reasoning purely from this being
     /// empty.
     pub reasoning_levels: Vec<String>,
+    /// What the row advertised about thinking (`adaptive_thinking`,
+    /// `min/max_thinking_budget`); all-`None` when it said nothing.
+    pub thinking: crate::thinking::ThinkingSupport,
 }
 
 impl ModelInfo {
@@ -332,6 +347,7 @@ impl ModelInfo {
             output_limit: None,
             supported_endpoints: Vec::new(),
             reasoning_levels: Vec::new(),
+            thinking: crate::thinking::ThinkingSupport::default(),
         }
     }
 
