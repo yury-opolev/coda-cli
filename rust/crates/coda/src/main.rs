@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
-use coda_boot::{parse_diagnostic_verbosity, parse_effort_level, resolve_system_prompt, SessionIntent, ServeArgs};
+use coda_boot::{parse_context_tier, parse_diagnostic_verbosity, parse_effort_level, resolve_system_prompt, SessionIntent, ServeArgs};
 use coda_client::EngineCommand;
 use coda_render::theme::ColorDepth;
 use coda_tui::app::App;
@@ -122,6 +122,12 @@ struct InteractiveArgs {
     /// engine uses the saved per-model preference when this is not given.
     #[arg(long, value_name = "LEVEL", value_parser = parse_effort_level)]
     effort: Option<String>,
+
+    /// Context tier for this session: default, long_context, or auto (the
+    /// provider-reported window). Session-only; refused with a reason when the
+    /// model does not offer the tier. See `/context tier`.
+    #[arg(long = "context", value_name = "TIER", value_parser = parse_context_tier)]
+    context_tier: Option<String>,
 
     /// Model to use for this session (session-only override, not saved).
     #[arg(long, value_name = "MODEL")]
@@ -230,6 +236,10 @@ struct RunArgs {
     /// Initial reasoning-effort level: low, medium, high, xhigh, or max.
     #[arg(long, value_name = "LEVEL", value_parser = parse_effort_level)]
     effort: Option<String>,
+
+    /// Context tier for this run: default, long_context, or auto.
+    #[arg(long = "context", value_name = "TIER", value_parser = parse_context_tier)]
+    context_tier: Option<String>,
 
     /// Model to use for this run (session-only override, not saved).
     #[arg(long, value_name = "MODEL")]
@@ -586,6 +596,10 @@ async fn run_interactive(
     if let Some(ref prompt) = system_prompt {
         apply_or_abort!(app.apply_cli_system_prompt(prompt).await);
     }
+    // The context tier is per model too, so it follows the model.
+    if let Some(ref tier) = args.context_tier {
+        apply_or_abort!(app.apply_cli_context(tier).await);
+    }
     // Effort last, after the active model is settled (Finding C1).
     if let Some(ref level) = args.effort {
         apply_or_abort!(app.apply_cli_effort(level).await);
@@ -761,6 +775,14 @@ async fn run_headless(
             method::SET_SYSTEM_PROMPT,
             serde_json::json!({ "text": prompt_text }),
             "--system-prompt"
+        );
+    }
+    // The context tier is per model too, so it follows the model.
+    if let Some(ref tier) = args.context_tier {
+        must_apply!(
+            method::SET_CONTEXT_TIER,
+            serde_json::json!({ "tier": tier }),
+            format!("--context {tier}")
         );
     }
     // Effort last, after the active model is settled (Finding C1).
@@ -945,6 +967,18 @@ mod tests {
             Some(Command::Serve(args)) => assert_eq!(args.effort.as_deref(), Some("high")),
             other => panic!("expected serve, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn context_tier_flags_parse_and_normalise_on_both_launch_surfaces() {
+        match Cli::try_parse_from(["coda", "run", "-p", "x", "--context", "Long-Context"]).expect("parse").command {
+            Some(Command::Run(args)) => assert_eq!(args.context_tier.as_deref(), Some("long_context")),
+            other => panic!("expected run, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["coda", "--context", "default"]).expect("parse");
+        assert_eq!(cli.interactive.context_tier.as_deref(), Some("default"));
+        assert!(Cli::try_parse_from(["coda", "--context", "huge"]).is_err());
+        assert!(Cli::try_parse_from(["coda", "run", "-p", "x", "--context", "1m"]).is_err());
     }
 
     #[test]

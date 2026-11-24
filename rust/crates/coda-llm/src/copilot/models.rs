@@ -266,6 +266,7 @@ pub fn parse_models(value: &Value) -> Vec<ModelInfo> {
             supported_endpoints,
             reasoning_levels,
             thinking,
+            context_tiers: crate::context_tier::ContextTiers::from_copilot_row(item),
         });
     }
 

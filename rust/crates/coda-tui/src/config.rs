@@ -282,6 +282,28 @@ impl Settings {
         self.root.get("theme")?.as_str()
     }
 
+    /// The saved context tier for a model (`contextTierByModel`).
+    pub fn context_tier_for(&self, provider: &str, model: &str) -> Option<&str> {
+        self.root
+            .get("contextTierByModel")?
+            .get(format!("{provider}/{model}"))?
+            .as_str()
+    }
+
+    /// Saves (or, with `None`, resets) the context tier for a model.
+    pub fn set_context_tier_for(&mut self, provider: &str, model: &str, tier: Option<&str>) {
+        let key = format!("{provider}/{model}");
+        let map = self.object_mut("contextTierByModel");
+        match tier {
+            Some(tier) => {
+                map.insert(key, Value::String(tier.to_string()));
+            }
+            None => {
+                map.remove(&key);
+            }
+        }
+    }
+
     /// The raw `theme` value, so startup can tell a non-string value apart
     /// from an absent one. `null` counts as absent: it is how a hand-edited
     /// file says "no choice".

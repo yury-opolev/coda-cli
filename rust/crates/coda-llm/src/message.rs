@@ -336,6 +336,9 @@ pub struct ModelInfo {
     /// What the row advertised about thinking (`adaptive_thinking`,
     /// `min/max_thinking_budget`); all-`None` when it said nothing.
     pub thinking: crate::thinking::ThinkingSupport,
+    /// The context tiers the row advertised (Copilot `billing.token_prices`);
+    /// `None` when it carried no tier metadata.
+    pub context_tiers: Option<crate::context_tier::ContextTiers>,
 }
 
 impl ModelInfo {
@@ -348,6 +351,7 @@ impl ModelInfo {
             supported_endpoints: Vec::new(),
             reasoning_levels: Vec::new(),
             thinking: crate::thinking::ThinkingSupport::default(),
+            context_tiers: None,
         }
     }
 

@@ -50,7 +50,7 @@ impl App {
                 Err(error) => self.notice(error, NoticeLevel::Warning),
             },
             "status" => self.output(self.status_text()),
-            "context" => self.output(self.context_text()),
+            "context" => self.cmd_context(&invocation.words()).await,
             "cost" => self.output(self.cost_text()),
             // Bare invocations open a browser; arguments keep the text path.
             "model" | "models" if invocation.args.is_empty() => {

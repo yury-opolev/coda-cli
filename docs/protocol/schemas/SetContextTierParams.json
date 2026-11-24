@@ -1,0 +1,29 @@
+{
+  "type": "object",
+  "properties": {
+    "tier": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "`\"default\"`, `\"long_context\"`, or `\"auto\"`/`None` to clear the session\nrequest (falling back to the saved preference, then the provider\ndefault window)."
+    },
+    "expectedModel": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Guard: the model the caller believed was active. A mismatch is refused\nwithout mutating anything."
+    },
+    "expectedProvider": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Guard: the provider the caller believed was connected."
+    }
+  },
+  "description": "Parameters for `session/setContextTier`.",
+  "title": "SetContextTierParams",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

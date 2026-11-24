@@ -367,6 +367,7 @@ Inside the REPL:
 /effort [low|medium|high|xhigh|max|auto]  choose or set model-specific reasoning effort
 /theme [name]             show or switch the colour theme (saved to this profile)
 /context                  show context-window occupancy and the session's token totals
+/context tier [tier]      show or select the context tier (default|long_context|auto)
 /cost                     show cumulative session token totals by category, and the cost estimate
 /goal [<text> | off]      set/clear the autonomous goal (--timeout, --max-turns)
 /log [<level> | stderr on|off]  show or set telemetry logging level
@@ -527,6 +528,22 @@ configuration changes to its live MCP connections.
   until a request has measured it; a small but real occupancy reads `<1%`, never
   `0%`. After a resume, rewind, compaction, fork or model switch the last
   measurement is shown as the last known one (`~20%`) until the next request.
+- **`/context tier`** shows the active model's context tiers as the provider
+  reports them — `tiered` (e.g. `default` 200,000 / `long_context` 936,000
+  tokens), `single` (one fixed window: nothing to choose) or `unknown` (no
+  provider metadata yet; `/models --refresh` re-fetches) — with the requested
+  tier, the effective tier and the effective window kept apart.
+  `/context tier <default|long_context>` applies and saves a per-provider/model
+  preference (`contextTierByModel`); add `--session` to apply for this session
+  only; `/context tier auto` clears both and returns to the provider-reported
+  window. In the model browser, `t` activates the highlighted model and shows
+  its tiers. A tier the model does not offer is refused with the reason, never
+  faked. The selected tier's window drives fit checks, occupancy, the
+  compaction threshold and summary budgets, not only the display. **Cost:** on
+  Copilot, input above the default tier's size is billed at the model's
+  long-context rate; `default` keeps the conversation within it by compacting
+  earlier. Unset keeps the window Coda used before tiers existed. Precedence:
+  `--context` > the resumed session's tier > saved preference > provider window.
 - **`/cost`** shows the **cumulative session totals** — every request's tokens
   summed, cached input included, broken down into uncached / cache read / cache
   write (5-minute and 1-hour) / output, and by model — with the engine's cost
@@ -982,6 +999,7 @@ for the full startup flag set):
 | `--goal-timeout <duration>` | Positive wall-clock budget such as `30m` or `2h`; requires `--goal`. Alias: `--goal-max-duration`. |
 | `--max-continuations <n>` | Nonnegative goal continuation budget; requires `--goal`. Alias: `--goal-max-continuations`. |
 | `--effort <level>` | Session-only reasoning effort (`low`/`medium`/`high`/`xhigh`/`max`/`auto`), validated against model capability. |
+| `--context <tier>` | Session-only context tier (`default`/`long_context`/`auto`), validated against the model's advertised tiers; refused with a reason when the model does not offer it. See `/context tier`. |
 
 Legacy-only options such as `--yolo-safe` and `--session-memory` are not supported
 by the Rust CLI; they are rejected rather than silently enabled.
@@ -1362,6 +1380,7 @@ Configurable in `~/.coda/settings.json`:
 |---|---|---|
 | `maxOutputTokens` | *(none)* | Output budget for every model. Clamped to the model's own limit and raised to at least 4,096. |
 | `maxOutputTokensByModel` | *(none)* | Per-model budget keyed `"<provider>/<model>"` (as `effortByModel`). Wins over `maxOutputTokens`. |
+| `contextTierByModel` | *(none)* | Per-model context tier keyed `"<provider>/<model>"`: `"default"` or `"long_context"`. Written by `/context tier`; removed by `/context tier auto`. Applied only when the model advertises that tier — otherwise the provider-reported window is used and `/context tier` says why. An unrecognised value is ignored. |
 
 Values that are not positive integers are ignored. The budget used and where it came from
 (`setting`, `live`, `catalog` or `fallback`) are recorded as `output_budget` in the

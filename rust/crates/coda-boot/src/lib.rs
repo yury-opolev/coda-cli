@@ -36,7 +36,7 @@ mod prompt;
 mod version;
 
 pub use prompt::resolve_system_prompt;
-pub use serve::{parse_diagnostic_verbosity, parse_effort_level, ServeArgs};
+pub use serve::{parse_context_tier, parse_diagnostic_verbosity, parse_effort_level, ServeArgs};
 pub use session_intent::SessionIntent;
 pub use settings_store::{SettingsError, SettingsFile};
 pub use version::version;

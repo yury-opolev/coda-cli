@@ -66,6 +66,8 @@ pub(super) fn document() -> Value {
         rpc(m::SET_EFFORT, Some("SetEffortParams"), Some("SetEffortResult"), C, C),
         rpc(m::ADJUST_MODEL_EFFORT, Some("ModelAdjustEffortParams"), Some("ModelEffortResult"), C, C),
         rpc(m::REASONING_CAPABILITY, None, Some("ReasoningCapabilityResult"), C, C),
+        rpc(m::CONTEXT_CAPABILITY, None, Some("ContextCapabilityResult"), C, C),
+        rpc(m::SET_CONTEXT_TIER, Some("SetContextTierParams"), Some("ContextCapabilityResult"), C, C),
         rpc(m::SET_PERMISSION_MODE, Some("SetPermissionModeParams"), Some("SetPermissionModeResult"), C, C),
         rpc(m::SET_SYSTEM_PROMPT, Some("SetSystemPromptParams"), Some("SetSystemPromptResult"), C, C),
         rpc(m::SCHEDULE_LIST, None, Some("ScheduleListResult"), C, C),

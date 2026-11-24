@@ -453,10 +453,21 @@ pub struct ContextWindowInfo {
     pub model: String,
     /// The effective window used for inference, compaction and display.
     pub context_window: u64,
-    /// `"live"`, `"catalog"`, `"setting"` or `"fallback"`.
+    /// `"live"`, `"catalog"`, `"setting"`, `"tier"` or `"fallback"`.
     pub source: String,
     /// Auto-compaction threshold resolved against this window.
     pub compaction_threshold: u64,
+    /// The requested context tier (`"default"`/`"long_context"`); absent when
+    /// unset. Older engines never send it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_tier: Option<String>,
+    /// The tier the effective window belongs to, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_tier: Option<String>,
+    /// Why the requested tier is not in effect (`single_window`,
+    /// `tier_unavailable`, `capability_unknown`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier_note: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -1572,6 +1583,7 @@ mod tests {
                 context_window: 200_000,
                 source: "fallback".into(),
                 compaction_threshold: 160_000,
+                ..Default::default()
             }));
         }
 

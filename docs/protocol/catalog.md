@@ -56,6 +56,8 @@ might infer from its name. Unsupported operations are listed separately.
 | `session/setEffort` | Reusable | Validate and set session reasoning effort for subsequent turns. |
 | `model/adjustEffort` | Reusable | Adjust a specified model's effort without implicitly activating that model. |
 | `model/reasoningCapability` | Reusable | Live authority for supported effort levels, auto/current state and indeterminate capability. Unknown is not unsupported. |
+| `model/contextCapability` | Reusable | The active model's context tiers (`unknown`/`single`/`tiered`), requested vs effective tier, effective window and its source, with a cost disclosure for tiered models. Fetches the model list at most once when unknown. |
+| `session/setContextTier` | Reusable | Validate and set the session's context tier for the active model (`default`, `long_context`, or `auto` to clear). Unsupported or unconfirmable tiers return `ok: false` with a reason and change nothing. Session-only; clients persist `contextTierByModel` themselves. |
 | `session/setPermissionMode` | Reusable | Update the mode read by subsequent permission checks; not a persistent preference. |
 | `session/setSystemPrompt` | Reusable | Set/clear the session prompt override for subsequent turns. |
 | `session/setGoal` | Reusable | Configure the session goal and budgets; not fleet scheduling. |

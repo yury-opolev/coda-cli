@@ -202,6 +202,20 @@ pub struct SetEffortParams {
     pub expected_provider: Option<String>,
 }
 
+/// `session/setContextTier` — a session-level context-tier request for the
+/// active model. Guarded exactly like `session/setEffort`.
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SetContextTierParams {
+    /// `"default"`, `"long_context"`, or `"auto"`/absent to clear.
+    #[serde(default)]
+    pub tier: Option<String>,
+    #[serde(default)]
+    pub expected_model: Option<String>,
+    #[serde(default)]
+    pub expected_provider: Option<String>,
+}
+
 /// `model/adjustEffort` — steps a *specific* model's reasoning-effort level up
 /// or down by one rung, server-authoritatively.
 ///
@@ -415,6 +429,15 @@ pub trait ServeBackend: Send + Sync {
     /// Sets a session-only custom system prompt. Never written to disk.
     async fn session_set_system_prompt(&self, p: SetSystemPromptParams) -> Result<Value, RpcError>;
     async fn model_reasoning_capability(&self) -> Result<Value, RpcError>;
+    /// The active model's context tiers and its requested/effective tier.
+    /// Defaults to "method not found" so backends predating tiers stay valid.
+    async fn model_context_capability(&self) -> Result<Value, RpcError> {
+        Err(RpcError::method_not_found("model/contextCapability"))
+    }
+    /// Requests a context tier for the active model (session-only).
+    async fn session_set_context_tier(&self, _p: SetContextTierParams) -> Result<Value, RpcError> {
+        Err(RpcError::method_not_found("session/setContextTier"))
+    }
     async fn session_schedule_list(&self) -> Result<Value, RpcError>;
     async fn session_schedule_create(&self, p: ScheduleCreateParams) -> Result<Value, RpcError>;
     async fn session_schedule_delete(&self, p: ScheduleDeleteParams) -> Result<Value, RpcError>;
@@ -597,6 +620,8 @@ pub async fn dispatch(
             backend.session_set_system_prompt(optional(params)).await
         }
         "model/reasoningCapability" => backend.model_reasoning_capability().await,
+        "model/contextCapability" => backend.model_context_capability().await,
+        "session/setContextTier" => backend.session_set_context_tier(optional(params)).await,
         "session/scheduleList" => backend.session_schedule_list().await,
         "session/scheduleCreate" => backend.session_schedule_create(required(params)?).await,
         "session/scheduleDelete" => backend.session_schedule_delete(optional(params)).await,
@@ -936,6 +961,12 @@ mod tests {
         }
         async fn model_reasoning_capability(&self) -> Result<Value, RpcError> {
             self.0.model_reasoning_capability().await
+        }
+        async fn model_context_capability(&self) -> Result<Value, RpcError> {
+            self.0.model_context_capability().await
+        }
+        async fn session_set_context_tier(&self, p: SetContextTierParams) -> Result<Value, RpcError> {
+            self.0.session_set_context_tier(p).await
         }
         async fn session_schedule_list(&self) -> Result<Value, RpcError> {
             self.0.session_schedule_list().await

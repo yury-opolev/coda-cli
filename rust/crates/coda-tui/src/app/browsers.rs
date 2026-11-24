@@ -243,6 +243,7 @@ impl App {
                     .on_activate(|id| A::SwitchModel(id.to_string()))
                     .on_horizontal(|id, direction| A::AdjustModelEffort { model: id.into(), direction })
                     .on_key('e', |id| A::OpenEffortPickerForModel(id.to_string()))
+                    .on_key('t', |id| A::ShowContextTiersForModel(id.to_string()))
             }
             BrowserKind::Sessions => {
                 RowActions::new().on_activate(|id| A::ResumeSession(id.to_string()))

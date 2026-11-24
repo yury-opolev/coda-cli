@@ -6,6 +6,7 @@
 
 pub mod anthropic;
 pub mod client;
+pub mod context_tier;
 pub mod copilot;
 pub mod credential_source;
 pub mod diagnostics;
@@ -19,6 +20,7 @@ pub mod thinking;
 pub(crate) mod pump;
 
 pub use client::{CompletedResponse, LlmClient, ResponseStream};
+pub use context_tier::{ContextTier, ContextTiers};
 pub use copilot::{CopilotClient, CopilotConfig};
 pub use credential_source::CredentialSource;
 pub use error::{FailureKind, LlmError};

@@ -101,8 +101,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "context",
         aliases: &[],
-        args: "",
-        summary: "Show how full the context window is (last request, cache included).",
+        args: "[tier [default|long_context|auto] [--session]]",
+        summary: "Show how full the context window is; `tier` shows or selects the context tier.",
         scope: Scope::Local,
     },
     CommandSpec {

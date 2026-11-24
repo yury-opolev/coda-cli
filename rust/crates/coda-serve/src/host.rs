@@ -1114,13 +1114,29 @@ pub struct ServeHost {
     /// stored `Effort` is the level the user *requested*, re-resolved against
     /// each model's capability so switching models never carries a stale level.
     effort_overrides: Mutex<HashMap<String, Option<Effort>>>,
+    /// Session-level context-tier requests, keyed by model id, with the same
+    /// presence semantics as `effort_overrides`: a key means an explicit
+    /// session choice (`None` = cleared to the provider default), absence
+    /// means "fall back to the saved preference". Shared with the subagent
+    /// budget resolver, which sizes children by the same rule.
+    context_overrides: Arc<Mutex<HashMap<String, Option<coda_llm::ContextTier>>>>,
+    /// The `(session id, model, requested tier)` last recorded in the
+    /// session's context sidecar, so a turn writes it only when it changes.
+    recorded_context_tier: Mutex<Option<(String, String, Option<coda_llm::ContextTier>)>>,
+    /// `provider/model` keys whose model list was already fetched for tier
+    /// discovery, so an unknown capability costs at most one fetch per model
+    /// per process (a `/models --refresh` still re-fetches explicitly).
+    tier_discovery_attempted: Mutex<std::collections::HashSet<String>>,
     /// Context and output limits the provider's live model list reported,
     /// recorded whenever `session/models` fetches it. Preferred over the
     /// catalogue when sizing a turn's output budget.
     live_model_limits: Arc<Mutex<crate::output_budget::LiveLimitMap>>,
     /// The last `(provider, model, window, source)` announced as
     /// `event/contextWindow`; a turn announces only a change.
-    last_context_window: Mutex<Option<(String, String, u64, String)>>,
+    #[allow(clippy::type_complexity)]
+    last_context_window: Mutex<
+        Option<(String, String, u64, String, (Option<String>, Option<String>, Option<String>))>,
+    >,
     /// Serialises configuration mutations so a commit that awaits a provider
     /// capability lookup cannot interleave with another one.
     ///
@@ -1694,6 +1710,9 @@ impl ServeHost {
                 override_ => Some(override_),
             }),
             effort_overrides: Mutex::new(HashMap::new()),
+            context_overrides: Arc::new(Mutex::new(HashMap::new())),
+            recorded_context_tier: Mutex::new(None),
+            tier_discovery_attempted: Mutex::new(std::collections::HashSet::new()),
             live_model_limits: Arc::new(Mutex::new(HashMap::new())),
             last_context_window: Mutex::new(None),
             config_commit: tokio::sync::Mutex::new(()),
@@ -1822,9 +1841,224 @@ impl ServeHost {
 
     /// The effective limits for `model` on `provider`: live list, then
     /// catalogue, then fallback for the window; settings override the output
-    /// only. The one resolution inference, compaction and display share.
+    /// only; the requested context tier (session, then saved) selects a tier
+    /// window when the model advertises it. The one resolution inference,
+    /// compaction and display share.
     fn effective_limits(&self, provider: &str, model: &str) -> crate::output_budget::ResolvedBudget {
-        resolve_output_budget_now(&self.live_model_limits, provider, model)
+        resolve_output_budget_now(&self.live_model_limits, &self.context_overrides, provider, model)
+    }
+
+    /// The context tier requested for `model`, and where the request came
+    /// from: a session override (`"session"`, including an explicit clear),
+    /// else the saved preference (`"saved"`), else unset.
+    fn requested_context_tier_for(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> (Option<coda_llm::ContextTier>, Option<&'static str>) {
+        requested_context_tier(&self.context_overrides, &load_settings_value(), provider, model)
+    }
+
+    /// `<sessions>/<id>.context-tier`: the context tier a session ran with.
+    ///
+    /// Deliberately not `*.json`: the session store lists every `*.json` in
+    /// that directory as a transcript.
+    fn context_sidecar_path(&self, session_id: &str) -> std::path::PathBuf {
+        SessionTranscriptStore::new(&self.working_dir)
+            .sessions_dir()
+            .join(format!("{session_id}.context-tier"))
+    }
+
+    /// Records the tier the active session runs with, when it changed.
+    /// Best-effort and atomic (temp file + rename): a failed write only means
+    /// a later resume falls back to the saved preference, as for a session
+    /// saved before tiers existed.
+    fn record_session_context_tier(
+        &self,
+        provider: &str,
+        model: &str,
+        requested: Option<coda_llm::ContextTier>,
+    ) {
+        let session_id = self.active_session_id();
+        if !session_id_is_valid(&session_id) {
+            return;
+        }
+        let entry = (session_id.clone(), crate::output_budget::live_key(provider, model), requested);
+        {
+            let mut recorded = self.recorded_context_tier.lock().expect("recorded tier poisoned");
+            if recorded.as_ref() == Some(&entry) {
+                return;
+            }
+            *recorded = Some(entry);
+        }
+        let path = self.context_sidecar_path(&session_id);
+        let body = json!({
+            "provider": provider,
+            "model": model,
+            "tier": requested.map(|t| t.as_str()),
+        });
+        let write = || -> std::io::Result<()> {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let temp = path.with_extension("context-tier.tmp");
+            std::fs::write(&temp, body.to_string())?;
+            std::fs::rename(&temp, &path)
+        };
+        if let Err(error) = write() {
+            tracing::warn!(%error, "cannot record the session's context tier");
+        }
+    }
+
+    /// Restores a resumed session's recorded tier as a session request.
+    /// A missing, unreadable or invalid record changes nothing.
+    fn restore_session_context_tier(&self, session_id: &str) {
+        let Ok(text) = std::fs::read_to_string(self.context_sidecar_path(session_id)) else {
+            return;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&text) else { return };
+        let field = |name: &str| value.get(name).and_then(Value::as_str).filter(|s| !s.is_empty());
+        let (Some(provider), Some(model)) = (field("provider"), field("model")) else {
+            return;
+        };
+        let tier = match value.get("tier") {
+            Some(Value::Null) | None => None,
+            Some(Value::String(raw)) => match coda_llm::ContextTier::parse(raw) {
+                Some(tier) => Some(tier),
+                None => return,
+            },
+            Some(_) => return,
+        };
+        self.context_overrides
+            .lock()
+            .expect("context overrides poisoned")
+            .insert(context_override_key(provider, model), tier);
+    }
+
+    /// Fetches the provider's model list once when the live limits hold no
+    /// row for `model`, so tier capability can be answered. Bounded: at most
+    /// one attempt per `(provider, model)` per process, served from the
+    /// client's cache where it has one; a failure leaves the capability
+    /// `unknown` rather than guessing.
+    async fn ensure_live_limits(&self, provider: &str, model: &str) {
+        let known = {
+            let live = self.live_model_limits.lock().expect("live model limits poisoned");
+            let normalized = coda_llm::copilot::models::normalize_model_id(model);
+            live.contains_key(&crate::output_budget::live_key(provider, model))
+                || live.contains_key(&crate::output_budget::live_key(provider, &normalized))
+        };
+        if known {
+            return;
+        }
+        if !self
+            .tier_discovery_attempted
+            .lock()
+            .expect("tier discovery poisoned")
+            .insert(context_override_key(provider, model))
+        {
+            return;
+        }
+        let client = self.client.lock().await.clone();
+        let Some(client) = client.filter(|c| c.provider_id().eq_ignore_ascii_case(provider)) else {
+            return;
+        };
+        self.discover_with(&client, provider).await;
+    }
+
+    /// Lists `client`'s models and records their live limits.
+    async fn discover_with(&self, client: &Arc<dyn LlmClient>, provider: &str) {
+        if let Ok(models) = client.list_models().await {
+            if !models.is_empty() {
+                self.record_live_limits(provider, &models);
+            }
+        }
+    }
+
+    /// [`Self::ensure_live_limits`] with a client the caller already holds
+    /// (the turn path, which must not touch the client mutex again).
+    async fn ensure_live_limits_using(&self, client: &Arc<dyn LlmClient>, model: &str) {
+        let provider = client.provider_id().to_owned();
+        let known = {
+            let live = self.live_model_limits.lock().expect("live model limits poisoned");
+            let normalized = coda_llm::copilot::models::normalize_model_id(model);
+            live.contains_key(&crate::output_budget::live_key(&provider, model))
+                || live.contains_key(&crate::output_budget::live_key(&provider, &normalized))
+        };
+        if known
+            || !self
+                .tier_discovery_attempted
+                .lock()
+                .expect("tier discovery poisoned")
+                .insert(context_override_key(&provider, model))
+        {
+            return;
+        }
+        self.discover_with(client, &provider).await;
+    }
+
+    /// The `model/contextCapability` answer for `(provider, model)`.
+    fn context_capability_result(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> coda_proto::messages::ContextCapabilityResult {
+        use crate::output_budget::ContextCapability;
+        let resolved = self.effective_limits(provider, model);
+        let (requested, requested_source) = self.requested_context_tier_for(provider, model);
+        let tiers = match resolved.context.capability {
+            ContextCapability::Tiered(tiers) | ContextCapability::Single { tiers: Some(tiers) } => {
+                [coda_llm::ContextTier::Default, coda_llm::ContextTier::LongContext]
+                    .into_iter()
+                    .filter_map(|tier| {
+                        tiers.window(tier).map(|window| coda_proto::messages::ContextTierOption {
+                            tier: tier.as_str().to_owned(),
+                            context_window: window as u64,
+                        })
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        let (preferred_tier, disclosure) = match resolved.context.capability {
+            ContextCapability::Tiered(tiers) => (
+                tiers.preferred.map(|t| t.as_str().to_owned()),
+                Some(format!(
+                    "Requests whose input exceeds {} tokens are billed at this model's \
+                     long-context rate. `default` keeps the conversation within that size \
+                     (compacting earlier); `long_context` lets it grow to {} tokens.",
+                    tiers.default_window,
+                    tiers.long_context_window.unwrap_or(tiers.default_window),
+                )),
+            ),
+            _ => (None, None),
+        };
+        coda_proto::messages::ContextCapabilityResult {
+            ok: true,
+            state: resolved.context.capability.as_str().to_owned(),
+            tiers,
+            preferred_tier,
+            requested: requested.map(|t| t.as_str().to_owned()),
+            requested_source: requested_source.map(str::to_owned),
+            effective: resolved.context.effective.map(|t| t.as_str().to_owned()),
+            effective_window: resolved.budget.context_window.map(|n| n as u64),
+            window_source: resolved.context_source.as_str().to_owned(),
+            note: match (resolved.context.note, requested) {
+                (Some(note), Some(tier)) => Some(note.message(tier)),
+                _ => None,
+            },
+            disclosure,
+            model: Some(model.to_owned()),
+            provider_id: Some(provider.to_owned()),
+        }
+    }
+
+    /// Republishes the active model's effective window and tier after a
+    /// configuration change outside a turn.
+    fn announce_active_context_window(&self, provider: &str, model: &str) {
+        let resolved = self.effective_limits(provider, model);
+        self.publish_context_limit(&resolved);
+        let policy = compaction_policy_for(&load_settings_value(), provider, model, &resolved);
+        self.announce_context_window(context_window_info(provider, model, &resolved, &policy));
     }
 
     /// The compaction service both the automatic and the manual path use: a
@@ -1871,7 +2105,11 @@ impl ServeHost {
         for m in models {
             limits.insert(
                 crate::output_budget::live_key(provider, &m.id),
-                crate::output_budget::LiveLimits { context: m.context_limit, output: m.output_limit },
+                crate::output_budget::LiveLimits {
+                    context: m.context_limit,
+                    output: m.output_limit,
+                    tiers: m.context_tiers,
+                },
             );
         }
     }
@@ -1884,6 +2122,7 @@ impl ServeHost {
             info.model.clone(),
             info.context_window,
             info.source.clone(),
+            (info.requested_tier.clone(), info.effective_tier.clone(), info.tier_note.clone()),
         );
         {
             let mut last = self.last_context_window.lock().expect("context window poisoned");
@@ -3070,8 +3309,11 @@ impl ServeHost {
         // which a request may set to something other than the parent's.
         let budget_source: Arc<dyn Fn(&str) -> coda_agent::ModelBudget + Send + Sync> = {
             let live = Arc::clone(&self.live_model_limits);
+            let overrides = Arc::clone(&self.context_overrides);
             let provider = client.provider_id().to_owned();
-            Arc::new(move |model: &str| resolve_output_budget_now(&live, &provider, model).budget)
+            Arc::new(move |model: &str| {
+                resolve_output_budget_now(&live, &overrides, &provider, model).budget
+            })
         };
         // 1. Hook-free subagent (prevents hook re-entrancy for agent-type hooks).
         //    It receives the SAME in-memory schedule store as the main agent
@@ -3952,6 +4194,11 @@ impl ServeBackend for ServeHost {
             // Adopt the resumed id so future saves go to the right file.
             *self.current_session_id.lock().expect("session_id poisoned") = req_id.clone();
             resumed = true;
+            // The session's recorded context tier is restored as a session
+            // request, so resuming never silently changes the window (and
+            // spend) the conversation ran with. A later `--context` launch
+            // override still wins: it is applied after `initialize`.
+            self.restore_session_context_tier(&req_id);
             // F2: resume changes the whole conversation view; announce it.
             // F3 (review): seeding the committed history and announcing
             // the new epoch/fence are one critical section under
@@ -4751,6 +4998,106 @@ impl ServeBackend for ServeHost {
             "model": model,
             "providerId": provider_id,
         }))
+    }
+
+    async fn model_context_capability(&self) -> Result<Value, RpcError> {
+        let captured = self.capture_runtime().config;
+        let provider = captured
+            .provider_id
+            .clone()
+            .unwrap_or_else(|| crate::settings::FALLBACK_PROVIDER.to_owned());
+        self.ensure_live_limits(&provider, &captured.model).await;
+        serde_json::to_value(self.context_capability_result(&provider, &captured.model))
+            .map_err(|e| RpcError::internal(e.to_string()))
+    }
+
+    async fn session_set_context_tier(
+        &self,
+        p: crate::dispatch::SetContextTierParams,
+    ) -> Result<Value, RpcError> {
+        // Discovery (a possible network fetch) happens before the writer lock,
+        // so a slow provider never stalls other configuration changes.
+        let provider_of = |config: &RuntimeConfig| {
+            config
+                .provider_id
+                .clone()
+                .unwrap_or_else(|| crate::settings::FALLBACK_PROVIDER.to_owned())
+        };
+        let before = self.capture_runtime().config;
+        self.ensure_live_limits(&provider_of(&before), &before.model).await;
+
+        // Serialised with every other config change, so the model this tier is
+        // validated against cannot change underneath it.
+        let _guard = self.config_commit.lock().await;
+        let captured = self.capture_runtime().config;
+        let model = captured.model.clone();
+        let provider = provider_of(&captured);
+        let refuse = |note: String| -> Result<Value, RpcError> {
+            let mut result = self.context_capability_result(&provider, &model);
+            result.ok = false;
+            result.note = Some(note);
+            serde_json::to_value(result).map_err(|e| RpcError::internal(e.to_string()))
+        };
+        if let Some(expected) = p.expected_model.as_deref() {
+            if !expected.eq_ignore_ascii_case(&model) {
+                return refuse(format!(
+                    "active model is now {model}, not {expected}; context tier not changed"
+                ));
+            }
+        }
+        if let Some(expected) = p.expected_provider.as_deref() {
+            if !expected.eq_ignore_ascii_case(&provider) {
+                return refuse(format!(
+                    "active provider is now {provider}, not {expected}; context tier not changed"
+                ));
+            }
+        }
+        let raw = p.tier.as_deref().map(str::trim).unwrap_or_default();
+        let requested = if raw.is_empty() || raw.eq_ignore_ascii_case("auto") {
+            None
+        } else {
+            match coda_llm::ContextTier::parse(raw) {
+                Some(tier) => Some(tier),
+                None => {
+                    return refuse(format!(
+                        "unsupported context tier: {raw} (expected default, long_context or auto)"
+                    ))
+                }
+            }
+        };
+        if let Some(tier) = requested {
+            // Validate against what the provider actually advertises; an
+            // unknown capability is refused, never accepted optimistically,
+            // because the window it implies cannot be confirmed.
+            let live = self.live_model_limits.lock().expect("live model limits poisoned").clone();
+            let probe = crate::output_budget::resolve_with_tier(
+                &crate::catalog::ModelCatalog::load(),
+                &live,
+                &load_settings_value(),
+                &provider,
+                &model,
+                Some(tier),
+            );
+            if let Some(note) = probe.context.note {
+                return refuse(note.message(tier));
+            }
+        }
+        self.context_overrides
+            .lock()
+            .expect("context overrides poisoned")
+            .insert(context_override_key(&provider, &model), requested);
+        // Recorded now, so a resume restores it even if no turn ran since.
+        self.record_session_context_tier(&provider, &model, requested);
+        let mut result = self.context_capability_result(&provider, &model);
+        if *self.turn_active.lock().expect("turn_active poisoned") {
+            // The running turn keeps the window it started with; announcing
+            // the new one now would rebase occupancy onto a window no request
+            // uses yet. The next turn announces it.
+            result.note = Some("applies from the next turn; the running turn keeps its window".into());
+        } else {
+            self.announce_active_context_window(&provider, &model);
+        }
+        serde_json::to_value(result).map_err(|e| RpcError::internal(e.to_string()))
     }
 
     async fn session_schedule_list(&self) -> Result<Value, RpcError> {
@@ -6252,6 +6599,16 @@ impl ServeHost {
             None => Arc::clone(&self.permission_prompt),
         };
 
+        // A requested tier (saved or resumed) can only apply once the model's
+        // tiers are known. Headless runs never list models, so discover them
+        // here — at most once per model per process, never per prompt.
+        {
+            let model = self.current_model();
+            if self.requested_context_tier_for(client.provider_id(), &model).0.is_some() {
+                self.ensure_live_limits_using(&client, &model).await;
+            }
+        }
+
         // ONE coherent read of the configuration this turn runs under, taken
         // after every await that precedes the build. Everything below — the
         // model and effort handed to the builder, the system-prompt override
@@ -6264,6 +6621,13 @@ impl ServeHost {
         // the `max_tokens` on the wire, the reply reserve auto-compaction
         // keeps free, the compaction threshold and the displayed window.
         let output_budget = self.effective_limits(client.provider_id(), &captured.config.model);
+        // Remember the tier this conversation runs with, so a resume restores
+        // it rather than whatever the saved preference says by then.
+        self.record_session_context_tier(
+            client.provider_id(),
+            &captured.config.model,
+            output_budget.context.requested,
+        );
         // Correct the claim-time estimate: lazy wiring, live discovery or a
         // config change during the awaits above can move the window.
         self.publish_context_limit(&output_budget);
@@ -7538,21 +7902,58 @@ fn parse_duration(s: Option<&str>) -> Option<Duration> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// The output budget for `model` on `provider`, from the user's settings, the
-/// live limits recorded so far and the catalogue. Offline and cheap, so it is
+/// live limits recorded so far, the catalogue and the requested context tier
+/// (session override, then saved preference). Offline and cheap, so it is
 /// safe on the turn path and per subagent spawn.
 fn resolve_output_budget_now(
     live: &Mutex<crate::output_budget::LiveLimitMap>,
+    overrides: &Mutex<HashMap<String, Option<coda_llm::ContextTier>>>,
     provider: &str,
     model: &str,
 ) -> crate::output_budget::ResolvedBudget {
     let live = live.lock().expect("live model limits poisoned").clone();
-    crate::output_budget::resolve(
+    let settings = load_settings_value();
+    let (requested, _) = requested_context_tier(overrides, &settings, provider, model);
+    crate::output_budget::resolve_with_tier(
         &crate::catalog::ModelCatalog::load(),
         &live,
-        &load_settings_value(),
+        &settings,
         provider,
         model,
+        requested,
     )
+}
+
+/// The key a session context-tier request is stored under: provider and
+/// model, case-folded, with Copilot's dashed Claude ids normalised, so the
+/// same model on another provider never inherits it.
+fn context_override_key(provider: &str, model: &str) -> String {
+    let normalized = coda_llm::copilot::models::normalize_model_id(model);
+    crate::output_budget::live_key(&provider.to_ascii_lowercase(), &normalized.to_ascii_lowercase())
+}
+
+/// See [`ServeHost::requested_context_tier_for`].
+fn requested_context_tier(
+    overrides: &Mutex<HashMap<String, Option<coda_llm::ContextTier>>>,
+    settings: &Value,
+    provider: &str,
+    model: &str,
+) -> (Option<coda_llm::ContextTier>, Option<&'static str>) {
+    let session = overrides
+        .lock()
+        .expect("context overrides poisoned")
+        .get(&context_override_key(provider, model))
+        .copied();
+    if let Some(tier) = session {
+        return (tier, tier.map(|_| "session"));
+    }
+    let normalized = coda_llm::copilot::models::normalize_model_id(model);
+    match crate::output_budget::context_tier_from_settings(settings, provider, model)
+        .or_else(|| crate::output_budget::context_tier_from_settings(settings, provider, &normalized))
+    {
+        Some(tier) => (Some(tier), Some("saved")),
+        None => (None, None),
+    }
 }
 
 /// The auto-compaction policy for a turn: the configured trigger (settings,
@@ -7590,6 +7991,9 @@ fn context_window_info(
             .unwrap_or(coda_agent::compaction::DEFAULT_CONTEXT_WINDOW) as u64,
         source: budget.context_source.as_str().to_owned(),
         compaction_threshold: policy.token_threshold as u64,
+        requested_tier: budget.context.requested.map(|t| t.as_str().to_owned()),
+        effective_tier: budget.context.effective.map(|t| t.as_str().to_owned()),
+        tier_note: budget.context.note.map(|n| n.as_str().to_owned()),
     }
 }
 
@@ -13897,14 +14301,14 @@ mod tests {
         let model = host.current_model();
         host.live_model_limits.lock().unwrap().insert(
             live_key("capturing", &model),
-            LiveLimits { context: Some(150_000), output: Some(12_345) },
+            LiveLimits { context: Some(150_000), output: Some(12_345), tiers: None },
         );
 
         host.session_prompt(PromptParams { text: Some("hello".into()), images: None })
             .await
             .unwrap();
 
-        let expected = resolve_output_budget_now(&host.live_model_limits, "capturing", &model);
+        let expected = resolve_output_budget_now(&host.live_model_limits, &host.context_overrides, "capturing", &model);
         assert_eq!(client.last_max_tokens(), Some(expected.budget.max_tokens));
         // A user's own `maxOutputTokens` legitimately wins over the live limit.
         if expected.source == coda_agent::OutputBudgetSource::Live {
@@ -13976,7 +14380,7 @@ mod tests {
         set_model(&host, "mystery-1m");
         host.live_model_limits.lock().unwrap().insert(
             live_key("capturing", "mystery-1m"),
-            LiveLimits { context: Some(1_000_000), output: Some(64_000) },
+            LiveLimits { context: Some(1_000_000), output: Some(64_000), tiers: None },
         );
 
         let budget = host.effective_limits("capturing", "mystery-1m");
@@ -14019,7 +14423,7 @@ mod tests {
         set_model(&host, "mystery-1m");
         host.live_model_limits.lock().unwrap().insert(
             live_key("capturing", "mystery-1m"),
-            LiveLimits { context: Some(1_000_000), output: Some(64_000) },
+            LiveLimits { context: Some(1_000_000), output: Some(64_000), tiers: None },
         );
         host.note_effective_context_limit();
         assert_eq!(published_context_limit(&host).await, Value::Null);
@@ -14039,7 +14443,7 @@ mod tests {
         let (host, _client) = make_capturing_host();
         host.live_model_limits.lock().unwrap().insert(
             live_key("capturing", "mystery-1m"),
-            LiveLimits { context: Some(1_000_000), output: Some(64_000) },
+            LiveLimits { context: Some(1_000_000), output: Some(64_000), tiers: None },
         );
         let budget = host.effective_limits("capturing", "mystery-1m");
         let policy =
@@ -14057,11 +14461,333 @@ mod tests {
             context_window: window,
             source: source.into(),
             compaction_threshold: 1,
+            ..Default::default()
         };
         assert!(host.announce_context_window(info(200_000, "fallback")));
         assert!(!host.announce_context_window(info(200_000, "fallback")));
         assert!(host.announce_context_window(info(200_000, "catalog")));
         assert!(host.announce_context_window(info(1_000_000, "live")));
+    }
+
+    // ── context tiers ──────────────────────────────────────────────────────
+
+    use coda_proto::messages::ContextCapabilityResult;
+
+    fn tiered_row() -> crate::output_budget::LiveLimits {
+        crate::output_budget::LiveLimits {
+            context: Some(1_000_000),
+            output: Some(64_000),
+            tiers: Some(coda_llm::ContextTiers {
+                default_window: 200_000,
+                long_context_window: Some(936_000),
+                preferred: None,
+            }),
+        }
+    }
+
+    fn set_tier(tier: Option<&str>) -> crate::dispatch::SetContextTierParams {
+        crate::dispatch::SetContextTierParams { tier: tier.map(str::to_owned), ..Default::default() }
+    }
+
+    /// A selected tier changes the window that inference, compaction, the
+    /// published limit and capability discovery all use; `auto` restores the
+    /// provider-reported window. Requested and effective are reported apart.
+    #[tokio::test]
+    async fn a_selected_tier_drives_budget_compaction_and_reporting() {
+        use crate::output_budget::live_key;
+        let (host, _client) = make_capturing_host();
+        set_model(&host, "tiered-m");
+        host.live_model_limits.lock().unwrap().insert(live_key("capturing", "tiered-m"), tiered_row());
+
+        let before: ContextCapabilityResult =
+            serde_json::from_value(host.model_context_capability().await.unwrap()).unwrap();
+        assert_eq!(before.state, "tiered");
+        assert_eq!(before.tiers.len(), 2);
+        assert_eq!(before.requested, None);
+        assert_eq!(before.effective.as_deref(), Some("long_context"), "the legacy window is the long tier");
+        assert_eq!(before.effective_window, Some(1_000_000));
+        assert!(before.disclosure.as_deref().unwrap().contains("200000"));
+
+        let set: ContextCapabilityResult =
+            serde_json::from_value(host.session_set_context_tier(set_tier(Some("default"))).await.unwrap()).unwrap();
+        assert!(set.ok);
+        assert_eq!(set.requested.as_deref(), Some("default"));
+        assert_eq!(set.requested_source.as_deref(), Some("session"));
+        assert_eq!(set.effective_window, Some(200_000));
+        assert_eq!(published_context_limit(&host).await, json!(200_000), "occupancy rebases on the new window");
+
+        let budget = host.effective_limits("capturing", "tiered-m");
+        assert_eq!(budget.context_source, WindowSource::Tier);
+        let policy = compaction_policy_for(&json!({}), "capturing", "tiered-m", &budget);
+        assert_eq!(policy.token_threshold, 160_000, "compaction follows the selected tier");
+
+        host.session_set_context_tier(set_tier(Some("long_context"))).await.unwrap();
+        assert_eq!(host.effective_limits("capturing", "tiered-m").budget.context_window, Some(936_000));
+
+        let auto: ContextCapabilityResult =
+            serde_json::from_value(host.session_set_context_tier(set_tier(Some("auto"))).await.unwrap()).unwrap();
+        assert!(auto.ok);
+        assert_eq!(auto.requested, None);
+        assert_eq!(auto.effective_window, Some(1_000_000));
+    }
+
+    /// Unsupported, unknown and malformed requests are refused with a reason
+    /// and leave the session's request untouched — never success-shaped.
+    #[tokio::test]
+    async fn unavailable_tiers_are_refused_without_changing_anything() {
+        use crate::output_budget::{live_key, LiveLimits};
+        let (host, _client) = make_capturing_host();
+        set_model(&host, "single-m");
+        host.live_model_limits.lock().unwrap().insert(
+            live_key("capturing", "single-m"),
+            LiveLimits { context: Some(400_000), output: Some(64_000), tiers: None },
+        );
+        let refused: ContextCapabilityResult = serde_json::from_value(
+            host.session_set_context_tier(set_tier(Some("long_context"))).await.unwrap(),
+        ).unwrap();
+        assert!(!refused.ok);
+        assert_eq!(refused.state, "single");
+        assert!(refused.note.as_deref().unwrap().contains("one fixed context window"), "{:?}", refused.note);
+        assert_eq!(refused.requested, None, "the refused request is not recorded");
+        assert!(host.context_overrides.lock().unwrap().is_empty());
+        assert_eq!(host.effective_limits("capturing", "single-m").budget.context_window, Some(400_000));
+
+        set_model(&host, "never-listed");
+        let unknown: ContextCapabilityResult = serde_json::from_value(
+            host.session_set_context_tier(set_tier(Some("default"))).await.unwrap(),
+        ).unwrap();
+        assert!(!unknown.ok);
+        assert_eq!(unknown.state, "unknown");
+        assert!(unknown.note.as_deref().unwrap().contains("refresh"));
+
+        let garbage: ContextCapabilityResult = serde_json::from_value(
+            host.session_set_context_tier(set_tier(Some("enormous"))).await.unwrap(),
+        ).unwrap();
+        assert!(!garbage.ok);
+        assert!(host.context_overrides.lock().unwrap().is_empty());
+    }
+
+    /// A stale guard (the picker was opened for another model) is refused.
+    #[tokio::test]
+    async fn a_tier_set_for_a_model_that_is_no_longer_active_is_refused() {
+        use crate::output_budget::live_key;
+        let (host, _client) = make_capturing_host();
+        set_model(&host, "tiered-m");
+        host.live_model_limits.lock().unwrap().insert(live_key("capturing", "tiered-m"), tiered_row());
+        let params = crate::dispatch::SetContextTierParams {
+            tier: Some("default".into()),
+            expected_model: Some("other-model".into()),
+            expected_provider: None,
+        };
+        let result: ContextCapabilityResult =
+            serde_json::from_value(host.session_set_context_tier(params).await.unwrap()).unwrap();
+        assert!(!result.ok);
+        assert!(host.context_overrides.lock().unwrap().is_empty());
+    }
+
+    /// Session request beats the saved preference; an explicit clear is a
+    /// session choice too; tiers are keyed per model, so a model switch
+    /// resolves the new model's own request.
+    #[test]
+    fn requested_tier_precedence_is_session_then_saved_then_unset() {
+        use coda_llm::ContextTier;
+        let overrides = Mutex::new(HashMap::new());
+        let settings = json!({ "contextTierByModel": { "p/a": "long_context", "p/b": "default" } });
+        assert_eq!(requested_context_tier(&overrides, &settings, "p", "a"), (Some(ContextTier::LongContext), Some("saved")));
+        overrides.lock().unwrap().insert(context_override_key("p", "a"), Some(ContextTier::Default));
+        assert_eq!(requested_context_tier(&overrides, &settings, "p", "a"), (Some(ContextTier::Default), Some("session")));
+        overrides.lock().unwrap().insert(context_override_key("p", "a"), None);
+        assert_eq!(requested_context_tier(&overrides, &settings, "p", "a"), (None, None));
+        assert_eq!(requested_context_tier(&overrides, &settings, "p", "b"), (Some(ContextTier::Default), Some("saved")));
+        assert_eq!(requested_context_tier(&overrides, &settings, "p", "c"), (None, None));
+    }
+
+    /// The tier a session ran with is restored on resume as a session
+    /// request, so a changed saved preference cannot silently change it.
+    #[tokio::test]
+    async fn resume_restores_the_recorded_context_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = CapturingClient::new(Vec::new());
+        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let make = || ServeHost::new_with_client(
+            Arc::clone(&client) as Arc<dyn LlmClient>,
+            Arc::new(ServeSink::new(tx.clone())),
+            Arc::new(PromptChannel::new(tx.clone())),
+            dir.path().to_string_lossy().into_owned(),
+        );
+        let first = make();
+        let session_id = first.active_session_id();
+        first.record_session_context_tier("capturing", "tiered-m", Some(coda_llm::ContextTier::Default));
+
+        let second = make();
+        let settings = json!({ "contextTierByModel": { "capturing/tiered-m": "long_context" } });
+        assert_eq!(
+            requested_context_tier(&second.context_overrides, &settings, "capturing", "tiered-m").0,
+            Some(coda_llm::ContextTier::LongContext),
+        );
+        second.restore_session_context_tier(&session_id);
+        assert_eq!(
+            requested_context_tier(&second.context_overrides, &settings, "capturing", "tiered-m"),
+            (Some(coda_llm::ContextTier::Default), Some("session")),
+        );
+
+        // A corrupt record changes nothing.
+        std::fs::write(second.context_sidecar_path("broken-id"), "{not json").unwrap();
+        let third = make();
+        third.restore_session_context_tier("broken-id");
+        assert!(third.context_overrides.lock().unwrap().is_empty());
+    }
+
+    /// A model-list client for tier tests that counts its fetches.
+    struct TierListClient(std::sync::atomic::AtomicUsize);
+    #[async_trait]
+    impl LlmClient for TierListClient {
+        fn provider_id(&self) -> &str { "capturing" }
+        async fn stream(&self, _r: coda_llm::ChatRequest) -> Result<coda_llm::ResponseStream, coda_llm::LlmError> {
+            let (tx, rx) = tokio::sync::mpsc::channel(4);
+            tokio::spawn(async move {
+                let _ = tx.send(Ok(coda_llm::anthropic::StreamEvent::Done {
+                    stop_reason: Some("end_turn".into()),
+                    usage: coda_llm::Usage::ZERO,
+                })).await;
+            });
+            Ok(coda_llm::ResponseStream::new(rx))
+        }
+        async fn list_models(&self) -> Result<Vec<ModelInfo>, coda_llm::LlmError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut m = ModelInfo::new("tiered-m");
+            m.context_limit = Some(1_000_000);
+            m.context_tiers = tiered_row().tiers;
+            Ok(vec![m])
+        }
+    }
+
+    fn counting_host(dir: &str) -> (Arc<ServeHost>, Arc<TierListClient>) {
+        let client = Arc::new(TierListClient(std::sync::atomic::AtomicUsize::new(0)));
+        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let host = ServeHost::new_with_client(
+            Arc::clone(&client) as Arc<dyn LlmClient>,
+            Arc::new(ServeSink::new(tx.clone())),
+            Arc::new(PromptChannel::new(tx)),
+            dir.into(),
+        );
+        set_model(&host, "tiered-m");
+        (host, client)
+    }
+
+    /// A headless run never lists models; a requested tier (here a resumed
+    /// one) must still take effect, discovered once at turn start — and never
+    /// again on later prompts.
+    #[tokio::test]
+    async fn a_requested_tier_is_discovered_once_on_the_turn_path() {
+        let (host, client) = counting_host(".");
+        host.context_overrides
+            .lock()
+            .unwrap()
+            .insert(context_override_key("capturing", "tiered-m"), Some(coda_llm::ContextTier::Default));
+        host.session_prompt(PromptParams { text: Some("one".into()), images: None }).await.unwrap();
+        assert_eq!(published_context_limit(&host).await, json!(200_000));
+        let after_first = client.0.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(after_first >= 1, "the tiers were discovered");
+        host.session_prompt(PromptParams { text: Some("two".into()), images: None }).await.unwrap();
+        assert_eq!(
+            client.0.load(std::sync::atomic::Ordering::SeqCst),
+            after_first,
+            "no model-list fetch on later prompts"
+        );
+    }
+
+    /// Session requests are scoped to provider and model: the same model id
+    /// on another provider does not inherit them, and Copilot's dashed alias
+    /// finds the dotted request.
+    #[test]
+    fn session_tier_requests_are_scoped_by_provider() {
+        use coda_llm::ContextTier;
+        let overrides = Mutex::new(HashMap::new());
+        overrides
+            .lock()
+            .unwrap()
+            .insert(context_override_key("github-copilot", "claude-opus-4.8"), Some(ContextTier::Default));
+        let none = json!({});
+        assert_eq!(requested_context_tier(&overrides, &none, "github-copilot", "claude-opus-4-8").0, Some(ContextTier::Default));
+        assert_eq!(requested_context_tier(&overrides, &none, "anthropic", "claude-opus-4.8").0, None);
+    }
+
+    /// A change while a turn runs is reported as pending and does not move the
+    /// published window under the running turn.
+    #[tokio::test]
+    async fn a_tier_change_during_a_turn_applies_from_the_next_turn() {
+        use crate::output_budget::live_key;
+        let (host, _client) = make_capturing_host();
+        set_model(&host, "tiered-m");
+        host.live_model_limits.lock().unwrap().insert(live_key("capturing", "tiered-m"), tiered_row());
+        host.note_effective_context_limit();
+        assert_eq!(published_context_limit(&host).await, json!(1_000_000));
+        *host.turn_active.lock().unwrap() = true;
+        let result: ContextCapabilityResult = serde_json::from_value(
+            host.session_set_context_tier(set_tier(Some("default"))).await.unwrap(),
+        ).unwrap();
+        assert!(result.ok);
+        assert!(result.note.as_deref().unwrap().contains("next turn"));
+        assert_eq!(published_context_limit(&host).await, json!(1_000_000), "the running turn's window stays");
+        *host.turn_active.lock().unwrap() = false;
+        assert_eq!(host.effective_limits("capturing", "tiered-m").budget.context_window, Some(200_000));
+    }
+
+    /// The tier record must never look like a transcript to the session list.
+    #[tokio::test]
+    async fn the_tier_record_is_not_listed_as_a_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, _client) = counting_host(&dir.path().to_string_lossy());
+        host.record_session_context_tier("capturing", "tiered-m", Some(coda_llm::ContextTier::Default));
+        let path = host.context_sidecar_path(&host.active_session_id());
+        assert!(path.exists());
+        let listed = SessionTranscriptStore::new(dir.path()).list();
+        assert!(listed.is_empty(), "{:?}", listed.iter().map(|s| &s.id).collect::<Vec<_>>());
+    }
+
+    /// The provider contract has no tier field or header, so a tier must not
+    /// change the request on the wire: only Coda's own budgeting moves. Each
+    /// turn uses the tier in force when it started.
+    #[tokio::test]
+    async fn a_tier_changes_budgeting_but_never_the_wire_request() {
+        use crate::output_budget::live_key;
+        let (host, client) = make_capturing_host();
+        set_model(&host, "tiered-m");
+        host.live_model_limits.lock().unwrap().insert(live_key("capturing", "tiered-m"), tiered_row());
+
+        host.session_set_context_tier(set_tier(Some("default"))).await.unwrap();
+        host.session_prompt(PromptParams { text: Some("one".into()), images: None }).await.unwrap();
+        let first = client.last_request.lock().unwrap().clone().unwrap();
+        assert_eq!(published_context_limit(&host).await, json!(200_000));
+
+        host.session_set_context_tier(set_tier(Some("long_context"))).await.unwrap();
+        assert_eq!(published_context_limit(&host).await, json!(936_000));
+        host.session_prompt(PromptParams { text: Some("two".into()), images: None }).await.unwrap();
+        let second = client.last_request.lock().unwrap().clone().unwrap();
+
+        assert_eq!(first.model, second.model);
+        assert_eq!(first.max_tokens, second.max_tokens, "the output limit is independent of the tier");
+        assert_eq!(first.effort, second.effort);
+        assert_eq!(first.thinking, second.thinking);
+        assert_eq!(first.tools, second.tools);
+        assert_eq!(first.system, second.system);
+    }
+
+    /// Discovery fetches the model list at most once per unknown model and
+    /// relies on the client's cache after that — no per-prompt metadata call.
+    #[tokio::test]
+    async fn capability_discovery_fetches_the_model_list_only_when_unknown() {
+        let (host, client) = counting_host(".");
+        for _ in 0..3 {
+            let result: ContextCapabilityResult =
+                serde_json::from_value(host.model_context_capability().await.unwrap()).unwrap();
+            assert_eq!(result.state, "tiered");
+        }
+        for _ in 0..5 {
+            host.effective_limits("capturing", "tiered-m");
+        }
+        assert_eq!(client.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     fn summary_turn(text: &str, stop: &str) -> Vec<coda_llm::anthropic::StreamEvent> {
@@ -14100,7 +14826,7 @@ mod tests {
         set_model(&host, "mystery-1m");
         host.live_model_limits.lock().unwrap().insert(
             live_key(&provider, "mystery-1m"),
-            LiveLimits { context: Some(1_000_000), output: Some(64_000) },
+            LiveLimits { context: Some(1_000_000), output: Some(64_000), tiers: None },
         );
         *host.session.history.lock().unwrap() = compactable_history();
         (host, rx)
@@ -14278,7 +15004,7 @@ mod tests {
         set_model(&host, "mystery-1m");
         host.live_model_limits.lock().unwrap().insert(
             live_key(&provider, "mystery-1m"),
-            LiveLimits { context: Some(1_000_000), output: Some(64_000) },
+            LiveLimits { context: Some(1_000_000), output: Some(64_000), tiers: None },
         );
         *host.session.history.lock().unwrap() = compactable_history();
 

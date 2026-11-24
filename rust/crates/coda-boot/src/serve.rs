@@ -200,6 +200,19 @@ pub fn parse_effort_level(raw: &str) -> Result<String, String> {
     }
 }
 
+/// Validates a `--context` value at the parser layer: `default`,
+/// `long_context` (also `long-context`), or `auto` (the provider-reported
+/// window). Whether the model offers the tier is decided by the engine.
+pub fn parse_context_tier(raw: &str) -> Result<String, String> {
+    let tier = raw.trim().to_ascii_lowercase().replace('-', "_");
+    match tier.as_str() {
+        "default" | "long_context" | "auto" => Ok(tier),
+        _ => Err(format!(
+            "invalid context tier '{raw}' (expected one of: default, long_context, auto)"
+        )),
+    }
+}
+
 /// Validates a `--diagnostic-verbosity` value at the parser layer.
 pub fn parse_diagnostic_verbosity(raw: &str) -> Result<String, String> {
     let level = raw.trim().to_ascii_lowercase();
