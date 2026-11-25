@@ -74,6 +74,12 @@ pub struct SavedMessage {
     pub schedule_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+    /// For a pending task completion: the presentation record of the same
+    /// occurrence, as named by the engine that accepted it. Restored as is —
+    /// the restarted engine reuses task numbers, so re-deriving it would
+    /// name a different occurrence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation_item_id: Option<String>,
 }
 
 impl SavedMessage {
@@ -90,6 +96,7 @@ impl SavedMessage {
             schedule_definition_id: message.schedule_definition_id.clone(),
             schedule_name: message.schedule_name.clone(),
             idempotency_key: message.idempotency_key.clone(),
+            presentation_item_id: None,
         }
     }
 
@@ -106,6 +113,7 @@ impl SavedMessage {
             schedule_definition_id: message.schedule_definition_id.clone(),
             schedule_name: message.schedule_name.clone(),
             idempotency_key: message.idempotency_key.clone(),
+            presentation_item_id: message.presentation_item_id.clone(),
         }
     }
 

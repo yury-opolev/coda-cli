@@ -494,6 +494,7 @@ pub fn build_markdown_export(blocks: &[crate::transcript::Block]) -> String {
             | Block::Banner { .. }
             | Block::AgentMessage { .. }
             | Block::TaskCompletion { .. }
+            | Block::TaskCompletionReport { .. }
             | Block::SessionBoundary { .. } => {}
         }
     }

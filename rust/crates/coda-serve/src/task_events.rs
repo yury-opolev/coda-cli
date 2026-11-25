@@ -88,7 +88,7 @@ impl TaskEventPublisher {
         let Some(state) = self.presentation.get().and_then(Weak::upgrade) else { return };
         let engine = state.bus_ref().engine_instance_id().to_owned();
         state.accept_presentation(
-            format!("task:{engine}:{}", task.id),
+            coda_agent::tasks::completion_push::task_presentation_item_id(&engine, &task.id),
             PresentationPayload::TaskCompletion {
                 task_id: task.id.clone(),
                 status: status.as_str().to_owned(),

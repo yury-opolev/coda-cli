@@ -48,6 +48,9 @@ pub fn is_exchange_start(msg: &Message) -> bool {
 }
 
 fn is_runtime_injection(msg: &Message) -> bool {
+    if msg.origin.is_some() {
+        return true;
+    }
     let first_text = msg.content.iter().find_map(|b| match b {
         Content::Text(t) if !t.trim().is_empty() => Some(t.trim_start()),
         _ => None,
@@ -318,6 +321,17 @@ mod tests {
         }
         let h = vec![user("go"), assistant("ok"), user("[task-completed] taskId=task-1")];
         assert_eq!(exchange_boundaries(&h), vec![0]);
+    }
+
+    #[test]
+    fn a_message_with_a_trusted_origin_is_never_an_exchange_start() {
+        let tagged = user("whatever text the frame carries").with_origin(Some(coda_llm::MessageOrigin {
+            kind: coda_llm::MessageOriginKind::TaskCompletion,
+            message_id: None,
+            task_id: Some("task-1".into()),
+            presentation_item_id: None,
+        }));
+        assert!(!is_exchange_start(&tagged));
     }
 
     #[test]

@@ -566,7 +566,7 @@ impl AgentLoop {
                 if let Some(bus) = &self.message_bus {
                     let drained = bus.take_main_for_delivery();
                     for item in &drained {
-                        history.push(Message::user(item.injected_text()));
+                        history.push(Message::user(item.injected_text()).with_origin(item.origin()));
                     }
                 }
             }
@@ -4642,6 +4642,43 @@ mod tests {
         assert!(last_injected_idx < assistant_idx, "main-inbox items must be injected before the model call");
     }
 
+    /// A delivered task completion keeps its trusted origin on the history
+    /// message, while the text the model receives is the unchanged frame.
+    #[tokio::test]
+    async fn a_delivered_task_completion_is_tagged_with_its_origin_and_keeps_its_frame() {
+        let bus = Arc::new(crate::message::MessageBus::new());
+        bus.set_presentation_scope("engine-a");
+        let source = crate::message::MessageSource::TaskCompletion {
+            task_id: "task-0001".into(),
+            label: "synthetic job".into(),
+        };
+        bus.publish_main(&source, "status: completed\nlast output:\nsynthetic output line 1", None, None)
+            .unwrap();
+
+        let client =
+            MockLlmClient::new(vec![vec![Ok(StreamEvent::TextDelta("noted".into())), Ok(done())]]);
+        let tools = Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
+        let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
+            .with_message_bus(bus.clone())
+            .with_main_context()
+            .with_tool_max_duration(None)
+            .build();
+
+        let mut history = vec![Message::user("go")];
+        agent.run(&mut history, &NullSink, None, CancellationToken::new()).await.unwrap();
+
+        assert_eq!(history[0].origin, None, "the operator's prompt has no runtime origin");
+        let injected = history
+            .iter()
+            .find(|m| m.text().starts_with("[task-completed]"))
+            .expect("the completion frame reached the model's history");
+        assert_eq!(injected.role, Role::User);
+        assert!(injected.text().contains("synthetic output line 1"));
+        assert!(injected.text().contains("<task_output>"));
+        let origin = injected.origin.as_ref().expect("trusted origin");
+        assert_eq!(origin.kind, coda_llm::MessageOriginKind::TaskCompletion);
+        assert_eq!(origin.presentation_item_id.as_deref(), Some("task:engine-a:task-0001"));
+    }
     /// A child/subagent run (`is_main_context = false`) shares the SAME bus
     /// but must never drain the main inbox itself, and must still be able to
     /// stop normally with the item left untouched for the real main loop.

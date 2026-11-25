@@ -27,7 +27,8 @@ pub use error::{FailureKind, LlmError};
 pub use reasoning::{ReasoningCapability, resolve as resolve_reasoning, resolve_applied_level};
 pub use retry::RetryPolicy;
 pub use message::{
-    ChatRequest, Content, Correlation, Effort, Message, ModelInfo, Role, ToolDefinition, Usage,
+    ChatRequest, Content, Correlation, Effort, Message, MessageOrigin, MessageOriginKind, ModelInfo,
+    Role, ToolDefinition, Usage,
 };
 pub use sse::{SseDecoder, SseEvent};
 pub use thinking::{ThinkingMode, ThinkingPolicy, ThinkingSource, ThinkingSupport};

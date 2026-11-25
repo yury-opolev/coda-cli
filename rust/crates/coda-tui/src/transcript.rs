@@ -240,6 +240,18 @@ pub enum Block {
         /// The task's full prompt.
         instructions: String,
     },
+    /// The report a background task's completion delivered to the model,
+    /// shown only when no card for that occurrence can be found (a forked
+    /// session, an evicted record). Part of the conversation, never an
+    /// operator prompt: collapsed it is one header row, expanded the original
+    /// report. Nothing is invented for it — no title, no instructions.
+    TaskCompletionReport {
+        /// The occurrence's identity (presentation item id, else inbox id):
+        /// keys the expansion state.
+        key: String,
+        task_id: Option<String>,
+        text: String,
+    },
     /// The startup banner: wordmark plus session details.
     ///
     /// Rendered in the transcript rather than written to the raw console, so it
@@ -288,6 +300,7 @@ impl Block {
             Block::TaskCompletion { session_id, task_id, .. } => {
                 Some((session_id.clone().unwrap_or_default(), task_id.clone()))
             }
+            Block::TaskCompletionReport { key, .. } => Some((REPORT_KEY_SCOPE.to_string(), key.clone())),
             _ => None,
         }
     }
@@ -295,6 +308,9 @@ impl Block {
     /// Renders a task completion card, collapsed or expanded. Empty for any
     /// other block.
     pub fn render_card(&self, width: usize, expanded: bool) -> Vec<RenderLine> {
+        if let Block::TaskCompletionReport { task_id, text, .. } = self {
+            return render_report(task_id.as_deref(), text, width, expanded);
+        }
         let Block::TaskCompletion { task_id, status, title, instructions, .. } = self else {
             return Vec::new();
         };
@@ -472,7 +488,7 @@ impl Block {
                 }
                 lines
             }
-            Block::TaskCompletion { .. } => self.render_card(width, false),
+            Block::TaskCompletion { .. } | Block::TaskCompletionReport { .. } => self.render_card(width, false),
             Block::SessionBoundary { id } => {
                 let label = format!("{0}{0} session {id} {0}{0}", glyphs::RULE);
                 text::wrap(&label, width)
@@ -523,6 +539,45 @@ fn task_card_header(
         None => text::truncate_with_ellipsis(&compact, budget),
     };
     RenderLine::new(format!("{prefix}{headline}"), role).with_chrome_cells(chrome)
+}
+
+/// The expansion-key scope of a [`Block::TaskCompletionReport`], so it can
+/// never share a key with a card of some session.
+const REPORT_KEY_SCOPE: &str = "#task-report";
+
+/// A task-completion report with no card: one header row collapsed, the
+/// original report preformatted when expanded.
+fn render_report(task_id: Option<&str>, text: &str, width: usize, expanded: bool) -> Vec<RenderLine> {
+    let width = width.max(1);
+    let marker = if expanded { glyphs::FOLD_EXPANDED } else { glyphs::FOLD_COLLAPSED };
+    let prefix = format!(" {marker} ");
+    let chrome = text::width(&prefix);
+    let tag = task_id.map(|id| format!("  [{}]", text::sanitize(id))).unwrap_or_default();
+    let headline = format!("Earlier task completion report (no card){tag}");
+    let role = NoticeLevel::Info.role();
+    let header = if width > chrome {
+        RenderLine::new(
+            format!("{prefix}{}", text::truncate_with_ellipsis(&headline, width - chrome)),
+            role,
+        )
+        .with_chrome_cells(chrome)
+    } else {
+        RenderLine::new(text::truncate_with_ellipsis(&headline, width), role)
+    };
+    let mut out = vec![header];
+    if expanded {
+        let (gutter, content) = if width > MARKER_CELLS {
+            (Gutter::Continuation, width - MARKER_CELLS)
+        } else {
+            (Gutter::None, width)
+        };
+        for line in text.lines() {
+            for chunk in text::wrap_preformatted(&text::sanitize(line), content) {
+                out.push(RenderLine::new(chunk, Role::Notification).with_gutter(gutter));
+            }
+        }
+    }
+    out
 }
 
 fn render_user(text: &str, timestamp: &str, pending: bool, width: usize) -> Vec<RenderLine> {
@@ -874,9 +929,11 @@ impl Transcript {
     /// Classifies a block appended by the live reducer.
     fn classify(&mut self, block: &Block) -> Placement {
         match block {
-            Block::User { .. } | Block::Assistant { .. } | Block::Thinking { .. } | Block::Tools { .. } => {
-                Placement::Conversation
-            }
+            Block::User { .. }
+            | Block::Assistant { .. }
+            | Block::Thinking { .. }
+            | Block::Tools { .. }
+            | Block::TaskCompletionReport { .. } => Placement::Conversation,
             Block::HistoryNotice { .. } => Placement::View,
             Block::TaskCompletion { session_id, task_id, .. } => {
                 let item_id = format!("legacy-task:{}:{task_id}", session_id.as_deref().unwrap_or(""));
@@ -907,6 +964,17 @@ impl Transcript {
     /// The index of the record with this identity.
     pub fn find_record(&self, item_id: &str) -> Option<usize> {
         self.meta.iter().position(|m| matches!(m, Placement::Record(r) if r.item_id == item_id))
+    }
+
+    /// The identities of every record shown.
+    pub fn record_ids(&self) -> std::collections::HashSet<String> {
+        self.meta
+            .iter()
+            .filter_map(|m| match m {
+                Placement::Record(record) => Some(record.item_id.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The placement of the record at `index`, if it is one.
@@ -990,7 +1058,10 @@ impl Transcript {
     }
 
     pub fn is_task_card(&self, index: usize) -> bool {
-        matches!(self.blocks.get(index), Some(Block::TaskCompletion { .. }))
+        matches!(
+            self.blocks.get(index),
+            Some(Block::TaskCompletion { .. } | Block::TaskCompletionReport { .. })
+        )
     }
 
     /// Toggles the task card at `index`, reporting whether it was one.
@@ -2883,6 +2954,35 @@ mod tests {
 
         fn joined(rows: &[RenderLine]) -> String {
             rows.iter().map(|r| r.text.clone()).collect::<Vec<_>>().join("\n")
+        }
+
+        #[test]
+        fn a_report_without_a_card_is_one_row_at_any_width_and_expands_to_the_original() {
+            let frame = "[task-completed] taskId=task-0001 (job): done\n<task_output>\nstatus: completed\n\
+                         last output:\nsynthetic output line 1\n</task_output>";
+            let report = Block::TaskCompletionReport {
+                key: "task:engine-a:task-0001".into(),
+                task_id: Some("task-0001".into()),
+                text: frame.into(),
+            };
+            for w in [1usize, 5, 12, 30, 80, 200] {
+                let rows = report.render_card(w, false);
+                assert_eq!(rows.len(), 1, "w={w}");
+                assert!(text::width(&rows[0].text) <= w, "w={w}: {:?}", rows[0].text);
+                assert!(report.render_card(w, true).iter().all(|r| text::width(&r.text) <= w), "w={w}");
+            }
+            let header = &report.render_card(80, false)[0].text;
+            assert!(header.contains("no card") && header.contains("[task-0001]"), "{header}");
+            assert!(!header.contains("synthetic output"), "the output is not shown collapsed");
+            assert!(joined(&report.render_card(80, true)).contains("synthetic output line 1"));
+
+            let mut t = Transcript::new();
+            t.push(Block::User { text: "go".into(), timestamp: String::new(), pending: false, queue_id: None });
+            t.push(report.clone());
+            assert!(t.is_task_card(1));
+            assert_eq!(t.render(80, ToolDisplayMode::Summary).iter().filter(|r| r.text.contains("synthetic")).count(), 0);
+            assert!(t.toggle_task_card(1));
+            assert!(t.render(80, ToolDisplayMode::Summary).iter().any(|r| r.text.contains("synthetic output line 1")));
         }
 
         #[test]

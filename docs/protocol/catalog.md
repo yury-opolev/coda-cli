@@ -206,6 +206,14 @@ A delivered steering message appears in the live projection tagged with `steerin
 in the same read that reports its `delivered` outcome. A client that queued it holds the
 original text and should match on that id rather than on the text, which is not an identity.
 
+An entry the engine itself injected carries `runtimeOrigin`. Today that is only
+`{ "kind": "taskCompletion", "messageId", "taskId", "presentationItemId" }`: the
+model-facing report of a finished background task, which is still a `user`/`userPrompt`
+entry for clients that ignore the field. Do not render it as an operator prompt; show the
+presentation record named by `presentationItemId` instead, keep the entry's index in your
+layout bookkeeping, and fall back to a bounded rendering of the entry when that record is
+absent. Treat an unknown `kind` as no origin, and never infer an origin from text.
+
 Honor advertised bounds and omission metadata. Missing elapsed time,
 credentials resolution, provider identity or background counts means unknown,
 not zero or false. Server elapsed durations are authoritative baselines;

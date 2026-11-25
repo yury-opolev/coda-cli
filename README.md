@@ -417,7 +417,12 @@ theirs. A finished background task appears in the transcript as a one-row card,
 `Task completed: <title>  [task-id]` — click its header to expand the full instructions, or
 use `/tasks all` and `Enter` for the details page (title, instructions, report, output).
 Tasks restored from older checkpoints that carry no title show a short preview of their
-instructions instead.
+instructions instead. The report the agent receives about the same completion (status, exit
+code and output tail) is part of the agent's conversation, not something you typed: it is never
+shown as a user message. If its card cannot be found (for example in a forked session) it is
+shown as one collapsed `Earlier task completion report (no card)` row that expands to the
+report. Sessions saved before 0.1.187 did not record who wrote such a report, so there it still
+appears as an ordinary message — Coda never hides text by guessing from its content.
 
 Task ids are `task-00000001`, `task-00000002`, … — unique within the session, never reused,
 and simply wider past `task-99999999`.

@@ -735,3 +735,30 @@ fn saved_message_fields_rebuild_the_same_source_and_main_snapshot_keeps_the_queu
     assert_eq!(snapshot[0].schedule_name.as_deref(), Some("nightly"));
     assert!(bus.has_pending_main(), "a snapshot does not consume the queue");
 }
+
+#[test]
+fn a_task_completion_carries_its_trusted_origin_scoped_to_the_engine() {
+    let bus = MessageBus::new();
+    bus.set_presentation_scope("engine-a");
+    let completion = MessageSource::TaskCompletion { task_id: "task-0001".into(), label: "sync".into() };
+    bus.publish_main(&completion, "status: completed", None, None).unwrap();
+    bus.publish_main(&subagent("task-0002", "child"), "hello", None, None).unwrap();
+    let drained = bus.take_main_for_delivery();
+
+    let origin = drained[0].origin().expect("a completion has an origin");
+    assert_eq!(origin.kind, coda_llm::MessageOriginKind::TaskCompletion);
+    assert_eq!(origin.message_id.as_deref(), Some(drained[0].id.as_str()));
+    assert_eq!(origin.task_id.as_deref(), Some("task-0001"));
+    assert_eq!(origin.presentation_item_id.as_deref(), Some("task:engine-a:task-0001"));
+    assert_eq!(drained[1].origin(), None, "only task completions are runtime origins here");
+}
+
+#[test]
+fn without_a_presentation_scope_a_completion_names_no_record() {
+    let bus = MessageBus::new();
+    let completion = MessageSource::TaskCompletion { task_id: "task-0001".into(), label: "sync".into() };
+    bus.publish_main(&completion, "status: completed", None, None).unwrap();
+    let origin = bus.take_main_for_delivery()[0].origin().unwrap();
+    assert_eq!(origin.presentation_item_id, None);
+    assert_eq!(origin.task_id.as_deref(), Some("task-0001"));
+}

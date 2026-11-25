@@ -406,11 +406,26 @@ pub struct MainMessage {
     pub body: String,
     pub context: Option<String>,
     pub idempotency_key: Option<String>,
+    /// The presentation record of the same occurrence, for a task completion
+    /// published on a bus with a presentation scope.
+    pub presentation_item_id: Option<String>,
     /// Internal idempotency scope id (not part of the wire payload).
     scope_id: String,
 }
 
 impl MainMessage {
+    /// The trusted runtime origin of this item once it is injected into the
+    /// conversation. Only task completions carry one: every other main-inbox
+    /// item is out of this provenance's scope.
+    pub fn origin(&self) -> Option<coda_llm::MessageOrigin> {
+        (self.source_kind == "taskCompletion").then(|| coda_llm::MessageOrigin {
+            kind: coda_llm::MessageOriginKind::TaskCompletion,
+            message_id: Some(self.id.clone()),
+            task_id: self.task_id.clone(),
+            presentation_item_id: self.presentation_item_id.clone(),
+        })
+    }
+
     /// The single authoritative formatter for this message's injected text.
     ///
     /// Used both to append this item to the main `AgentLoop`'s own history
@@ -634,6 +649,10 @@ pub struct MessageBus {
     /// Signalled whenever an item is accepted into the main FIFO, so a parked
     /// main loop (headless `coda run`) can wake without polling.
     main_arrived: tokio::sync::Notify,
+    /// The engine-scoped namespace of presentation record ids (the serve
+    /// host's engine instance id), so a delivered completion can name the
+    /// record of the same occurrence. Unset outside a serve host.
+    presentation_scope: std::sync::OnceLock<String>,
 }
 
 impl MessageBus {
@@ -667,7 +686,13 @@ impl MessageBus {
             }),
             observer,
             main_arrived: tokio::sync::Notify::new(),
+            presentation_scope: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Sets the presentation record namespace once; later calls are ignored.
+    pub fn set_presentation_scope(&self, scope: impl Into<String>) {
+        let _ = self.presentation_scope.set(scope.into());
     }
 
     /// Resolves once the main FIFO holds at least one undelivered item.
@@ -920,6 +945,27 @@ impl MessageBus {
         context: Option<String>,
         idempotency_key: Option<String>,
     ) -> Result<AskReceipt, AskMainError> {
+        let presentation_item_id = match (source, self.presentation_scope.get()) {
+            (MessageSource::TaskCompletion { task_id, .. }, Some(scope)) => {
+                Some(crate::tasks::completion_push::task_presentation_item_id(scope, task_id))
+            }
+            _ => None,
+        };
+        self.publish_main_as(source, body, context, idempotency_key, presentation_item_id)
+    }
+
+    /// [`Self::publish_main`] with the presentation identity given rather
+    /// than derived from this bus's scope: a main-inbox item saved across a
+    /// planned restart keeps the record id of the engine that first accepted
+    /// it, because a restarted engine reuses task numbers.
+    pub fn publish_main_as(
+        &self,
+        source: &MessageSource,
+        body: impl Into<String>,
+        context: Option<String>,
+        idempotency_key: Option<String>,
+        presentation_item_id: Option<String>,
+    ) -> Result<AskReceipt, AskMainError> {
         let body = body.into();
         if body.trim().is_empty() {
             return Err(AskMainError::EmptyBody);
@@ -1005,6 +1051,7 @@ impl MessageBus {
             body: body.clone(),
             context: context.clone(),
             idempotency_key: idempotency_key.clone(),
+            presentation_item_id,
             scope_id: scope_id.clone(),
         };
 

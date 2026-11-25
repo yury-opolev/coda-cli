@@ -90,6 +90,13 @@ impl TaskCompletionListener for MainInboxCompletionPush {
     }
 }
 
+/// The presentation record identity of a task's completion: engine-scoped,
+/// because a restarted engine reuses task numbers. Shared by the record
+/// itself and by the conversation message that reports the same occurrence.
+pub fn task_presentation_item_id(scope: &str, task_id: &str) -> String {
+    format!("task:{scope}:{task_id}")
+}
+
 /// The single formatter for a delivered completion: a `[task-completed]`
 /// header and the body framed as data, never as instructions.
 pub fn completion_frame(task_id: &str, label: &str, body: &str) -> String {
