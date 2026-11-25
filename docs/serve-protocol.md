@@ -326,6 +326,18 @@ conversation with no trace of it. A client holding its own copy of a queued mess
 that id — never the text, since two messages with identical text are two messages — to decide
 whether a re-read conversation already contains it.
 
+`runtimeOrigin` is present on an entry — live or committed — that the engine itself wrote into
+the conversation rather than the operator. Its only kind today is `taskCompletion`: the
+`[task-completed]` report of a main-agent background task, delivered so the model learns the
+task's status and output. `role` and `entryKind` stay `user` / `userPrompt`, so a client that
+ignores the field behaves exactly as before. The object carries `kind` (a string; treat an
+unknown kind as no origin), and when known `messageId` (the inbox item), `taskId` (process-local)
+and `presentationItemId` — the `itemId` of the presentation record for the same occurrence,
+which is the identity to correlate on. A client should show that record rather than the
+entry, while still counting the entry for anchors and fences. The origin is recorded in the
+saved transcript, so it survives a restart, a fork and compaction; transcripts written before
+it existed carry none, and a client must not infer one from text.
+
 **Internal metadata is not exposed.** History, state, config and MCP projections do not expose a
 `Content::Thinking.signature`, `RedactedThinking` ciphertext, image base64, a provider
 credential, an MCP `env` value, a custom header value, a `coda-secret:` target, or a URL with

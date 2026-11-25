@@ -740,10 +740,18 @@ impl App {
             self.view.note_history_read(cursor);
         }
 
-        let hydrated = api::history::hydrate(
+        // The cards this rebuild will show: the read's own record set when
+        // the engine keeps one, otherwise the records already on screen. A
+        // completion frame whose card is among them is not shown twice.
+        let covered = match &history.presentation {
+            Some(timeline) => timeline.records.iter().map(|r| r.item_id.clone()).collect(),
+            None => self.state.transcript.record_ids(),
+        };
+        let hydrated = api::history::hydrate_with(
             &history.entries,
             history.live_entries.as_deref().unwrap_or(&[]),
             history.live_truncated.unwrap_or(false),
+            &covered,
         );
         let mut layout = hydrated.layout;
         layout.epoch = history.history_epoch.unwrap_or_else(|| self.view.history_epoch());
