@@ -89,11 +89,56 @@ impl Content {
     }
 }
 
+/// What kind of runtime injection a message is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageOriginKind {
+    /// A background task this conversation started has finished; the message
+    /// is the model-facing `[task-completed]` frame.
+    TaskCompletion,
+}
+
+impl MessageOriginKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MessageOriginKind::TaskCompletion => "taskCompletion",
+        }
+    }
+
+    /// Inverse of [`Self::as_str`]; an unknown name is not an origin.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "taskCompletion" => Some(MessageOriginKind::TaskCompletion),
+            _ => None,
+        }
+    }
+}
+
+/// Trusted provenance of a message the runtime itself wrote into the
+/// conversation (as opposed to text the operator sent).
+///
+/// Set only by engine code at the point of injection — never parsed from
+/// message text or model output. Providers never see it: the model receives
+/// the message's role and content exactly as before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageOrigin {
+    pub kind: MessageOriginKind,
+    /// The id of the inbox item that was delivered.
+    pub message_id: Option<String>,
+    /// The task the message reports on, as the engine that ran it named it.
+    pub task_id: Option<String>,
+    /// The engine-scoped presentation record identity of the same
+    /// occurrence (`task:<engine>:<task>`), when the engine keeps records.
+    pub presentation_item_id: Option<String>,
+}
+
 /// One turn of the conversation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Message {
     pub role: Role,
     pub content: Vec<Content>,
+    /// Trusted runtime provenance; `None` for operator and model messages
+    /// and for anything restored from a transcript that did not record it.
+    pub origin: Option<MessageOrigin>,
 }
 
 impl Message {
@@ -101,6 +146,7 @@ impl Message {
         Self {
             role: Role::User,
             content: vec![Content::text(text)],
+            origin: None,
         }
     }
 
@@ -108,11 +154,17 @@ impl Message {
         Self {
             role: Role::Assistant,
             content: vec![Content::text(text)],
+            origin: None,
         }
     }
 
     pub fn new(role: Role, content: Vec<Content>) -> Self {
-        Self { role, content }
+        Self { role, content, origin: None }
+    }
+
+    pub fn with_origin(mut self, origin: Option<MessageOrigin>) -> Self {
+        self.origin = origin;
+        self
     }
 
     /// All text blocks joined, which is what a transcript shows.

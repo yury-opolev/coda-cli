@@ -49,7 +49,7 @@
 use std::sync::Arc;
 
 use coda_proto::history::{
-    truncate_text, HistoryBlock, HistoryEntry, OMITTED_LIVE_BUDGET, OMITTED_TOO_LARGE,
+    truncate_text, HistoryBlock, HistoryEntry, RuntimeOrigin, OMITTED_LIVE_BUDGET, OMITTED_TOO_LARGE,
 };
 
 /// Default cap on the total bytes of live-turn content retained (§2.5).
@@ -149,7 +149,7 @@ impl LiveTurnAccumulator {
     /// it made a turn look like it had no operator prompt at all, and keeping
     /// it silently short made a truncated prompt look complete.
     pub fn push_user_text(&mut self, text: &str) {
-        self.push_user_block(text, None, None);
+        self.push_user_block(text, None, None, None);
     }
 
     /// Operator steering the engine has just delivered into this turn.
@@ -173,11 +173,13 @@ impl LiveTurnAccumulator {
             return;
         }
         self.flush_assistant();
-        self.push_user_block(text, upstream_full_length, Some(message_id));
+        self.push_user_block(text, upstream_full_length, Some(message_id), None);
     }
 
     /// Projects a delivered `ask_main` item's already-formatted
-    /// `MainMessage::injected_text()` into this live turn (Stage 3 chunk B).
+    /// `MainMessage::injected_text()` into this live turn (Stage 3 chunk B),
+    /// with its trusted runtime origin when it has one (a task completion),
+    /// so a client never has to guess from the text who wrote it.
     ///
     /// Deduplicated by `id` alone — the message's own stable id — never by
     /// matching the projected text, so a duplicate delivery callback (an
@@ -191,11 +193,11 @@ impl LiveTurnAccumulator {
     /// assistant entry first: an `ask_main` delivery is not a mid-stream
     /// preemption the model observed — it is appended as the running turn's
     /// own next inbox item, exactly like [`Self::push_user_text`].
-    pub fn push_main_message_text(&mut self, id: &str, text: &str) -> bool {
+    pub fn push_main_message(&mut self, id: &str, text: &str, origin: Option<RuntimeOrigin>) -> bool {
         if !self.delivered_main_ids.insert(id.to_string()) {
             return false;
         }
-        self.push_user_block(text, None, None);
+        self.push_user_block(text, None, None, origin);
         true
     }
 
@@ -204,6 +206,7 @@ impl LiveTurnAccumulator {
         text: &str,
         upstream_full_length: Option<i64>,
         steering_id: Option<&str>,
+        origin: Option<RuntimeOrigin>,
     ) {
         if text.is_empty() {
             return;
@@ -212,6 +215,7 @@ impl LiveTurnAccumulator {
         if self.charge(OVERHEAD + text.len()) {
             self.push_user_entry(
                 steering_id,
+                origin,
                 HistoryBlock::Text {
                     text: text.to_string(),
                     omitted_reason: upstream_full_length.map(|_| OMITTED_TOO_LARGE.to_string()),
@@ -234,6 +238,7 @@ impl LiveTurnAccumulator {
         self.omitted_bytes -= (OVERHEAD + capped.len()) as i64;
         self.push_user_entry(
             steering_id,
+            origin,
             HistoryBlock::Text {
                 text: capped,
                 omitted_reason: Some(OMITTED_LIVE_BUDGET.to_string()),
@@ -245,10 +250,15 @@ impl LiveTurnAccumulator {
         );
     }
 
-    fn push_user_entry(&mut self, steering_id: Option<&str>, block: HistoryBlock) {
+    fn push_user_entry(
+        &mut self,
+        steering_id: Option<&str>,
+        origin: Option<RuntimeOrigin>,
+        block: HistoryBlock,
+    ) {
         let index = self.next_index;
         self.next_index += 1;
-        let entry = HistoryEntry::new(index, "user", vec![block]);
+        let entry = HistoryEntry::new(index, "user", vec![block]).with_runtime_origin(origin);
         self.entries.push(Arc::new(match steering_id {
             Some(id) => entry.from_steering(id),
             None => entry,

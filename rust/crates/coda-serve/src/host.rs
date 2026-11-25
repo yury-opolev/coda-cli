@@ -1666,6 +1666,9 @@ impl ServeHost {
         let message_bus: Arc<coda_agent::MessageBus> = Arc::new(coda_agent::MessageBus::with_observer(Some(
             message_bus_bridge as Arc<dyn coda_agent::message::MessageBusObserver>,
         )));
+        // A delivered completion names the presentation record of the same
+        // occurrence, so a client shows the card instead of the model frame.
+        message_bus.set_presentation_scope(bus.engine_instance_id());
         // Non-blocking runtime: a backgrounded shell task's completion is
         // pushed onto the main inbox, whose acceptance wakes the idle pump —
         // so the model learns about it without polling.
@@ -17774,6 +17777,86 @@ mod tests {
             assert!(seen.contains("status: failed") && seen.contains("exit code: 101"), "{seen}");
             assert!(seen.contains("Finished dev profile"), "{seen}");
             assert_eq!(host.message_bus.pending_main_len(), 0);
+        }
+
+        /// The model-facing completion frame is a runtime message, and every
+        /// surface a client rebuilds the conversation from says so: the
+        /// committed history, `session/getHistory` (committed and after a
+        /// reload of the saved transcript), each naming the presentation
+        /// record of the same occurrence — while the model still receives
+        /// the full original frame.
+        #[tokio::test]
+        async fn a_backgrounded_completion_is_marked_as_a_runtime_message_wherever_history_is_read() {
+            use coda_agent::tasks::{TaskExecutionMode, TaskKind};
+
+            let dir = tempfile::tempdir().unwrap();
+            let client = PumpClient::new(vec![answer("noted"), answer("noted again")]);
+            let host = host_with(Some(Arc::clone(&client) as Arc<dyn LlmClient>), dir.path());
+            host.initialize(InitParams::default()).await.unwrap();
+            let engine = host.engine_state.bus_ref().engine_instance_id().to_owned();
+
+            let mut ids = Vec::new();
+            for round in 1..=2 {
+                // Identical titles: identity must never come from the label.
+                let task = host
+                    .task_manager
+                    .register(TaskKind::Shell, "synthetic job", "synthetic job", None, TaskExecutionMode::Foreground)
+                    .unwrap();
+                host.task_manager.append_output(&task.id, &format!("synthetic output line {round}\n"));
+                task.try_promote_to_background().unwrap();
+                host.task_manager.complete(&task.id, Some("exit code: 0".into()));
+                wait_for("the completion turn", || client.request_count() == round).await;
+                wait_for("the turn to finish", || idle(&host) && last_outcome(&host).is_some()).await;
+                settle().await;
+                ids.push(task.id.clone());
+            }
+
+            for (round, request) in client.requests().iter().enumerate() {
+                let seen = request.messages.last().unwrap().text();
+                assert!(seen.starts_with("[task-completed]"), "{seen}");
+                assert!(seen.contains("status: completed") && seen.contains("exit code: 0"), "{seen}");
+                assert!(seen.contains(&format!("synthetic output line {}", round + 1)), "{seen}");
+            }
+
+            let expected: Vec<String> =
+                ids.iter().map(|id| format!("task:{engine}:{id}")).collect();
+            let origins = |messages: &[coda_llm::Message]| -> Vec<String> {
+                messages
+                    .iter()
+                    .filter_map(|m| m.origin.as_ref()?.presentation_item_id.clone())
+                    .collect()
+            };
+            assert_eq!(origins(&committed(&host)), expected, "committed history keeps the origin");
+
+            let history = host.session_get_history(GetHistoryParams::default()).await.unwrap();
+            let entries = history["entries"].as_array().unwrap();
+            let tagged: Vec<&Value> =
+                entries.iter().filter(|e| e.get("runtimeOrigin").is_some()).collect();
+            assert_eq!(tagged.len(), 2, "{history}");
+            for (entry, item) in tagged.iter().zip(&expected) {
+                assert_eq!(entry["role"], "user");
+                assert_eq!(entry["entryKind"], "userPrompt", "older clients see what they saw before");
+                assert_eq!(entry["runtimeOrigin"]["kind"], "taskCompletion");
+                assert_eq!(&entry["runtimeOrigin"]["presentationItemId"], item);
+                assert!(entry["blocks"][0]["text"].as_str().unwrap().starts_with("[task-completed]"));
+            }
+            let records: Vec<&Value> = history["presentation"]["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|r| r["payload"]["kind"] == "taskCompletion")
+                .collect();
+            let record_ids: Vec<String> =
+                records.iter().map(|r| r["itemId"].as_str().unwrap().to_owned()).collect();
+            assert_eq!(record_ids, expected, "each frame names exactly its own card");
+
+            let saved = SessionTranscriptStore::new(dir.path())
+                .load(&host.active_session_id())
+                .await
+                .expect("the session was saved");
+            assert_eq!(origins(&saved), expected, "a reload keeps the origin");
+            let reprojected = crate::history::project_messages(0, &saved);
+            assert_eq!(reprojected.iter().filter(|e| e.runtime_origin.is_some()).count(), 2);
         }
 
         /// Engine shutdown stops work the agent had handed to the background:

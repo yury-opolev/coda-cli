@@ -198,6 +198,41 @@ pub struct HistoryEntry {
     /// that identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub steering_message_id: Option<String>,
+    /// Who wrote this entry, when the engine itself injected it into the
+    /// conversation rather than the operator typing it.
+    ///
+    /// Additive: `role` and `entryKind` are unchanged (a task completion is
+    /// still a `user`/`userPrompt` entry to a client that ignores this), and
+    /// absent for operator and model messages and for transcripts written
+    /// before provenance was recorded. Never derived from the entry's text —
+    /// an operator can type or paste anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_origin: Option<RuntimeOrigin>,
+}
+
+/// [`RuntimeOrigin::kind`] of a background task completion frame.
+pub const RUNTIME_ORIGIN_TASK_COMPLETION: &str = "taskCompletion";
+
+/// Trusted provenance of a runtime-injected entry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RuntimeOrigin {
+    /// `taskCompletion`. A string, not an enum, so a client meeting a kind
+    /// it does not know still reads the entry; it should then treat the
+    /// entry as it would without an origin.
+    pub kind: String,
+    /// The id of the inbox item the engine delivered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    /// The task the entry reports on, as the engine that ran it named it.
+    /// Process-local: a restarted engine reuses task numbers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    /// The presentation record (`PresentationRecord.itemId`) of the same
+    /// occurrence — the engine-scoped identity to correlate on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation_item_id: Option<String>,
 }
 
 fn default_entry_kind() -> HistoryEntryKind {
@@ -222,7 +257,14 @@ impl HistoryEntry {
             blocks,
             streaming_text_index: None,
             steering_message_id: None,
+            runtime_origin: None,
         }
+    }
+
+    /// Records who injected this entry. See [`HistoryEntry::runtime_origin`].
+    pub fn with_runtime_origin(mut self, origin: Option<RuntimeOrigin>) -> Self {
+        self.runtime_origin = origin;
+        self
     }
 
     /// Tags this entry as the delivered steering message `message_id`.
@@ -361,6 +403,46 @@ mod tests {
         assert_eq!(v["entryKind"], "userPrompt", "steering is text the operator typed");
         let back: HistoryEntry = serde_json::from_value(v).unwrap();
         assert_eq!(back, steered);
+    }
+
+    // ── Runtime origin (additive) ────────────────────────────────────────
+
+    #[test]
+    fn a_runtime_origin_is_additive_and_keeps_the_provider_role_and_kind() {
+        let plain = HistoryEntry::new(0, "user", vec![HistoryBlock::text_capped("hi", 1024)]);
+        assert!(serde_json::to_value(&plain).unwrap().get("runtimeOrigin").is_none());
+
+        let tagged = HistoryEntry::new(1, "user", vec![HistoryBlock::text_capped("[task-completed]", 1024)])
+            .with_runtime_origin(Some(RuntimeOrigin {
+                kind: RUNTIME_ORIGIN_TASK_COMPLETION.into(),
+                message_id: Some("m1".into()),
+                task_id: Some("task-0001".into()),
+                presentation_item_id: Some("task:engine-a:task-0001".into()),
+            }));
+        let v = serde_json::to_value(&tagged).unwrap();
+        assert_eq!(v["role"], "user");
+        assert_eq!(v["entryKind"], "userPrompt", "an older client sees exactly what it saw before");
+        assert_eq!(v["runtimeOrigin"]["kind"], "taskCompletion");
+        assert_eq!(v["runtimeOrigin"]["presentationItemId"], "task:engine-a:task-0001");
+        let back: HistoryEntry = serde_json::from_value(v).unwrap();
+        assert_eq!(back, tagged);
+    }
+
+    #[test]
+    fn an_entry_from_an_older_engine_reads_with_no_runtime_origin_and_a_future_kind_still_reads() {
+        let old: HistoryEntry = serde_json::from_value(serde_json::json!({
+            "index": 0, "role": "user", "entryKind": "userPrompt",
+            "blocks": [{ "kind": "text", "text": "[task-completed] pasted" }],
+        }))
+        .unwrap();
+        assert_eq!(old.runtime_origin, None);
+
+        let future: HistoryEntry = serde_json::from_value(serde_json::json!({
+            "index": 0, "role": "user", "entryKind": "userPrompt",
+            "blocks": [], "runtimeOrigin": { "kind": "somethingNew", "extra": 1 },
+        }))
+        .unwrap();
+        assert_eq!(future.runtime_origin.unwrap().kind, "somethingNew");
     }
 
     // ── A user-role tool-result message is not an operator prompt ────────

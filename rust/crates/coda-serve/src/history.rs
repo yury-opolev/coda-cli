@@ -28,10 +28,10 @@
 //! `entries[..historyLength]` with `liveEntries` cannot double-count at any
 //! interleaving, including a turn completing mid-page.
 
-use coda_llm::{Content, Message};
+use coda_llm::{Content, Message, MessageOrigin};
 use std::collections::HashSet;
 use coda_proto::history::{
-    GetHistoryResult, HistoryBlock, HistoryEntry, SessionSummaryDto, truncate_text,
+    GetHistoryResult, HistoryBlock, HistoryEntry, RuntimeOrigin, SessionSummaryDto, truncate_text,
 };
 
 use crate::dispatch::RpcError;
@@ -60,6 +60,17 @@ pub fn project_message(index: i64, message: &Message) -> HistoryEntry {
     let role = message.role.as_str();
     let blocks = message.content.iter().filter_map(project_block).collect();
     HistoryEntry::new(index, role, blocks)
+        .with_runtime_origin(message.origin.as_ref().map(runtime_origin))
+}
+
+/// The wire form of a message's trusted runtime origin.
+pub fn runtime_origin(origin: &MessageOrigin) -> RuntimeOrigin {
+    RuntimeOrigin {
+        kind: origin.kind.as_str().to_owned(),
+        message_id: origin.message_id.clone(),
+        task_id: origin.task_id.clone(),
+        presentation_item_id: origin.presentation_item_id.clone(),
+    }
 }
 
 /// Projects a slice of committed history, numbering from `start_index`.
@@ -394,6 +405,28 @@ pub fn build_saved_result(
 mod tests {
     use super::*;
     use coda_llm::{Correlation, Role};
+
+    #[test]
+    fn a_committed_task_completion_keeps_its_runtime_origin_and_full_text() {
+        let frame = "[task-completed] taskId=task-0001 (job): done\n<task_output>\nstatus: completed\n</task_output>";
+        let messages = vec![
+            Message::user("[task-completed] typed by the operator"),
+            Message::user(frame).with_origin(Some(coda_llm::MessageOrigin {
+                kind: coda_llm::MessageOriginKind::TaskCompletion,
+                message_id: Some("m1".into()),
+                task_id: Some("task-0001".into()),
+                presentation_item_id: Some("task:engine-a:task-0001".into()),
+            })),
+        ];
+        let entries = project_messages(4, &messages);
+        assert_eq!(entries[0].runtime_origin, None, "text alone never earns an origin");
+        let origin = entries[1].runtime_origin.as_ref().expect("origin projected");
+        assert_eq!(origin.kind, "taskCompletion");
+        assert_eq!(origin.message_id.as_deref(), Some("m1"));
+        assert_eq!(origin.presentation_item_id.as_deref(), Some("task:engine-a:task-0001"));
+        assert_eq!(entries[1].index, 5);
+        assert!(matches!(&entries[1].blocks[0], HistoryBlock::Text { text, .. } if text == frame));
+    }
 
     // ── BUG 9 B: a page boundary must not split a call from its result ──────
 

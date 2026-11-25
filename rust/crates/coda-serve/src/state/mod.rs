@@ -1612,7 +1612,7 @@ impl EngineState {
     /// its own live turn) must never fabricate history.
     ///
     /// Dedup is by each item's own stable `id`, scoped to the running turn's
-    /// live state (`LiveTurnAccumulator::push_main_message_text`) — an id
+    /// live state (`LiveTurnAccumulator::push_main_message`) — an id
     /// already projected earlier in this same turn is silently excluded from
     /// both the live projection and the announced `items`, so a duplicate
     /// callback can never double-project or double-announce.
@@ -1625,7 +1625,11 @@ impl EngineState {
             let Some(t) = s.turn.as_mut() else { return Vec::new() };
             let mut projected = Vec::new();
             for m in msgs {
-                if t.live.push_main_message_text(&m.id, &m.injected_text()) {
+                if t.live.push_main_message(
+                    &m.id,
+                    &m.injected_text(),
+                    m.origin().as_ref().map(crate::history::runtime_origin),
+                ) {
                     projected.push(ProjectedMainMessage {
                         id: m.id.clone(),
                         seq: m.seq,
@@ -2382,6 +2386,45 @@ pub(crate) mod tests {
             vec![("start".to_string(), None), (expected_text, None)],
             "the exact committed-source injected_text() must appear as an ordinary live user \
              block, appended after the turn's own prompt"
+        );
+    }
+
+    #[test]
+    fn a_delivered_task_completion_is_projected_live_with_its_trusted_origin() {
+        let state = test_state();
+        state.begin_turn("t1", "start", active_config(), ActivityPhase::Responding);
+        let bus = coda_agent::MessageBus::new();
+        bus.set_presentation_scope("engine-a");
+        let completion = coda_agent::message::MessageSource::TaskCompletion {
+            task_id: "task-0001".into(),
+            label: "synthetic job".into(),
+        };
+        bus.publish_main(&completion, "status: completed\nlast output:\nsynthetic output line 1", None, None)
+            .unwrap();
+        let other = coda_agent::message::MessageSource::Subagent { task_id: "t2".into(), label: "w".into() };
+        bus.publish_main(&other, "a question", None, None).unwrap();
+        let drained = bus.take_main_for_delivery();
+
+        state.main_messages_delivered(&drained);
+
+        let live = state.history_view().live.expect("a running turn");
+        let completion_entry = live
+            .entries
+            .iter()
+            .find(|e| e.runtime_origin.is_some())
+            .expect("the completion is projected with its origin");
+        let origin = completion_entry.runtime_origin.as_ref().unwrap();
+        assert_eq!(origin.kind, "taskCompletion");
+        assert_eq!(origin.message_id.as_deref(), Some(drained[0].id.as_str()));
+        assert_eq!(origin.task_id.as_deref(), Some("task-0001"));
+        assert_eq!(origin.presentation_item_id.as_deref(), Some("task:engine-a:task-0001"));
+        assert_eq!(completion_entry.role, "user", "the provider role is unchanged");
+        assert!(matches!(&completion_entry.blocks[0],
+            coda_proto::history::HistoryBlock::Text { text, .. } if *text == drained[0].injected_text()));
+        assert_eq!(
+            live.entries.iter().filter(|e| e.runtime_origin.is_some()).count(),
+            1,
+            "an agent message and the operator's prompt carry no runtime origin"
         );
     }
 

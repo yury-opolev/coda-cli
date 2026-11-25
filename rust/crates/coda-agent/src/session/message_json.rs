@@ -5,8 +5,13 @@
 //!
 //! ## On-disk message format
 //! ```json
-//! { "role": "user" | "assistant", "blocks": [...] }
+//! { "role": "user" | "assistant", "blocks": [...], "origin"?: {...} }
 //! ```
+//!
+//! `origin` is present only on a message the runtime injected (today: a
+//! background task completion) — `{ "kind": "taskCompletion", "messageId"?,
+//! "taskId"?, "presentationItemId"? }`. Readers that predate it ignore it; an
+//! unknown kind reads as no origin.
 //!
 //! ## Block shapes
 //! | C# / common type     | JSON `"type"` | key fields |
@@ -28,7 +33,7 @@
 
 use serde_json::{Map, Value, json};
 
-use coda_llm::{Content, Correlation, Message, Role, ToolDefinition};
+use coda_llm::{Content, Correlation, Message, MessageOrigin, MessageOriginKind, Role, ToolDefinition};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Messages
@@ -41,9 +46,44 @@ pub fn serialize_messages(messages: &[Message]) -> Value {
 }
 
 fn serialize_message(msg: &Message) -> Value {
-    json!({
-        "role": role_str(msg.role),
-        "blocks": serialize_blocks(&msg.content),
+    let mut obj = Map::new();
+    obj.insert("role".into(), json!(role_str(msg.role)));
+    obj.insert("blocks".into(), serialize_blocks(&msg.content));
+    if let Some(origin) = &msg.origin {
+        obj.insert("origin".into(), serialize_origin(origin));
+    }
+    Value::Object(obj)
+}
+
+/// `"origin": { "kind", "messageId"?, "taskId"?, "presentationItemId"? }` —
+/// written only for a message the runtime injected, so the transcript keeps
+/// saying who wrote it after a restart, a fork or a compaction.
+fn serialize_origin(origin: &MessageOrigin) -> Value {
+    let mut obj = Map::new();
+    obj.insert("kind".into(), json!(origin.kind.as_str()));
+    for (key, value) in [
+        ("messageId", &origin.message_id),
+        ("taskId", &origin.task_id),
+        ("presentationItemId", &origin.presentation_item_id),
+    ] {
+        if let Some(value) = value {
+            obj.insert(key.into(), json!(value));
+        }
+    }
+    Value::Object(obj)
+}
+
+/// An origin this build does not understand — an unknown kind, a malformed
+/// value — reads as none: the message is kept, its provenance is not trusted.
+fn deserialize_origin(v: Option<&Value>) -> Option<MessageOrigin> {
+    let obj = v?.as_object()?;
+    let kind = MessageOriginKind::parse(obj.get("kind")?.as_str()?)?;
+    let text = |key: &str| obj.get(key).and_then(Value::as_str).map(str::to_owned);
+    Some(MessageOrigin {
+        kind,
+        message_id: text("messageId"),
+        task_id: text("taskId"),
+        presentation_item_id: text("presentationItemId"),
     })
 }
 
@@ -61,7 +101,7 @@ fn deserialize_message(v: &Value) -> Option<Message> {
     };
     let blocks_raw = obj.get("blocks").cloned().unwrap_or(Value::Array(vec![]));
     let content = deserialize_blocks(&blocks_raw);
-    Some(Message::new(role, content))
+    Some(Message::new(role, content).with_origin(deserialize_origin(obj.get("origin"))))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -257,6 +297,50 @@ mod tests {
         assert_eq!(rt[0].text(), "hello");
         assert_eq!(rt[1].role, Role::Assistant);
         assert_eq!(rt[1].text(), "world");
+    }
+
+    fn completion_origin() -> coda_llm::MessageOrigin {
+        coda_llm::MessageOrigin {
+            kind: coda_llm::MessageOriginKind::TaskCompletion,
+            message_id: Some("m1".into()),
+            task_id: Some("task-0001".into()),
+            presentation_item_id: Some("task:engine-a:task-0001".into()),
+        }
+    }
+
+    #[test]
+    fn a_runtime_origin_round_trips_and_is_absent_otherwise() {
+        let msgs = vec![
+            Message::user("[task-completed] taskId=task-0001").with_origin(Some(completion_origin())),
+            Message::user("operator words"),
+        ];
+        let v = serialize_messages(&msgs);
+        assert_eq!(v[0]["origin"]["kind"], "taskCompletion");
+        assert_eq!(v[0]["origin"]["presentationItemId"], "task:engine-a:task-0001");
+        assert!(v[1].get("origin").is_none(), "no origin key for an ordinary message");
+        assert_eq!(deserialize_messages(&v), msgs);
+    }
+
+    #[test]
+    fn a_partial_origin_omits_absent_fields() {
+        let mut origin = completion_origin();
+        origin.presentation_item_id = None;
+        let msgs = vec![Message::user("frame").with_origin(Some(origin))];
+        let v = serialize_messages(&msgs);
+        assert!(v[0]["origin"].get("presentationItemId").is_none());
+        assert_eq!(deserialize_messages(&v), msgs);
+    }
+
+    #[test]
+    fn an_unknown_or_malformed_origin_reads_as_none() {
+        let v = serde_json::json!([
+            { "role": "user", "blocks": [{ "type": "text", "text": "a" }], "origin": { "kind": "future" } },
+            { "role": "user", "blocks": [{ "type": "text", "text": "b" }], "origin": "taskCompletion" },
+            { "role": "user", "blocks": [{ "type": "text", "text": "c" }] },
+        ]);
+        let msgs = deserialize_messages(&v);
+        assert_eq!(msgs.len(), 3, "the message itself is kept");
+        assert!(msgs.iter().all(|m| m.origin.is_none()));
     }
 
     #[test]
