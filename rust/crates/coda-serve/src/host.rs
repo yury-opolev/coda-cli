@@ -3268,8 +3268,10 @@ impl ServeHost {
         for m in messages {
             let Some(source) = m.message_source() else { continue };
             let outcome = if m.channel == "main" {
+                // The occurrence keeps the identity it was saved with (or
+                // none, from an engine that did not record one).
                 self.message_bus
-                    .publish_main(&source, m.text, m.context, m.idempotency_key)
+                    .publish_main_as(&source, m.text, m.context, m.idempotency_key, m.presentation_item_id)
                     .map(|_| ())
                     .map_err(|e| format!("{e:?}"))
             } else {
@@ -20400,6 +20402,7 @@ mod tests {
                 schedule_definition_id: None,
                 schedule_name: None,
                 idempotency_key: None,
+                presentation_item_id: None,
             };
             for _ in 0..2 {
                 host.restored_messages.lock().unwrap().push(saved.clone());
@@ -20409,6 +20412,41 @@ mod tests {
             assert_eq!(records.len(), 1, "{records:?}");
             assert_eq!(records[0]["itemId"], "notification:saved-message-1");
             assert!(host.engine_state.take_notification_alias().is_none());
+        }
+
+        #[tokio::test]
+        async fn a_completion_restored_across_a_restart_keeps_the_record_id_it_was_saved_with() {
+            let dir = tempfile::tempdir().unwrap();
+            let (host, _rx) = host_in(dir.path(), ScriptedClient::new(vec![]));
+            let saved = crate::restart::SavedMessage {
+                channel: "main".into(),
+                cursor: 1,
+                id: "saved-main-1".into(),
+                source: "taskCompletion".into(),
+                label: "synthetic job".into(),
+                text: "status: completed".into(),
+                context: None,
+                task_id: Some("task-00000001".into()),
+                schedule_definition_id: None,
+                schedule_name: None,
+                idempotency_key: None,
+                presentation_item_id: Some("task:old-engine:task-00000001".into()),
+            };
+            let json = serde_json::to_value(&saved).unwrap();
+            assert_eq!(json["presentationItemId"], "task:old-engine:task-00000001");
+            let saved: crate::restart::SavedMessage = serde_json::from_value(json).unwrap();
+            host.restored_messages.lock().unwrap().push(saved);
+            host.after_initialize_response();
+
+            let pending = host.message_bus.pending_main_snapshot();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(
+                pending[0].origin().unwrap().presentation_item_id.as_deref(),
+                Some("task:old-engine:task-00000001"),
+                "never the restarted engine's id for a reused task number"
+            );
+            let snapshot = crate::restart::snapshot_messages(&host.message_bus, 0);
+            assert_eq!(snapshot[0].presentation_item_id.as_deref(), Some("task:old-engine:task-00000001"));
         }
     }
 }

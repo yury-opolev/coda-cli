@@ -16,7 +16,7 @@
 //!   "systemPrompt": "...",
 //!   "systemPromptOverride": "...",
 //!   "toolDefs": [...],
-//!   "turns": [{"role":"user","blocks":[...]},...],
+//!   "turns": [{"role":"user","blocks":[...],"origin"?:{...}},...],
 //!   "auditTurns": [...]
 //! }
 //! ```
@@ -30,8 +30,8 @@ use serde_json::{Value, json};
 use super::audit::{AuditToolCall, AuditTurn, SessionAuditStore};
 use super::ids;
 use super::message_json::{
-    deserialize_blocks, deserialize_tool_defs, serialize_blocks,
-    serialize_tool_defs,
+    deserialize_blocks, deserialize_origin, deserialize_tool_defs, serialize_blocks,
+    serialize_origin, serialize_tool_defs,
 };
 use super::store::SessionTranscriptStore;
 
@@ -70,6 +70,8 @@ pub struct SessionBundle {
 pub struct BundleTurn {
     pub role: String,
     pub blocks: Vec<coda_llm::Content>,
+    /// Trusted runtime provenance (`"origin"`), as in the transcript.
+    pub origin: Option<coda_llm::MessageOrigin>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -134,6 +136,7 @@ impl SessionBundleService {
                     Role::Assistant => "assistant".into(),
                 },
                 blocks: m.content.clone(),
+                origin: m.origin.clone(),
             })
             .collect();
 
@@ -226,7 +229,7 @@ impl SessionBundleService {
                 } else {
                     Role::User
                 };
-                Message::new(role, t.blocks.clone())
+                Message::new(role, t.blocks.clone()).with_origin(t.origin.clone())
             })
             .collect();
 
@@ -290,10 +293,14 @@ fn serialize_bundle(bundle: &SessionBundle) -> Value {
         .turns
         .iter()
         .map(|t| {
-            json!({
+            let mut turn = json!({
                 "role": t.role,
                 "blocks": serialize_blocks(&t.blocks),
-            })
+            });
+            if let Some(origin) = &t.origin {
+                turn["origin"] = serialize_origin(origin);
+            }
+            turn
         })
         .collect();
 
@@ -414,7 +421,8 @@ fn deserialize_turns(arr: &Value) -> Vec<BundleTurn> {
             let role = obj.get("role")?.as_str()?.to_owned();
             let blocks_raw = obj.get("blocks").cloned().unwrap_or(Value::Array(vec![]));
             let blocks = deserialize_blocks(&blocks_raw);
-            Some(BundleTurn { role, blocks })
+            let origin = deserialize_origin(obj.get("origin"));
+            Some(BundleTurn { role, blocks, origin })
         })
         .collect()
 }
@@ -534,11 +542,21 @@ mod tests {
         let import_svc = SessionBundleService::new(import_dir.path(), "0.1.0");
 
         let id = "abc123456789";
-        let msgs = vec![Message::user("hello"), Message::assistant("world")];
+        let origin = coda_llm::MessageOrigin {
+            kind: coda_llm::MessageOriginKind::TaskCompletion,
+            message_id: Some("m1".into()),
+            task_id: Some("task-00000001".into()),
+            presentation_item_id: Some("task:engine-a:task-00000001".into()),
+        };
+        let msgs = vec![
+            Message::user("hello"),
+            Message::assistant("world"),
+            Message::user("[task-completed] taskId=task-00000001").with_origin(Some(origin.clone())),
+        ];
         make_session(&export_dir, id, &msgs).await;
 
         let bundle = export_svc.export(id, Utc::now()).await.unwrap();
-        assert_eq!(bundle.turns.len(), 2);
+        assert_eq!(bundle.turns.len(), 3);
 
         let bundle_path = export_dir.path().join("export.coda-session.json");
         export_svc.write_bundle(&bundle, &bundle_path, false).await.unwrap();
@@ -549,9 +567,11 @@ mod tests {
 
         let store = SessionTranscriptStore::new(import_dir.path());
         let loaded = store.load(id).await.unwrap();
-        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.len(), 3);
         assert_eq!(loaded[0].text(), "hello");
         assert_eq!(loaded[1].text(), "world");
+        assert_eq!(loaded[0].origin, None);
+        assert_eq!(loaded[2].origin, Some(origin), "a runtime message stays one across export/import");
         // The reported id must actually be resumable, not just readable by
         // its own name — i.e. it must show up wherever a resume picker looks.
         assert!(

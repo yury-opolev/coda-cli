@@ -945,6 +945,27 @@ impl MessageBus {
         context: Option<String>,
         idempotency_key: Option<String>,
     ) -> Result<AskReceipt, AskMainError> {
+        let presentation_item_id = match (source, self.presentation_scope.get()) {
+            (MessageSource::TaskCompletion { task_id, .. }, Some(scope)) => {
+                Some(crate::tasks::completion_push::task_presentation_item_id(scope, task_id))
+            }
+            _ => None,
+        };
+        self.publish_main_as(source, body, context, idempotency_key, presentation_item_id)
+    }
+
+    /// [`Self::publish_main`] with the presentation identity given rather
+    /// than derived from this bus's scope: a main-inbox item saved across a
+    /// planned restart keeps the record id of the engine that first accepted
+    /// it, because a restarted engine reuses task numbers.
+    pub fn publish_main_as(
+        &self,
+        source: &MessageSource,
+        body: impl Into<String>,
+        context: Option<String>,
+        idempotency_key: Option<String>,
+        presentation_item_id: Option<String>,
+    ) -> Result<AskReceipt, AskMainError> {
         let body = body.into();
         if body.trim().is_empty() {
             return Err(AskMainError::EmptyBody);
@@ -1030,12 +1051,7 @@ impl MessageBus {
             body: body.clone(),
             context: context.clone(),
             idempotency_key: idempotency_key.clone(),
-            presentation_item_id: match (source, self.presentation_scope.get()) {
-                (MessageSource::TaskCompletion { task_id, .. }, Some(scope)) => {
-                    Some(crate::tasks::completion_push::task_presentation_item_id(scope, task_id))
-                }
-                _ => None,
-            },
+            presentation_item_id,
             scope_id: scope_id.clone(),
         };
 

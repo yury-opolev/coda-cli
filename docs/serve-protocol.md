@@ -336,7 +336,9 @@ and `presentationItemId` — the `itemId` of the presentation record for the sam
 which is the identity to correlate on. A client should show that record rather than the
 entry, while still counting the entry for anchors and fences. The origin is recorded in the
 saved transcript, so it survives a restart, a fork and compaction; transcripts written before
-it existed carry none, and a client must not infer one from text.
+it existed carry none, and a client must not infer one from text. Only `session/getHistory`
+(and the live entries of `session/getState`) carry `runtimeOrigin`; the older flat
+`session/history` / `session/messages` projections do not.
 
 **Internal metadata is not exposed.** History, state, config and MCP projections do not expose a
 `Content::Thinking.signature`, `RedactedThinking` ciphertext, image base64, a provider

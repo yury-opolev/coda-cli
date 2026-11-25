@@ -740,9 +740,10 @@ impl App {
             self.view.note_history_read(cursor);
         }
 
-        // The cards this rebuild will show: the read's own record set when
-        // the engine keeps one, otherwise the records already on screen. A
-        // completion frame whose card is among them is not shown twice.
+        // The cards this rebuild accounts for: the read's own record set when
+        // the engine keeps one (including records held back until the
+        // running turn ends), otherwise the records already on screen. A
+        // completion frame whose card is among them is not shown as well.
         let covered = match &history.presentation {
             Some(timeline) => timeline.records.iter().map(|r| r.item_id.clone()).collect(),
             None => self.state.transcript.record_ids(),

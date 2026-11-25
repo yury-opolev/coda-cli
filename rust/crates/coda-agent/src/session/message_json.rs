@@ -58,7 +58,7 @@ fn serialize_message(msg: &Message) -> Value {
 /// `"origin": { "kind", "messageId"?, "taskId"?, "presentationItemId"? }` —
 /// written only for a message the runtime injected, so the transcript keeps
 /// saying who wrote it after a restart, a fork or a compaction.
-fn serialize_origin(origin: &MessageOrigin) -> Value {
+pub(crate) fn serialize_origin(origin: &MessageOrigin) -> Value {
     let mut obj = Map::new();
     obj.insert("kind".into(), json!(origin.kind.as_str()));
     for (key, value) in [
@@ -75,7 +75,7 @@ fn serialize_origin(origin: &MessageOrigin) -> Value {
 
 /// An origin this build does not understand — an unknown kind, a malformed
 /// value — reads as none: the message is kept, its provenance is not trusted.
-fn deserialize_origin(v: Option<&Value>) -> Option<MessageOrigin> {
+pub(crate) fn deserialize_origin(v: Option<&Value>) -> Option<MessageOrigin> {
     let obj = v?.as_object()?;
     let kind = MessageOriginKind::parse(obj.get("kind")?.as_str()?)?;
     let text = |key: &str| obj.get(key).and_then(Value::as_str).map(str::to_owned);
