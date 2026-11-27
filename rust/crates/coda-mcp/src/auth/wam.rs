@@ -9,7 +9,7 @@
 
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -21,6 +21,7 @@ use windows::Security::Authentication::Web::Core::{
 };
 use windows::Security::Credentials::{WebAccount, WebAccountProvider};
 use windows::Win32::Foundation::{HWND, RPC_E_CHANGED_MODE};
+use windows::Win32::System::Com::CoIncrementMTAUsage;
 use windows::Win32::System::Console::GetConsoleWindow;
 use windows::Win32::System::WinRT::{
     IWebAuthenticationCoreManagerInterop, RoInitialize, RO_INIT_MULTITHREADED,
@@ -175,8 +176,31 @@ fn interactive(
     finish(&result, accounts)
 }
 
+/// Keeps the process MTA — and with it the WAM DLLs behind the activation
+/// factories `windows-core` caches process-wide — alive for the life of the
+/// process.
+///
+/// Without it the MTA is torn down when the last blocking-pool thread that
+/// joined it exits, COM unloads `Windows.Security.Authentication.Web.Core.dll`
+/// about 30 s later, and the next WAM call dereferences the dangling cached
+/// factory (access violation). `windows-core` gives implicit callers the same
+/// guarantee; the explicit `RoInitialize` below bypasses that path.
+fn keep_mta_alive() -> Result<(), BrokerError> {
+    static KEPT: OnceLock<Result<(), String>> = OnceLock::new();
+    KEPT.get_or_init(|| {
+        // SAFETY: plain COM bookkeeping. The cookie is deliberately never
+        // passed to `CoDecrementMTAUsage`.
+        unsafe { CoIncrementMTAUsage() }
+            .map(|_cookie| ())
+            .map_err(|e| e.message().to_string())
+    })
+    .clone()
+    .map_err(|m| BrokerError::Failed(format!("Windows broker could not keep COM initialised: {m}")))
+}
+
 /// Join the WinRT multi-threaded apartment once per (blocking pool) thread.
 fn ensure_mta() -> Result<(), BrokerError> {
+    keep_mta_alive()?;
     thread_local! {
         static INITIALIZED: Cell<bool> = const { Cell::new(false) };
     }
@@ -749,9 +773,60 @@ mod tests {
     }
 
     #[test]
+    fn keep_mta_alive_is_idempotent_across_threads() {
+        keep_mta_alive().expect("first call");
+        keep_mta_alive().expect("second call");
+        std::thread::spawn(|| keep_mta_alive().expect("call on another thread"))
+            .join()
+            .expect("thread panicked");
+        std::thread::spawn(|| ensure_mta().expect("ensure_mta keeps working"))
+            .join()
+            .expect("thread panicked");
+    }
+
+    #[test]
     fn debug_never_shows_the_token() {
         let outcome = success("super-secret-token", Some("1"));
         assert!(!format!("{outcome:?}").contains("super-secret-token"));
+    }
+
+    /// Regression: the WinRT factory `windows-core` caches process-wide must
+    /// stay valid after the thread that first used it (and joined the MTA)
+    /// exits. Before `keep_mta_alive`, the MTA was torn down with that
+    /// thread, COM unloaded the WAM DLL and the second lookup crashed the
+    /// process with an access violation.
+    #[ignore = "talks to the real Windows broker"]
+    #[test]
+    fn real_wam_provider_lookup_survives_mta_thread_exit() {
+        let lookup = || {
+            std::thread::spawn(|| {
+                ensure_mta().expect("join the MTA");
+                let deadline = Instant::now() + SILENT_TIMEOUT;
+                find_provider(
+                    "https://login.microsoftonline.com/organizations",
+                    deadline,
+                    SILENT_TIMEOUT,
+                )
+                .map(|_| ())
+            })
+            .join()
+            .expect("lookup thread panicked")
+        };
+        lookup().expect("first provider lookup");
+        // COM unloads the WAM DLL roughly 30 s after the last MTA thread is
+        // gone. Wait past that point (or until it happens) before the second
+        // lookup, which then goes through the factory `windows-core` cached.
+        let wam_dll = HSTRING::from("Windows.Security.Authentication.Web.Core.dll");
+        for _ in 0..12 {
+            std::thread::sleep(Duration::from_secs(5));
+            // SAFETY: only queries whether a module is loaded.
+            let loaded = unsafe {
+                windows::Win32::System::LibraryLoader::GetModuleHandleW(&wam_dll)
+            }
+            .is_ok();
+            assert!(loaded, "the WAM DLL was unloaded after its MTA thread exited");
+        }
+        lookup().expect("second provider lookup on a fresh thread");
     }
 
     /// Real WAM silent acquisition. Run with
