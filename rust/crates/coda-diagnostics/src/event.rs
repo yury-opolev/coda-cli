@@ -279,11 +279,13 @@ pub enum Event {
     /// `entra-broker` sign-in. `mode` is `silent` or `interactive`; `status`
     /// is a closed label (`success`, `account_switch`, `user_cancel`,
     /// `user_interaction_required`, `account_provider_not_available`,
-    /// `provider_error`, `timeout`, `winrt_error`, `no_console`). Only numbers
+    /// `provider_error`, `no_token` — WAM reported success without a token,
+    /// `timeout`, `winrt_error`, `no_console`). Only numbers
     /// come from the broker: its provider error code and the `AADSTS` number
     /// parsed from its message — never the message, a token or an account.
     /// `account_known` tells whether a specific Windows account was used
-    /// rather than the Windows default account.
+    /// rather than the Windows default account; it is always `false` for
+    /// interactive calls, where the dialog picks the account.
     McpBrokerCall {
         mode: &'static str,
         duration_ms: u64,

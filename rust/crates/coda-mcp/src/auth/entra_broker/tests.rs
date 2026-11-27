@@ -1147,3 +1147,110 @@ async fn http_rejected_token_and_failed_reacquire_report_the_broker_error() {
     assert!(message.contains("broker-down-xyz"), "{message}");
     assert_eq!(unauthenticated.load(Ordering::SeqCst), 0);
 }
+
+// ── log redaction ─────────────────────────────────────────────────────────────
+
+const EUII_MESSAGE: &str = "AADSTS50020: User account 'ada@contoso.com' from identity provider \
+     'https://sts.windows.net/x/' does not exist in tenant 'Contoso'. (0xcaa20005) hint=bob@fabrikam.com";
+
+#[test]
+fn redacted_broker_detail_drops_accounts_and_keeps_codes() {
+    let redacted = redact_broker_detail(EUII_MESSAGE);
+    assert!(!redacted.contains('@'), "{redacted}");
+    assert!(!redacted.contains("ada"), "{redacted}");
+    assert!(!redacted.contains("fabrikam"), "{redacted}");
+    assert!(redacted.starts_with("AADSTS50020: User account '<redacted>' from identity provider"), "{redacted}");
+    assert!(redacted.contains("0xcaa20005"), "{redacted}");
+    assert_eq!(
+        redact_broker_detail("user 'ada' (UPN: \"ada.l@contoso.com\") AADSTS700082 ada%40contoso.com"),
+        "user '<redacted>' (UPN: '<redacted>') AADSTS700082 <redacted>"
+    );
+    let plain = "WAM error 0x80070005: Access is denied. AADSTS53003";
+    assert_eq!(redact_broker_detail(plain), plain);
+}
+
+thread_local! {
+    /// The log buffer of the test running on this thread, if it captures.
+    static CAPTURE: std::cell::RefCell<Option<Arc<Mutex<Vec<u8>>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A process-wide subscriber that writes every event's fields into the
+/// current thread's [`CAPTURE`] buffer, if any.
+struct CaptureSubscriber;
+
+/// Formats an event's fields as ` name=value` pairs.
+struct Fields(String);
+
+impl tracing::field::Visit for Fields {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        use std::fmt::Write as _;
+        let _ = write!(self.0, " {}={value:?}", field.name());
+    }
+}
+
+impl tracing::Subscriber for CaptureSubscriber {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        CAPTURE.with(|c| {
+            if let Some(sink) = c.borrow().as_ref() {
+                let mut fields = Fields(String::new());
+                event.record(&mut fields);
+                let line = format!("{}{}\n", event.metadata().level(), fields.0);
+                sink.lock().unwrap().extend_from_slice(line.as_bytes());
+            }
+        });
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Capture this thread's log output. A process-wide subscriber is used
+/// because a scoped one races with other tests over the callsite interest
+/// cache; events of threads that do not capture are dropped.
+fn capture_logs() -> Arc<Mutex<Vec<u8>>> {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        tracing::subscriber::set_global_default(CaptureSubscriber)
+            .expect("no other global subscriber");
+    });
+    let sink = Arc::new(Mutex::new(Vec::new()));
+    CAPTURE.with(|c| *c.borrow_mut() = Some(Arc::clone(&sink)));
+    sink
+}
+
+// Current-thread runtime: the spawned acquisition logs on this thread too.
+#[tokio::test]
+async fn broker_messages_naming_the_account_are_redacted_in_logs() {
+    let logs = capture_logs();
+
+    let broker = FakeBroker::new();
+    broker
+        .silent(Err(BrokerError::InteractionRequired(EUII_MESSAGE.into())))
+        .interactive(Err(BrokerError::Failed(EUII_MESSAGE.into())));
+    let p = provider(&broker);
+    assert_eq!(token_of(&p).await, None);
+    assert_eq!(broker.interactive_calls(), 1);
+
+    let logged = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert!(logged.contains("broker silent sign-in needs interaction"), "{logged}");
+    assert!(logged.contains("entra-broker auth:"), "{logged}");
+    assert!(logged.contains("AADSTS50020"), "{logged}");
+    assert!(!logged.contains("ada@contoso.com"), "{logged}");
+    assert!(!logged.contains("bob@fabrikam.com"), "{logged}");
+    // The user still sees the broker's full message.
+    assert!(last_error(&p).contains("ada@contoso.com"), "{}", last_error(&p));
+}

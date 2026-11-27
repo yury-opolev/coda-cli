@@ -361,7 +361,10 @@ impl McpHttpClient {
                     response = self.send_once(message).await?;
                 } else if let Some(error) = auth.status().and_then(|s| s.last_error) {
                     // The sign-in failure explains the 401 better than the
-                    // server's own body does.
+                    // server's own body does. Applies to every provider: each
+                    // records a fresh error whenever it cannot resolve a 401
+                    // and clears it once it has a usable token, so this is
+                    // never a stale message.
                     return Err(HttpCallError::Auth(format!(
                         "HTTP 401 from MCP server; sign-in failed: {error}"
                     )));
@@ -738,5 +741,99 @@ mod tests {
         // A wholly non-Latin body is the ordinary case, not an exotic one.
         let jp = "日本語のエラーです。".repeat(40);
         assert!(jp.starts_with(truncate(&jp, 200)));
+    }
+
+    // ── 401 with a failed sign-in (oauth mode) ───────────────────────────────
+
+    /// An MCP server that answers 401 without a bearer token and serves
+    /// `initialize`/`tools/list` with one.
+    fn oauth_server() -> Arc<crate::auth::test_http::RawHandler> {
+        use crate::auth::test_http::{TestRequest, TestResponse};
+        Arc::new(|req: &TestRequest, _port: u16| {
+            if req.header("authorization").is_none() {
+                return TestResponse::json(401, "{}");
+            }
+            let msg: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
+            let Some(id) = msg.get("id").cloned() else {
+                return TestResponse::json(202, "");
+            };
+            let result = match msg.get("method").and_then(|m| m.as_str()) {
+                Some("initialize") => serde_json::json!({
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "fake-oauth", "version": "1" },
+                }),
+                _ => serde_json::json!({ "tools": [] }),
+            };
+            TestResponse::json(
+                200,
+                serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string(),
+            )
+        })
+    }
+
+    fn oauth_provider(
+        url: &str,
+        store: Arc<dyn coda_auth::CredentialStore>,
+    ) -> Arc<crate::auth::McpOAuthProvider> {
+        let config = crate::auth::McpAuthConfig {
+            mode: crate::auth::McpAuthMode::OAuth,
+            ..Default::default()
+        };
+        Arc::new(crate::auth::McpOAuthProvider::new(
+            reqwest::Client::new(),
+            &reqwest::Url::parse(url).unwrap(),
+            store,
+            config,
+            false,
+            None,
+            None,
+        ))
+    }
+
+    async fn connect_test(
+        url: &str,
+        auth: Arc<dyn McpAuthProvider>,
+    ) -> Result<McpHttpClient, McpError> {
+        McpHttpClient::connect_unvetted(
+            "o",
+            url,
+            &HashMap::new(),
+            Some(auth),
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+        )
+        .await
+    }
+
+    /// OAuth records a fresh error on every failed 401 and clears it on any
+    /// usable token, so the "sign-in failed" text is never a stale one.
+    #[tokio::test]
+    async fn oauth_401_reports_the_current_sign_in_error_never_a_stale_one() {
+        let (port, _) = crate::auth::test_http::spawn_raw_server(oauth_server()).await;
+        let url = format!("http://127.0.0.1:{port}/mcp");
+        let store: Arc<dyn coda_auth::CredentialStore> = Arc::new(coda_auth::InMemoryStore::new());
+
+        let p = oauth_provider(&url, Arc::clone(&store));
+        p.record_error("stale-error-xyz");
+        let message = connect_test(&url, p.clone()).await.err().expect("connect must fail").to_string();
+        assert!(message.contains("HTTP 401 from MCP server; sign-in failed:"), "{message}");
+        assert!(message.contains("requires authorization"), "{message}");
+        assert!(!message.contains("stale-error-xyz"), "{message}");
+
+        let token = crate::auth::McpStoredToken {
+            access_token: coda_auth::secret::Secret::new("at".into()),
+            refresh_token: None,
+            expires_at_unix: i64::MAX / 2,
+            scope: String::new(),
+            issuer: "https://as.example.com".into(),
+            client_id: "cid".into(),
+            discovery_issuer: None,
+        };
+        let url_parsed = reqwest::Url::parse(&url).unwrap();
+        let key = format!("mcp-token:{}", crate::auth::canonical_resource_uri(&url_parsed));
+        store.set(&key, &serde_json::to_string(&token).unwrap()).await.unwrap();
+        connect_test(&url, p.clone()).await.expect("connects with the stored token");
+        assert_eq!(p.status_snapshot().last_error, None, "a usable token clears the old error");
     }
 }

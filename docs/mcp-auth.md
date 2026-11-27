@@ -77,8 +77,13 @@ request. Otherwise it discovers them from the server first (below).
    - the account remembered from an earlier sign-in (see *What is stored*), if Windows
      still has it;
    - else, when `account` is configured, the Windows account with that user name
-     (case-insensitive) among the accounts the broker reports for the app's `clientId`,
-     then among all of the provider's accounts;
+     (case-insensitive) among the accounts the broker reports for the app's `clientId`
+     — or, when the app has none or listing them fails, among all of the provider's
+     accounts. Listing accounts has its own short budget (at most **5 s**, a quarter of
+     the silent budget) and never counts against the token request; if it times out or
+     fails, Coda simply goes on with the default account. When the listing answers but
+     no account matches, that is remembered for the rest of the process (per `clientId`
+     and `account`), so the lookup is not repeated on every silent sign-in;
    - else the Windows default account. When `account` is configured but no such
      Windows account is found (or the broker does not allow listing accounts), it is
      still sent as a login hint, but the broker then signs in the **default** account,
@@ -88,12 +93,15 @@ request. Otherwise it discovers them from the server first (below).
    consent, MFA, a new account) does Coda show the broker's own sign-in dialog, parented
    to the console window (its root owner, so it also works under Windows Terminal),
    bounded at **180 s**. Besides the broker's own "interaction required" status, a broker
-   provider error counts as interaction required when it carries `AADSTS50020`, `50055`,
-   `50058`, `50072`, `50074`, `50076`, `50079`, `50133`, `50158`, `50173`, `53000`,
-   `65001`, `65004`, `70043`, `160021` or `700082`, or (without one of those codes)
+   provider error counts as interaction required when it carries `AADSTS50020`, `90072`,
+   `50055`, `50058`, `50072`, `50074`, `50076`, `50079`, `50133`, `50158`, `50173`,
+   `53000`, `65001`, `70043`, `160021` or `700082`, or (without one of those codes)
    `interaction_required`, `consent_required`, `login_required` or `invalid_grant`. Codes a
-   dialog cannot fix (`AADSTS53003` Conditional Access block, `50011`, `50105`, `90002`,
-   `700016`, `7000218`, `901002`) fail straight away. If that dialog is cancelled or fails, Coda does **not** show it
+   dialog cannot fix fail straight away: Conditional Access blocks (`AADSTS53001`,
+   `53002`, `53003`, `530002`, `530003`), declined consent (`65004`), a locked or
+   disabled account (`50053`, `50057`), app registration problems (`50011`, `700016`,
+   `7000112`, `7000218`, `901002`), a user not assigned to the app (`50105`) and an
+   unknown tenant (`90002`). If that dialog is cancelled or fails, Coda does **not** show it
    again automatically: further requests fail with a hint until you run
    `/mcp login <name>`. Without a console window (no terminal attached) it never prompts
    and tells you to run `/mcp login <name>` from an interactive session. The sign-in runs
@@ -108,6 +116,13 @@ request. Otherwise it discovers them from the server first (below).
    failed: … Run `/mcp login …` to retry."). If the server rejects a token and the
    re-acquisition fails, the error reads "HTTP 401 from MCP server; sign-in failed: …".
    The same error is the server's last error in `/mcp` and its `auth error` line.
+   This applies to the broker only: in the browser fallback (`CODA_DISABLE_WAM` set, or
+   not Windows) the first request may still go out without a token, as with
+   `auth.mode: "oauth"`, and a resulting 401 that cannot be resolved also reads
+   "HTTP 401 from MCP server; sign-in failed: …" with the current sign-in error. Broker
+   messages can name your account; that full text is shown to you, but the engine log
+   only ever records it with user names and e-mail addresses replaced by `<redacted>`
+   (`AADSTS` numbers and `0x…` codes are kept).
 5. **Caching.** Tokens are cached in memory, process-wide, keyed by the server's canonical
    resource URI plus the configured `account` (lower-cased, or the default account), so a
    restarted connection reuses the token and two connections never show two dialogs. A
@@ -248,9 +263,11 @@ error message:
 - `mcp_broker_call` — one per Windows broker token call: `mode` (`silent`,
   `interactive`), `status` (`success`, `account_switch`, `user_cancel`,
   `user_interaction_required`, `account_provider_not_available`, `provider_error`,
-  `timeout`, `winrt_error`, `no_console`), `provider_error_code`, the `aadsts` error
+  `no_token` — the broker reported success but returned no token, `timeout`,
+  `winrt_error`, `no_console`), `provider_error_code`, the `aadsts` error
   number, `console_window`, and `account_known` (`true` when a specific Windows account
-  was used, `false` for the Windows default account).
+  was used, `false` for the Windows default account; always `false` for `interactive`
+  calls, where you pick the account in the dialog).
 
 For example, `mcp_broker_call` with `status: user_interaction_required`, `aadsts: 50020`
 and `account_known: false`, followed by `mcp_broker_acquire` with `outcome: no_console`,

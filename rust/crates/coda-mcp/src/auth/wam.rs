@@ -8,7 +8,7 @@
 //! its time budget.
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -48,6 +48,9 @@ pub struct WamBroker {
     /// `WebAccount`s seen so far, by account id (WinRT agile objects, so they
     /// may be used from any MTA thread).
     accounts: Arc<Mutex<HashMap<String, WebAccount>>>,
+    /// Login hints no Windows account matched, so enumeration is not
+    /// repeated on every silent call.
+    no_match: Arc<NoMatchCache>,
     silent_budget: Duration,
     interactive_budget: Duration,
 }
@@ -62,6 +65,7 @@ impl WamBroker {
     pub fn new() -> Self {
         Self {
             accounts: Arc::default(),
+            no_match: Arc::default(),
             silent_budget: SILENT_TIMEOUT,
             interactive_budget: INTERACTIVE_TIMEOUT,
         }
@@ -110,9 +114,10 @@ impl TokenBroker for WamBroker {
     async fn acquire_silent(&self, request: &BrokerRequest) -> Result<BrokerToken, BrokerError> {
         let request = request.clone();
         let accounts = Arc::clone(&self.accounts);
+        let no_match = Arc::clone(&self.no_match);
         let budget = self.silent_budget;
         self.run(budget, "silent", move |deadline, info| {
-            silent(&request, &accounts, deadline, budget, info)
+            silent(&request, &accounts, &no_match, deadline, budget, info)
         })
         .await
     }
@@ -133,9 +138,14 @@ impl TokenBroker for WamBroker {
 
 type AccountCache = Mutex<HashMap<String, WebAccount>>;
 
+/// `(client id, lower-cased login hint)` pairs for which account
+/// enumeration conclusively found no matching Windows account.
+type NoMatchCache = Mutex<HashSet<(String, String)>>;
+
 fn silent(
     request: &BrokerRequest,
     accounts: &AccountCache,
+    no_match: &NoMatchCache,
     deadline: Instant,
     budget: Duration,
     info: &mut CallInfo,
@@ -151,8 +161,13 @@ fn silent(
         // Without a WebAccount, WAM signs in the Windows default account and
         // ignores the login hint, which may be an account of another tenant.
         if let Some(hint) = login_hint(request) {
-            account =
-                find_account_by_hint(&provider, &request.client_id, hint, accounts, deadline, budget);
+            // Enumeration gets its own short budget so it never eats the
+            // token call's time; a failure just means the default account.
+            let (enum_deadline, enum_budget) =
+                enumeration_window(Instant::now(), deadline, budget);
+            account = account_for_hint(no_match, &request.client_id, hint, || {
+                find_account_by_hint(&provider, &request.client_id, hint, accounts, enum_deadline, enum_budget)
+            });
         }
     }
     info.account_known = account.is_some();
@@ -210,17 +225,25 @@ fn interactive(
 /// about 30 s later, and the next WAM call dereferences the dangling cached
 /// factory (access violation). `windows-core` gives implicit callers the same
 /// guarantee; the explicit `RoInitialize` below bypasses that path.
+///
+/// Only success is remembered, so a transient failure is retried on the next
+/// call. Concurrent first callers may each increment the usage count; that is
+/// harmless since it is never decremented.
 fn keep_mta_alive() -> Result<(), BrokerError> {
-    static KEPT: OnceLock<Result<(), String>> = OnceLock::new();
-    KEPT.get_or_init(|| {
-        // SAFETY: plain COM bookkeeping. The cookie is deliberately never
-        // passed to `CoDecrementMTAUsage`.
-        unsafe { CoIncrementMTAUsage() }
-            .map(|_cookie| ())
-            .map_err(|e| e.message().to_string())
-    })
-    .clone()
-    .map_err(|m| BrokerError::Failed(format!("Windows broker could not keep COM initialised: {m}")))
+    static KEPT: OnceLock<()> = OnceLock::new();
+    if KEPT.get().is_some() {
+        return Ok(());
+    }
+    // SAFETY: plain COM bookkeeping. The cookie is deliberately never passed
+    // to `CoDecrementMTAUsage`.
+    unsafe { CoIncrementMTAUsage() }.map_err(|e| {
+        BrokerError::Failed(format!(
+            "Windows broker could not keep COM initialised: {}",
+            e.message()
+        ))
+    })?;
+    let _ = KEPT.set(());
+    Ok(())
 }
 
 /// Join the WinRT multi-threaded apartment once per (blocking pool) thread.
@@ -342,10 +365,111 @@ fn find_all_accounts(
     Ok((status, accounts))
 }
 
-/// The Windows account whose user name is the configured login hint, from
-/// the app's accounts first, then all of the provider's accounts. `None`
-/// when there is no such account or enumeration is unsupported, denied or
-/// fails; the caller then falls back to the default account plus hint.
+/// Upper bound for account enumeration inside one silent call.
+const ENUMERATION_MAX: Duration = Duration::from_secs(5);
+
+/// Deadline and budget of the account enumeration that starts at `start`:
+/// `min(5 s, budget / 4)`, never past the token call's own `deadline`.
+fn enumeration_window(start: Instant, deadline: Instant, budget: Duration) -> (Instant, Duration) {
+    let limit = ENUMERATION_MAX.min(budget / 4);
+    ((start + limit).min(deadline), limit)
+}
+
+/// The outcome of looking up the configured account among Windows accounts.
+#[derive(Debug, PartialEq, Eq)]
+enum HintLookup<A> {
+    Found(A),
+    /// Enumeration answered (possibly "not allowed") and no account matched.
+    NoMatch,
+    /// Enumeration failed or timed out before it could answer.
+    Inconclusive,
+}
+
+/// One account enumeration answer: whether WAM reported `Success`, and the
+/// accounts with their user names.
+struct Listing<A> {
+    success: bool,
+    accounts: Vec<(String, A)>,
+}
+
+/// The account for `hint`, unless an earlier lookup for the same client id
+/// and hint conclusively found none (remembered for the process lifetime).
+fn account_for_hint<A>(
+    no_match: &NoMatchCache,
+    client_id: &str,
+    hint: &str,
+    lookup: impl FnOnce() -> HintLookup<A>,
+) -> Option<A> {
+    let key = (client_id.to_owned(), hint.trim().to_lowercase());
+    if no_match.lock().unwrap_or_else(PoisonError::into_inner).contains(&key) {
+        return None;
+    }
+    match lookup() {
+        HintLookup::Found(account) => Some(account),
+        HintLookup::NoMatch => {
+            no_match.lock().unwrap_or_else(PoisonError::into_inner).insert(key);
+            None
+        }
+        HintLookup::Inconclusive => None,
+    }
+}
+
+/// Search the app's accounts (`by_client_id`), then all of the provider's,
+/// for the account named `hint`. Stops at the first scope that answers
+/// `Success` with at least one account, and when `deadline` passes.
+fn lookup_by_hint<A>(
+    hint: &str,
+    deadline: Instant,
+    mut enumerate: impl FnMut(bool) -> Result<Listing<A>, BrokerError>,
+) -> HintLookup<A> {
+    let mut answered = false;
+    for by_client_id in [true, false] {
+        match enumerate(by_client_id) {
+            Ok(Listing { success, mut accounts }) => {
+                let names: Vec<String> = accounts.iter().map(|(name, _)| name.clone()).collect();
+                let index = matching_account(&names, hint);
+                tracing::debug!(
+                    by_client_id,
+                    success,
+                    accounts = accounts.len(),
+                    matched = index.is_some(),
+                    "WAM account enumeration for the configured account"
+                );
+                if let Some(i) = index {
+                    return HintLookup::Found(accounts.swap_remove(i).1);
+                }
+                answered = true;
+                // The app's accounts are authoritative when there are any; an
+                // empty list (the app never signed in) says nothing yet.
+                if success && !accounts.is_empty() {
+                    return HintLookup::NoMatch;
+                }
+            }
+            Err(e) => {
+                answered = false;
+                tracing::debug!(
+                    by_client_id,
+                    timeout = matches!(e, BrokerError::Timeout(_)),
+                    "WAM account enumeration failed"
+                );
+            }
+        }
+        if Instant::now() >= deadline {
+            return HintLookup::Inconclusive;
+        }
+    }
+    if answered {
+        HintLookup::NoMatch
+    } else {
+        HintLookup::Inconclusive
+    }
+}
+
+/// The Windows account whose user name is the configured login hint (see
+/// [`lookup_by_hint`]), cached by id when found. When enumeration fails or
+/// times out ([`HintLookup::Inconclusive`]), is not allowed or finds nothing
+/// ([`HintLookup::NoMatch`]), the caller falls back to the default account
+/// plus hint.
 fn find_account_by_hint(
     provider: &WebAccountProvider,
     client_id: &str,
@@ -353,45 +477,27 @@ fn find_account_by_hint(
     accounts: &AccountCache,
     deadline: Instant,
     budget: Duration,
-) -> Option<WebAccount> {
-    for scope in [Some(client_id), None] {
-        match find_all_accounts(provider, scope, deadline, budget) {
-            Ok((status, found)) => {
-                let names: Vec<String> = found
-                    .iter()
-                    .map(|a| a.UserName().map(|u| u.to_string()).unwrap_or_default())
-                    .collect();
-                let index = matching_account(&names, hint);
-                tracing::debug!(
-                    by_client_id = scope.is_some(),
-                    status = status.0,
-                    accounts = found.len(),
-                    matched = index.is_some(),
-                    "WAM account enumeration for the configured account"
-                );
-                if let Some(account) = index.and_then(|i| found.into_iter().nth(i)) {
-                    if let Ok(id) = account.Id() {
-                        accounts
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .insert(id.to_string(), account.clone());
-                    }
-                    return Some(account);
-                }
-            }
-            Err(e) => {
-                tracing::debug!(
-                    by_client_id = scope.is_some(),
-                    timeout = matches!(e, BrokerError::Timeout(_)),
-                    "WAM account enumeration failed"
-                );
-            }
-        }
-        if Instant::now() >= deadline {
-            break;
+) -> HintLookup<WebAccount> {
+    let lookup = lookup_by_hint(hint, deadline, |by_client_id| {
+        let scope = by_client_id.then_some(client_id);
+        let (status, found) = find_all_accounts(provider, scope, deadline, budget)?;
+        Ok(Listing {
+            success: status == FindAllWebAccountsStatus::Success,
+            accounts: found
+                .into_iter()
+                .map(|a| (a.UserName().map(|u| u.to_string()).unwrap_or_default(), a))
+                .collect(),
+        })
+    });
+    if let HintLookup::Found(account) = &lookup {
+        if let Ok(id) = account.Id() {
+            accounts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(id.to_string(), account.clone());
         }
     }
-    None
+    lookup
 }
 
 /// Index of the account whose user name equals `hint`, ignoring case and
@@ -668,20 +774,25 @@ fn map_outcome(outcome: WamOutcome, now: i64) -> Result<BrokerToken, BrokerError
 }
 
 /// `AADSTS` errors an interactive sign-in can resolve: the account is not in
-/// the tenant (50020), no or an expired session (50058, 50133, 50173, 70043,
-/// 700082, 160021), MFA or strong authentication (50072, 50074, 50076,
+/// the tenant (50020, 90072), no or an expired session (50058, 50133, 50173,
+/// 70043, 700082, 160021), MFA or strong authentication (50072, 50074, 50076,
 /// 50079, 50158), an expired password (50055), a device-compliance
-/// remediation (53000) and consent (65001, 65004).
+/// remediation (53000) and consent (65001).
 const INTERACTIVE_AADSTS: &[u32] = &[
-    50020, 50055, 50058, 50072, 50074, 50076, 50079, 50133, 50158, 50173, 53000, 65001, 65004,
-    70043, 160021, 700082,
+    50020, 50055, 50058, 50072, 50074, 50076, 50079, 50133, 50158, 50173, 53000, 65001, 70043,
+    90072, 160021, 700082,
 ];
 
 /// `AADSTS` errors a sign-in cannot fix, even when the message also says
-/// `invalid_grant`: blocked by Conditional Access (53003), a misconfigured
-/// app registration (50011, 700016, 7000218, 901002), a user not assigned to
-/// the app (50105) or an unknown tenant (90002).
-const NON_INTERACTIVE_AADSTS: &[u32] = &[50011, 50105, 53003, 90002, 700016, 7000218, 901002];
+/// `invalid_grant`: blocked by Conditional Access (53001, 53002, 53003,
+/// 530002, 530003), the user declined consent (65004), a locked (50053) or
+/// disabled (50057) account, a misconfigured or disabled app registration
+/// (50011, 700016, 7000112, 7000218, 901002), a user not assigned to the app
+/// (50105) or an unknown tenant (90002).
+const NON_INTERACTIVE_AADSTS: &[u32] = &[
+    50011, 50053, 50057, 50105, 53001, 53002, 53003, 65004, 90002, 530002, 530003, 700016,
+    7000112, 7000218, 901002,
+];
 
 /// OAuth error codes that mean "ask the user".
 const INTERACTIVE_ERRORS: &[&str] =
@@ -719,6 +830,7 @@ struct CallInfo {
     aadsts: Option<u32>,
     console_window: bool,
     /// A specific `WebAccount` was used rather than the default account.
+    /// Always `false` for interactive calls: the dialog picks the account.
     account_known: bool,
 }
 
@@ -732,10 +844,16 @@ impl CallInfo {
 }
 
 /// The closed diagnostics label of a WAM call: the WAM status when a
-/// response was read, else what stopped the call.
+/// response was read (`no_token` when WAM reported success without a
+/// token), else what stopped the call.
 fn call_status(info: &CallInfo, result: &Result<BrokerToken, BrokerError>) -> &'static str {
     if let Some(status) = info.wam_status {
         return match status {
+            WebTokenRequestStatus::Success | WebTokenRequestStatus::AccountSwitch
+                if result.is_err() =>
+            {
+                "no_token"
+            }
             WebTokenRequestStatus::Success => "success",
             WebTokenRequestStatus::AccountSwitch => "account_switch",
             WebTokenRequestStatus::UserCancel => "user_cancel",
@@ -1027,6 +1145,7 @@ mod tests {
         for message in [
             "AADSTS65001: The user or administrator has not consented",
             "AADSTS50020: User account from identity provider does not exist in tenant",
+            "AADSTS90072: User account from external identity provider does not exist in tenant",
             "AADSTS50076: Due to a configuration change you must use MFA",
             "AADSTS700082: The refresh token has expired due to inactivity",
             "AADSTS53000: Device is not in required device state",
@@ -1044,6 +1163,14 @@ mod tests {
             "AADSTS53003: Access has been blocked by Conditional Access policies. invalid_grant",
             "AADSTS50011: The redirect URI does not match",
             "AADSTS700016: Application not found in the directory",
+            "AADSTS65004: User declined to consent to access the app. invalid_grant",
+            "AADSTS530002: Your device is required to be compliant. interaction_required",
+            "AADSTS530003: Your device is required to be managed. interaction_required",
+            "AADSTS53001: Device is not domain joined. invalid_grant",
+            "AADSTS53002: Application used is not an approved application. invalid_grant",
+            "AADSTS50053: The account is locked. invalid_grant",
+            "AADSTS50057: The user account is disabled. invalid_grant",
+            "AADSTS7000112: Application is disabled. invalid_grant",
             "something else entirely",
             "",
         ] {
@@ -1080,9 +1207,16 @@ mod tests {
         let with = |status| CallInfo { wam_status: Some(status), ..CallInfo::default() };
         let err = |e: BrokerError| -> Result<BrokerToken, BrokerError> { Err(e) };
         let failed = err(BrokerError::Failed("x".into()));
-        assert_eq!(call_status(&with(WebTokenRequestStatus::Success), &failed), "success");
+        assert_eq!(call_status(&with(WebTokenRequestStatus::Success), &failed), "no_token");
+        assert_eq!(call_status(&with(WebTokenRequestStatus::AccountSwitch), &failed), "no_token");
+        let token = Ok(BrokerToken {
+            access_token: Secret::new("t".into()),
+            expires_at_unix: 0,
+            account: None,
+        });
+        assert_eq!(call_status(&with(WebTokenRequestStatus::Success), &token), "success");
         assert_eq!(
-            call_status(&with(WebTokenRequestStatus::AccountSwitch), &failed),
+            call_status(&with(WebTokenRequestStatus::AccountSwitch), &token),
             "account_switch"
         );
         assert_eq!(call_status(&with(WebTokenRequestStatus::UserCancel), &failed), "user_cancel");
@@ -1143,6 +1277,92 @@ mod tests {
     }
 
     #[test]
+    fn enumeration_gets_a_short_budget_inside_the_call_deadline() {
+        let start = Instant::now();
+        let far = start + Duration::from_secs(60);
+        assert_eq!(
+            enumeration_window(start, far, Duration::from_secs(30)),
+            (start + Duration::from_secs(5), Duration::from_secs(5))
+        );
+        assert_eq!(
+            enumeration_window(start, far, Duration::from_secs(8)),
+            (start + Duration::from_secs(2), Duration::from_secs(2))
+        );
+        let near = start + Duration::from_secs(1);
+        assert_eq!(enumeration_window(start, near, Duration::from_secs(30)).0, near);
+    }
+
+    fn listing(success: bool, names: &[&str]) -> Result<Listing<String>, BrokerError> {
+        Ok(Listing {
+            success,
+            accounts: names.iter().map(|n| (n.to_string(), format!("acct:{n}"))).collect(),
+        })
+    }
+
+    /// Runs [`lookup_by_hint`] over scripted answers (app scope first),
+    /// returning the outcome and how many scopes were asked.
+    fn lookup(
+        answers: Vec<Result<Listing<String>, BrokerError>>,
+        deadline: Instant,
+    ) -> (HintLookup<String>, usize) {
+        let mut answers = answers.into_iter();
+        let mut calls = 0;
+        let result = lookup_by_hint("ada@contoso.com", deadline, |_| {
+            calls += 1;
+            answers.next().expect("unexpected enumeration")
+        });
+        (result, calls)
+    }
+
+    #[test]
+    fn hint_lookup_stops_at_the_first_conclusive_scope() {
+        let later = Instant::now() + Duration::from_secs(60);
+        assert_eq!(
+            lookup(vec![listing(true, &["Ada@contoso.com"])], later),
+            (HintLookup::Found("acct:Ada@contoso.com".into()), 1)
+        );
+        assert_eq!(
+            lookup(vec![listing(true, &["bob@contoso.com"])], later),
+            (HintLookup::NoMatch, 1),
+            "a Success listing of the app's accounts is not followed by a full listing"
+        );
+        assert_eq!(
+            lookup(vec![listing(true, &[]), listing(true, &["ada@contoso.com"])], later),
+            (HintLookup::Found("acct:ada@contoso.com".into()), 2)
+        );
+        assert_eq!(
+            lookup(vec![Err(BrokerError::Timeout(ENUMERATION_MAX)), listing(false, &[])], later),
+            (HintLookup::NoMatch, 2)
+        );
+        assert_eq!(
+            lookup(vec![listing(true, &[]), Err(BrokerError::Failed("x".into()))], later),
+            (HintLookup::Inconclusive, 2)
+        );
+        assert_eq!(
+            lookup(vec![listing(true, &[])], Instant::now()),
+            (HintLookup::Inconclusive, 1),
+            "no second scope once the enumeration budget is spent"
+        );
+    }
+
+    #[test]
+    fn a_hint_without_a_match_is_not_looked_up_again() {
+        let cache = NoMatchCache::default();
+        let mut calls = 0;
+        let mut run = |client: &str, hint: &str, outcome: fn() -> HintLookup<u8>| {
+            account_for_hint(&cache, client, hint, || {
+                calls += 1;
+                outcome()
+            })
+        };
+        assert_eq!(run("c", "ada@contoso.com", || HintLookup::Inconclusive), None);
+        assert_eq!(run("c", "ada@contoso.com", || HintLookup::NoMatch), None);
+        assert_eq!(run("c", " ADA@contoso.com ", || panic!("cached")), None);
+        assert_eq!(run("other", "ada@contoso.com", || HintLookup::Found(7)), Some(7));
+        assert_eq!(calls, 3, "only the cached (client id, hint) pair skipped enumeration");
+    }
+
+    #[test]
     fn keep_mta_alive_is_idempotent_across_threads() {
         keep_mta_alive().expect("first call");
         keep_mta_alive().expect("second call");
@@ -1165,6 +1385,10 @@ mod tests {
     /// exits. Before `keep_mta_alive`, the MTA was torn down with that
     /// thread, COM unloaded the WAM DLL and the second lookup crashed the
     /// process with an access violation.
+    ///
+    /// Run it alone (`cargo test -p coda-mcp real_wam_provider_lookup --
+    /// --ignored`): other tests in the same process can keep the MTA alive
+    /// and mask the bug.
     #[ignore = "talks to the real Windows broker"]
     #[test]
     fn real_wam_provider_lookup_survives_mta_thread_exit() {

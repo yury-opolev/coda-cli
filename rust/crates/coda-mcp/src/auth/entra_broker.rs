@@ -122,6 +122,40 @@ fn failure_outcome(error: &BrokerError) -> &'static str {
     }
 }
 
+/// A broker (or sign-in) message fit for logs: user names and other
+/// account identifiers are replaced by `<redacted>`, while `AADSTS` numbers,
+/// `0x` codes and the rest of the text are kept.
+///
+/// Broker messages may name the account (e.g. AADSTS50020 "User account
+/// 'ada@contoso.com' from identity provider … does not exist"). The full text
+/// stays in `last_error`, which only the user sees; every log line uses this.
+pub(crate) fn redact_broker_detail(msg: &str) -> String {
+    static PATTERNS: std::sync::OnceLock<[(regex::Regex, &'static str); 2]> =
+        std::sync::OnceLock::new();
+    let patterns = PATTERNS.get_or_init(|| {
+        [
+            // A quoted name after an account-ish word: "User account '…'",
+            // "user '…'", "login_hint \"…\"", "UPN: '…'".
+            (
+                regex::Regex::new(
+                    r#"(?i)\b(user\s+account|account|user(?:\s*name)?|upn|login_?hint|identity)(\s*[:=]?\s*)(?:'[^']*'|"[^"]*")"#,
+                )
+                .expect("valid account pattern"),
+                "$1$2'<redacted>'",
+            ),
+            // Anything that looks like an e-mail address or UPN.
+            (
+                regex::Regex::new(r#"[^\s'"<>(),;\[\]{}]*(?:@|%40)[^\s'"<>(),;\[\]{}]*"#)
+                    .expect("valid address pattern"),
+                "<redacted>",
+            ),
+        ]
+    });
+    patterns
+        .iter()
+        .fold(msg.to_owned(), |text, (re, with)| re.replace_all(&text, *with).into_owned())
+}
+
 type FlightGuard = tokio::sync::OwnedMutexGuard<()>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -303,7 +337,7 @@ impl Inner {
             state.last_error = Some(msg.clone());
             changed
         };
-        tracing::debug!(server = %self.name(), "entra-broker auth: {msg}");
+        tracing::debug!(server = %self.name(), "entra-broker auth: {}", redact_broker_detail(&msg));
         if changed {
             self.log(&msg);
         }
@@ -619,7 +653,11 @@ impl Inner {
                 return Ok(self.accept(token).await);
             }
             Err(BrokerError::InteractionRequired(detail)) => {
-                tracing::debug!(server = %name, %detail, "broker silent sign-in needs interaction");
+                tracing::debug!(
+                    server = %name,
+                    detail = %redact_broker_detail(&detail),
+                    "broker silent sign-in needs interaction"
+                );
             }
             Err(e) => {
                 report.outcome = failure_outcome(&e);
