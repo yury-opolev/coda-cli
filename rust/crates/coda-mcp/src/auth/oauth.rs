@@ -855,6 +855,7 @@ mod tests {
             client_id: None,
             scopes: vec!["config_scope".into()],
             bearer_token: None,
+            ..Default::default()
         };
         let as_meta = make_as_meta(vec!["as_scope"]);
         let scopes = select_scopes(None, &config, None, &as_meta);

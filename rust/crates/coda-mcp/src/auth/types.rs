@@ -30,6 +30,21 @@ pub enum McpAuthMode {
     /// Run the MCP OAuth flow (discovery + PKCE) on a 401 challenge.
     #[default]
     OAuth,
+    /// Acquire Entra ID tokens through the OS broker (WAM on Windows), falling
+    /// back to the browser OAuth flow.
+    EntraBroker,
+}
+
+impl McpAuthMode {
+    /// Stable lowercase label used in config and status surfaces.
+    pub fn label(self) -> &'static str {
+        match self {
+            McpAuthMode::None => "none",
+            McpAuthMode::Bearer => "bearer",
+            McpAuthMode::OAuth => "oauth",
+            McpAuthMode::EntraBroker => "entra-broker",
+        }
+    }
 }
 
 // ── McpAuthConfig ─────────────────────────────────────────────────────────────
@@ -38,7 +53,7 @@ pub enum McpAuthMode {
 ///
 /// When the `auth` block is absent, defaults to `McpAuthMode::OAuth` so a 401
 /// transparently triggers the discovery flow (mirrors `McpAuthConfig.Default`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct McpAuthConfig {
     pub mode: McpAuthMode,
     /// Configured OAuth client id; takes precedence over Dynamic Client Registration.
@@ -48,13 +63,31 @@ pub struct McpAuthConfig {
     /// Static bearer token (used when `mode == Bearer`).
     /// Wrapped in `Secret<String>` so it is redacted in `Debug` output.
     pub bearer_token: Option<Secret<String>>,
+    /// Entra tenant override (GUID, domain, `organizations`, ...).
+    pub tenant: Option<String>,
+    /// Preferred account (login hint) for the Entra broker.
+    pub account: Option<String>,
+    /// Loopback redirect-URI template for the browser flow, e.g.
+    /// `http://localhost/callback` (port chosen at runtime when omitted).
+    pub redirect_uri: Option<String>,
 }
 
 impl McpAuthConfig {
     /// Default: OAuth mode, no pre-configured client id, scopes, or token.
     pub fn oauth_default() -> Self {
-        Self { mode: McpAuthMode::OAuth, client_id: None, scopes: Vec::new(), bearer_token: None }
+        Self::default()
     }
+}
+
+// ── McpAuthStatus ─────────────────────────────────────────────────────────────
+
+/// Secret-free auth state for status surfaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpAuthStatus {
+    pub mode: McpAuthMode,
+    pub account: Option<String>,
+    pub expires_at_unix: Option<i64>,
+    pub last_error: Option<String>,
 }
 
 // ── ProtectedResourceMetadata ─────────────────────────────────────────────────

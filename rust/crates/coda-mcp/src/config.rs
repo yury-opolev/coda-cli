@@ -359,8 +359,16 @@ pub(crate) fn parse_auth_config(def: &Value) -> crate::auth::types::McpAuthConfi
     let parsed_mode = match mode.map(|m| m.to_ascii_lowercase()).as_deref() {
         Some("none") => McpAuthMode::None,
         Some("bearer") => McpAuthMode::Bearer,
+        Some("entra-broker" | "entra_broker" | "entrabroker") => McpAuthMode::EntraBroker,
         _ => McpAuthMode::OAuth,
     };
+
+    let non_empty = |key: &str| {
+        auth.get(key).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned)
+    };
+    let tenant = non_empty("tenant");
+    let account = non_empty("account");
+    let redirect_uri = non_empty("redirectUri");
 
     let client_id = auth
         .get("clientId")
@@ -385,7 +393,15 @@ pub(crate) fn parse_auth_config(def: &Value) -> crate::auth::types::McpAuthConfi
         .filter(|s| !s.is_empty())
         .map(|s| Secret::new(s.to_owned()));
 
-    McpAuthConfig { mode: parsed_mode, client_id, scopes, bearer_token }
+    McpAuthConfig {
+        mode: parsed_mode,
+        client_id,
+        scopes,
+        bearer_token,
+        tenant,
+        account,
+        redirect_uri,
+    }
 }
 
 /// Resolve the standard `.mcp.json` paths from a project root.
@@ -560,6 +576,55 @@ mod tests {
         assert_eq!(stdio[0].env["K"], "V");
         assert_eq!(http.len(), 1);
         assert_eq!(http[0].headers["X"], "y");
+    }
+
+    #[test]
+    fn parse_auth_config_entra_broker_reads_all_fields() {
+        use crate::auth::types::McpAuthMode;
+        let def: Value = serde_json::json!({"auth": {
+            "mode": "entra-broker",
+            "clientId": "cid",
+            "scopes": ["api://x/.default"],
+            "tenant": "contoso.onmicrosoft.com",
+            "account": "user@contoso.com",
+            "redirectUri": "http://localhost/callback"
+        }});
+        let cfg = parse_auth_config(&def);
+        assert_eq!(cfg.mode, McpAuthMode::EntraBroker);
+        assert_eq!(cfg.client_id.as_deref(), Some("cid"));
+        assert_eq!(cfg.scopes, vec!["api://x/.default".to_string()]);
+        assert_eq!(cfg.tenant.as_deref(), Some("contoso.onmicrosoft.com"));
+        assert_eq!(cfg.account.as_deref(), Some("user@contoso.com"));
+        assert_eq!(cfg.redirect_uri.as_deref(), Some("http://localhost/callback"));
+    }
+
+    #[test]
+    fn parse_auth_config_entra_broker_aliases_are_case_insensitive() {
+        use crate::auth::types::McpAuthMode;
+        for mode in ["entra-broker", "ENTRA_BROKER", "EntraBroker", "entrabroker"] {
+            let def = serde_json::json!({"auth": {"mode": mode}});
+            assert_eq!(parse_auth_config(&def).mode, McpAuthMode::EntraBroker, "mode {mode}");
+        }
+    }
+
+    #[test]
+    fn parse_auth_config_reads_redirect_uri_for_oauth_and_ignores_empty_strings() {
+        use crate::auth::types::McpAuthMode;
+        let def = serde_json::json!({"auth": {
+            "mode": "oauth", "redirectUri": "http://127.0.0.1:8400/cb", "tenant": "", "account": ""
+        }});
+        let cfg = parse_auth_config(&def);
+        assert_eq!(cfg.mode, McpAuthMode::OAuth);
+        assert_eq!(cfg.redirect_uri.as_deref(), Some("http://127.0.0.1:8400/cb"));
+        assert_eq!(cfg.tenant, None);
+        assert_eq!(cfg.account, None);
+    }
+
+    #[test]
+    fn parse_auth_config_unknown_mode_is_oauth() {
+        use crate::auth::types::McpAuthMode;
+        let def = serde_json::json!({"auth": {"mode": "kerberos"}});
+        assert_eq!(parse_auth_config(&def).mode, McpAuthMode::OAuth);
     }
 
     struct TempDir(PathBuf);

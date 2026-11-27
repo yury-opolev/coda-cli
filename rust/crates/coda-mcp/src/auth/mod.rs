@@ -9,6 +9,7 @@
 //! protected-resource metadata and RFC 8414 / OIDC authorization-server
 //! metadata) and drives Dynamic Client Registration (RFC 7591).
 
+pub mod entra;
 pub mod metadata_client;
 pub mod oauth;
 pub mod provider;
@@ -18,7 +19,7 @@ pub use metadata_client::McpAuthMetadataClient;
 pub use oauth::{McpOAuthProvider, McpOAuthReauthenticator};
 pub use provider::{McpAuthProvider, StaticBearerAuthProvider};
 pub use types::{
-    AuthorizationServerMetadata, McpAuthConfig, McpAuthMode, McpAuthResult,
+    AuthorizationServerMetadata, McpAuthConfig, McpAuthMode, McpAuthResult, McpAuthStatus,
     McpClientRegistration, McpStoredToken, ProtectedResourceMetadata,
     WwwAuthenticateChallenge, canonical_resource_uri,
 };

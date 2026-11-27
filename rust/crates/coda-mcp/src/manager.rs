@@ -886,7 +886,9 @@ async fn connect_one_http(
                 }
             }
         }
-        McpAuthMode::OAuth => {
+        // Entra-broker servers use the browser OAuth provider until the broker
+        // provider is wired in; the browser flow is its fallback anyway.
+        McpAuthMode::OAuth | McpAuthMode::EntraBroker => {
             match credential_store {
                 Some(store) => {
                     // Non-interactive: use cached tokens from the credential store.
