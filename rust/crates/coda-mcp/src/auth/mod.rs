@@ -20,6 +20,8 @@ pub mod provider;
 #[cfg(test)]
 pub(crate) mod test_http;
 pub mod types;
+#[cfg(windows)]
+mod wam;
 
 pub use broker::{
     BrokerAccount, BrokerError, BrokerRequest, BrokerToken, BrokerTokenCache, TokenBroker,

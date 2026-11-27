@@ -114,7 +114,7 @@ pub fn default_broker() -> Arc<dyn TokenBroker> {
 // The single place where the Windows WAM broker is plugged in.
 #[cfg(windows)]
 fn platform_broker() -> Arc<dyn TokenBroker> {
-    Arc::new(UnavailableBroker::new("the Windows broker is not supported in this build"))
+    Arc::new(super::wam::WamBroker::new())
 }
 
 #[cfg(not(windows))]

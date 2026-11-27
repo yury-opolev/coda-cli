@@ -117,7 +117,8 @@ interactively. Tokens are not persisted — the broker owns refresh.
 - Provider: `FindAccountProviderWithAuthorityAsync("https://login.microsoft.com", authority)`
   where authority is `organizations` or the tenant authority URL.
 - `WebTokenRequest(provider, scopes joined by space, clientId)` with prompt type
-  `Default` (the broker shows its own picker/consent only when needed), properties: `wam_compat=2.0`, `api-version=2.0`,
+  `Default` (the broker shows its own picker/consent only when needed), properties: `wam_compat=2.0`
+  (not `api-version=2.0`: together with `wam_compat` Entra rejects the request with AADSTS901002),
   `authority=<authority URL>`, `LoginHint=<account>` when configured.
 - Silent: with a known `WebAccount` (from the cache / persisted id via
   `FindAccountAsync`) → `GetTokenSilentlyWithWebAccountAsync`; otherwise
@@ -127,8 +128,9 @@ interactively. Tokens are not persisted — the broker owns refresh.
   `InteractionRequired`; `UserCancel` → `Cancelled`;
   `AccountProviderNotAvailable` → `Unavailable`; `ProviderError` → `Failed`
   with the provider error code/message (AADSTS text).
-- Expiry: response property `TokenExpiresOn` (unix seconds) → JWT `exp` →
-  now + 1 h.
+- Expiry: response property `TokenExpiresOn` (seconds since 1601-01-01, the
+  Windows epoch, as observed from the Entra WAM plugin; plain unix seconds are
+  accepted too) → JWT `exp` → now + 1 h.
 - COM: each call runs on a `spawn_blocking` thread that initialises the MTA.
 
 ### Brokered redirect URI
