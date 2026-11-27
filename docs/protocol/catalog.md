@@ -36,8 +36,8 @@ might infer from its name. Unsupported operations are listed separately.
 | `shutdown` | Reusable | Stop this engine; not a user/browser detach operation. |
 | `session/prompt` | Reusable | Run one foreground turn; response arrives when execution ends. A concurrent prompt is refused, not queued. |
 | `session/interrupt` | Reusable | Request cancellation of the active turn. Observe terminal state; a request acknowledgement alone is not completion. |
-| `session/steer` | Reusable | Add text to the active turn's inbox; returns a message ID or a rejection reason. No future-job backlog. |
-| `session/recallSteering` | Reusable | Atomically withdraw pending inbox text. Destructive; never use for queue inspection. |
+| `session/steer` | Reusable | Add text — and, with capability `steering.images`, optional `images` (same shape and validation as `session/prompt`) — to the active turn's inbox as one message; returns a message ID or a rejection reason (`noActiveTurn`, `turnEnding`, `emptyText` = neither text nor images, `invalidImage`, `imagesUnsupported`, `attachmentCapacity`, with optional `rejectedDetail`). Queued images are bounded to 32 MiB of base64 in aggregate. A refusal queues nothing. No future-job backlog. |
+| `session/recallSteering` | Reusable | Atomically withdraw pending inbox messages, each with its `images`. Destructive; never use for queue inspection. Queue status (`steering.pending[].images`) carries image metadata only. |
 | `session/getState` | Reusable | Authoritative snapshot with identity, cursor, lifecycle (`initializing`, `ready`, `busy`, `draining`, `stopping`, `stopped`), phase, queue, tools, requests, configuration, usage and limits, plus `drain` progress while a planned restart drains. `sections` filtering is unsupported and rejected. |
 | `session/getEvents` | Reusable | Bounded replay for a matching engine instance. Ring eviction and process replacement are explicit, not silent success. |
 | `session/getHistory` | Reusable | Rich committed history plus optional live projection, with instance/epoch/length fences and bounded pages. |
