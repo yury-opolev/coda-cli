@@ -13,9 +13,10 @@
 //!
 //! # Thread safety
 //!
-//! The manager is `Send + Sync`. Client handles are stored behind an
-//! `Arc<RwLock<…>>` so `call_tool` can be called concurrently from the
-//! agent loop's parallel tool execution paths.
+//! The manager is `Send + Sync`. Client handles are `Arc`s stored behind a
+//! `RwLock`; a request clones its server's handle and releases the lock
+//! before awaiting, so a slow call (or an interactive sign-in behind a 401)
+//! never blocks status reads, restarts or other servers.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -30,8 +31,8 @@ use coda_tool::{Tool, ToolSource};
 
 use crate::auth::entra_broker::INTERACTIVE_TIMEOUT;
 use crate::auth::{
-    EntraBrokerOptions, EntraBrokerProvider, McpAuthMode, McpAuthProvider, McpAuthStatus, McpOAuthProvider,
-    StaticBearerAuthProvider,
+    BrokerTokenCache, EntraBrokerOptions, EntraBrokerProvider, McpAuthMode, McpAuthProvider, McpAuthStatus,
+    McpOAuthProvider, StaticBearerAuthProvider, TokenBroker,
 };
 use crate::client::{McpClient, McpServerInfo, McpToolCallError, McpToolInfo, DEFAULT_CONNECT_TIMEOUT};
 use crate::config::{self, McpConnectable, McpHttpConnectable};
@@ -82,7 +83,7 @@ impl AnyClient {
         }
     }
 
-    async fn shutdown(self, deadline: tokio::time::Instant) -> Result<(), String> {
+    async fn shutdown(&self, deadline: tokio::time::Instant) -> Result<(), String> {
         match self {
             Self::Stdio(c) => c.shutdown(deadline).await,
             Self::Http(c) => {
@@ -123,7 +124,8 @@ impl AnyClient {
 
 /// Per-server state held by the manager.
 struct ServerEntry {
-    client: AnyClient,
+    /// Shared so a request can run without holding the registry lock.
+    client: Arc<AnyClient>,
     /// Child process kept alive as long as the entry exists; `None` for HTTP.
     _process: Option<McpProcess>,
 }
@@ -289,6 +291,14 @@ struct ServerSlot {
     auth: Option<Arc<dyn McpAuthProvider>>,
 }
 
+/// How the manager builds auth providers. Only tests replace the defaults.
+#[derive(Clone, Default)]
+struct AuthWiring {
+    /// Replaces the platform broker and the process-wide broker token cache
+    /// for `entra-broker` servers.
+    broker: Option<(Arc<dyn TokenBroker>, Arc<BrokerTokenCache>)>,
+}
+
 /// Connects configured MCP servers and exposes their tools.
 pub struct McpClientManager {
     /// Per-server slot, protected so `call_tool` is lock-free while the
@@ -299,6 +309,7 @@ pub struct McpClientManager {
     tool_snapshot: std::sync::RwLock<Vec<(String, McpToolInfo)>>,
     tool_timeout: Duration,
     stopping: CancellationToken,
+    auth_wiring: AuthWiring,
 }
 
 impl McpClientManager {
@@ -310,6 +321,7 @@ impl McpClientManager {
             tool_snapshot: std::sync::RwLock::new(Vec::new()),
             tool_timeout: McpClient::resolve_tool_timeout(),
             stopping: CancellationToken::new(),
+            auth_wiring: AuthWiring::default(),
         }
     }
 
@@ -501,8 +513,10 @@ impl McpClientManager {
             .map(|cfg| {
                 let name = cfg.name.clone();
                 let store = credential_store.clone();
+                let wiring = &self.auth_wiring;
                 async move {
-                    let (auth, result) = build_and_connect_http(&cfg, connect_timeout, tool_timeout, store.as_ref()).await;
+                    let (auth, result) =
+                        build_and_connect_http(&cfg, connect_timeout, tool_timeout, store.as_ref(), wiring).await;
                     (name, ServerSpec::Http(Box::new(cfg), store), auth, result)
                 }
             })
@@ -613,17 +627,8 @@ impl McpClientManager {
         tool_name: &str,
         arguments: &serde_json::Value,
     ) -> Result<(String, bool), String> {
-        let guard = self.servers.read().await;
-        let Some(slot) = guard.get(server_name) else {
-            return Err(Self::unknown_server(server_name, &guard));
-        };
-        let Some(entry) = slot.live.as_ref() else {
-            return Err(Self::not_connected(server_name, slot));
-        };
-        let generation = slot.generation;
-
-        let outcome = self.until_shutdown(entry.client.call_tool(tool_name, arguments)).await?;
-        drop(guard);
+        let (client, generation) = self.live_client(server_name).await?;
+        let outcome = self.until_shutdown(client.call_tool(tool_name, arguments)).await?;
         match outcome {
             Ok(pair) => Ok(pair),
             Err(McpToolCallError::Timeout) => Err(format!(
@@ -646,16 +651,38 @@ impl McpClientManager {
         }
     }
 
+    /// The live client of a server and its connection generation, cloned out
+    /// of the registry so the caller does not hold the lock across a request
+    /// (an entra-broker 401 can wait minutes for an interactive sign-in).
+    async fn live_client(&self, server_name: &str) -> Result<(Arc<AnyClient>, u64), String> {
+        let guard = self.servers.read().await;
+        let Some(slot) = guard.get(server_name) else {
+            return Err(Self::unknown_server(server_name, &guard));
+        };
+        let Some(entry) = slot.live.as_ref() else {
+            return Err(Self::not_connected(server_name, slot));
+        };
+        Ok((Arc::clone(&entry.client), slot.generation))
+    }
+
+    /// Live clients of every connected server, cloned out of the registry.
+    async fn live_clients(&self) -> Vec<(String, Arc<AnyClient>)> {
+        let guard = self.servers.read().await;
+        guard
+            .iter()
+            .filter_map(|(name, slot)| slot.live.as_ref().map(|e| (name.clone(), Arc::clone(&e.client))))
+            .collect()
+    }
+
     /// Lists prompts across every connected server, tagged with the server name.
     ///
     /// A server that does not support prompts, or fails to answer, contributes
     /// nothing rather than failing the whole listing — one broken server must
     /// not hide every other server's prompts.
     pub async fn list_prompts(&self) -> Vec<(String, crate::client::McpPromptInfo)> {
-        let guard = self.servers.read().await;
         let mut out = Vec::new();
-        for (name, entry) in guard.iter().filter_map(|(n, s)| s.live.as_ref().map(|e| (n, e))) {
-            let prompts = match self.until_shutdown(entry.client.list_prompts()).await {
+        for (name, client) in self.live_clients().await {
+            let prompts = match self.until_shutdown(client.list_prompts()).await {
                 Ok(prompts) => prompts,
                 Err(error) => {
                     tracing::warn!(%error, "MCP prompt listing interrupted");
@@ -672,10 +699,9 @@ impl McpClientManager {
 
     /// Lists resources across every connected server, tagged with the server name.
     pub async fn list_resources(&self) -> Vec<(String, crate::client::McpResourceInfo)> {
-        let guard = self.servers.read().await;
         let mut out = Vec::new();
-        for (name, entry) in guard.iter().filter_map(|(n, s)| s.live.as_ref().map(|e| (n, e))) {
-            let resources = match self.until_shutdown(entry.client.list_resources()).await {
+        for (name, client) in self.live_clients().await {
+            let resources = match self.until_shutdown(client.list_resources()).await {
                 Ok(resources) => resources,
                 Err(error) => {
                     tracing::warn!(%error, "MCP resource listing interrupted");
@@ -692,26 +718,14 @@ impl McpClientManager {
 
     /// Fetches one prompt's rendered text from a named server.
     pub async fn get_prompt(&self, server_name: &str, prompt_name: &str) -> Result<String, String> {
-        let guard = self.servers.read().await;
-        let Some(slot) = guard.get(server_name) else {
-            return Err(Self::unknown_server(server_name, &guard));
-        };
-        let Some(entry) = slot.live.as_ref() else {
-            return Err(Self::not_connected(server_name, slot));
-        };
-        self.until_shutdown(entry.client.get_prompt(prompt_name)).await?
+        let (client, _) = self.live_client(server_name).await?;
+        self.until_shutdown(client.get_prompt(prompt_name)).await?
     }
 
     /// Reads one resource from a named server.
     pub async fn read_resource(&self, server_name: &str, uri: &str) -> Result<String, String> {
-        let guard = self.servers.read().await;
-        let Some(slot) = guard.get(server_name) else {
-            return Err(Self::unknown_server(server_name, &guard));
-        };
-        let Some(entry) = slot.live.as_ref() else {
-            return Err(Self::not_connected(server_name, slot));
-        };
-        self.until_shutdown(entry.client.read_resource(uri)).await?
+        let (client, _) = self.live_client(server_name).await?;
+        self.until_shutdown(client.read_resource(uri)).await?
     }
 
     /// Restarts one server from its retained launch spec, whatever state it is
@@ -768,7 +782,8 @@ impl McpClientManager {
                     (None, connect_one_stdio(cfg, connect_timeout, tool_timeout).await)
                 }
                 ServerSpec::Http(cfg, store) => {
-                    build_and_connect_http(cfg, connect_timeout, tool_timeout, store.as_ref()).await
+                    build_and_connect_http(cfg, connect_timeout, tool_timeout, store.as_ref(), &self.auth_wiring)
+                        .await
                 }
             }
         };
@@ -813,14 +828,24 @@ impl McpClientManager {
         }
     }
 
-    /// Auth state of every HTTP server that has an auth provider, sorted by
-    /// name. Reads only in-memory provider state.
+    /// Auth state of every HTTP server, sorted by name: its provider's state,
+    /// or `mode: none` for a server that uses no authentication. Reads only
+    /// in-memory provider state.
     pub async fn auth_status(&self) -> Vec<McpServerAuthStatus> {
         let guard = self.servers.read().await;
         let mut statuses: Vec<McpServerAuthStatus> = guard
             .iter()
             .filter_map(|(name, slot)| {
-                let status = slot.auth.as_ref()?.status()?;
+                let status = match (&slot.auth, &slot.spec) {
+                    (Some(auth), _) => auth.status()?,
+                    (None, ServerSpec::Http(cfg, _)) if cfg.auth.mode == McpAuthMode::None => McpAuthStatus {
+                        mode: McpAuthMode::None,
+                        account: None,
+                        expires_at_unix: None,
+                        last_error: None,
+                    },
+                    (None, _) => return None,
+                };
                 Some(McpServerAuthStatus { name: name.clone(), status })
             })
             .collect();
@@ -828,13 +853,12 @@ impl McpClientManager {
         statuses
     }
 
-    /// Launch spec, credential store, live state and current provider of an
-    /// HTTP server that supports sign-in.
+    /// Launch spec, credential store and current provider of an HTTP server
+    /// that supports sign-in.
     async fn sign_in_target(
         &self,
         name: &str,
-    ) -> Result<(McpHttpConnectable, Option<Arc<dyn CredentialStore>>, bool, Option<Arc<dyn McpAuthProvider>>), String>
-    {
+    ) -> Result<(McpHttpConnectable, Option<Arc<dyn CredentialStore>>, Option<Arc<dyn McpAuthProvider>>), String> {
         let guard = self.servers.read().await;
         let Some(slot) = guard.get(name) else {
             return Err(Self::unknown_server(name, &guard));
@@ -851,7 +875,7 @@ impl McpClientManager {
                  change the token in the MCP configuration instead."
             )),
             McpAuthMode::OAuth | McpAuthMode::EntraBroker => {
-                Ok(((**cfg).clone(), store.clone(), slot.live.is_some(), slot.auth.clone()))
+                Ok(((**cfg).clone(), store.clone(), slot.auth.clone()))
             }
         }
     }
@@ -860,8 +884,8 @@ impl McpClientManager {
     /// `oauth`, the OS broker (silent, then interactive) for `entra-broker`.
     /// A server that is not connected is restarted afterwards.
     pub async fn auth_login(&self, name: &str) -> Result<String, String> {
-        let (cfg, store, connected, _) = self.sign_in_target(name).await?;
-        let provider = build_http_auth(&cfg, store.as_ref(), true)?
+        let (cfg, store, _) = self.sign_in_target(name).await?;
+        let provider = build_http_auth(&cfg, store.as_ref(), true, &self.auth_wiring)?
             .ok_or_else(|| format!("MCP server '{name}' has an invalid URL; fix it in the MCP configuration."))?;
         let result = self.until_shutdown(provider.login()).await?;
         if !result.succeeded {
@@ -872,37 +896,44 @@ impl McpClientManager {
             Some(account) => format!("Signed in to MCP server '{name}' as {account}."),
             None => format!("Signed in to MCP server '{name}'."),
         };
-        let needs_restart = !connected && {
-            let mut guard = self.servers.write().await;
-            match guard.get_mut(name) {
-                Some(slot) if slot.live.is_none() => {
-                    slot.auth = Some(provider);
-                    true
-                }
-                _ => false,
-            }
-        };
-        if needs_restart {
-            match self.restart_server(name).await {
-                Ok(report) => {
-                    message.push(' ');
-                    message.push_str(&report.summary(name));
-                }
-                Err(error) => {
-                    message.push_str(&format!(" The server could not be reconnected: {error}"));
-                }
-            }
+        if let Some(reconnect) = self.after_sign_in(name).await {
+            message.push(' ');
+            message.push_str(&reconnect);
         }
         Ok(message)
+    }
+
+    /// Brings a server up to date with a sign-in made by a separate provider:
+    /// a connected server's provider reloads the new token (clearing its
+    /// stale failure and expiry); a server that is not connected is restarted,
+    /// which builds its new provider. Returns what the restart did.
+    async fn after_sign_in(&self, name: &str) -> Option<String> {
+        let live_auth = {
+            let guard = self.servers.read().await;
+            let slot = guard.get(name)?;
+            slot.live.as_ref().map(|_| slot.auth.clone())
+        };
+        match live_auth {
+            Some(auth) => {
+                if let Some(auth) = auth {
+                    let _ = self.until_shutdown(auth.get_access_token()).await;
+                }
+                None
+            }
+            None => Some(match self.restart_server(name).await {
+                Ok(report) => report.summary(name),
+                Err(error) => format!("The server could not be reconnected: {error}"),
+            }),
+        }
     }
 
     /// Signs out of an HTTP server (`/mcp logout`). The live connection is
     /// kept; its next request needs a new sign-in.
     pub async fn auth_logout(&self, name: &str) -> Result<String, String> {
-        let (cfg, store, _, current) = self.sign_in_target(name).await?;
+        let (cfg, store, current) = self.sign_in_target(name).await?;
         let provider = match current {
             Some(provider) => provider,
-            None => build_http_auth(&cfg, store.as_ref(), false)?.ok_or_else(|| {
+            None => build_http_auth(&cfg, store.as_ref(), false, &self.auth_wiring)?.ok_or_else(|| {
                 format!("MCP server '{name}' has an invalid URL; fix it in the MCP configuration.")
             })?,
         };
@@ -985,7 +1016,7 @@ async fn connect_one_stdio(
 ) -> Result<ServerEntry, McpError> {
     let (proc, stdin, stdout) = McpProcess::spawn(config)?;
     let client = McpClient::connect(stdout, stdin, connect_timeout, tool_timeout).await?;
-    Ok(ServerEntry { client: AnyClient::Stdio(client), _process: Some(proc) })
+    Ok(ServerEntry { client: Arc::new(AnyClient::Stdio(client)), _process: Some(proc) })
 }
 
 /// A dead pipe, or an HTTP-style "session not found" answer, means the
@@ -1004,10 +1035,10 @@ fn is_transport_loss(error: &crate::error::McpTransportError) -> bool {
 }
 
 fn auth_http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(AUTH_HTTP_TIMEOUT)
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+    reqwest::Client::builder().timeout(AUTH_HTTP_TIMEOUT).build().unwrap_or_else(|error| {
+        tracing::warn!(%error, "could not build the MCP auth HTTP client; using one without a request timeout");
+        reqwest::Client::new()
+    })
 }
 
 /// Builds the auth provider for one HTTP server.
@@ -1021,6 +1052,7 @@ fn build_http_auth(
     config: &McpHttpConnectable,
     credential_store: Option<&Arc<dyn CredentialStore>>,
     interactive: bool,
+    wiring: &AuthWiring,
 ) -> Result<Option<Arc<dyn McpAuthProvider>>, String> {
     match config.auth.mode {
         McpAuthMode::None => Ok(None),
@@ -1035,10 +1067,17 @@ fn build_http_auth(
         }
         McpAuthMode::OAuth => {
             let Some(store) = credential_store else {
-                return Err("auth.mode is 'oauth' but no credential store is available; \
+                // `/mcp login` itself lands here, so do not point back at it.
+                return Err(if interactive {
+                    "auth.mode is 'oauth' but no credential store is available to keep the \
+                     sign-in; make sure the OS credential store (keyring) is accessible, then \
+                     restart the engine"
+                } else {
+                    "auth.mode is 'oauth' but no credential store is available; \
                      authenticate via `coda auth` or the /mcp commands first, then \
                      restart the engine"
-                    .into());
+                }
+                .into());
             };
             // URL errors are reported by McpHttpClient::connect.
             let Ok(url) = reqwest::Url::parse(&config.url) else {
@@ -1061,11 +1100,15 @@ fn build_http_auth(
             let Ok(url) = reqwest::Url::parse(&config.url) else {
                 return Ok(None);
             };
-            let opts = EntraBrokerOptions {
+            let mut opts = EntraBrokerOptions {
                 store: credential_store.cloned(),
                 allow_interactive: true,
                 ..EntraBrokerOptions::defaults(config.name.as_str())
             };
+            if let Some((broker, cache)) = &wiring.broker {
+                opts.broker = Arc::clone(broker);
+                opts.cache = Arc::clone(cache);
+            }
             let provider = EntraBrokerProvider::new(auth_http_client(), &url, config.auth.clone(), opts)?;
             Ok(Some(Arc::new(provider)))
         }
@@ -1079,8 +1122,9 @@ async fn build_and_connect_http(
     connect_timeout: Duration,
     tool_timeout: Duration,
     credential_store: Option<&Arc<dyn CredentialStore>>,
+    wiring: &AuthWiring,
 ) -> (Option<Arc<dyn McpAuthProvider>>, Result<ServerEntry, McpError>) {
-    match build_http_auth(config, credential_store, false) {
+    match build_http_auth(config, credential_store, false, wiring) {
         Ok(auth) => {
             let result = connect_one_http(config, connect_timeout, tool_timeout, auth.clone()).await;
             (auth, result)
@@ -1109,7 +1153,7 @@ async fn connect_one_http(
         tool_timeout,
     )
     .await?;
-    Ok(ServerEntry { client: AnyClient::Http(client), _process: None })
+    Ok(ServerEntry { client: Arc::new(AnyClient::Http(client)), _process: None })
 }
 
 // ── Test support (hermetic in-memory fake server) ────────────────────────────
@@ -1190,7 +1234,7 @@ pub mod test_support {
                 args: Vec::new(),
                 env: Default::default(),
             })),
-            ServerEntry { client: AnyClient::Stdio(client), _process: None },
+            ServerEntry { client: Arc::new(AnyClient::Stdio(client)), _process: None },
             None,
         );
         manager.rebuild_snapshot(&guard);
@@ -1334,7 +1378,7 @@ mod tests {
                 args: Vec::new(),
                 env: Default::default(),
             })),
-            ServerEntry { client: AnyClient::Stdio(client), _process: None },
+            ServerEntry { client: Arc::new(AnyClient::Stdio(client)), _process: None },
             None,
         );
         manager.rebuild_snapshot(&guard);
@@ -1967,5 +2011,168 @@ mod tests {
         let message = manager.auth_logout("o").await.unwrap();
         assert!(message.contains("Signed out of MCP server 'o'"), "{message}");
         assert_eq!(store.get(&key).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn the_registry_is_not_locked_while_a_tool_call_is_in_flight() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let manager = Arc::new(McpClientManager::new());
+        let (client, input, mut output) = make_client_with_streams(json!([])).await;
+        inject_client(&manager, "slow", client).await;
+        let caller = Arc::clone(&manager);
+        let call = tokio::spawn(async move { caller.call_tool("slow", "wait", &json!({})).await });
+        let mut input = BufReader::new(input);
+        let mut line = String::new();
+        input.read_line(&mut line).await.unwrap();
+        assert!(line.contains("tools/call"), "{line}");
+
+        tokio::time::timeout(Duration::from_millis(500), async {
+            assert_eq!(manager.connected_status().await.len(), 1);
+            manager.auth_status().await;
+            drop(manager.servers.write().await);
+        })
+        .await
+        .expect("a pending tool call must not hold the server registry lock");
+
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let reply = json!({
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": { "content": [{ "type": "text", "text": "done" }], "isError": false }
+        });
+        output.write_all(format!("{reply}\n").as_bytes()).await.unwrap();
+        output.flush().await.unwrap();
+        let (text, is_error) = call.await.unwrap().unwrap();
+        assert_eq!((text.as_str(), is_error), ("done", false));
+    }
+
+    #[tokio::test]
+    async fn a_none_mode_http_server_reports_auth_mode_none() {
+        let manager = McpClientManager::new();
+        manager
+            .connect_http_many(
+                vec![http_server("open", auth_config(McpAuthMode::None))],
+                Some(Duration::from_secs(5)),
+                None,
+            )
+            .await;
+        inject_client(&manager, "stdio", make_client(json!([])).await).await;
+        let statuses = manager.auth_status().await;
+        assert_eq!(
+            statuses,
+            [McpServerAuthStatus {
+                name: "open".into(),
+                status: McpAuthStatus { mode: McpAuthMode::None, account: None, expires_at_unix: None, last_error: None },
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connected_oauth_server_drops_its_stale_error_after_sign_in() {
+        let store = memory_store();
+        let url = reqwest::Url::parse(UNREACHABLE_URL).unwrap();
+        let cfg = http_server("o", auth_config(McpAuthMode::OAuth));
+        let manager = McpClientManager::new();
+        inject_client(&manager, "o", make_client(json!([])).await).await;
+        let provider = McpOAuthProvider::new(
+            reqwest::Client::new(),
+            &url,
+            Arc::clone(&store),
+            cfg.auth.clone(),
+            false,
+            None,
+            None,
+        );
+        provider.record_error("MCP server requires OAuth sign-in");
+        {
+            let mut guard = manager.servers.write().await;
+            let slot = guard.get_mut("o").unwrap();
+            slot.spec = ServerSpec::Http(Box::new(cfg), Some(Arc::clone(&store)));
+            slot.auth = Some(Arc::new(provider));
+        }
+        assert!(manager.auth_status().await[0].status.last_error.is_some());
+
+        // What a successful `/mcp login` leaves behind in the shared store.
+        let token = crate::auth::McpStoredToken {
+            access_token: coda_auth::secret::Secret::new("at".into()),
+            refresh_token: None,
+            expires_at_unix: chrono_now() + 3600,
+            scope: String::new(),
+            issuer: "https://as.example.com".into(),
+            client_id: "cid".into(),
+            discovery_issuer: None,
+        };
+        let key = format!("mcp-token:{}", crate::auth::canonical_resource_uri(&url));
+        store.set(&key, &serde_json::to_string(&token).unwrap()).await.unwrap();
+
+        assert_eq!(manager.after_sign_in("o").await, None, "a connected server is not restarted");
+        let status = &manager.auth_status().await[0].status;
+        assert_eq!(status.last_error, None);
+        assert_eq!(status.expires_at_unix, Some(token.expires_at_unix));
+    }
+
+    fn chrono_now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    struct SigningBroker;
+
+    #[async_trait::async_trait]
+    impl TokenBroker for SigningBroker {
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn can_interact(&self) -> bool {
+            true
+        }
+
+        async fn acquire_silent(&self, _: &crate::auth::BrokerRequest) -> Result<crate::auth::BrokerToken, crate::auth::BrokerError> {
+            Err(crate::auth::BrokerError::InteractionRequired("AADSTS50076".into()))
+        }
+
+        async fn acquire_interactive(
+            &self,
+            _: &crate::auth::BrokerRequest,
+        ) -> Result<crate::auth::BrokerToken, crate::auth::BrokerError> {
+            Ok(crate::auth::BrokerToken {
+                access_token: coda_auth::secret::Secret::new("at".into()),
+                expires_at_unix: chrono_now() + 3600,
+                account: Some(crate::auth::BrokerAccount { id: "acc-1".into(), username: "ada@contoso.com".into() }),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn login_to_a_disconnected_entra_broker_server_signs_in_and_restarts_it() {
+        let manager = McpClientManager {
+            auth_wiring: AuthWiring {
+                broker: Some((Arc::new(SigningBroker), Arc::new(BrokerTokenCache::new()))),
+            },
+            ..McpClientManager::new()
+        };
+        let auth = crate::auth::McpAuthConfig {
+            client_id: Some("cid".into()),
+            tenant: Some("tid".into()),
+            scopes: vec!["api://x/.default".into()],
+            ..auth_config(McpAuthMode::EntraBroker)
+        };
+        let errors = manager
+            .connect_http_many(vec![http_server("e", auth)], Some(Duration::from_secs(5)), Some(memory_store()))
+            .await;
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(manager.auth_status().await[0].status.account, None);
+
+        let message = manager.auth_login("e").await.unwrap();
+        assert!(message.starts_with("Signed in to MCP server 'e' as ada@contoso.com."), "{message}");
+        // Loopback is SSRF-blocked, so the restart that follows is attempted and fails.
+        assert!(message.contains("could not be reconnected: failed to restart 'e'"), "{message}");
+        let status = &manager.auth_status().await[0].status;
+        assert_eq!(status.account.as_deref(), Some("ada@contoso.com"));
+        assert_eq!(status.last_error, None);
+        assert!(manager.servers.read().await["e"].auth.is_some(), "the restart installs the new provider");
     }
 }

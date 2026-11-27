@@ -51,6 +51,10 @@ const SECRET_PREFIX: &str = "coda-secret:";
 /// Longest `lastError` published, in characters, before the ellipsis.
 const MAX_ERROR_CHARS: usize = 200;
 
+/// Longest `mcp/auth` message published: these carry a whole sign-in or
+/// restart outcome, so they get more room than a status field.
+const MAX_MESSAGE_CHARS: usize = 1000;
+
 /// Builds the wire inventory from the file layer plus whatever the running
 /// manager knows.
 ///
@@ -177,6 +181,23 @@ fn auth_dto(auth: &McpServerAuthStatus, raw: Option<&McpRawServer>) -> McpAuthSt
     }
 }
 
+/// Makes an `mcp/auth` result message safe to publish, like a `lastError`
+/// but with a larger length cap. `raw_server` is the configured entry in use,
+/// whose URL, command and env values are redacted when echoed.
+pub(crate) fn sanitise_message(raw_server: Option<&McpRawServer>, msg: &str) -> String {
+    let redacted = match raw_server {
+        Some(raw) => redact_configured(raw, msg),
+        None => msg.to_string(),
+    };
+    sanitise_capped(&redacted, MAX_MESSAGE_CHARS)
+}
+
+/// The configured entry the manager runs for `name`: a project entry shadows
+/// a user entry of the same name.
+pub(crate) fn server_in_use<'a>(configured: &'a [McpRawServer], name: &str) -> Option<&'a McpRawServer> {
+    configured.iter().filter(|s| s.name == name).max_by_key(|s| s.scope == McpScope::Project)
+}
+
 /// Makes a connection error safe to publish: URLs are reduced to scheme + host
 /// + path, control characters become spaces, whitespace is collapsed and the
 /// length capped.
@@ -185,6 +206,10 @@ fn auth_dto(auth: &McpServerAuthStatus, raw: Option<&McpRawServer>) -> McpAuthSt
 /// credential-named `k=v` / `k:v` tokens, and drops the query of schemeless
 /// URL-like tokens.
 fn sanitise_error(raw: &str) -> String {
+    sanitise_capped(raw, MAX_ERROR_CHARS)
+}
+
+fn sanitise_capped(raw: &str, max_chars: usize) -> String {
     const LEADING: &[char] = &['(', '\'', '"', '<', '['];
     const TRAILING: &[char] = &[',', '.', ';', ')', '\'', '"', '>', ']'];
     const SENSITIVE_KEYS: &[&str] =
@@ -222,7 +247,7 @@ fn sanitise_error(raw: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ");
-    match cleaned.char_indices().nth(MAX_ERROR_CHARS) {
+    match cleaned.char_indices().nth(max_chars) {
         Some((end, _)) => format!("{}…", &cleaned[..end]),
         None => cleaned,
     }
@@ -676,5 +701,28 @@ mod tests {
         let faults = [fault("fs", "not connected")];
         let result = build(&[raw("fs", McpScope::User)], Some(&[]), &faults, &[], true);
         assert!(find(&result, "fs").last_error.is_none());
+    }
+
+    #[test]
+    fn an_auth_message_is_sanitised_against_the_entry_in_use() {
+        let mut user = http("docs", "https://user.example.com/mcp?api_key=USER");
+        user.scope = McpScope::User;
+        let mut project = http("docs", "https://mcp.example.com/mcp?api_key=SECRET");
+        project.scope = McpScope::Project;
+        let configured = [user, project];
+        let raw = server_in_use(&configured, "docs");
+        assert!(raw.is_some_and(|r| r.scope == McpScope::Project));
+
+        let message = sanitise_message(
+            raw,
+            "Signed in to MCP server 'docs'. The server could not be reconnected: \
+             failed to restart 'docs': connect to https://mcp.example.com/mcp?api_key=SECRET failed",
+        );
+        assert!(!message.contains("SECRET"), "SECURITY: {message}");
+        assert!(message.contains("https://mcp.example.com/mcp"), "{message}");
+        assert!(message.starts_with("Signed in to MCP server 'docs'."), "{message}");
+        assert!(sanitise_message(None, &"x ".repeat(450)).chars().count() > MAX_ERROR_CHARS);
+        assert!(sanitise_message(None, &"é".repeat(1500)).chars().count() <= MAX_MESSAGE_CHARS + 1);
+        assert!(server_in_use(&configured, "nope").is_none());
     }
 }

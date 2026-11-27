@@ -25,6 +25,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::error::McpTransportError;
 
@@ -55,9 +56,18 @@ pub(crate) struct Connection {
     /// Set (under the `pending` lock) once the reader hit EOF, so a request
     /// registered afterwards fails instead of waiting for a reply that cannot come.
     reader_done: Arc<AtomicBool>,
+    /// Cancelled by [`Connection::close`]: the writer flushes what is queued
+    /// and closes the server's stdin even while other clones are alive.
+    closed: CancellationToken,
 }
 
 impl Connection {
+    /// Closes the outgoing stream (stdin EOF for a stdio server) for every
+    /// clone of this connection. Replies to in-flight requests are still read.
+    pub fn close(&self) {
+        self.closed.cancel();
+    }
+
     /// Sends a request and awaits its response.
     pub async fn request(
         &self,
@@ -145,25 +155,39 @@ where
     let (notif_tx, notif_rx) = mpsc::unbounded_channel::<ServerNotification>();
     let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
     let reader_done = Arc::new(AtomicBool::new(false));
+    let closed = CancellationToken::new();
 
     let connection = Connection {
         outgoing: outgoing_tx,
         pending: Arc::clone(&pending),
         next_id: Arc::new(AtomicI64::new(1)),
         reader_done: Arc::clone(&reader_done),
+        closed: closed.clone(),
     };
 
-    let writer_task = tokio::spawn(write_loop(writer, outgoing_rx));
+    let writer_task = tokio::spawn(write_loop(writer, outgoing_rx, closed));
     let reader_task = tokio::spawn(read_loop(reader, notif_tx, pending, reader_done));
 
     (connection, notif_rx, ConnectionTasks { reader: reader_task, writer: writer_task })
 }
 
-async fn write_loop<W>(mut writer: W, mut outgoing: mpsc::UnboundedReceiver<String>)
-where
+async fn write_loop<W>(
+    mut writer: W,
+    mut outgoing: mpsc::UnboundedReceiver<String>,
+    closed: CancellationToken,
+) where
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    while let Some(line) = outgoing.recv().await {
+    loop {
+        // Queued lines are written before a close is honoured.
+        let line = tokio::select! {
+            biased;
+            line = outgoing.recv() => match line {
+                Some(line) => line,
+                None => break,
+            },
+            _ = closed.cancelled() => break,
+        };
         let data = format!("{line}\n");
         if let Err(e) = writer.write_all(data.as_bytes()).await {
             tracing::debug!(%e, "MCP stdin closed; stopping writer");

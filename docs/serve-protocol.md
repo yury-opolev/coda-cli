@@ -432,17 +432,19 @@ reference does not resolve, which is a different — and unverified — claim. O
 engine already holds may ever populate it; a read must not probe an auth store or wake a keyring
 prompt to find out. `lastError` is optional: the sanitised last connection error for an enabled
 server that is not connected; restart it via the agent's `restart_mcp_server` tool. `auth` is
-optional: for an HTTP server the manager holds an auth provider for, `{ mode, account?,
-expiresAtUnix?, lastError? }` (`mode` is `none`/`bearer`/`oauth`/`entra-broker`, `lastError`
-sanitised) — never a token.
+optional: for an HTTP server the running manager knows, `{ mode, account?, expiresAtUnix?,
+lastError? }` (`mode` is `none`/`bearer`/`oauth`/`entra-broker` — `none` for a server without
+authentication; `lastError` sanitised and cleared once a valid token is in use) — never a token.
 
 **`mcp/auth` signs in or out.** `{ server, action }` with `action` `login` or `logout`.
 Login runs the browser OAuth flow for `oauth` servers and the Windows account broker (silent,
 then interactive) for `entra-broker`; a server that was not connected is restarted afterwards
-and the message says how that went. Logout removes the stored token (`oauth`) or drops the
+and the message says how that went; a connected server keeps its connection and its `auth`
+state picks up the new sign-in. Logout removes the stored token (`oauth`) or drops the
 cached token and pauses automatic sign-in until the next login (`entra-broker`; the Windows
 account itself stays signed in). Unknown servers, stdio servers, `none`/`bearer` servers and
-failed sign-ins answer `ok: false` with an actionable `message`; an engine without an MCP
+failed sign-ins answer `ok: false` with an actionable `message`. Every `message` is sanitised
+like `lastError` (credentials, URL queries and configured values are masked); an engine without an MCP
 manager answers `-32600` "MCP is not running in this engine". Login may take minutes (it waits
 for the user), so clients should use a long request timeout.
 

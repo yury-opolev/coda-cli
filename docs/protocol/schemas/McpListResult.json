@@ -89,7 +89,7 @@
               "type": "null"
             }
           ],
-          "description": "Auth state of an HTTP server the running manager holds a provider\nfor. Never a token."
+          "description": "Auth state of an HTTP server the running manager knows (`mode:\n\"none\"` for one without authentication). Never a token."
         }
       },
       "required": [

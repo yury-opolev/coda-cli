@@ -5607,7 +5607,8 @@ impl ServeBackend for ServeHost {
     }
 
     /// `/mcp login|logout`. An unknown server or a failed sign-in is
-    /// `ok: false` with the manager's message.
+    /// `ok: false` with the manager's message, sanitised like `mcp/list`
+    /// errors (it can echo a server URL or a connect failure).
     async fn mcp_auth(&self, p: McpAuthParams) -> Result<Value, RpcError> {
         use coda_proto::mcp::{McpAuthAction, McpAuthActionResult};
         let Some(manager) = &self.mcp_manager else {
@@ -5617,9 +5618,11 @@ impl ServeBackend for ServeHost {
             McpAuthAction::Login => manager.auth_login(&p.server).await,
             McpAuthAction::Logout => manager.auth_logout(&p.server).await,
         };
+        let configured = self.configured_mcp_servers(!crate::mcp::mcp_disabled());
+        let raw = crate::mcp_list::server_in_use(&configured, &p.server);
         let result = match outcome {
-            Ok(message) => McpAuthActionResult { ok: true, message },
-            Err(message) => McpAuthActionResult { ok: false, message },
+            Ok(message) => McpAuthActionResult { ok: true, message: crate::mcp_list::sanitise_message(raw, &message) },
+            Err(message) => McpAuthActionResult { ok: false, message: crate::mcp_list::sanitise_message(raw, &message) },
         };
         serde_json::to_value(&result).map_err(|e| RpcError::internal(e.to_string()))
     }
@@ -6109,7 +6112,22 @@ impl ServeHost {
     /// credential-store read.
     async fn mcp_inventory(&self) -> coda_proto::mcp::McpListResult {
         let enabled = !crate::mcp::mcp_disabled();
-        let configured = if enabled {
+        let configured = self.configured_mcp_servers(enabled);
+        match &self.mcp_manager {
+            Some(manager) => {
+                let status = manager.connected_status().await;
+                let faults = manager.server_faults().await;
+                let auth = manager.auth_status().await;
+                crate::mcp_list::build(&configured, Some(&status), &faults, &auth, enabled)
+            }
+            None => crate::mcp_list::build(&configured, None, &[], &[], enabled),
+        }
+    }
+
+    /// The MCP servers declared in the user and (unless disabled) project
+    /// files; empty when MCP is disabled.
+    fn configured_mcp_servers(&self, enabled: bool) -> Vec<coda_mcp::config::McpRawServer> {
+        if enabled {
             let (user_mcp, project_mcp) =
                 coda_mcp::config::resolve_paths(std::path::Path::new(&self.working_dir));
             let project_mcp = if crate::mcp::project_mcp_disabled() {
@@ -6120,15 +6138,6 @@ impl ServeHost {
             coda_mcp::config::load_all(&user_mcp, &project_mcp)
         } else {
             Vec::new()
-        };
-        match &self.mcp_manager {
-            Some(manager) => {
-                let status = manager.connected_status().await;
-                let faults = manager.server_faults().await;
-                let auth = manager.auth_status().await;
-                crate::mcp_list::build(&configured, Some(&status), &faults, &auth, enabled)
-            }
-            None => crate::mcp_list::build(&configured, None, &[], &[], enabled),
         }
     }
 

@@ -633,9 +633,12 @@ pub(crate) fn is_needs_interactive_error(msg: &str) -> bool {
 #[async_trait]
 impl McpAuthProvider for McpOAuthProvider {
     async fn get_access_token(&self) -> Option<Secret<String>> {
+        // `load_token` records the expiry; a usable token also supersedes any
+        // earlier failure (e.g. one fixed by `/mcp login` on another provider).
         let stored = self.load_token().await?;
         let now = unix_now();
         if !stored.is_expired(now) {
+            self.clear_error();
             return Some(stored.access_token);
         }
         // Attempt silent refresh.
@@ -1453,6 +1456,23 @@ mod tests {
             .unwrap();
         assert!(fresh.get_access_token().await.is_some());
         assert!(fresh.status_snapshot().expires_at_unix.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_valid_token_clears_a_stale_error_and_refreshes_the_expiry() {
+        let signer = provider(McpAuthConfig::default(), false, "https://mcp.example.com/mcp");
+        let live = provider(McpAuthConfig::default(), false, "https://mcp.example.com/mcp");
+        let live = McpOAuthProvider { store: Arc::clone(&signer.store), ..live };
+        live.record_error("MCP server requires OAuth sign-in");
+        signer
+            .persist_token(Secret::new("at".into()), None, Some(3600), origin("https://as"), "s")
+            .await
+            .unwrap();
+
+        assert!(live.get_access_token().await.is_some());
+        let status = live.status_snapshot();
+        assert_eq!(status.last_error, None);
+        assert!(status.expires_at_unix.is_some_and(|e| e > unix_now()));
     }
 
     #[tokio::test]

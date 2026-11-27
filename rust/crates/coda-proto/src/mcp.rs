@@ -104,8 +104,8 @@ pub struct McpServerDto {
     /// connected. Never a secret.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
-    /// Auth state of an HTTP server the running manager holds a provider
-    /// for. Never a token.
+    /// Auth state of an HTTP server the running manager knows (`mode:
+    /// "none"` for one without authentication). Never a token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<McpAuthStatusDto>,
 }

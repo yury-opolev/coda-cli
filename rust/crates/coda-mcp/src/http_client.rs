@@ -278,10 +278,10 @@ impl McpHttpClient {
         }
     }
 
-    /// Cancel all in-flight requests and drop the connection.
-    pub async fn shutdown(self) {
+    /// Cancel all in-flight requests. The reqwest client and its connection
+    /// pool are freed when the last handle is dropped.
+    pub async fn shutdown(&self) {
         self.lifetime.cancel();
-        // Dropping self frees the reqwest client and its connection pool.
     }
 
     // ── internal ──────────────────────────────────────────────────────────────
