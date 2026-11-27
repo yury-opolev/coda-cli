@@ -68,8 +68,8 @@ so two sessions in one process never show two broker dialogs. Across
 processes the broker itself is the shared cache (silent calls are parallel-safe).
 
 The account the broker picked is persisted (non-secret: account id + username)
-in the credential store under `mcp-broker-account:<resource>` when a store is
-available, so restarts silently reuse a non-default account picked
+in the credential store under `mcp-broker-account:<resource>#<account key>`
+(so two configured accounts never collide) when a store is available, so restarts silently reuse a non-default account picked
 interactively. Tokens are not persisted — the broker owns refresh.
 
 ### Acquisition flow
@@ -91,9 +91,19 @@ interactively. Tokens are not persisted — the broker owns refresh.
 4. **Caching.** `get_access_token` returns the cached token while it is valid
    for more than 5 minutes; inside that window it re-acquires silently and keeps
    serving the old token if silent refresh fails but the token has not expired.
+   A request inside the window never waits for a refresh another task is
+   already running — it gets the old token. After a failed acquisition,
+   automatic refreshes are skipped for a 60 s cool-down (the unexpired token is
+   served, or no token at once), so a failing or hung broker does not slow
+   every request; `/mcp login` and the 401 path ignore the cool-down.
 5. **401 with a token.** `handle_unauthorized` drops the cached token and
-   re-acquires once (the HTTP client already retries exactly once).
-6. **No hangs.** Every broker call is bounded; the WAM implementation also polls
+   re-acquires once with `BrokerRequest::force_refresh` set, so the broker
+   bypasses its own cache instead of returning the rejected token (the HTTP
+   client already retries exactly once). Simultaneous 401s re-acquire once: a
+   handler that finds the token already replaced (cache generation changed)
+   just retries.
+6. **No hangs.** Every broker call is bounded, as are credential-store
+   reads/writes (10 s) and protected-resource metadata discovery (30 s); the WAM implementation also polls
    the WinRT async op against the deadline and cancels it on expiry. Errors are
    actionable, e.g. "Windows broker sign-in for 'https://…' needs interaction
    but no console window is available. Run `/mcp login <name>` from an

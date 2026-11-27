@@ -621,6 +621,15 @@ impl McpOAuthProvider {
     }
 }
 
+const NEEDS_INTERACTIVE_ERROR: &str =
+    "MCP server requires authorization. Run `coda` interactively to sign in";
+
+/// Whether `msg` is the headless provider's "sign in interactively" error
+/// (as opposed to a more specific failure).
+pub(crate) fn is_needs_interactive_error(msg: &str) -> bool {
+    msg.starts_with(NEEDS_INTERACTIVE_ERROR)
+}
+
 #[async_trait]
 impl McpAuthProvider for McpOAuthProvider {
     async fn get_access_token(&self) -> Option<Secret<String>> {
@@ -638,10 +647,7 @@ impl McpAuthProvider for McpOAuthProvider {
         let challenge = WwwAuthenticateChallenge::parse(www_authenticate);
 
         if !self.interactive {
-            let msg = format!(
-                "MCP server requires authorization. Run `coda` interactively to sign in to {}.",
-                self.display_resource()
-            );
+            let msg = format!("{NEEDS_INTERACTIVE_ERROR} to {}.", self.display_resource());
             self.log(&msg);
             self.record_error(&msg);
             return false;

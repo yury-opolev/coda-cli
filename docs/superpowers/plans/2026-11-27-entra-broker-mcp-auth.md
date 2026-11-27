@@ -151,7 +151,9 @@ pub trait McpAuthProvider: Send + Sync {
 ```rust
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrokerRequest { pub authority: String, pub client_id: String, pub scopes: Vec<String>,
-    pub login_hint: Option<String>, pub account_id: Option<String> }
+    pub login_hint: Option<String>, pub account_id: Option<String>,
+    /// Bypass the broker's token cache; true only when re-acquiring after a 401.
+    pub force_refresh: bool }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrokerAccount { pub id: String, pub username: String }
 #[derive(Debug, Clone)]
@@ -178,11 +180,14 @@ pub fn default_broker() -> Arc<dyn TokenBroker>; // CODA_DISABLE_WAM truthy → 
     // behind cfg(windows) too, Task 5 swaps it); cfg(not(windows)) → Unavailable("not Windows")
 pub async fn with_timeout<F: Future<Output = Result<BrokerToken, BrokerError>>>(limit: Duration, f: F) -> Result<BrokerToken, BrokerError>;
 pub fn cache_key(resource: &str, account: Option<&str>) -> String; // "{resource}\n{account lowercased | <default>}"
+pub fn account_store_key(resource: &str, account: Option<&str>) -> String; // "mcp-broker-account:{resource}#{account lowercased | <default>}"
 pub struct BrokerTokenCache { entries: std::sync::Mutex<HashMap<String, Arc<CacheEntry>>> }
 impl BrokerTokenCache { pub fn new() -> Self; pub fn global() -> Arc<Self>; pub fn entry(&self, key: &str) -> Arc<CacheEntry>; }
 pub struct CacheEntry { pub flight: tokio::sync::Mutex<()>, pub state: std::sync::Mutex<CachedState> }
-#[derive(Default)] pub struct CachedState { pub token: Option<BrokerToken>, pub interaction_declined: bool,
-    pub signed_out: bool, pub last_error: Option<String> }
+#[derive(Default)] pub struct CachedState { pub token: Option<BrokerToken>, pub account: Option<BrokerAccount>,
+    pub interaction_declined: bool, pub signed_out: bool, pub last_error: Option<String>,
+    pub last_failure_at: Option<tokio::time::Instant>, // starts the automatic-refresh cool-down
+    pub generation: u64 }                              // incremented whenever a new token is cached
 ```
 
 `entra_broker.rs`:
@@ -190,6 +195,9 @@ pub struct CacheEntry { pub flight: tokio::sync::Mutex<()>, pub state: std::sync
 pub const SILENT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const INTERACTIVE_TIMEOUT: Duration = Duration::from_secs(180);
 pub const REFRESH_SKEW_SECS: i64 = 300;
+pub const FAILURE_COOL_DOWN: Duration = Duration::from_secs(60);
+pub const STORE_TIMEOUT: Duration = Duration::from_secs(10);     // credential-store get/set
+pub const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30); // PRM discovery
 
 pub struct EntraBrokerOptions {
     pub server_name: String,
@@ -213,15 +221,15 @@ impl EntraBrokerProvider {
 }
 ```
 Behaviour (all through `McpAuthProvider`):
-- Broker unavailable → every method delegates to `fallback` (status mode stays `EntraBroker`, last_error from fallback).
+- Broker unavailable → every method delegates to `fallback` (status mode stays `EntraBroker`, last_error from fallback). On a 401 only the headless provider's "sign in interactively" error is replaced by the `/mcp login <name>` hint; more specific errors (discovery failure, invalid `redirectUri`) are kept.
 - Initial target: if `config.tenant` and non-empty `config.scopes` → `authority = EntraAuthority{host:"login.microsoftonline.com", tenant}.authority_url()`, scopes = config scopes; else None until a 401.
 - `resolve_target(challenge)`: PRM via `resolve_resource_metadata_url` + `McpAuthMetadataClient`; `authorization_servers[0]` must parse as `EntraAuthority` (else error "… does not advertise a Microsoft Entra authorization server; use auth.mode 'oauth'"); tenant override; scopes via `derive_scopes(config, challenge.scope, prm.scopes_supported, canonical_resource)`.
-- Request: `BrokerRequest{authority, client_id, scopes, login_hint: config.account, account_id: cached/persisted account id}`. Persisted account: store key `mcp-broker-account:{canonical_resource}` JSON `{"id","username","signedOut":bool}`.
-- `acquire(force_interactive_allowed: bool, user_initiated: bool)` under `entry.flight`: re-check cache after locking (another task may have filled it); if `signed_out && !user_initiated` → error "Signed out of … Run `/mcp login <name>`"; silent with `silent_timeout`; on `InteractionRequired`: if `user_initiated || (allow_interactive && !declined)` and `broker.can_interact()` → interactive with `interactive_timeout`; failure/cancel/timeout of interactive sets `interaction_declined = true` (unless user_initiated success). Success → store token, clear declined/signed_out/last_error, persist account. Every failure sets `last_error` (actionable text, includes `/mcp login <server_name>` hint).
-- `get_access_token`: no target → None; cached token with `expires_at - now > REFRESH_SKEW_SECS` → it; else try acquire (non-user); on failure return the old token if not yet expired, else None.
-- `handle_unauthorized(www)`: parse challenge; resolve target when unknown or challenge carries `resource_metadata` and the target is unknown; if a cached token exists, drop it (401 with token ⇒ invalid); acquire once; true iff a token is now cached.
+- Request: `BrokerRequest{authority, client_id, scopes, login_hint: config.account, account_id: cached/persisted account id, force_refresh: trigger == Unauthorized}`. Persisted account: store key `account_store_key(canonical_resource, config.account)` JSON `{"id","username","signedOut":bool}`. Store reads/writes are bounded by `STORE_TIMEOUT` and PRM discovery by `DISCOVERY_TIMEOUT` (clear error naming the limit).
+- `acquire_locked(trigger: Automatic | Unauthorized | User)`, caller holds `entry.flight`: for `Automatic` re-check the cache after locking (another task may have filled it) and return the last error without a broker call while in the cool-down; if `signed_out && !user_initiated` → error "Signed out of … Run `/mcp login <name>`"; silent with `silent_timeout`; on `InteractionRequired`: if `user_initiated || (allow_interactive && !declined)` and `broker.can_interact()` → interactive with `interactive_timeout`; failure/cancel/timeout of interactive sets `interaction_declined = true` (unless user_initiated success). Success → store token, clear declined/signed_out/last_error, persist account. Every failure sets `last_error` (actionable text, includes `/mcp login <server_name>` hint); every failure after asking the broker also sets `last_failure_at`.
+- `get_access_token`: cached token with `expires_at - now > REFRESH_SKEW_SECS` → it; no target or within `FAILURE_COOL_DOWN` of a failure → the old token if not yet expired, else None (no broker call); inside the refresh window `try_lock` the flight and return the old token immediately when a refresh is already running; without a usable token wait for the flight; acquire (`Automatic`); on failure return the old token if not yet expired, else None.
+- `handle_unauthorized(www)`: record `generation`; parse challenge; resolve target when unknown; take the flight; if the generation changed and a token is cached (a concurrent 401 already re-acquired) → true; else drop the cached token (401 with token ⇒ invalid) and acquire once with `Unauthorized` (`force_refresh`, ignores the cool-down); true iff a token is now cached.
 - `status`: mode EntraBroker, account username, expiry, last_error.
-- `login`: clear declined & signed_out; if no target try `resolve_target(None)`; acquire with user_initiated=true; result.
+- `login`: if no target try `resolve_target(None)`; under the flight load the persisted account, clear declined & signed_out and acquire with `User` (ignores the cool-down); result.
 - `logout`: clear token, set signed_out, persist `signedOut:true`; message notes the Windows account stays signed in.
 
 - [ ] Step 1: Unit tests (fake broker in the test module: scripted `VecDeque<Result<BrokerToken,BrokerError>>` per method + call counters + `can_interact` flag + optional delay): cache keying (case-insensitive account, default); `with_timeout` returns `Timeout` (use `tokio::time::pause`); silent success → no interactive call; InteractionRequired → interactive called once; interactive cancel → declined, second `handle_unauthorized` does NOT call interactive again; `login()` after decline calls interactive; `can_interact=false` → no interactive, last_error mentions `/mcp login`; token near expiry triggers silent refresh, old token served when refresh fails; 401 with token → exactly one silent re-acquire; logout → `get_access_token` None and no broker call; missing clientId → `new` Err; tenant+scopes configured → token without any 401/HTTP; concurrent `get_access_token` x8 → broker silent called once (single-flight).
@@ -245,7 +253,7 @@ Implementation outline:
 - Each op runs in `tokio::task::spawn_blocking`, calls `RoInitialize(RO_INIT_MULTITHREADED)` (ignore `RPC_E_CHANGED_MODE`/`S_FALSE`), and waits for the `IAsyncOperation` by polling `Status()` every 25 ms until the deadline; on deadline `Cancel()` and return `Timeout`. Outer `with_timeout(limit + 2s)` as a belt.
 - Provider: `WebAuthenticationCoreManager::FindAccountProviderWithAuthorityAsync("https://login.microsoft.com", authority)` where authority is `organizations` when the tenant is `organizations`/`common`, else the full authority URL. Null provider → `Unavailable`.
 - Request: `WebTokenRequest::CreateWithPromptType(provider, scopes.join(" "), client_id, prompt)` (`Default` for silent; interactive uses `Default` unless no account is known → `ForceAuthentication` is NOT used; keep `Default` — the broker shows its picker when needed). Properties: `wam_compat`=`2.0`, `api-version`=`2.0`, `authority`=authority URL, `LoginHint`=hint when set.
-- Silent: account known (cache by `account_id`, or `FindAccountAsync(provider, id)`) → `GetTokenSilentlyWithWebAccountAsync`; else `GetTokenSilentlyAsync`.
+- Silent: account known (cache by `account_id`, or `FindAccountAsync(provider, id)`) → `GetTokenSilentlyWithWebAccountAsync`; else `GetTokenSilentlyAsync`. When `request.force_refresh` is set, ask WAM to bypass its token cache (request property `forcerefresh`=`true`, as MSAL's WAM broker does; verify against MSAL) so a token the server rejected with 401 is not returned again.
 - Interactive: `HWND` = `GetAncestor(GetConsoleWindow(), GA_ROOTOWNER)` (fallback `GetConsoleWindow()`); null → `InteractionRequired("no console window …")`. `windows::core::factory::<WebAuthenticationCoreManager, IWebAuthenticationCoreManagerInterop>()?.RequestTokenForWindowAsync::<_, IAsyncOperation<WebTokenRequestResult>>(hwnd, &request)`.
 - Map `WebTokenRequestStatus`: Success → token from `ResponseData().GetAt(0)` (`Token()`, `WebAccount()` → id/username, `Properties().Lookup("TokenExpiresOn")` parse i64 → else `jwt_expiry_unix` → else now+3600); UserInteractionRequired → InteractionRequired(provider error message if any); UserCancel → Cancelled; AccountProviderNotAvailable → Unavailable; ProviderError/other → Failed(`"{code:#x}: {message}"` from `ResponseError()`).
 - `is_available`: true (actual availability is discovered per call → `Unavailable` error makes the provider report it); `can_interact`: console window non-null.

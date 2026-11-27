@@ -25,6 +25,9 @@ pub struct BrokerRequest {
     pub login_hint: Option<String>,
     /// Broker account id remembered from an earlier acquisition.
     pub account_id: Option<String>,
+    /// Bypass the broker's own token cache: set only when re-acquiring after
+    /// the server rejected a token with 401.
+    pub force_refresh: bool,
 }
 
 /// The account a broker token was issued to (non-secret).
@@ -135,12 +138,21 @@ where
 
 /// Cache key: canonical resource + configured account (lower-cased) or `<default>`.
 pub fn cache_key(resource: &str, account: Option<&str>) -> String {
-    let account = account
+    format!("{resource}\n{}", account_label(account))
+}
+
+/// Credential-store key of the persisted broker account for a resource and
+/// configured account.
+pub fn account_store_key(resource: &str, account: Option<&str>) -> String {
+    format!("mcp-broker-account:{resource}#{}", account_label(account))
+}
+
+fn account_label(account: Option<&str>) -> String {
+    account
         .map(str::trim)
         .filter(|a| !a.is_empty())
         .map(str::to_lowercase)
-        .unwrap_or_else(|| "<default>".to_owned());
-    format!("{resource}\n{account}")
+        .unwrap_or_else(|| "<default>".to_owned())
 }
 
 /// Process-wide broker token cache, so a restarted MCP connection (a new
@@ -192,6 +204,11 @@ pub struct CachedState {
     /// The user signed out; no automatic acquisition until the next login.
     pub signed_out: bool,
     pub last_error: Option<String>,
+    /// When the last broker acquisition failed; automatic refreshes are
+    /// skipped for a cool-down after it.
+    pub last_failure_at: Option<tokio::time::Instant>,
+    /// Incremented whenever a new token is cached.
+    pub generation: u64,
 }
 
 #[cfg(test)]
@@ -208,6 +225,12 @@ mod tests {
             cache_key("https://r", Some("A@B.C"))
         );
         assert_ne!(cache_key("https://r", Some("a@b.c")), cache_key("https://r", None));
+    }
+
+    #[test]
+    fn account_store_key_includes_the_account() {
+        assert_eq!(account_store_key("https://r", Some("A@B.C")), "mcp-broker-account:https://r#a@b.c");
+        assert_ne!(account_store_key("https://r", Some("a@b.c")), account_store_key("https://r", None));
     }
 
     #[test]
@@ -252,6 +275,7 @@ mod tests {
             scopes: vec![],
             login_hint: None,
             account_id: None,
+            force_refresh: false,
         };
         assert_eq!(
             b.acquire_silent(&req).await.unwrap_err(),

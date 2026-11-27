@@ -16,11 +16,13 @@ use serde::{Deserialize, Serialize};
 
 use super::broker::{
     BrokerAccount, BrokerError, BrokerRequest, BrokerToken, BrokerTokenCache, CacheEntry,
-    TokenBroker, cache_key, default_broker, with_timeout,
+    CachedState, TokenBroker, account_store_key, cache_key, default_broker, with_timeout,
 };
 use super::entra::{self, EntraAuthority};
 use super::metadata_client::McpAuthMetadataClient;
-use super::oauth::{McpOAuthProvider, is_valid_tenant, resolve_resource_metadata_url};
+use super::oauth::{
+    McpOAuthProvider, is_needs_interactive_error, is_valid_tenant, resolve_resource_metadata_url,
+};
 use super::provider::McpAuthProvider;
 use super::types::{
     McpAuthConfig, McpAuthMode, McpAuthResult, McpAuthStatus, WwwAuthenticateChallenge,
@@ -33,6 +35,12 @@ pub const SILENT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const INTERACTIVE_TIMEOUT: Duration = Duration::from_secs(180);
 /// A cached token is refreshed once it is valid for less than this.
 pub const REFRESH_SKEW_SECS: i64 = 300;
+/// Automatic refreshes are skipped for this long after a failed acquisition.
+pub const FAILURE_COOL_DOWN: Duration = Duration::from_secs(60);
+/// Upper bound for a credential-store read or write.
+pub const STORE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Upper bound for protected-resource metadata discovery.
+pub const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 const DEFAULT_ENTRA_HOST: &str = "login.microsoftonline.com";
 
@@ -74,13 +82,26 @@ impl EntraBrokerOptions {
     }
 }
 
+/// Why a token is being acquired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Trigger {
+    /// A request needs a token; honours the cache and the failure cool-down.
+    Automatic,
+    /// The server rejected the token; bypasses both caches.
+    Unauthorized,
+    /// `/mcp login`; may always prompt.
+    User,
+}
+
+type FlightGuard<'a> = tokio::sync::MutexGuard<'a, ()>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Target {
     authority: String,
     scopes: Vec<String>,
 }
 
-/// Non-secret account record persisted under `mcp-broker-account:<resource>`.
+/// Non-secret account record persisted under `mcp-broker-account:<resource>#<account>`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PersistedAccount {
@@ -225,7 +246,14 @@ impl EntraBrokerProvider {
     }
 
     fn account_key(&self) -> String {
-        format!("mcp-broker-account:{}", self.canonical_resource)
+        account_store_key(&self.canonical_resource, self.config.account.as_deref())
+    }
+
+    /// Like [`Self::fail`], for a failure after the broker was asked: also
+    /// starts the automatic-refresh cool-down.
+    fn broker_failed(&self, msg: String) -> String {
+        self.entry.state().last_failure_at = Some(tokio::time::Instant::now());
+        self.fail(msg)
     }
 
     /// Load the persisted account record once, seeding the shared cache state.
@@ -235,11 +263,22 @@ impl EntraBrokerProvider {
             return;
         }
         let record = match &self.opts.store {
-            Some(store) => match store.get(&self.account_key()).await {
-                Ok(Some(json)) => serde_json::from_str::<PersistedAccount>(&json).ok(),
-                Ok(None) => None,
-                Err(e) => {
+            Some(store) => match tokio::time::timeout(STORE_TIMEOUT, store.get(&self.account_key()))
+                .await
+            {
+                Ok(Ok(Some(json))) => serde_json::from_str::<PersistedAccount>(&json).ok(),
+                Ok(Ok(None)) => None,
+                Ok(Err(e)) => {
                     tracing::debug!(error = %e, "failed to read persisted broker account");
+                    None
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        server = %self.name(),
+                        "credential store did not respond within {}s; continuing without the \
+                         persisted broker account",
+                        STORE_TIMEOUT.as_secs()
+                    );
                     None
                 }
             },
@@ -273,9 +312,21 @@ impl EntraBrokerProvider {
                     return;
                 }
             };
-            if let Err(e) = store.set(&self.account_key(), &json).await {
-                tracing::debug!(error = %e, "failed to persist broker account");
-                return;
+            match tokio::time::timeout(STORE_TIMEOUT, store.set(&self.account_key(), &json)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::debug!(error = %e, "failed to persist broker account");
+                    return;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        server = %self.name(),
+                        "credential store did not respond within {}s; the broker account was \
+                         not persisted",
+                        STORE_TIMEOUT.as_secs()
+                    );
+                    return;
+                }
             }
         }
         *persisted = Some(record);
@@ -289,17 +340,29 @@ impl EntraBrokerProvider {
     ) -> Result<Target, String> {
         let name = self.name();
         let metadata_url = resolve_resource_metadata_url(challenge, &self.canonical_resource);
-        let prm = self
-            .metadata
-            .get_protected_resource_metadata(&metadata_url)
-            .await
-            .ok_or_else(|| {
-                format!(
+        let discovery = tokio::time::timeout(
+            DISCOVERY_TIMEOUT,
+            self.metadata.get_protected_resource_metadata(&metadata_url),
+        )
+        .await;
+        let prm = match discovery {
+            Ok(Some(prm)) => prm,
+            Ok(None) => {
+                return Err(format!(
                     "Could not discover OAuth protected-resource metadata for {}. Set \
                      auth.tenant and auth.scopes for MCP server '{name}'.",
                     self.display_resource()
-                )
-            })?;
+                ));
+            }
+            Err(_) => {
+                return Err(format!(
+                    "Discovery of OAuth protected-resource metadata for {} did not complete \
+                     within {}s. Set auth.tenant and auth.scopes for MCP server '{name}'.",
+                    self.display_resource(),
+                    DISCOVERY_TIMEOUT.as_secs()
+                ));
+            }
+        };
         let authority = prm
             .authorization_servers
             .first()
@@ -353,8 +416,12 @@ impl EntraBrokerProvider {
     }
 
     /// Acquire a token: cache re-check, then silent, then interactive when
-    /// required and allowed. Serialised per cache key.
-    async fn acquire(&self, user_initiated: bool) -> Result<BrokerToken, String> {
+    /// required and allowed. The caller holds `entry.flight`.
+    async fn acquire_locked(
+        &self,
+        _flight: &FlightGuard<'_>,
+        trigger: Trigger,
+    ) -> Result<BrokerToken, String> {
         let name = self.name().to_owned();
         let Some(target) = self.target.lock().await.clone() else {
             return Err(self.fail(format!(
@@ -363,15 +430,21 @@ impl EntraBrokerProvider {
             )));
         };
 
-        let _flight = self.entry.flight.lock().await;
         self.load_persisted().await;
+        let user_initiated = trigger == Trigger::User;
 
         let (account_id, declined, signed_out) = {
             let state = self.entry.state();
-            if !user_initiated {
+            if trigger == Trigger::Automatic {
                 // Another task may have refreshed the token while we waited.
                 if let Some(token) = state.token.as_ref().filter(|t| is_fresh(t, unix_now())) {
                     return Ok(token.clone());
+                }
+                // ...or failed, in which case the broker is not asked again yet.
+                if in_cool_down(&state) {
+                    return Err(state.last_error.clone().unwrap_or_else(|| {
+                        format!("Sign-in to MCP server '{name}' failed recently.")
+                    }));
                 }
             }
             (
@@ -392,6 +465,7 @@ impl EntraBrokerProvider {
             scopes: target.scopes,
             login_hint: self.config.account.clone(),
             account_id,
+            force_refresh: trigger == Trigger::Unauthorized,
         };
 
         let silent =
@@ -401,7 +475,7 @@ impl EntraBrokerProvider {
             Err(BrokerError::InteractionRequired(detail)) => {
                 tracing::debug!(server = %name, %detail, "broker silent sign-in needs interaction");
             }
-            Err(e) => return Err(self.fail(self.broker_failure(&e))),
+            Err(e) => return Err(self.broker_failed(self.broker_failure(&e))),
         }
 
         if !(user_initiated || (self.opts.allow_interactive && !declined)) {
@@ -416,10 +490,10 @@ impl EntraBrokerProvider {
                      `/mcp login {name}` to sign in."
                 )
             };
-            return Err(self.fail(msg));
+            return Err(self.broker_failed(msg));
         }
         if !self.opts.broker.can_interact() {
-            return Err(self.fail(format!(
+            return Err(self.broker_failed(format!(
                 "Windows broker sign-in for '{}' needs interaction but no console window is \
                  available. Run `/mcp login {name}` from an interactive coda session.",
                 self.display_resource()
@@ -436,7 +510,7 @@ impl EntraBrokerProvider {
             Ok(token) => Ok(self.accept(token).await),
             Err(e) => {
                 self.entry.state().interaction_declined = true;
-                Err(self.fail(self.broker_failure(&e)))
+                Err(self.broker_failed(self.broker_failure(&e)))
             }
         }
     }
@@ -449,9 +523,11 @@ impl EntraBrokerProvider {
                 state.account = token.account.clone();
             }
             state.token = Some(token.clone());
+            state.generation = state.generation.wrapping_add(1);
             state.interaction_declined = false;
             state.signed_out = false;
             state.last_error = None;
+            state.last_failure_at = None;
             state.account.clone()
         };
         self.persist(PersistedAccount {
@@ -463,18 +539,36 @@ impl EntraBrokerProvider {
         token
     }
 
+    /// The `/mcp login` hint replacing the headless fallback's error, or
+    /// `None` to keep a more specific error.
+    fn fallback_hint(&self, headless_error: Option<&str>) -> Option<String> {
+        if !headless_error.is_some_and(is_needs_interactive_error) {
+            return None;
+        }
+        let name = self.name();
+        Some(format!(
+            "MCP server '{name}' requires sign-in and the Windows broker is unavailable. Run \
+             `/mcp login {name}` to sign in with your browser."
+        ))
+    }
+
     async fn fallback_unauthorized(&self, fallback: &Fallback, www: Option<&str>) -> bool {
+        let before = fallback.headless.status_snapshot().last_error;
         if fallback.headless.handle_unauthorized(www).await {
             return true;
         }
-        let name = self.name();
-        let msg = format!(
-            "MCP server '{name}' requires sign-in and the Windows broker is unavailable. Run \
-             `/mcp login {name}` to sign in with your browser."
-        );
-        let changed = fallback.headless.status_snapshot().last_error.as_deref() != Some(&msg);
-        fallback.headless.record_error(&msg);
-        if changed {
+        let error = fallback.headless.status_snapshot().last_error;
+        let msg = match self.fallback_hint(error.as_deref()) {
+            Some(hint) => {
+                fallback.headless.record_error(&hint);
+                hint
+            }
+            None => match error {
+                Some(e) => e,
+                None => return false,
+            },
+        };
+        if before.as_deref() != Some(msg.as_str()) {
             self.log(&msg);
         }
         false
@@ -487,20 +581,35 @@ impl McpAuthProvider for EntraBrokerProvider {
         if let Some(fallback) = &self.fallback {
             return fallback.headless.get_access_token().await;
         }
-        let cached = self.entry.state().token.clone();
+        let (cached, cooling) = {
+            let state = self.entry.state();
+            (state.token.clone(), in_cool_down(&state))
+        };
         if let Some(token) = cached.as_ref().filter(|t| is_fresh(t, unix_now())) {
             return Some(token.access_token.clone());
         }
-        let unexpired = |c: Option<BrokerToken>| {
-            c.filter(|t| t.expires_at_unix > unix_now()).map(|t| t.access_token)
+        // Keep serving the old token until it actually expires.
+        let unexpired = || {
+            cached
+                .as_ref()
+                .filter(|t| t.expires_at_unix > unix_now())
+                .map(|t| t.access_token.clone())
         };
-        if self.target.lock().await.is_none() {
-            return unexpired(cached);
+        if cooling || self.target.lock().await.is_none() {
+            return unexpired();
         }
-        match self.acquire(false).await {
+        let flight = if unexpired().is_some() {
+            // Inside the refresh window: never wait for a refresh in flight.
+            match self.entry.flight.try_lock() {
+                Ok(guard) => guard,
+                Err(_) => return unexpired(),
+            }
+        } else {
+            self.entry.flight.lock().await
+        };
+        match self.acquire_locked(&flight, Trigger::Automatic).await {
             Ok(token) => Some(token.access_token),
-            // Keep serving the old token until it actually expires.
-            Err(_) => unexpired(cached),
+            Err(_) => unexpired(),
         }
     }
 
@@ -508,6 +617,7 @@ impl McpAuthProvider for EntraBrokerProvider {
         if let Some(fallback) = &self.fallback {
             return self.fallback_unauthorized(fallback, www_authenticate).await;
         }
+        let seen = self.entry.state().generation;
         let challenge = WwwAuthenticateChallenge::parse(www_authenticate);
         {
             let mut target = self.target.lock().await;
@@ -522,9 +632,17 @@ impl McpAuthProvider for EntraBrokerProvider {
                 }
             }
         }
-        // A 401 while a token was attached means the token is no good.
-        self.entry.state().token = None;
-        self.acquire(false).await.is_ok()
+        let flight = self.entry.flight.lock().await;
+        {
+            let mut state = self.entry.state();
+            // Another 401 already replaced the token while we waited.
+            if state.generation != seen && state.token.is_some() {
+                return true;
+            }
+            // A 401 while a token was attached means the token is no good.
+            state.token = None;
+        }
+        self.acquire_locked(&flight, Trigger::Unauthorized).await.is_ok()
     }
 
     fn status(&self) -> Option<McpAuthStatus> {
@@ -557,12 +675,6 @@ impl McpAuthProvider for EntraBrokerProvider {
             return result;
         }
 
-        self.load_persisted().await;
-        {
-            let mut state = self.entry.state();
-            state.interaction_declined = false;
-            state.signed_out = false;
-        }
         {
             let mut target = self.target.lock().await;
             if target.is_none() {
@@ -576,7 +688,16 @@ impl McpAuthProvider for EntraBrokerProvider {
                 }
             }
         }
-        match self.acquire(true).await {
+        let flight = self.entry.flight.lock().await;
+        self.load_persisted().await;
+        {
+            let mut state = self.entry.state();
+            state.interaction_declined = false;
+            state.signed_out = false;
+        }
+        let acquired = self.acquire_locked(&flight, Trigger::User).await;
+        drop(flight);
+        match acquired {
             Ok(token) => {
                 let who = token.account.map(|a| a.username).filter(|u| !u.is_empty());
                 self.log(&match who {
@@ -602,6 +723,7 @@ impl McpAuthProvider for EntraBrokerProvider {
             state.signed_out = true;
             state.interaction_declined = false;
             state.last_error = None;
+            state.last_failure_at = None;
         }
         self.persist(PersistedAccount { id: None, username: None, signed_out: true }).await;
         self.log(&format!(
@@ -610,6 +732,10 @@ impl McpAuthProvider for EntraBrokerProvider {
         ));
         McpAuthResult { succeeded: true, error: None }
     }
+}
+
+fn in_cool_down(state: &CachedState) -> bool {
+    state.last_failure_at.is_some_and(|at| at.elapsed() < FAILURE_COOL_DOWN)
 }
 
 fn is_fresh(token: &BrokerToken, now: i64) -> bool {

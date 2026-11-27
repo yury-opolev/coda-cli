@@ -20,6 +20,7 @@ struct FakeBroker {
     interactive_calls: AtomicUsize,
     no_interaction: AtomicBool,
     delay: Option<Duration>,
+    interactive_delay: Option<Duration>,
     requests: Mutex<Vec<BrokerRequest>>,
 }
 
@@ -30,6 +31,10 @@ impl FakeBroker {
 
     fn with_delay(delay: Duration) -> Arc<Self> {
         Arc::new(Self { delay: Some(delay), ..Self::default() })
+    }
+
+    fn with_interactive_delay(delay: Duration) -> Arc<Self> {
+        Arc::new(Self { interactive_delay: Some(delay), ..Self::default() })
     }
 
     fn silent(&self, r: Result<BrokerToken, BrokerError>) -> &Self {
@@ -59,10 +64,11 @@ impl FakeBroker {
         script: &Script,
         counter: &AtomicUsize,
         request: &BrokerRequest,
+        delay: Option<Duration>,
     ) -> Result<BrokerToken, BrokerError> {
         counter.fetch_add(1, Ordering::SeqCst);
         self.requests.lock().unwrap().push(request.clone());
-        if let Some(d) = self.delay {
+        if let Some(d) = delay {
             tokio::time::sleep(d).await;
         }
         let next = script.lock().unwrap().pop_front();
@@ -81,22 +87,27 @@ impl TokenBroker for FakeBroker {
     }
 
     async fn acquire_silent(&self, request: &BrokerRequest) -> Result<BrokerToken, BrokerError> {
-        self.next(&self.silent, &self.silent_calls, request).await
+        self.next(&self.silent, &self.silent_calls, request, self.delay).await
     }
 
     async fn acquire_interactive(
         &self,
         request: &BrokerRequest,
     ) -> Result<BrokerToken, BrokerError> {
-        self.next(&self.interactive, &self.interactive_calls, request).await
+        self.next(&self.interactive, &self.interactive_calls, request, self.interactive_delay.or(self.delay))
+            .await
     }
 }
 
 fn tok(value: &str, ttl_secs: i64) -> Result<BrokerToken, BrokerError> {
+    tok_for(value, ttl_secs, "acc-1")
+}
+
+fn tok_for(value: &str, ttl_secs: i64, account_id: &str) -> Result<BrokerToken, BrokerError> {
     Ok(BrokerToken {
         access_token: Secret::new(value.to_owned()),
         expires_at_unix: unix_now() + ttl_secs,
-        account: Some(BrokerAccount { id: "acc-1".into(), username: "user@contoso.com".into() }),
+        account: Some(BrokerAccount { id: account_id.into(), username: "user@contoso.com".into() }),
     })
 }
 
@@ -177,6 +188,7 @@ async fn configured_target_acquires_silently_without_any_401() {
     assert_eq!(req.authority, "https://login.microsoftonline.com/tid");
     assert_eq!(req.client_id, "cid");
     assert_eq!(req.scopes, vec!["api://x/.default".to_owned()]);
+    assert!(!req.force_refresh, "automatic acquisition uses the broker cache");
 
     let status = p.status().unwrap();
     assert_eq!(status.mode, McpAuthMode::EntraBroker);
@@ -216,6 +228,9 @@ async fn cancelled_prompt_is_not_reshown_until_login() {
     assert_eq!(broker.interactive_calls(), 2);
     assert_eq!(token_of(&p).await.as_deref(), Some("t2"));
     assert_eq!(p.status().unwrap().last_error, None);
+    assert!(broker.request(0).force_refresh, "the 401 path bypasses the broker cache");
+    assert!(!broker.request(3).force_refresh, "login does not force a refresh");
+    assert!(!broker.request(4).force_refresh);
 }
 
 #[tokio::test]
@@ -232,7 +247,7 @@ async fn no_console_window_means_no_prompt_and_a_login_hint() {
     assert!(err.contains("`/mcp login contoso`"), "{err}");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn near_expiry_refreshes_silently_and_keeps_old_token_on_failure() {
     let broker = FakeBroker::new();
     broker
@@ -245,9 +260,77 @@ async fn near_expiry_refreshes_silently_and_keeps_old_token_on_failure() {
     assert_eq!(token_of(&p).await.as_deref(), Some("short"), "refresh failed: old token kept");
     assert_eq!(broker.silent_calls(), 2);
     assert!(last_error(&p).contains("AADSTS-transient"));
+    tokio::time::advance(FAILURE_COOL_DOWN + Duration::from_secs(1)).await;
     assert_eq!(token_of(&p).await.as_deref(), Some("renewed"));
     assert_eq!(broker.silent_calls(), 3);
     assert_eq!(broker.interactive_calls(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn refresh_in_progress_does_not_block_requests() {
+    let broker = FakeBroker::with_delay(Duration::from_secs(10));
+    broker.silent(tok("short", 100)).silent(tok("renewed", 3600));
+    let p = Arc::new(provider(&broker));
+    assert_eq!(token_of(&p).await.as_deref(), Some("short"));
+
+    let refresh = tokio::spawn({
+        let p = Arc::clone(&p);
+        async move { token_of(&p).await }
+    });
+    while broker.silent_calls() < 2 {
+        tokio::task::yield_now().await;
+    }
+    let start = tokio::time::Instant::now();
+    assert_eq!(token_of(&p).await.as_deref(), Some("short"));
+    assert_eq!(start.elapsed(), Duration::ZERO, "must not wait for the refresh in flight");
+    assert_eq!(refresh.await.unwrap().as_deref(), Some("renewed"));
+    assert_eq!(broker.silent_calls(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_refresh_starts_a_cool_down() {
+    let broker = FakeBroker::with_delay(Duration::from_secs(5));
+    broker
+        .silent(tok("short", 100))
+        .silent(Err(BrokerError::Failed("down".into())))
+        .silent(tok("renewed", 3600));
+    let p = provider(&broker);
+    assert_eq!(token_of(&p).await.as_deref(), Some("short"));
+    assert_eq!(token_of(&p).await.as_deref(), Some("short"));
+    assert_eq!(broker.silent_calls(), 2);
+
+    let start = tokio::time::Instant::now();
+    let tokens = futures::future::join_all((0..4).map(|_| token_of(&p))).await;
+    assert!(tokens.iter().all(|t| t.as_deref() == Some("short")), "{tokens:?}");
+    assert_eq!(start.elapsed(), Duration::ZERO);
+    assert_eq!(broker.silent_calls(), 2, "no broker call during the cool-down");
+
+    tokio::time::advance(FAILURE_COOL_DOWN).await;
+    assert_eq!(token_of(&p).await.as_deref(), Some("renewed"));
+    assert_eq!(broker.silent_calls(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn queued_requests_without_a_token_do_not_retry_a_failed_broker() {
+    let broker = FakeBroker::with_delay(Duration::from_secs(5));
+    broker.silent(Err(BrokerError::Failed("down".into())));
+    let p = provider(&broker);
+    let tokens = futures::future::join_all((0..4).map(|_| token_of(&p))).await;
+    assert!(tokens.iter().all(Option::is_none), "{tokens:?}");
+    assert_eq!(broker.silent_calls(), 1);
+}
+
+#[tokio::test]
+async fn login_ignores_the_cool_down() {
+    let broker = FakeBroker::new();
+    broker.silent(Err(BrokerError::Failed("down".into()))).silent(tok("t1", 3600));
+    let p = provider(&broker);
+    assert_eq!(token_of(&p).await, None);
+    assert_eq!(token_of(&p).await, None);
+    assert_eq!(broker.silent_calls(), 1);
+    assert!(p.login().await.succeeded);
+    assert_eq!(broker.silent_calls(), 2);
+    assert_eq!(token_of(&p).await.as_deref(), Some("t1"));
 }
 
 #[tokio::test]
@@ -270,6 +353,21 @@ async fn unauthorized_with_token_reacquires_exactly_once() {
     assert_eq!(broker.silent_calls(), 2);
     assert_eq!(token_of(&p).await.as_deref(), Some("t2"));
     assert_eq!(broker.silent_calls(), 2);
+    assert!(!broker.request(0).force_refresh);
+    assert!(broker.request(1).force_refresh, "a rejected token must not come from the cache");
+}
+
+#[tokio::test(start_paused = true)]
+async fn simultaneous_unauthorized_reacquire_once() {
+    let broker = FakeBroker::with_delay(Duration::from_secs(1));
+    broker.silent(tok("t1", 3600)).silent(tok("t2", 3600)).silent(tok("t3", 3600));
+    let p = provider(&broker);
+    assert_eq!(token_of(&p).await.as_deref(), Some("t1"));
+
+    let (a, b) = tokio::join!(p.handle_unauthorized(None), p.handle_unauthorized(None));
+    assert!(a && b);
+    assert_eq!(broker.silent_calls(), 2, "the second 401 reuses the first re-acquisition");
+    assert_eq!(token_of(&p).await.as_deref(), Some("t2"));
 }
 
 #[tokio::test]
@@ -307,7 +405,7 @@ async fn logout_stops_automatic_sign_in_until_login() {
     assert!(restarted.login().await.succeeded);
     assert_eq!(token_of(&restarted).await.as_deref(), Some("t2"));
     let saved = store
-        .get("mcp-broker-account:https://mcp.example.com/mcp")
+        .get("mcp-broker-account:https://mcp.example.com/mcp#<default>")
         .await
         .unwrap()
         .expect("account persisted");
@@ -334,6 +432,139 @@ async fn persisted_account_is_reused_after_restart() {
     assert!(token_of(&make()).await.is_some());
     assert_eq!(broker.request(0).account_id, None);
     assert_eq!(broker.request(1).account_id.as_deref(), Some("acc-1"));
+}
+
+#[tokio::test]
+async fn persisted_accounts_are_keyed_by_configured_account() {
+    let broker = FakeBroker::new();
+    broker
+        .silent(tok_for("a1", 3600, "acc-a"))
+        .silent(tok_for("b1", 3600, "acc-b"))
+        .silent(tok_for("a2", 3600, "acc-a"))
+        .silent(tok_for("b2", 3600, "acc-b"));
+    let store: Arc<dyn CredentialStore> = Arc::new(InMemoryStore::new());
+    let make = |account: &str| {
+        provider_with(
+            McpAuthConfig { account: Some(account.into()), ..configured() },
+            EntraBrokerOptions {
+                store: Some(Arc::clone(&store)),
+                ..options(broker.clone(), &Arc::new(BrokerTokenCache::new()))
+            },
+        )
+    };
+    assert!(token_of(&make("a@contoso.com")).await.is_some());
+    assert!(token_of(&make("b@contoso.com")).await.is_some());
+    assert!(token_of(&make("a@contoso.com")).await.is_some());
+    assert!(token_of(&make("b@contoso.com")).await.is_some());
+    assert_eq!(broker.request(2).account_id.as_deref(), Some("acc-a"));
+    assert_eq!(broker.request(3).account_id.as_deref(), Some("acc-b"));
+}
+
+#[tokio::test]
+async fn sign_out_is_shared_by_providers_on_the_same_key() {
+    let broker = FakeBroker::new();
+    broker.silent(tok("t1", 3600));
+    let cache = Arc::new(BrokerTokenCache::new());
+    let first = provider_with(configured(), options(broker.clone(), &cache));
+    let second = provider_with(configured(), options(broker.clone(), &cache));
+    assert_eq!(token_of(&first).await.as_deref(), Some("t1"));
+
+    assert!(second.logout().await.succeeded);
+    assert_eq!(token_of(&first).await, None);
+    assert!(!first.handle_unauthorized(None).await);
+    assert_eq!(broker.silent_calls(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn interactive_timeout_marks_the_prompt_declined() {
+    let broker = FakeBroker::with_interactive_delay(Duration::from_secs(3600));
+    broker.silent(interaction_required()).silent(interaction_required());
+    let p = provider(&broker);
+
+    assert!(!p.handle_unauthorized(None).await);
+    assert_eq!(broker.interactive_calls(), 1);
+    assert!(last_error(&p).contains("did not respond within 180s"), "{}", last_error(&p));
+    assert!(!p.handle_unauthorized(None).await);
+    assert_eq!(broker.interactive_calls(), 1, "a timed-out prompt is not re-shown");
+}
+
+#[tokio::test]
+async fn automatic_prompts_disabled_never_call_interactive() {
+    let broker = FakeBroker::new();
+    broker.silent(interaction_required()).silent(interaction_required());
+    let cache = Arc::new(BrokerTokenCache::new());
+    let p = provider_with(
+        configured(),
+        EntraBrokerOptions { allow_interactive: false, ..options(broker.clone(), &cache) },
+    );
+    assert_eq!(token_of(&p).await, None);
+    assert!(!p.handle_unauthorized(None).await);
+    assert_eq!(broker.interactive_calls(), 0);
+    assert!(last_error(&p).contains("`/mcp login contoso`"), "{}", last_error(&p));
+}
+
+/// A credential store that never answers.
+struct HungStore;
+
+#[async_trait]
+impl CredentialStore for HungStore {
+    async fn get(&self, _: &str) -> Result<Option<String>, coda_auth::AuthError> {
+        std::future::pending().await
+    }
+    async fn set(&self, _: &str, _: &str) -> Result<(), coda_auth::AuthError> {
+        std::future::pending().await
+    }
+    async fn delete(&self, _: &str) -> Result<(), coda_auth::AuthError> {
+        std::future::pending().await
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn hung_credential_store_is_bounded() {
+    let broker = FakeBroker::new();
+    broker.silent(tok("t1", 3600));
+    let cache = Arc::new(BrokerTokenCache::new());
+    let p = provider_with(
+        configured(),
+        EntraBrokerOptions { store: Some(Arc::new(HungStore)), ..options(broker.clone(), &cache) },
+    );
+    assert_eq!(token_of(&p).await.as_deref(), Some("t1"));
+    assert!(p.logout().await.succeeded);
+}
+
+#[tokio::test(start_paused = true)]
+async fn hung_discovery_is_bounded() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    let broker = FakeBroker::new();
+    let cache = Arc::new(BrokerTokenCache::new());
+    let p = http_provider(port, discovered(), options(broker.clone(), &cache));
+
+    let r = p.login().await;
+    assert!(!r.succeeded);
+    let err = r.error.unwrap_or_default();
+    assert!(err.contains("within 30s"), "{err}");
+    assert_eq!(broker.silent_calls(), 0);
+}
+
+#[test]
+fn fallback_only_replaces_the_needs_interactive_error() {
+    let cache = Arc::new(BrokerTokenCache::new());
+    let p = provider_with(
+        configured(),
+        options(Arc::new(UnavailableBroker::new("not Windows")), &cache),
+    );
+    let headless = "MCP server requires authorization. Run `coda` interactively to sign in to x.";
+    let hint = p.fallback_hint(Some(headless)).expect("replaced");
+    assert!(hint.contains("`/mcp login contoso`"), "{hint}");
+    assert_eq!(p.fallback_hint(Some("Invalid auth.redirectUri 'x': bad")), None);
+    assert_eq!(p.fallback_hint(Some("Could not discover OAuth protected-resource metadata.")), None);
 }
 
 #[tokio::test]
@@ -369,6 +600,11 @@ async fn hung_broker_times_out_with_actionable_error() {
     let err = last_error(&p);
     assert!(err.contains("did not respond within 30s"), "{err}");
     assert!(err.contains("/mcp login contoso"), "{err}");
+
+    let start = tokio::time::Instant::now();
+    assert_eq!(token_of(&p).await, None);
+    assert_eq!(start.elapsed(), Duration::ZERO, "cool-down answers without the broker");
+    assert_eq!(broker.silent_calls(), 1);
 }
 
 #[tokio::test]
@@ -517,7 +753,11 @@ async fn http_unavailable_broker_falls_back_without_opening_a_browser() {
     };
     let p = http_provider(port, discovered(), opts);
 
-    assert!(connect(port, p.clone()).await.is_err());
+    let err = connect(port, p.clone()).await.err().expect("connect must fail");
+    assert!(
+        matches!(&err, McpError::Protocol { message, .. } if message.starts_with("HTTP 401")),
+        "expected an authorization failure, got {err:?}"
+    );
     let status = p.status().unwrap();
     assert_eq!(status.mode, McpAuthMode::EntraBroker);
     let err = status.last_error.unwrap_or_default();
@@ -535,5 +775,6 @@ async fn http_rejected_token_is_reacquired_once() {
 
     connect(port, p).await.expect("connected");
     assert_eq!(broker.silent_calls(), 2);
+    assert!(broker.request(1).force_refresh);
     assert_eq!(broker.interactive_calls(), 0);
 }
