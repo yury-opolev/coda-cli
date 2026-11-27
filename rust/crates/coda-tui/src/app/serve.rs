@@ -1582,6 +1582,7 @@ impl App {
             auth: super::auth::AuthState::new(),
             auth_port: crate::local::auth::AuthPort::profile(),
             asides: Default::default(),
+            mcp_auth: Default::default(),
         }
     }
 }

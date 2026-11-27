@@ -178,8 +178,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "mcp",
         aliases: &[],
-        args: "",
-        summary: "Browse configured MCP servers.",
+        args: "[login|logout <server>]",
+        summary: "Browse configured MCP servers, or sign in to / out of one.",
         scope: Scope::Local,
     },
     CommandSpec {

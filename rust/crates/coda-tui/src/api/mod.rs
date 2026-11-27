@@ -30,7 +30,7 @@ pub mod view;
 use coda_client::{ClientError, Connection};
 use coda_proto::config::ConfigDescribeResult;
 use coda_proto::history::{GetHistoryResult, ListSessionsResult};
-use coda_proto::mcp::McpListResult;
+use coda_proto::mcp::{McpAuthAction, McpAuthActionResult, McpAuthParams, McpListResult};
 use coda_proto::messages::method;
 use coda_proto::responses::PendingMessagesResult;
 use coda_proto::state::{PendingRequestDto, StateSnapshot};
@@ -176,6 +176,21 @@ pub async fn config_describe(
 /// `mcp/list` — read-only MCP server inventory as the engine sees it.
 pub async fn mcp_list(connection: &Connection) -> Result<McpListResult, ClientError> {
     fetch(connection, method::MCP_LIST, Some(json!({}))).await
+}
+
+/// `mcp/auth` — sign in to (or out of) one configured HTTP MCP server.
+///
+/// Unbounded here: a sign-in waits for the user in a browser or the OS
+/// account broker, so the caller chooses the bound and must not await this
+/// inline in the event loop.
+pub async fn mcp_auth(
+    connection: &Connection,
+    server: &str,
+    action: McpAuthAction,
+) -> Result<McpAuthActionResult, ClientError> {
+    let params = McpAuthParams { server: server.to_owned(), action };
+    let params = serde_json::to_value(params).map_err(ClientError::Serde)?;
+    fetch(connection, method::MCP_AUTH, Some(params)).await
 }
 
 /// `session/pendingMessages` — non-destructive recovery of engine-owned user

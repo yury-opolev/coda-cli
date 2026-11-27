@@ -31,6 +31,7 @@ mod input;
 mod interrupt;
 mod layout;
 mod link;
+mod mcp_auth;
 mod models;
 #[cfg(test)]
 mod image_steering_tests;
@@ -313,6 +314,8 @@ pub struct App {
     auth_port: crate::local::auth::AuthPort,
     /// Side questions (`/btw`) in flight and the channel their answers return on.
     asides: aside::Asides,
+    /// `/mcp login|logout` requests in flight and the channel their outcomes return on.
+    mcp_auth: mcp_auth::McpAuthRequests,
 }
 
 
@@ -390,6 +393,7 @@ impl App {
         let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<TurnOutcome>();
         let mut auth_events = self.auth.take_events();
         let mut aside_replies = self.asides.take_replies();
+        let mut mcp_auth_replies = self.mcp_auth.take_replies();
 
         // The screen first, before anything off this machine is awaited. The
         // model list is a round-trip and the preflight opens a credential
@@ -434,6 +438,9 @@ impl App {
 
                 // A `/btw` side question was answered.
                 Some(reply) = aside_replies.recv() => self.on_aside_reply(reply),
+
+                // A `/mcp login|logout` finished.
+                Some(reply) = mcp_auth_replies.recv() => self.on_mcp_auth_reply(reply),
 
                 // Terminal input.
                 action = crate::terminal::read_input() => match action {
