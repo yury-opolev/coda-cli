@@ -768,6 +768,7 @@ dependencies = [
  "base64",
  "bytes",
  "coda-auth",
+ "coda-diagnostics",
  "coda-proto",
  "coda-tool",
  "directories",

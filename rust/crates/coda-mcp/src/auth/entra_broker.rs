@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use coda_auth::{CredentialStore, InMemoryStore, secret::Secret};
+use coda_diagnostics::{DiagnosticContext, Event};
 use serde::{Deserialize, Serialize};
 
 use super::broker::{
@@ -94,6 +95,67 @@ enum Trigger {
     User,
 }
 
+impl Trigger {
+    fn label(self) -> &'static str {
+        match self {
+            Trigger::Automatic => "automatic",
+            Trigger::Unauthorized { .. } => "unauthorized",
+            Trigger::User => "user",
+        }
+    }
+}
+
+/// How an acquisition ended, for diagnostics (closed labels only).
+#[derive(Debug, Clone, Copy)]
+struct AcquireReport {
+    outcome: &'static str,
+    interactive_attempted: bool,
+}
+
+/// The diagnostics outcome label of a failed broker call.
+fn failure_outcome(error: &BrokerError) -> &'static str {
+    match error {
+        BrokerError::Cancelled => "cancelled",
+        BrokerError::Timeout(_) => "timeout",
+        BrokerError::Unavailable(_) => "unavailable",
+        BrokerError::InteractionRequired(_) | BrokerError::Failed(_) => "failed",
+    }
+}
+
+/// A broker (or sign-in) message fit for logs: user names and other
+/// account identifiers are replaced by `<redacted>`, while `AADSTS` numbers,
+/// `0x` codes and the rest of the text are kept.
+///
+/// Broker messages may name the account (e.g. AADSTS50020 "User account
+/// 'ada@contoso.com' from identity provider … does not exist"). The full text
+/// stays in `last_error`, which only the user sees; every log line uses this.
+pub(crate) fn redact_broker_detail(msg: &str) -> String {
+    static PATTERNS: std::sync::OnceLock<[(regex::Regex, &'static str); 2]> =
+        std::sync::OnceLock::new();
+    let patterns = PATTERNS.get_or_init(|| {
+        [
+            // A quoted name after an account-ish word: "User account '…'",
+            // "user '…'", "login_hint \"…\"", "UPN: '…'".
+            (
+                regex::Regex::new(
+                    r#"(?i)\b(user\s+account|account|user(?:\s*name)?|upn|login_?hint|identity)(\s*[:=]?\s*)(?:'[^']*'|"[^"]*")"#,
+                )
+                .expect("valid account pattern"),
+                "$1$2'<redacted>'",
+            ),
+            // Anything that looks like an e-mail address or UPN.
+            (
+                regex::Regex::new(r#"[^\s'"<>(),;\[\]{}]*(?:@|%40)[^\s'"<>(),;\[\]{}]*"#)
+                    .expect("valid address pattern"),
+                "<redacted>",
+            ),
+        ]
+    });
+    patterns
+        .iter()
+        .fold(msg.to_owned(), |text, (re, with)| re.replace_all(&text, *with).into_owned())
+}
+
 type FlightGuard = tokio::sync::OwnedMutexGuard<()>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,6 +203,9 @@ struct Inner {
     /// `None` until loaded from the store.
     persisted: tokio::sync::Mutex<Option<PersistedAccount>>,
     fallback: Option<Fallback>,
+    /// The diagnostics context the provider was built in; acquisitions
+    /// record through it when their caller has none.
+    diagnostics: Option<DiagnosticContext>,
 }
 
 impl EntraBrokerProvider {
@@ -224,6 +289,7 @@ impl EntraBrokerProvider {
                 discovery: tokio::sync::Mutex::new(()),
                 persisted: tokio::sync::Mutex::new(None),
                 fallback,
+                diagnostics: coda_diagnostics::current(),
             }),
         })
     }
@@ -271,7 +337,7 @@ impl Inner {
             state.last_error = Some(msg.clone());
             changed
         };
-        tracing::debug!(server = %self.name(), "entra-broker auth: {msg}");
+        tracing::debug!(server = %self.name(), "entra-broker auth: {}", redact_broker_detail(&msg));
         if changed {
             self.log(&msg);
         }
@@ -457,7 +523,17 @@ impl Inner {
         trigger: Trigger,
     ) -> Result<BrokerToken, String> {
         let this = Arc::clone(self);
-        let task = tokio::spawn(async move { this.acquire_locked(&flight, trigger).await });
+        // The spawned task loses the caller's task-local diagnostics context,
+        // so it is carried over (falling back to the construction context).
+        let diagnostics = coda_diagnostics::current().or_else(|| self.diagnostics.clone());
+        let task = tokio::spawn(async move {
+            let run = this.acquire_locked(&flight, trigger, diagnostics.clone());
+            match diagnostics {
+                // Broker implementations pick the context up from the scope.
+                Some(ctx) => coda_diagnostics::scope(ctx, run).await,
+                None => run.await,
+            }
+        });
         match task.await {
             Ok(result) => result,
             Err(e) => Err(self.fail(format!(
@@ -467,15 +543,61 @@ impl Inner {
         }
     }
 
-    /// Acquire a token: cache re-check, then silent, then interactive when
-    /// required and allowed. The caller holds `entry.flight`.
+    /// [`Self::acquire_steps`], recording how it ended.
     async fn acquire_locked(
         &self,
         _flight: &FlightGuard,
         trigger: Trigger,
+        diagnostics: Option<DiagnosticContext>,
+    ) -> Result<BrokerToken, String> {
+        let started = std::time::Instant::now();
+        let mut report = AcquireReport { outcome: "failed", interactive_attempted: false };
+        let result = self.acquire_steps(trigger, &mut report).await;
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let console_window = self.opts.broker.can_interact();
+        if result.is_ok() {
+            tracing::info!(
+                server = %self.name(),
+                trigger = trigger.label(),
+                outcome = report.outcome,
+                interactive_attempted = report.interactive_attempted,
+                duration_ms,
+                console_window,
+                "entra-broker token acquisition succeeded"
+            );
+        } else {
+            tracing::warn!(
+                server = %self.name(),
+                trigger = trigger.label(),
+                outcome = report.outcome,
+                interactive_attempted = report.interactive_attempted,
+                duration_ms,
+                console_window,
+                "entra-broker token acquisition failed"
+            );
+        }
+        if let Some(ctx) = diagnostics {
+            ctx.record(Event::McpBrokerAcquire {
+                trigger: trigger.label(),
+                outcome: report.outcome,
+                interactive_attempted: report.interactive_attempted,
+                duration_ms,
+                console_window,
+            });
+        }
+        result
+    }
+
+    /// Acquire a token: cache re-check, then silent, then interactive when
+    /// required and allowed. The caller holds `entry.flight`.
+    async fn acquire_steps(
+        &self,
+        trigger: Trigger,
+        report: &mut AcquireReport,
     ) -> Result<BrokerToken, String> {
         let name = self.name().to_owned();
         let Some(target) = self.target() else {
+            report.outcome = "no_target";
             return Err(self.fail(format!(
                 "The Microsoft Entra authority for MCP server '{name}' is not known yet. Set \
                  auth.tenant and auth.scopes, or connect to the server first."
@@ -490,10 +612,12 @@ impl Inner {
             if trigger == Trigger::Automatic {
                 // Another task may have refreshed the token while we waited.
                 if let Some(token) = state.token.as_ref().filter(|t| is_fresh(t, unix_now())) {
+                    report.outcome = "cached";
                     return Ok(token.clone());
                 }
                 // ...or failed, in which case the broker is not asked again yet.
                 if in_cool_down(&state) {
+                    report.outcome = "cool_down";
                     return Err(state.last_error.clone().unwrap_or_else(|| {
                         format!("Sign-in to MCP server '{name}' failed recently.")
                     }));
@@ -506,6 +630,7 @@ impl Inner {
             )
         };
         if signed_out && !user_initiated {
+            report.outcome = "signed_out";
             return Err(self.fail(format!(
                 "Signed out of MCP server '{name}'. Run `/mcp login {name}` to sign in again."
             )));
@@ -523,14 +648,30 @@ impl Inner {
         let silent =
             with_timeout(self.opts.silent_timeout, self.opts.broker.acquire_silent(&request)).await;
         match silent {
-            Ok(token) => return Ok(self.accept(token).await),
-            Err(BrokerError::InteractionRequired(detail)) => {
-                tracing::debug!(server = %name, %detail, "broker silent sign-in needs interaction");
+            Ok(token) => {
+                report.outcome = "silent";
+                return Ok(self.accept(token).await);
             }
-            Err(e) => return Err(self.broker_failed(self.broker_failure(&e))),
+            Err(BrokerError::InteractionRequired(detail)) => {
+                tracing::debug!(
+                    server = %name,
+                    detail = %redact_broker_detail(&detail),
+                    "broker silent sign-in needs interaction"
+                );
+            }
+            Err(e) => {
+                report.outcome = failure_outcome(&e);
+                return Err(self.broker_failed(self.broker_failure(&e)));
+            }
         }
 
         if !(user_initiated || (self.opts.allow_interactive && !declined)) {
+            report.outcome = if declined { "declined" } else { "interaction_required" };
+            tracing::warn!(
+                server = %name,
+                reason = report.outcome,
+                "entra-broker sign-in needs interaction; interactive sign-in skipped"
+            );
             let msg = if declined {
                 format!(
                     "Sign-in to MCP server '{name}' was cancelled earlier, so coda will not prompt \
@@ -545,6 +686,12 @@ impl Inner {
             return Err(self.broker_failed(msg));
         }
         if !self.opts.broker.can_interact() {
+            report.outcome = "no_console";
+            tracing::warn!(
+                server = %name,
+                reason = report.outcome,
+                "entra-broker sign-in needs interaction; interactive sign-in skipped"
+            );
             return Err(self.broker_failed(format!(
                 "Windows broker sign-in for '{}' needs interaction but no console window is \
                  available. Run `/mcp login {name}` from an interactive coda session.",
@@ -553,14 +700,19 @@ impl Inner {
         }
 
         self.log(&format!("Signing in to MCP server '{name}' with your Windows account…"));
+        report.interactive_attempted = true;
         let interactive = with_timeout(
             self.opts.interactive_timeout,
             self.opts.broker.acquire_interactive(&request),
         )
         .await;
         match interactive {
-            Ok(token) => Ok(self.accept(token).await),
+            Ok(token) => {
+                report.outcome = "interactive";
+                Ok(self.accept(token).await)
+            }
             Err(e) => {
+                report.outcome = failure_outcome(&e);
                 self.entry.state().interaction_declined = true;
                 Err(self.broker_failed(self.broker_failure(&e)))
             }
@@ -645,6 +797,10 @@ impl McpAuthProvider for EntraBrokerProvider {
         self.inner.status()
     }
 
+    fn required_auth_error(&self) -> Option<String> {
+        self.inner.required_auth_error()
+    }
+
     async fn login(&self) -> McpAuthResult {
         self.inner.login().await
     }
@@ -722,6 +878,20 @@ impl Inner {
         self.acquire(flight, Trigger::Unauthorized { force_refresh: had_token })
             .await
             .is_ok()
+    }
+
+    /// The last sign-in error, once the target is known (so a token is
+    /// required) and no unexpired token is cached. The browser fallback keeps
+    /// its own 401-driven flow and never reports one.
+    fn required_auth_error(&self) -> Option<String> {
+        if self.fallback.is_some() || self.target().is_none() {
+            return None;
+        }
+        let state = self.entry.state();
+        if state.token.as_ref().is_some_and(|t| t.expires_at_unix > unix_now()) {
+            return None;
+        }
+        state.last_error.clone()
     }
 
     fn status(&self) -> Option<McpAuthStatus> {

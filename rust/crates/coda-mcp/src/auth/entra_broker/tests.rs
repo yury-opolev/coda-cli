@@ -560,6 +560,155 @@ async fn automatic_prompts_disabled_never_call_interactive() {
     assert!(last_error(&p).contains("`/mcp login contoso`"), "{}", last_error(&p));
 }
 
+// ── diagnostics ───────────────────────────────────────────────────────────────
+
+/// A diagnostics log under the workspace `target` directory, removed on drop.
+struct DiagLog {
+    dir: std::path::PathBuf,
+    ctx: Option<coda_diagnostics::DiagnosticContext>,
+}
+
+impl DiagLog {
+    fn new() -> Self {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-diagnostics")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).expect("create the diagnostics dir");
+        let logger = coda_diagnostics::Logger::open(
+            coda_diagnostics::Options {
+                directory: dir.clone(),
+                file: None,
+                role: coda_diagnostics::ProcessRole::Serve,
+                version: "test".into(),
+                verbosity: coda_diagnostics::Verbosity::Normal,
+            },
+            coda_diagnostics::Limits::default(),
+        )
+        .expect("logger opens");
+        let ctx = coda_diagnostics::DiagnosticContext::root(Arc::new(logger), "run-1");
+        Self { dir, ctx: Some(ctx) }
+    }
+
+    fn ctx(&self) -> coda_diagnostics::DiagnosticContext {
+        self.ctx.clone().expect("context")
+    }
+
+    fn text(&self) -> String {
+        let path = self.ctx().logger().status().path.expect("a log path");
+        std::fs::read_to_string(path).unwrap_or_default()
+    }
+
+    fn events(&self, kind: &str) -> Vec<serde_json::Value> {
+        self.text()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["kind"] == kind)
+            .collect()
+    }
+}
+
+impl Drop for DiagLog {
+    fn drop(&mut self) {
+        self.ctx = None;
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[tokio::test]
+async fn acquisition_records_a_broker_acquire_event_through_the_callers_context() {
+    let log = DiagLog::new();
+    let broker = FakeBroker::new();
+    broker.silent(interaction_required()).interactive(tok("tok-secret-value", 3600));
+    let p = provider(&broker);
+
+    let token = coda_diagnostics::scope(log.ctx(), token_of(&p)).await;
+    assert_eq!(token.as_deref(), Some("tok-secret-value"));
+
+    let events = log.events("mcp_broker_acquire");
+    assert_eq!(events.len(), 1, "{}", log.text());
+    let event = &events[0];
+    assert_eq!(event["trigger"], "automatic");
+    assert_eq!(event["outcome"], "interactive");
+    assert_eq!(event["interactive_attempted"], true);
+    assert_eq!(event["console_window"], true);
+    assert!(event["duration_ms"].is_u64());
+    let text = log.text();
+    assert!(!text.contains("tok-secret-value"), "{text}");
+    assert!(!text.contains("user@contoso.com"), "{text}");
+}
+
+#[tokio::test]
+async fn acquisition_outside_a_scope_records_through_the_construction_context() {
+    let log = DiagLog::new();
+    let broker = FakeBroker::new();
+    broker.no_interaction.store(true, Ordering::SeqCst);
+    broker.silent(interaction_required());
+    let p = coda_diagnostics::scope(log.ctx(), async { provider(&broker) }).await;
+
+    assert_eq!(token_of(&p).await, None);
+
+    let events = log.events("mcp_broker_acquire");
+    assert_eq!(events.len(), 1, "{}", log.text());
+    assert_eq!(events[0]["outcome"], "no_console");
+    assert_eq!(events[0]["interactive_attempted"], false);
+    assert_eq!(events[0]["console_window"], false);
+}
+
+#[tokio::test]
+async fn skipped_and_failed_acquisitions_record_why() {
+    let log = DiagLog::new();
+    let broker = FakeBroker::new();
+    broker
+        .silent(interaction_required())
+        .silent(Err(BrokerError::Timeout(Duration::from_secs(30))));
+    let cache = Arc::new(BrokerTokenCache::new());
+    let p = provider_with(
+        configured(),
+        EntraBrokerOptions { allow_interactive: false, ..options(broker.clone(), &cache) },
+    );
+    coda_diagnostics::scope(log.ctx(), async {
+        assert_eq!(token_of(&p).await, None);
+        // The cool-down answers the next automatic request without the broker.
+        assert_eq!(token_of(&p).await, None);
+        assert!(!p.handle_unauthorized(None).await);
+    })
+    .await;
+
+    let outcomes: Vec<_> = log
+        .events("mcp_broker_acquire")
+        .iter()
+        .map(|e| (e["trigger"].as_str().unwrap().to_owned(), e["outcome"].as_str().unwrap().to_owned()))
+        .collect();
+    assert_eq!(
+        outcomes,
+        [
+            ("automatic".to_owned(), "interaction_required".to_owned()),
+            ("unauthorized".to_owned(), "timeout".to_owned()),
+        ],
+        "{}",
+        log.text()
+    );
+    assert_eq!(broker.interactive_calls(), 0);
+}
+
+#[tokio::test]
+async fn required_auth_error_is_reported_only_once_a_known_target_failed() {
+    let broker = FakeBroker::new();
+    broker.silent(Err(BrokerError::Failed("AADSTS53003: blocked".into())));
+    let p = provider(&broker);
+    assert_eq!(p.required_auth_error(), None, "nothing has failed yet");
+    assert_eq!(token_of(&p).await, None);
+    let error = p.required_auth_error().expect("a token is required and sign-in failed");
+    assert!(error.contains("AADSTS53003"), "{error}");
+    assert!(error.contains("`/mcp login contoso`"), "{error}");
+
+    // Without a known target the first request must still go out to discover it.
+    let cache = Arc::new(BrokerTokenCache::new());
+    let discovering = provider_with(discovered(), options(FakeBroker::new(), &cache));
+    assert_eq!(token_of(&discovering).await, None);
+    assert_eq!(discovering.required_auth_error(), None);
+}
+
 /// A credential store that never answers.
 struct HungStore;
 
@@ -916,4 +1065,192 @@ async fn http_rejected_token_is_reacquired_once() {
     assert_eq!(broker.silent_calls(), 2);
     assert!(broker.request(1).force_refresh);
     assert_eq!(broker.interactive_calls(), 0);
+}
+
+/// Wraps a handler, counting `/mcp` requests that carry no `Authorization`.
+fn counting_unauthenticated(inner: Arc<RawHandler>, count: Arc<AtomicUsize>) -> Arc<RawHandler> {
+    Arc::new(move |req: &TestRequest, port: u16| {
+        if req.path == "/mcp" && req.header("authorization").is_none() {
+            count.fetch_add(1, Ordering::SeqCst);
+        }
+        inner(req, port)
+    })
+}
+
+#[tokio::test]
+async fn http_discovery_sends_only_the_first_request_unauthenticated() {
+    let unauthenticated = Arc::new(AtomicUsize::new(0));
+    let (port, _) =
+        spawn_raw_server(counting_unauthenticated(mcp_server("good"), Arc::clone(&unauthenticated)))
+            .await;
+    let broker = FakeBroker::new();
+    broker.silent(tok("good", 3600));
+    let cache = Arc::new(BrokerTokenCache::new());
+    let p = http_provider(port, discovered(), options(broker.clone(), &cache));
+
+    connect(port, p).await.expect("connected");
+    assert_eq!(unauthenticated.load(Ordering::SeqCst), 1, "only the discovery request");
+}
+
+#[tokio::test]
+async fn http_failed_sign_in_never_sends_unauthenticated_requests() {
+    let unauthenticated = Arc::new(AtomicUsize::new(0));
+    let (port, requests) =
+        spawn_raw_server(counting_unauthenticated(mcp_server("good"), Arc::clone(&unauthenticated)))
+            .await;
+    let broker = FakeBroker::new();
+    broker.silent(Err(BrokerError::Failed("AADSTS53003: blocked by policy".into())));
+    let cache = Arc::new(BrokerTokenCache::new());
+    let p = http_provider(port, configured(), options(broker.clone(), &cache));
+
+    let err = connect(port, p.clone()).await.err().expect("connect must fail");
+    let message = err.to_string();
+    assert!(message.contains("AADSTS53003: blocked by policy"), "{message}");
+    assert!(message.contains("`/mcp login contoso`"), "{message}");
+    assert!(!message.contains("HTTP 401"), "no request was sent: {message}");
+    assert_eq!(unauthenticated.load(Ordering::SeqCst), 0);
+    assert!(requests.lock().unwrap().is_empty(), "no request reaches the server");
+    assert!(last_error(&p).contains("AADSTS53003"), "{}", last_error(&p));
+    assert_eq!(broker.silent_calls(), 1);
+}
+
+#[tokio::test]
+async fn http_discovered_target_then_failed_sign_in_reports_the_broker_error() {
+    let unauthenticated = Arc::new(AtomicUsize::new(0));
+    let (port, _) =
+        spawn_raw_server(counting_unauthenticated(mcp_server("good"), Arc::clone(&unauthenticated)))
+            .await;
+    let broker = FakeBroker::new();
+    broker.silent(Err(BrokerError::Failed("broker-down-xyz".into())));
+    let cache = Arc::new(BrokerTokenCache::new());
+    let p = http_provider(port, discovered(), options(broker.clone(), &cache));
+
+    let message = connect(port, p).await.err().expect("connect must fail").to_string();
+    assert!(message.contains("HTTP 401"), "{message}");
+    assert!(message.contains("broker-down-xyz"), "{message}");
+    assert_eq!(unauthenticated.load(Ordering::SeqCst), 1, "only the discovery request");
+}
+
+#[tokio::test]
+async fn http_rejected_token_and_failed_reacquire_report_the_broker_error() {
+    let unauthenticated = Arc::new(AtomicUsize::new(0));
+    let (port, _) =
+        spawn_raw_server(counting_unauthenticated(mcp_server("good"), Arc::clone(&unauthenticated)))
+            .await;
+    let broker = FakeBroker::new();
+    broker.silent(tok("bad", 3600)).silent(Err(BrokerError::Failed("broker-down-xyz".into())));
+    let cache = Arc::new(BrokerTokenCache::new());
+    let p = http_provider(port, configured(), options(broker.clone(), &cache));
+
+    let message = connect(port, p).await.err().expect("connect must fail").to_string();
+    assert!(message.contains("HTTP 401"), "{message}");
+    assert!(message.contains("broker-down-xyz"), "{message}");
+    assert_eq!(unauthenticated.load(Ordering::SeqCst), 0);
+}
+
+// ── log redaction ─────────────────────────────────────────────────────────────
+
+const EUII_MESSAGE: &str = "AADSTS50020: User account 'ada@contoso.com' from identity provider \
+     'https://sts.windows.net/x/' does not exist in tenant 'Contoso'. (0xcaa20005) hint=bob@fabrikam.com";
+
+#[test]
+fn redacted_broker_detail_drops_accounts_and_keeps_codes() {
+    let redacted = redact_broker_detail(EUII_MESSAGE);
+    assert!(!redacted.contains('@'), "{redacted}");
+    assert!(!redacted.contains("ada"), "{redacted}");
+    assert!(!redacted.contains("fabrikam"), "{redacted}");
+    assert!(redacted.starts_with("AADSTS50020: User account '<redacted>' from identity provider"), "{redacted}");
+    assert!(redacted.contains("0xcaa20005"), "{redacted}");
+    assert_eq!(
+        redact_broker_detail("user 'ada' (UPN: \"ada.l@contoso.com\") AADSTS700082 ada%40contoso.com"),
+        "user '<redacted>' (UPN: '<redacted>') AADSTS700082 <redacted>"
+    );
+    let plain = "WAM error 0x80070005: Access is denied. AADSTS53003";
+    assert_eq!(redact_broker_detail(plain), plain);
+}
+
+thread_local! {
+    /// The log buffer of the test running on this thread, if it captures.
+    static CAPTURE: std::cell::RefCell<Option<Arc<Mutex<Vec<u8>>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A process-wide subscriber that writes every event's fields into the
+/// current thread's [`CAPTURE`] buffer, if any.
+struct CaptureSubscriber;
+
+/// Formats an event's fields as ` name=value` pairs.
+struct Fields(String);
+
+impl tracing::field::Visit for Fields {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        use std::fmt::Write as _;
+        let _ = write!(self.0, " {}={value:?}", field.name());
+    }
+}
+
+impl tracing::Subscriber for CaptureSubscriber {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        CAPTURE.with(|c| {
+            if let Some(sink) = c.borrow().as_ref() {
+                let mut fields = Fields(String::new());
+                event.record(&mut fields);
+                let line = format!("{}{}\n", event.metadata().level(), fields.0);
+                sink.lock().unwrap().extend_from_slice(line.as_bytes());
+            }
+        });
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Capture this thread's log output. A process-wide subscriber is used
+/// because a scoped one races with other tests over the callsite interest
+/// cache; events of threads that do not capture are dropped.
+fn capture_logs() -> Arc<Mutex<Vec<u8>>> {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        tracing::subscriber::set_global_default(CaptureSubscriber)
+            .expect("no other global subscriber");
+    });
+    let sink = Arc::new(Mutex::new(Vec::new()));
+    CAPTURE.with(|c| *c.borrow_mut() = Some(Arc::clone(&sink)));
+    sink
+}
+
+// Current-thread runtime: the spawned acquisition logs on this thread too.
+#[tokio::test]
+async fn broker_messages_naming_the_account_are_redacted_in_logs() {
+    let logs = capture_logs();
+
+    let broker = FakeBroker::new();
+    broker
+        .silent(Err(BrokerError::InteractionRequired(EUII_MESSAGE.into())))
+        .interactive(Err(BrokerError::Failed(EUII_MESSAGE.into())));
+    let p = provider(&broker);
+    assert_eq!(token_of(&p).await, None);
+    assert_eq!(broker.interactive_calls(), 1);
+
+    let logged = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert!(logged.contains("broker silent sign-in needs interaction"), "{logged}");
+    assert!(logged.contains("entra-broker auth:"), "{logged}");
+    assert!(logged.contains("AADSTS50020"), "{logged}");
+    assert!(!logged.contains("ada@contoso.com"), "{logged}");
+    assert!(!logged.contains("bob@fabrikam.com"), "{logged}");
+    // The user still sees the broker's full message.
+    assert!(last_error(&p).contains("ada@contoso.com"), "{}", last_error(&p));
 }

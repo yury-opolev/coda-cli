@@ -29,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 use coda_auth::store::CredentialStore;
 use coda_tool::{Tool, ToolSource};
 
-use crate::auth::entra_broker::INTERACTIVE_TIMEOUT;
+use crate::auth::entra_broker::{redact_broker_detail, INTERACTIVE_TIMEOUT};
 use crate::auth::{
     BrokerTokenCache, EntraBrokerOptions, EntraBrokerProvider, McpAuthMode, McpAuthProvider, McpAuthStatus,
     McpOAuthProvider, StaticBearerAuthProvider, TokenBroker,
@@ -164,7 +164,10 @@ impl ServerEntry {
         };
         let client = async {
             if let Err(error) = self.client.shutdown(deadline).await {
-                tracing::debug!(%error, "MCP client shutdown reported an error");
+                tracing::debug!(
+                    error = %redact_broker_detail(&error.to_string()),
+                    "MCP client shutdown reported an error"
+                );
             }
         };
         let ((), report) = tokio::join!(client, process);
@@ -538,7 +541,11 @@ impl McpClientManager {
                     Self::record_connected(&mut guard, name, spec, entry, auth);
                 }
                 Err(error) => {
-                    tracing::warn!(server = %name, %error, "MCP HTTP server failed to start");
+                    tracing::warn!(
+                        server = %name,
+                        error = %redact_broker_detail(&error.to_string()),
+                        "MCP HTTP server failed to start"
+                    );
                     Self::record_failed(&mut guard, name.clone(), spec, error.to_string(), auth);
                     errors.push(McpConnectError { server_name: name, error });
                 }
@@ -803,7 +810,11 @@ impl McpClientManager {
                     if let Err(error) =
                         entry.shutdown(tokio::time::Instant::now() + SHUTDOWN_GRACE).await
                     {
-                        tracing::warn!(server = %server_name, %error, "discarding restarted MCP server failed");
+                        tracing::warn!(
+                            server = %server_name,
+                            error = %redact_broker_detail(&error.to_string()),
+                            "discarding restarted MCP server failed"
+                        );
                     }
                     return Err(SHUTTING_DOWN.into());
                 };
