@@ -394,6 +394,9 @@ impl SteeringInbox {
         let mut inner = self.gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let dropped = std::mem::take(&mut inner.pending);
         inner.sealed_empty = true;
+        // The next turn's model decides afresh; a stale `false` must not
+        // refuse images it could take before its run reports in.
+        inner.accepts_images = true;
         if !dropped.is_empty() {
             if let Some(obs) = &self.observer {
                 obs.on_turn_ended_dropped(&dropped);
@@ -792,6 +795,15 @@ mod tests {
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].text, "plain");
         assert!(!inbox.has_any());
+    }
+
+    #[test]
+    fn a_text_only_turn_does_not_refuse_images_in_the_next_one() {
+        let inbox = SteeringInbox::new();
+        inbox.set_accepts_images(false);
+        inbox.close_for_turn();
+        inbox.open_for_turn();
+        assert!(inbox.enqueue_message("", vec![image("image/png", "AAAA")]).is_ok());
     }
 
     #[test]
