@@ -655,6 +655,7 @@ mod tests {
                 bearer_token: Some(Secret::new("coda-secret:mcp:srv/auth/token".into())),
                 client_id: None,
                 scopes: vec![],
+                ..Default::default()
             },
         }];
 

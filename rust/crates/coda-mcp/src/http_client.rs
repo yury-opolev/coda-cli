@@ -82,11 +82,40 @@ impl McpHttpClient {
         validate_mcp_url(url).map_err(McpError::Ssrf)?;
 
         // 2. Resolve host, check for SSRF-blocked ranges.
-        let lifetime = CancellationToken::new();
-        let vetted = check_ssrf(url, lifetime.clone())
+        let vetted = check_ssrf(url, CancellationToken::new())
             .await
             .map_err(McpError::Ssrf)?;
 
+        Self::connect_vetted(server_name, url, &vetted, headers, auth, connect_timeout, tool_timeout)
+            .await
+    }
+
+    /// Test-only connect to a loopback server: `check_ssrf` blocks loopback
+    /// addresses, so this skips the range check (URL validation still runs).
+    #[cfg(test)]
+    pub(crate) async fn connect_unvetted(
+        server_name: &str,
+        url: &str,
+        headers: &HashMap<String, String>,
+        auth: Option<Arc<dyn McpAuthProvider>>,
+        connect_timeout: Duration,
+        tool_timeout: Duration,
+    ) -> Result<Self, McpError> {
+        validate_mcp_url(url).map_err(McpError::Ssrf)?;
+        Self::connect_vetted(server_name, url, &[], headers, auth, connect_timeout, tool_timeout)
+            .await
+    }
+
+    async fn connect_vetted(
+        server_name: &str,
+        url: &str,
+        vetted: &[std::net::IpAddr],
+        headers: &HashMap<String, String>,
+        auth: Option<Arc<dyn McpAuthProvider>>,
+        connect_timeout: Duration,
+        tool_timeout: Duration,
+    ) -> Result<Self, McpError> {
+        let lifetime = CancellationToken::new();
         // 3. Build a reqwest client pinned to the vetted IP so a second DNS
         //    resolution at connect time cannot slip a private address through.
         let parsed_url: reqwest::Url =
@@ -249,10 +278,10 @@ impl McpHttpClient {
         }
     }
 
-    /// Cancel all in-flight requests and drop the connection.
-    pub async fn shutdown(self) {
+    /// Cancel all in-flight requests. The reqwest client and its connection
+    /// pool are freed when the last handle is dropped.
+    pub async fn shutdown(&self) {
         self.lifetime.cancel();
-        // Dropping self frees the reqwest client and its connection pool.
     }
 
     // ── internal ──────────────────────────────────────────────────────────────

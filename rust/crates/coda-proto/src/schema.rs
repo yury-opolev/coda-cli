@@ -28,6 +28,8 @@ pub fn documents() -> BTreeMap<&'static str, Value> {
         ("ConfigDescribeResult.json", schemars::schema_for!(crate::config::ConfigDescribeResult).to_value()),
         ("ConfigSetResult.json", schemars::schema_for!(crate::config::ConfigSetResult).to_value()),
         ("McpListResult.json", schemars::schema_for!(crate::mcp::McpListResult).to_value()),
+        ("McpAuthParams.json", schemars::schema_for!(crate::mcp::McpAuthParams).to_value()),
+        ("McpAuthActionResult.json", schemars::schema_for!(crate::mcp::McpAuthActionResult).to_value()),
         ("InitializeParams.json", schemars::schema_for!(crate::messages::InitializeParams).to_value()),
         ("InitializeResult.json", schemars::schema_for!(crate::messages::InitializeResult).to_value()),
         ("InitializeResponse.json", schemars::schema_for!(crate::messages::InitializeResponse).to_value()),

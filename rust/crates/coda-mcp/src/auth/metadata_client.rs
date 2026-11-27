@@ -117,3 +117,44 @@ impl McpAuthMetadataClient {
         serde_json::from_str(&text).ok()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::auth::test_http::spawn_server;
+
+    #[tokio::test]
+    async fn falls_back_to_openid_configuration_for_entra_shaped_issuers() {
+        let port = spawn_server(Arc::new(|path: &str, port: u16| match path {
+            "/tid/v2.0/.well-known/openid-configuration" => (
+                200,
+                serde_json::json!({
+                    "issuer": format!("http://127.0.0.1:{port}/tid/v2.0"),
+                    "authorization_endpoint":
+                        format!("http://127.0.0.1:{port}/tid/oauth2/v2.0/authorize"),
+                    "token_endpoint": format!("http://127.0.0.1:{port}/tid/oauth2/v2.0/token"),
+                    "scopes_supported": ["openid", "profile", "email", "offline_access"],
+                    "response_types_supported": ["code", "id_token"]
+                })
+                .to_string(),
+            ),
+            _ => (404, "{}".to_owned()),
+        }))
+        .await;
+
+        let client = McpAuthMetadataClient::new(reqwest::Client::new());
+        let meta = client
+            .get_authorization_server_metadata(&format!("http://127.0.0.1:{port}/tid/v2.0"))
+            .await
+            .expect("OIDC fallback parses");
+        assert_eq!(meta.issuer, format!("http://127.0.0.1:{port}/tid/v2.0"));
+        assert_eq!(
+            meta.token_endpoint,
+            format!("http://127.0.0.1:{port}/tid/oauth2/v2.0/token")
+        );
+        assert!(meta.registration_endpoint.is_none());
+        assert!(!meta.issuer_parameter_supported);
+    }
+}

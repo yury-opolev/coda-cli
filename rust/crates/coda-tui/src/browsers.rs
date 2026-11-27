@@ -487,6 +487,9 @@ pub fn mcp_from_engine(result: &coda_proto::mcp::McpListResult) -> Browser {
                     };
                     detail.push(format!("secret     {} ({resolved})", reference.name));
                 }
+                if let Some(auth) = &server.auth {
+                    detail.extend(mcp_auth_detail(&server.name, auth, Utc::now(), &chrono::Local));
+                }
 
                 let live = server.configured == McpConfiguredState::Enabled
                     && server.runtime_status == McpRuntimeStatus::Connected;
@@ -505,6 +508,43 @@ pub fn mcp_from_engine(result: &coda_proto::mcp::McpListResult) -> Browser {
             .collect(),
     );
     browser
+}
+
+/// The detail lines describing one server's authentication, secret-free:
+/// the mode, the signed-in account, when the token expires (in `zone`), and
+/// the most recent failure with how to retry.
+fn mcp_auth_detail<Tz: chrono::TimeZone>(
+    server: &str,
+    auth: &coda_proto::mcp::McpAuthStatusDto,
+    now: DateTime<Utc>,
+    zone: &Tz,
+) -> Vec<String>
+where
+    Tz::Offset: std::fmt::Display,
+{
+    let mut parts = vec![auth.mode.clone()];
+    if let Some(account) = &auth.account {
+        parts.push(account.clone());
+    }
+    if let Some(expires) = auth.expires_at_unix.and_then(|at| DateTime::<Utc>::from_timestamp(at, 0)) {
+        let local = expires.with_timezone(zone);
+        let when = if (expires - now).num_hours().abs() < 24 {
+            local.format("%H:%M").to_string()
+        } else {
+            local.format("%Y-%m-%d %H:%M").to_string()
+        };
+        parts.push(if expires > now { format!("expires {when}") } else { format!("expired {when}") });
+    }
+    let mut lines = vec![format!("auth       {}", parts.join(" · "))];
+    if let Some(error) = &auth.last_error {
+        lines.push(format!("auth error {error}"));
+    }
+    let interactive = matches!(auth.mode.as_str(), "oauth" | "entra-broker");
+    let signed_out = auth.account.is_none() && auth.expires_at_unix.is_none();
+    if interactive && (signed_out || auth.last_error.is_some()) {
+        lines.push(format!("sign in    /mcp login {server}"));
+    }
+    lines
 }
 
 /// Which tasks the `/tasks` browser shows.
@@ -1405,6 +1445,7 @@ mod tests {
                 env_var_names: vec!["TOKEN_NAME".into()],
                 secret_refs: vec![McpSecretRefDto { name: "TOKEN_NAME".into(), resolved: None }],
                                 last_error: None,
+                                auth: None,
                             }],
                         };
 
@@ -1447,6 +1488,7 @@ mod tests {
             env_var_names: Vec::new(),
             secret_refs: Vec::new(),
             last_error: last_error.map(str::to_string),
+            auth: None,
         };
         let result = McpListResult {
             enabled: true,
@@ -1467,6 +1509,87 @@ mod tests {
         );
         let up = items.iter().find(|i| i.cells[1] == "up").unwrap().detail.join("\n");
         assert!(!up.contains("restart "), "{up}");
+    }
+
+    #[test]
+    fn mcp_auth_detail_shows_mode_account_expiry_and_errors() {
+        use coda_proto::mcp::McpAuthStatusDto;
+
+        let now = DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap();
+        let soon = now + chrono::Duration::minutes(45);
+        let signed_in = McpAuthStatusDto {
+            mode: "entra-broker".into(),
+            account: Some("user@contoso.com".into()),
+            expires_at_unix: Some(soon.timestamp()),
+            last_error: None,
+        };
+        assert_eq!(
+            mcp_auth_detail("docs", &signed_in, now, &Utc),
+            vec![format!("auth       entra-broker · user@contoso.com · expires {}", soon.format("%H:%M"))]
+        );
+
+        let later = now + chrono::Duration::days(3);
+        let far = McpAuthStatusDto { expires_at_unix: Some(later.timestamp()), ..signed_in.clone() };
+        assert!(mcp_auth_detail("docs", &far, now, &Utc)[0]
+            .ends_with(&format!("expires {}", later.format("%Y-%m-%d %H:%M"))));
+
+        let past = now - chrono::Duration::minutes(5);
+        let stale = McpAuthStatusDto { expires_at_unix: Some(past.timestamp()), ..signed_in.clone() };
+        assert!(mcp_auth_detail("docs", &stale, now, &Utc)[0]
+            .ends_with(&format!("expired {}", past.format("%H:%M"))));
+
+        let failed = McpAuthStatusDto {
+            mode: "entra-broker".into(),
+            account: None,
+            expires_at_unix: None,
+            last_error: Some("AADSTS65001: consent required".into()),
+        };
+        assert_eq!(
+            mcp_auth_detail("docs", &failed, now, &Utc),
+            vec![
+                "auth       entra-broker".to_string(),
+                "auth error AADSTS65001: consent required".to_string(),
+                "sign in    /mcp login docs".to_string(),
+            ]
+        );
+
+        let bearer = McpAuthStatusDto { mode: "bearer".into(), account: None, expires_at_unix: None, last_error: None };
+        assert_eq!(mcp_auth_detail("docs", &bearer, now, &Utc), vec!["auth       bearer".to_string()]);
+    }
+
+    #[test]
+    fn the_engine_sourced_mcp_browser_shows_each_servers_auth() {
+        use coda_proto::mcp::{
+            McpAuthStatusDto, McpConfiguredState, McpListResult, McpRuntimeStatus, McpServerDto,
+        };
+
+        let result = McpListResult {
+            enabled: true,
+            manager_available: true,
+            servers: vec![McpServerDto {
+                name: "docs".into(),
+                scope: "user".into(),
+                transport: "http".into(),
+                target_kind: "url".into(),
+                target_display: "https://mcp.contoso.com/mcp".into(),
+                configured: McpConfiguredState::Enabled,
+                runtime_status: McpRuntimeStatus::NotConnected,
+                tool_count: None,
+                env_var_names: Vec::new(),
+                secret_refs: Vec::new(),
+                last_error: None,
+                auth: Some(McpAuthStatusDto {
+                    mode: "oauth".into(),
+                    account: None,
+                    expires_at_unix: None,
+                    last_error: Some("sign-in timed out".into()),
+                }),
+            }],
+        };
+        let detail = mcp_from_engine(&result).visible_items()[0].detail.join("\n");
+        assert!(detail.contains("auth       oauth"), "{detail}");
+        assert!(detail.contains("auth error sign-in timed out"), "{detail}");
+        assert!(detail.contains("sign in    /mcp login docs"), "{detail}");
     }
 
     #[test]

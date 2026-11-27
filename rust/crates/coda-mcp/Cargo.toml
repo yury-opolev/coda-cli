@@ -31,13 +31,16 @@ directories.workspace = true
 bytes.workspace = true
 reqwest.workspace = true
 uuid.workspace = true
+base64 = "0.22"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security"] }
+windows = { version = "0.62", features = ["Security_Authentication_Web_Core", "Security_Credentials", "Win32_Foundation", "Win32_System_Console", "Win32_System_WinRT", "Win32_UI_WindowsAndMessaging"] }
+windows-future = "0.3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
 pretty_assertions.workspace = true
-tokio = { workspace = true, features = ["rt", "macros", "time"] }
+tokio = { workspace = true, features = ["rt", "macros", "time", "test-util"] }

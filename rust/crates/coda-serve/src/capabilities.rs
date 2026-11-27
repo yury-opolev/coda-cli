@@ -59,6 +59,9 @@ pub fn capability_catalog() -> HashMap<String, CapabilityEntry> {
     m.insert("config.describe".into(), CapabilityEntry::supported());
     m.insert("config.session".into(), CapabilityEntry::supported());
     m.insert("mcp.list".into(), CapabilityEntry::supported());
+    // `mcp/auth`: sign in to / out of an HTTP MCP server; `mcp/list`
+    // reports each server's secret-free `auth` state.
+    m.insert("mcp.auth".into(), CapabilityEntry::supported());
     // Bounded schedules: `session/scheduleCreate` accepts `maxRuns` and
     // `expiresAt`/`expiresIn`, and `session/scheduleList` reports
     // `runsStarted`, the configured bounds and a truthful lifecycle `state`.
@@ -324,6 +327,7 @@ mod tests {
             "config.describe",
             "config.session",
             "mcp.list",
+            "mcp.auth",
             "state.awaitingUserInput",
             "schedules.bounds",
             "tasks.suspend",
@@ -380,6 +384,7 @@ mod tests {
             ("config.describe", coda_proto::messages::method::CONFIG_DESCRIBE),
             ("config.session", coda_proto::messages::method::CONFIG_SET),
             ("mcp.list", coda_proto::messages::method::MCP_LIST),
+            ("mcp.auth", coda_proto::messages::method::MCP_AUTH),
             ("tasks.suspend", coda_proto::messages::method::TASK_SUSPEND),
             ("session.plannedRestart", coda_proto::messages::method::PREPARE_RESTART),
         ];

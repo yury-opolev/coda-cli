@@ -37,13 +37,16 @@ mod test_fixture;
 pub(crate) mod transport;
 
 pub use error::{McpConnectError, McpError};
-pub use manager::{McpClientManager, McpServerFault, McpServerStatus, OldProcessOutcome, RestartReport};
+pub use manager::{
+    McpClientManager, McpServerAuthStatus, McpServerFault, McpServerStatus, OldProcessOutcome, RestartReport,
+};
 pub use tool::McpTool;
 
 // Auth re-exports for consumers that need to configure HTTP servers.
 pub use auth::{
-    McpAuthConfig, McpAuthMode, McpAuthProvider, McpOAuthProvider,
-    McpOAuthReauthenticator, McpAuthResult, StaticBearerAuthProvider,
+    EntraBrokerOptions, EntraBrokerProvider, McpAuthConfig, McpAuthMode, McpAuthProvider,
+    McpAuthStatus, McpOAuthProvider, McpOAuthReauthenticator, McpAuthResult,
+    StaticBearerAuthProvider, TokenBroker,
 };
 
 /// Hard cap on tool result text forwarded to the model, matching the built-in

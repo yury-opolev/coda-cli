@@ -1,0 +1,18 @@
+{
+  "type": "object",
+  "properties": {
+    "ok": {
+      "type": "boolean"
+    },
+    "message": {
+      "type": "string",
+      "description": "User-facing outcome (or failure reason with a next step)."
+    }
+  },
+  "required": [
+    "ok",
+    "message"
+  ],
+  "title": "McpAuthActionResult",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

@@ -1,0 +1,35 @@
+{
+  "type": "object",
+  "properties": {
+    "server": {
+      "type": "string",
+      "description": "Configured server name."
+    },
+    "action": {
+      "$ref": "#/$defs/McpAuthAction"
+    }
+  },
+  "required": [
+    "server",
+    "action"
+  ],
+  "title": "McpAuthParams",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "McpAuthAction": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "login",
+          "description": "Sign in: the browser flow for `oauth`, the OS account broker for\n`entra-broker`. A server that is not connected is restarted after a\nsuccessful sign-in."
+        },
+        {
+          "type": "string",
+          "const": "logout",
+          "description": "Sign out: forget the stored or cached token."
+        }
+      ],
+      "description": "`mcp/auth` action."
+    }
+  }
+}

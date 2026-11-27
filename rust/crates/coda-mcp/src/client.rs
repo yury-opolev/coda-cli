@@ -72,7 +72,8 @@ pub(crate) struct McpClient {
     pub server_info: McpServerInfo,
     pub tools: Vec<McpToolInfo>,
     tool_timeout: Duration,
-    _tasks: transport::ConnectionTasks,
+    /// Taken by the first [`McpClient::shutdown`].
+    tasks: std::sync::Mutex<Option<transport::ConnectionTasks>>,
 }
 
 impl McpClient {
@@ -100,7 +101,7 @@ impl McpClient {
                 server_info,
                 tools,
                 tool_timeout,
-                _tasks: tasks,
+                tasks: std::sync::Mutex::new(Some(tasks)),
             }),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(McpError::ConnectTimeout),
@@ -199,13 +200,14 @@ impl McpClient {
 
     /// MCP defines no shutdown RPC: close stdin and drain stdout while the
     /// owner concurrently waits for process exit.
-    pub async fn shutdown(self, deadline: tokio::time::Instant) -> Result<(), String> {
-        let Self {
-            connection,
-            mut _tasks,
-            ..
-        } = self;
-        drop(connection);
+    ///
+    /// Takes `&self` so a shared handle can stop the server while a call is
+    /// in flight; that call then fails once the server's stdout closes.
+    pub async fn shutdown(&self, deadline: tokio::time::Instant) -> Result<(), String> {
+        self.connection.close();
+        let Some(mut _tasks) = self.tasks.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            return Ok(());
+        };
         let writer_deadline = deadline.min(tokio::time::Instant::now() + Duration::from_secs(1));
         let writer = match tokio::time::timeout_at(writer_deadline, &mut _tasks.writer).await {
             Ok(Ok(())) => Ok(()),
