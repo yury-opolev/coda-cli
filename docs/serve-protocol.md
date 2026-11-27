@@ -148,6 +148,8 @@ the historical goal/startup details are not a promise of identical defaults.
 | `initialize` | `{ protocolVersion: string, clientInfo?: string, apiKey?: string, sessionId?: string, restore?: true\|false\|"suspended" }` | `{ protocolVersion: string, sessionId: string, serverInfo: string, telemetryLogPath?: string, restored?: RestoredSummary }` |
 | `session/prompt` | `{ text?, images?: [{ mediaType, base64 }] }` | `{ ok, stopReason?, interrupted, goalStatus? }` |
 | `session/interrupt` | `{}` | `{ ok }` |
+| `session/steer` | `{ text, images?: [{ mediaType, base64 }] }` | `{ ok, messageId?, rejectedReason?, rejectedDetail? }` |
+| `session/recallSteering` | `{}` | `{ messages: [{ id, text, enqueuedAt?, images? }] }` |
 | `session/history` | `{}` | `{ messages: [{ role, content }] }` |
 | `session/messages` | `{ sinceIndex }` | `{ messages, nextIndex }` |
 | `session/models` | `{ refresh? }` | `{ source, models: [{ id, displayName?, contextLimit? }] }` |
@@ -157,6 +159,35 @@ the historical goal/startup details are not a promise of identical defaults.
 `session/models` resolves the provider's model list (live endpoint → models.dev
 catalog → built-in); `source` is `live` / `catalog` / `builtin`. `refresh: true`
 re-fetches the catalog from models.dev first.
+
+### Image steering (Rust) — `steering.images` capability
+
+`session/steer` accepts optional `images` with the same shape and per-image validation as
+`session/prompt` (`image/png`, `image/jpeg`, `image/gif`, `image/webp`; well-formed
+base64). Text and images are **one** queued message: they are delivered together at the next
+safe boundary, each message's text followed by its own images in order, and never split. A
+message may be image-only; it is refused as `emptyText` only when it has neither text nor
+images. Every refusal queues nothing — never the text without its images:
+
+- `invalidImage` — an image failed validation (`rejectedDetail` names which; it never
+  quotes image data).
+- `imagesUnsupported` — the active model cannot receive image content.
+- `attachmentCapacity` — accepting the images would exceed the queue's aggregate budget of
+  32 MiB of base64 across all undelivered messages. Capacity returns as messages are
+  delivered or recalled.
+
+Queue status (`steering.pending[].images` in `session/getState` and
+`event/steeringQueue`) carries `{ mediaType, byteLength }` metadata only; the live
+history projection of a delivered message carries `image` blocks with the same metadata.
+The payload is handed back only by `session/recallSteering` (`messages[].images`). The
+`imagesUnsupported` check is against the model the running turn uses: when a run starts on a
+model that cannot receive images, image messages still queued are withdrawn with outcome
+`rejected` (never delivered as text alone). A planned restart describes a queued image message
+in the restart note without quoting its text; the client that sent it keeps the whole
+message, as recalled steering is reported `recalled`.
+
+An engine without `steering.images` ignores unknown fields, so a client must not send
+`images` to it: keep the draft and explain instead.
 
 ### Rich history, interaction and configuration (Rust)
 
@@ -1242,7 +1273,7 @@ with the same atomic, owner-only writer (format version `1`):
   "conversation": [ /* the subagent's messages, in the session transcript format */ ],
   "stepsUsed": 7,
   "parked": false,                  // true when it was parked waiting for its own tasks
-  "steering": [{ "kind": "message", "text": "focus on the API" }], // undelivered inbox items
+  "steering": [{ "kind": "message", "text": "focus on the API" }], // undelivered inbox items; a message may also carry "images": [{ mediaType, base64 }]
   "explicitlySuspended": false,     // suspended by the operator before the drain
   "startedAt": "2026-11-02T11:58:10Z",
   "suspendedAt": "2026-11-02T12:00:01Z",

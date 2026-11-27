@@ -168,12 +168,40 @@ impl LiveTurnAccumulator {
         message_id: &str,
         text: &str,
         upstream_full_length: Option<i64>,
+        images: &[coda_proto::state::SteeringImageMeta],
     ) {
-        if text.is_empty() {
+        if text.is_empty() && images.is_empty() {
             return;
         }
         self.flush_assistant();
+        let before = self.entries.len();
         self.push_user_block(text, upstream_full_length, Some(message_id), None);
+        let text_projected = self.entries.len() > before;
+        // Images never appear without the text they belong to.
+        if images.is_empty() || (!text.is_empty() && !text_projected) {
+            return;
+        }
+        let charge = images.len() * BLOCK_OVERHEAD + if text_projected { 0 } else { ENTRY_OVERHEAD };
+        if !self.charge(charge) {
+            return;
+        }
+        // Metadata only: the projection says an image was there, never what
+        // its bytes were.
+        let image_blocks = images.iter().map(|image| HistoryBlock::Image {
+            media_type: image.media_type.clone(),
+            byte_length: image.byte_length,
+        });
+        if text_projected {
+            let last = self.entries.pop().expect("the text entry was just pushed");
+            let mut entry = Arc::unwrap_or_clone(last);
+            entry.blocks.extend(image_blocks);
+            self.entries.push(Arc::new(entry));
+        } else {
+            let index = self.next_index;
+            self.next_index += 1;
+            let entry = HistoryEntry::new(index, "user", image_blocks.collect()).from_steering(message_id);
+            self.entries.push(Arc::new(entry));
+        }
     }
 
     /// Projects a delivered `ask_main` item's already-formatted

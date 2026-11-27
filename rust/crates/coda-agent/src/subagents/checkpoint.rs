@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::session::message_json::{deserialize_messages, serialize_messages};
 use crate::session::private_file::write_private_atomic;
-use crate::steering::InboxItemKind;
+use crate::steering::{InboxItemKind, SteeringEntry, SteeringImage};
 use crate::tasks::{TaskKind, TaskManager, TaskRunStatus};
 use crate::tool::ScheduleOrigin;
 
@@ -66,12 +66,54 @@ impl SubagentSpec {
 pub struct CheckpointInboxItem {
     pub kind: String,
     pub text: String,
+    /// Images queued with the message, in order (absent in older files).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<CheckpointImage>,
+}
+
+/// One image of an undelivered inbox message.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckpointImage {
+    pub media_type: String,
+    pub base64: String,
+}
+
+/// Never prints the payload.
+impl std::fmt::Debug for CheckpointImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CheckpointImage")
+            .field("media_type", &self.media_type)
+            .field("base64_len", &self.base64.len())
+            .finish()
+    }
 }
 
 impl CheckpointInboxItem {
     /// The inbox kind, defaulting to a plain message for unknown names.
     pub fn inbox_kind(&self) -> InboxItemKind {
         InboxItemKind::parse(&self.kind).unwrap_or_default()
+    }
+
+    /// Captures one inbox entry, images included.
+    pub fn from_entry(entry: &SteeringEntry) -> Self {
+        Self {
+            kind: entry.kind.as_str().to_owned(),
+            text: entry.text.clone(),
+            images: entry
+                .images
+                .iter()
+                .map(|i| CheckpointImage { media_type: i.media_type.clone(), base64: i.base64.clone() })
+                .collect(),
+        }
+    }
+
+    /// The images in the inbox's own representation.
+    pub fn steering_images(&self) -> Vec<SteeringImage> {
+        self.images
+            .iter()
+            .map(|i| SteeringImage { media_type: i.media_type.clone(), base64: i.base64.clone() })
+            .collect()
     }
 }
 
@@ -116,7 +158,7 @@ impl SubagentCheckpoint {
             .map(|inbox| inbox.snapshot_items())
             .unwrap_or_default()
             .into_iter()
-            .map(|(kind, text)| CheckpointInboxItem { kind: kind.as_str().to_owned(), text })
+            .map(|entry| CheckpointInboxItem::from_entry(&entry))
             .collect();
         Some(Self {
             version: SUBAGENT_CHECKPOINT_VERSION,

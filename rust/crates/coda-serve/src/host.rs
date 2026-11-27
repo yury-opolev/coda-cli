@@ -72,7 +72,6 @@ use crate::dispatch::{
     SetSystemPromptParams, SteerParams,
 };
 use crate::dispatch::AdjustEffortParams;
-use crate::images::validate_base64;
 use crate::prompts::{ImageAwareQuestion, PromptChannel, WirePermissionPrompt, WirePlanApprover, WireUserQuestion};
 use crate::mcp::McpBundle;
 use crate::session::Session;
@@ -109,9 +108,24 @@ struct SteerResponse {
     message_id: Option<String>,
     /// Additive (§2.7): `ok:false` used to be mute. `"noActiveTurn"` — no
     /// turn is currently running; `"turnEnding"` — the inbox raced sealed;
-    /// `"emptyText"` — nothing to send.
+    /// `"emptyText"` — nothing to send; `"invalidImage"`,
+    /// `"imagesUnsupported"`, `"attachmentCapacity"` — the images could not
+    /// be queued (see `rejected_detail`).
     #[serde(skip_serializing_if = "Option::is_none")]
     rejected_reason: Option<&'static str>,
+    /// Human-readable detail; never contains image data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rejected_detail: Option<String>,
+}
+
+impl SteerResponse {
+    fn accepted(message_id: String) -> Self {
+        Self { ok: true, message_id: Some(message_id), rejected_reason: None, rejected_detail: None }
+    }
+
+    fn refused(reason: &'static str, detail: Option<String>) -> Self {
+        Self { ok: false, message_id: None, rejected_reason: Some(reason), rejected_detail: detail }
+    }
 }
 
 #[derive(Serialize)]
@@ -121,6 +135,8 @@ struct RecalledMessage {
     text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     enqueued_at: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    images: Vec<coda_proto::messages::WireImage>,
 }
 
 #[derive(Serialize)]
@@ -2843,7 +2859,7 @@ impl ServeHost {
             .recall_all()
             .into_iter()
             .filter(|e| e.kind == coda_agent::steering::InboxItemKind::Message)
-            .map(|e| e.text)
+            .map(|e| restart_steering_text(&e))
             .collect()
     }
 
@@ -4384,6 +4400,40 @@ impl ServeBackend for ServeHost {
     }
 
     async fn session_steer(&self, p: SteerParams) -> Result<Value, RpcError> {
+        // With no turn running there is nothing to steer, whatever the
+        // message holds; say that before judging its images. The serialized
+        // check below still decides the race with a turn ending.
+        let steerable = |host: &Self| {
+            *host.turn_active.lock().expect("turn_active poisoned")
+                && host.steering_observer.turn_id().is_some()
+        };
+        if !steerable(self) {
+            return steer_reply(SteerResponse::refused("noActiveTurn", None));
+        }
+        // Images are checked before anything is queued, exactly as a prompt
+        // checks them, so a refusal never leaves half a message (its text)
+        // behind in the queue.
+        let mut images = Vec::new();
+        for (index, image) in p.images.as_deref().unwrap_or(&[]).iter().enumerate() {
+            let checked = crate::images::validate_wire_image(image).and_then(|(media_type, base64)| {
+                // A prompt tolerates this, but an empty image in steering
+                // would fail the running turn at the provider instead of
+                // this request.
+                if base64.is_empty() {
+                    Err("the image has no data".to_owned())
+                } else {
+                    Ok(coda_agent::steering::SteeringImage { media_type, base64 })
+                }
+            });
+            match checked {
+                Ok(image) => images.push(image),
+                Err(e) => {
+                    let detail = format!("image {}: {e}; nothing was queued", index + 1);
+                    return steer_reply(SteerResponse::refused("invalidImage", Some(detail)));
+                }
+            }
+        }
+        let offered: usize = images.iter().map(|i| i.byte_len()).sum();
         // I5: the busy check and the enqueue are performed on **one**
         // serialized path. Previously `turn_active` was read under its own
         // lock and `enqueue` then ran under the inbox's, so a turn could end
@@ -4395,21 +4445,40 @@ impl ServeBackend for ServeHost {
         let resp = {
             let busy = self.turn_active.lock().expect("turn_active poisoned");
             if !*busy || self.steering_observer.turn_id().is_none() {
-                SteerResponse { ok: false, message_id: None, rejected_reason: Some("noActiveTurn") }
+                SteerResponse::refused("noActiveTurn", None)
             } else {
                 // Attempt to enqueue; the inbox may have been sealed racing
-                // the turn end, or the text may be empty — each reported with
-                // its exact reason rather than a mute `ok:false` (§2.7).
-                match self.session.steering.enqueue_with_reason(&p.text) {
-                    Ok(entry) => {
-                        SteerResponse { ok: true, message_id: Some(entry.id), rejected_reason: None }
+                // the turn end, or the message may be empty — each reported
+                // with its exact reason rather than a mute `ok:false` (§2.7).
+                use coda_agent::steering::SteerRejectReason as Reject;
+                match self.session.steering.enqueue_message(p.text.as_str(), images) {
+                    Ok(entry) => SteerResponse::accepted(entry.id),
+                    Err(Reject::Sealed) => SteerResponse::refused("turnEnding", None),
+                    Err(Reject::EmptyText) => SteerResponse::refused("emptyText", None),
+                    Err(Reject::AttachmentCapacity) => {
+                        const MIB: usize = 1024 * 1024;
+                        let cap = coda_agent::steering::MAX_QUEUED_IMAGE_BYTES;
+                        let detail = if offered > cap {
+                            format!(
+                                "this message's images total {} MiB, more than the {} MiB the queue can hold; nothing was queued",
+                                offered.div_ceil(MIB),
+                                cap / MIB
+                            )
+                        } else {
+                            format!(
+                                "queued images may total at most {} MiB until earlier messages are delivered or reclaimed; nothing was queued",
+                                cap / MIB
+                            )
+                        };
+                        SteerResponse::refused("attachmentCapacity", Some(detail))
                     }
-                    Err(coda_agent::steering::SteerRejectReason::Sealed) => {
-                        SteerResponse { ok: false, message_id: None, rejected_reason: Some("turnEnding") }
-                    }
-                    Err(coda_agent::steering::SteerRejectReason::EmptyText) => {
-                        SteerResponse { ok: false, message_id: None, rejected_reason: Some("emptyText") }
-                    }
+                    // The inbox knows what the running turn's model accepts
+                    // (the agent tells it when the run starts); a model
+                    // chosen for the next turn does not matter here.
+                    Err(Reject::ImagesUnsupported) => SteerResponse::refused(
+                        "imagesUnsupported",
+                        Some("the model this turn is using cannot receive images; nothing was queued".to_owned()),
+                    ),
                 }
             }
         };
@@ -4420,7 +4489,7 @@ impl ServeBackend for ServeHost {
         // `SteeringStateObserver::on_rejected`). Because the check and the
         // enqueue above are now one serialized step, that reason is exact
         // rather than a guess about which side of a race we were on.
-        serde_json::to_value(&resp).map_err(|e| RpcError::internal(e.to_string()))
+        steer_reply(resp)
     }
 
     async fn session_recall_steering(&self) -> Result<Value, RpcError> {
@@ -4438,6 +4507,14 @@ impl ServeBackend for ServeHost {
                     .iter()
                     .find(|p| p.message_id == entry.id)
                     .map(|p| p.enqueued_at.clone()),
+                images: entry
+                    .images
+                    .iter()
+                    .map(|image| coda_proto::messages::WireImage {
+                        media_type: image.media_type.clone(),
+                        base64: image.base64.clone(),
+                    })
+                    .collect(),
             })
             .collect();
         Ok(json!({ "messages": messages }))
@@ -6395,20 +6472,8 @@ impl ServeHost {
         // never leaves the host stuck in "busy" state.
         if let Some(images) = p.images.as_deref() {
             for img in images {
-                let media_type = img["mediaType"].as_str().unwrap_or("");
-                match media_type {
-                    "image/png" | "image/jpeg" | "image/gif" | "image/webp" => {}
-                    other => {
-                        return Err(PromptRunFailure::Failed(RpcError::invalid_params(format!(
-                            "unsupported image media type: {other}"
-                        ))));
-                    }
-                }
-                let b64 = img["base64"].as_str().unwrap_or("");
-                if let Err(e) = validate_base64(b64) {
-                    return Err(PromptRunFailure::Failed(RpcError::invalid_params(format!(
-                        "invalid base64 encoding: {e}"
-                    ))));
+                if let Err(e) = crate::images::validate_wire_image(img) {
+                    return Err(PromptRunFailure::Failed(RpcError::invalid_params(e)));
                 }
             }
         }
@@ -7810,6 +7875,23 @@ fn project_history(history: &[Message]) -> Vec<WireHistoryMessage> {
             WireHistoryMessage { role: msg.role.as_str().to_string(), content }
         })
         .collect()
+}
+
+fn steer_reply(resp: SteerResponse) -> Result<Value, RpcError> {
+    serde_json::to_value(&resp).map_err(|e| RpcError::internal(e.to_string()))
+}
+
+/// How undelivered steering is named in the restart file, which the next
+/// engine shows the model. A message with images is described rather than
+/// quoted: its text must never reach the model without its images. The
+/// client that sent it keeps the whole message, since the recall reports it
+/// `recalled`.
+fn restart_steering_text(entry: &coda_agent::steering::SteeringEntry) -> String {
+    match entry.images.len() {
+        0 => entry.text.clone(),
+        1 => "[a message with 1 image; not carried over the restart, still held by the operator's client]".to_owned(),
+        n => format!("[a message with {n} images; not carried over the restart, still held by the operator's client]"),
+    }
 }
 
 fn build_user_message(p: &PromptParams) -> Message {
@@ -9545,7 +9627,7 @@ mod tests {
 
         // The steering inbox must not have been opened for a turn that never
         // started.
-        let steer = host.session_steer(SteerParams { text: "late".into() }).await.unwrap();
+        let steer = host.session_steer(SteerParams { text: "late".into(), images: None }).await.unwrap();
         assert_eq!(steer["ok"], false);
         assert_eq!(steer["rejectedReason"], "noActiveTurn");
 
@@ -10416,7 +10498,7 @@ mod tests {
         assert_eq!(state["turn"]["phase"], "preparing");
 
         let resp = host
-            .session_steer(SteerParams { text: "steer the new turn".into() })
+            .session_steer(SteerParams { text: "steer the new turn".into(), images: None })
             .await
             .unwrap();
         assert_eq!(
@@ -10540,7 +10622,7 @@ mod tests {
 
         host.begin_draining(None, drain_deadline()).await.unwrap();
         let resp = host
-            .session_steer(SteerParams { text: "finish up".into() })
+            .session_steer(SteerParams { text: "finish up".into(), images: None })
             .await
             .unwrap();
         assert_eq!(resp["ok"], true, "the running turn still takes steering: {resp}");
@@ -10666,7 +10748,7 @@ mod tests {
         // operator would type the follow-up.
         tokio::time::timeout(Duration::from_secs(5), client.paused[0].notified()).await.unwrap();
         let steer = host
-            .session_steer(SteerParams { text: "operator correction".into() })
+            .session_steer(SteerParams { text: "operator correction".into(), images: None })
             .await
             .unwrap();
         assert_eq!(steer["ok"], true, "{steer}");
@@ -10775,7 +10857,7 @@ mod tests {
         let (host, _rx) = host_with_events(dir.path());
         let _compaction =
             host.try_claim_turn("c1", "", TurnKind::Compaction).expect("claim succeeds");
-        let resp = host.session_steer(SteerParams { text: "steer".into() }).await.unwrap();
+        let resp = host.session_steer(SteerParams { text: "steer".into(), images: None }).await.unwrap();
         assert_eq!(resp["ok"], false);
         assert_eq!(
             resp["rejectedReason"], "turnEnding",
@@ -11140,7 +11222,7 @@ mod tests {
         let state = host.session_get_state(GetStateParams::default()).await.unwrap();
         assert_eq!(state["lifecycle"], "initializing");
         assert!(state.get("turn").is_none());
-        let steering = host.session_steer(SteerParams { text: "not a future prompt".into() }).await.unwrap();
+        let steering = host.session_steer(SteerParams { text: "not a future prompt".into(), images: None }).await.unwrap();
         assert_eq!(steering["ok"], false, "handshakes cannot consume steering");
         assert_eq!(steering["rejectedReason"], "noActiveTurn");
         drop(client);
@@ -11349,7 +11431,7 @@ mod tests {
             })
         };
         tokio::time::timeout(Duration::from_secs(2), client.started.notified()).await.unwrap();
-        assert_eq!(host.session_steer(SteerParams { text: "stranded-original".into() }).await.unwrap()["ok"], true);
+        assert_eq!(host.session_steer(SteerParams { text: "stranded-original".into(), images: None }).await.unwrap()["ok"], true);
         host.session_interrupt().await.unwrap();
         let result = tokio::time::timeout(Duration::from_secs(2), first).await.unwrap().unwrap().unwrap();
         assert_eq!(result["interrupted"], true);
@@ -11394,7 +11476,7 @@ mod tests {
         // A steering message queued just before the interrupt races the turn
         // end — it must surface as a `cancelledTurnEnded` outcome, not vanish
         // silently (§2.7 F1 gap this closes).
-        assert_eq!(host.session_steer(SteerParams { text: "never delivered".into() }).await.unwrap()["ok"], true);
+        assert_eq!(host.session_steer(SteerParams { text: "never delivered".into(), images: None }).await.unwrap()["ok"], true);
         host.session_interrupt().await.unwrap();
 
         let result = tokio::time::timeout(Duration::from_secs(2), run).await.unwrap().unwrap().unwrap();
@@ -11418,7 +11500,7 @@ mod tests {
     async fn pending_steering_is_withdrawn_when_the_turn_guard_exits_early() {
         let host = make_host();
         let turn = host.try_claim_turn("test-turn", "", TurnKind::Prompt).unwrap();
-        assert_eq!(host.session_steer(SteerParams { text: "not delivered".into() }).await.unwrap()["ok"], true);
+        assert_eq!(host.session_steer(SteerParams { text: "not delivered".into(), images: None }).await.unwrap()["ok"], true);
         drop(turn);
         assert!(!host.session.steering.has_pending());
         assert!(host.session.steering.enqueue("late").is_none());
@@ -11428,10 +11510,10 @@ mod tests {
     async fn pending_recall_withdraws_only_undelivered_messages() {
         let host = make_host();
         let _turn = host.try_claim_turn("test-turn", "", TurnKind::Prompt).unwrap();
-        let delivered = host.session_steer(SteerParams { text: "already delivered".into() }).await.unwrap();
+        let delivered = host.session_steer(SteerParams { text: "already delivered".into(), images: None }).await.unwrap();
         let taken = host.session.steering.take_all_for_delivery();
         assert_eq!(taken[0].id, delivered["messageId"]);
-        let pending = host.session_steer(SteerParams { text: "edit me".into() }).await.unwrap();
+        let pending = host.session_steer(SteerParams { text: "edit me".into(), images: None }).await.unwrap();
         let recalled = host.session_recall_steering().await.unwrap();
         assert_eq!(recalled["messages"].as_array().unwrap().len(), 1);
         assert_eq!(recalled["messages"][0]["id"], pending["messageId"]);
@@ -11439,6 +11521,158 @@ mod tests {
         assert!(!host.session.steering.has_pending(), "recalled text must no longer be deliverable");
         assert!(host.session_recall_steering().await.unwrap()["messages"].as_array().unwrap().is_empty());
         assert!(host.session.steering.take_all_for_delivery().is_empty());
+    }
+
+    mod image_steering {
+        use super::*;
+
+        const PAYLOAD: &str = "SU1BR0VQQVlMT0FE";
+
+        fn image(media_type: &str, base64: &str) -> Value {
+            json!({ "mediaType": media_type, "base64": base64 })
+        }
+
+        fn steer(text: &str, images: Vec<Value>) -> SteerParams {
+            SteerParams { text: text.into(), images: Some(images) }
+        }
+
+        #[tokio::test]
+        async fn text_and_images_queue_as_one_message_and_status_carries_metadata_only() {
+            let host = make_host();
+            let _turn = host.try_claim_turn("test-turn", "", TurnKind::Prompt).unwrap();
+            let resp = host
+                .session_steer(steer("here", vec![image("image/png", PAYLOAD), image("image/jpeg", "AAAA")]))
+                .await
+                .unwrap();
+            assert_eq!(resp["ok"], true, "{resp}");
+
+            let state = host.session_get_state(GetStateParams::default()).await.unwrap();
+            assert_eq!(state["steering"]["pendingCount"], 1);
+            assert_eq!(
+                state["steering"]["pending"][0]["images"],
+                json!([
+                    { "mediaType": "image/png", "byteLength": PAYLOAD.len() },
+                    { "mediaType": "image/jpeg", "byteLength": 4 },
+                ])
+            );
+            assert!(!state.to_string().contains(PAYLOAD), "status must never carry image bytes");
+
+            let taken = host.session.steering.take_all_for_delivery();
+            assert_eq!(taken.len(), 1);
+            assert_eq!(taken[0].text, "here");
+            let order: Vec<_> = taken[0].images.iter().map(|i| i.media_type.as_str()).collect();
+            assert_eq!(order, ["image/png", "image/jpeg"]);
+        }
+
+        #[tokio::test]
+        async fn an_image_only_message_is_accepted() {
+            let host = make_host();
+            let _turn = host.try_claim_turn("test-turn", "", TurnKind::Prompt).unwrap();
+            let resp = host.session_steer(steer("", vec![image("image/png", PAYLOAD)])).await.unwrap();
+            assert_eq!(resp["ok"], true, "{resp}");
+            let empty = host.session_steer(steer("  ", Vec::new())).await.unwrap();
+            assert_eq!(empty["rejectedReason"], "emptyText");
+        }
+
+        #[tokio::test]
+        async fn an_invalid_image_refuses_the_whole_message() {
+            let host = make_host();
+            let _turn = host.try_claim_turn("test-turn", "", TurnKind::Prompt).unwrap();
+            for bad in [image("image/bmp", "AAAA"), image("image/png", "not valid base64!!"), image("image/png", "")] {
+                let resp = host
+                    .session_steer(steer("explain", vec![image("image/png", PAYLOAD), bad]))
+                    .await
+                    .unwrap();
+                assert_eq!(resp["ok"], false);
+                assert_eq!(resp["rejectedReason"], "invalidImage");
+                let detail = resp["rejectedDetail"].as_str().unwrap();
+                assert!(detail.contains("image 2"), "{detail}");
+                assert!(!detail.contains(PAYLOAD));
+            }
+            assert!(!host.session.steering.has_any(), "no text-only partial message is queued");
+        }
+
+        #[tokio::test]
+        async fn a_model_that_cannot_take_images_is_reported_before_anything_is_queued() {
+            let host = make_host();
+            let idle = host.session_steer(steer("look", vec![image("image/png", PAYLOAD)])).await.unwrap();
+            assert_eq!(idle["rejectedReason"], "noActiveTurn", "no turn is the more fundamental refusal");
+            let _turn = host.try_claim_turn("test-turn", "", TurnKind::Prompt).unwrap();
+            // What the agent does when its run starts on a text-only model.
+            host.session.steering.set_accepts_images(false);
+            let resp = host.session_steer(steer("look", vec![image("image/png", PAYLOAD)])).await.unwrap();
+            assert_eq!(resp["rejectedReason"], "imagesUnsupported", "{resp}");
+            assert!(!host.session.steering.has_any());
+            let text = host.session_steer(steer("text still works", Vec::new())).await.unwrap();
+            assert_eq!(text["ok"], true, "text-only steering is unchanged");
+        }
+
+        #[tokio::test]
+        async fn exhausted_image_capacity_is_an_explicit_refusal() {
+            let host = make_host();
+            let _turn = host.try_claim_turn("test-turn", "", TurnKind::Prompt).unwrap();
+            let half = "A".repeat(coda_agent::steering::MAX_QUEUED_IMAGE_BYTES / 2);
+            for _ in 0..2 {
+                let resp = host.session_steer(steer("big", vec![image("image/png", &half)])).await.unwrap();
+                assert_eq!(resp["ok"], true);
+            }
+            let resp = host.session_steer(steer("one more", vec![image("image/png", "AAAA")])).await.unwrap();
+            assert_eq!(resp["rejectedReason"], "attachmentCapacity");
+            assert!(resp["rejectedDetail"].as_str().unwrap().contains("MiB"));
+            let state = host.session_get_state(GetStateParams::default()).await.unwrap();
+            assert_eq!(state["steering"]["pendingCount"], 2);
+
+            host.session_recall_steering().await.unwrap();
+            let whole = "A".repeat(coda_agent::steering::MAX_QUEUED_IMAGE_BYTES + 4);
+            let resp = host.session_steer(steer("too big", vec![image("image/png", &whole)])).await.unwrap();
+            assert_eq!(resp["rejectedReason"], "attachmentCapacity");
+            let detail = resp["rejectedDetail"].as_str().unwrap();
+            assert!(detail.contains("this message's images"), "an empty queue is not blamed: {detail}");
+        }
+
+        #[tokio::test]
+        async fn recall_hands_back_every_image_in_order() {
+            let host = make_host();
+            let _turn = host.try_claim_turn("test-turn", "", TurnKind::Prompt).unwrap();
+            host.session_steer(steer("first", vec![image("image/png", "AAA1"), image("image/gif", "AAA2")]))
+                .await
+                .unwrap();
+            host.session_steer(steer("second", Vec::new())).await.unwrap();
+            let recalled = host.session_recall_steering().await.unwrap();
+            let messages = recalled["messages"].as_array().unwrap();
+            assert_eq!(messages.len(), 2);
+            assert_eq!(
+                messages[0]["images"],
+                json!([
+                    { "mediaType": "image/png", "base64": "AAA1" },
+                    { "mediaType": "image/gif", "base64": "AAA2" },
+                ])
+            );
+            assert!(messages[1].get("images").is_none(), "a text-only recall is unchanged");
+        }
+
+        #[tokio::test]
+        async fn images_without_a_running_turn_are_refused_as_no_active_turn() {
+            let host = make_host();
+            let resp = host.session_steer(steer("x", vec![image("image/png", PAYLOAD)])).await.unwrap();
+            assert_eq!(resp["rejectedReason"], "noActiveTurn");
+        }
+
+        #[test]
+        fn the_restart_note_says_images_were_not_carried_over() {
+            let inbox = coda_agent::SteeringInbox::new();
+            let png = || coda_agent::steering::SteeringImage { media_type: "image/png".into(), base64: "AAAA".into() };
+            let one = inbox.enqueue_message("see this", vec![png()]).unwrap();
+            let two = inbox.enqueue_message("", vec![png(), png()]).unwrap();
+            let plain = inbox.enqueue("plain").unwrap();
+            assert_eq!(
+                restart_steering_text(&one),
+                "[a message with 1 image; not carried over the restart, still held by the operator's client]"
+            );
+            assert!(!restart_steering_text(&one).contains("see this"), "its text never reaches the model alone");
+            assert!(restart_steering_text(&two).starts_with("[a message with 2 images;"));
+            assert_eq!(restart_steering_text(&plain), "plain");
+        }
     }
 
     #[tokio::test]
@@ -12341,7 +12575,7 @@ mod tests {
         let host = make_host();
         // Steering inbox is sealed when no turn is running.
         let r = host
-            .session_steer(SteerParams { text: "steer without a turn".into() })
+            .session_steer(SteerParams { text: "steer without a turn".into(), images: None })
             .await
             .unwrap();
         assert_eq!(r["ok"], false, "steer with no turn running must return ok:false");
@@ -19128,7 +19362,7 @@ mod tests {
                 host.task_manager.list().into_iter().find(|t| t.kind == TaskKind::Shell)
             };
             wait_for("the command to start", || shell(&host).is_some()).await;
-            let steer = host.session_steer(SteerParams { text: "also check X".into() }).await.unwrap();
+            let steer = host.session_steer(SteerParams { text: "also check X".into(), images: None }).await.unwrap();
             assert_eq!(steer["ok"], true, "{steer}");
 
             let started = std::time::Instant::now();
@@ -19703,7 +19937,7 @@ mod tests {
                 a.task_manager.list().iter().any(|t| t.kind == TaskKind::Shell)
             })
             .await;
-            let steer = a.session_steer(SteerParams { text: "also check X".into() }).await.unwrap();
+            let steer = a.session_steer(SteerParams { text: "also check X".into(), images: None }).await.unwrap();
             assert_eq!(steer["ok"], true, "{steer}");
             let r = dispatch("session/prepareRestart", Some(json!({ "drainTimeoutMs": 300 })), a.as_ref())
                 .await

@@ -224,8 +224,13 @@ async fn run_tools_body(
                         results.push(make_result_block(sid, msg, true, ToolCallStatus::Skipped, scorr.clone()));
                     }
                 }
-                let steering_text = delivered.iter().map(|e| e.text.as_str()).collect::<Vec<_>>().join("\n\n");
-                results.push(Content::Text(steering_text));
+                if delivered.iter().any(|e| !e.images.is_empty()) {
+                    results.extend(crate::steering::steering_blocks(&delivered, None));
+                } else {
+                    let steering_text =
+                        delivered.iter().map(|e| e.text.as_str()).collect::<Vec<_>>().join("\n\n");
+                    results.push(Content::Text(steering_text));
+                }
                 sink.emit(AgentEvent::SteeringDelivered {
                     message_ids: delivered
                         .iter()

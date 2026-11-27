@@ -1544,7 +1544,7 @@ impl EngineState {
 
     // ── Steering projection (sole owner of `SteeringQueueState`) ─────────
 
-    pub fn steering_enqueued(&self, message_id: &str, text: &str) {
+    pub fn steering_enqueued(&self, message_id: &str, text: &str, images: Vec<coda_proto::state::SteeringImageMeta>) {
         let (message_id, text) = (message_id.to_string(), text.to_string());
         self.transact(move |s| {
             let (capped, full_len) =
@@ -1555,6 +1555,7 @@ impl EngineState {
                 text_length: full_len.unwrap_or(capped.len() as i64),
                 text_truncated: full_len.is_some(),
                 text: capped,
+                images,
             });
             s.steering_queue_event()
         });
@@ -1581,6 +1582,16 @@ impl EngineState {
     pub fn steering_recalled(&self, message_ids: &[String]) {
         let ids = message_ids.to_vec();
         self.transact(move |s| record_outcomes(s, &ids, SteeringOutcomeKind::Recalled, None));
+    }
+
+    /// Image-bearing messages the active model cannot receive were withdrawn
+    /// instead of delivered: reported `rejected`, so a client recovers them
+    /// explicitly rather than believing they reached the model.
+    pub fn steering_undeliverable(&self, message_ids: &[String], turn_id: Option<&str>) {
+        let (ids, turn_id) = (message_ids.to_vec(), turn_id.map(|s| s.to_string()));
+        self.transact(move |s| {
+            record_outcomes(s, &ids, SteeringOutcomeKind::Rejected, turn_id.as_deref())
+        });
     }
 
     /// Idempotent by message id (defensive; the inbox itself already only
@@ -2071,7 +2082,7 @@ fn project_delivered_steering(s: &mut StateInner, ids: &[String], turn_id: Optio
     if ids.is_empty() || turn_id.is_none() || s.current_turn_id() != turn_id {
         return;
     }
-    let mut deliver: Vec<(String, String, Option<i64>)> = Vec::new();
+    let mut deliver: Vec<(String, String, Option<i64>, Vec<coda_proto::state::SteeringImageMeta>)> = Vec::new();
     for id in ids {
         let already = s
             .steering_outcomes
@@ -2088,11 +2099,11 @@ fn project_delivered_steering(s: &mut StateInner, ids: &[String], turn_id: Optio
         // together so the projection can say it is short rather than look
         // complete.
         let full_length = entry.text_truncated.then_some(entry.text_length);
-        deliver.push((entry.message_id.clone(), entry.text.clone(), full_length));
+        deliver.push((entry.message_id.clone(), entry.text.clone(), full_length, entry.images.clone()));
     }
     let Some(turn) = s.turn.as_mut() else { return };
-    for (id, text, full_length) in deliver {
-        turn.live.push_steering_text(&id, &text, full_length);
+    for (id, text, full_length, images) in deliver {
+        turn.live.push_steering_text(&id, &text, full_length, &images);
     }
 }
 
@@ -2205,11 +2216,41 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn delivered_image_steering_is_projected_live_as_metadata_beside_its_text() {
+        let state = test_state();
+        state.begin_turn("t1", "start", active_config(), ActivityPhase::Responding);
+        let meta = |media_type: &str| coda_proto::state::SteeringImageMeta {
+            media_type: media_type.into(),
+            byte_length: 16,
+        };
+        state.steering_enqueued("m1", "see this", vec![meta("image/png"), meta("image/gif")]);
+        state.steering_enqueued("m2", "", vec![meta("image/jpeg")]);
+        state.steering_delivered(&["m1".into(), "m2".into()], Some("t1"));
+
+        let live = state.history_view().live.expect("a turn is running");
+        let steered: Vec<_> = live.entries.iter().filter(|e| e.steering_message_id.is_some()).collect();
+        assert_eq!(steered.len(), 2);
+        assert!(matches!(&steered[0].blocks[0], HistoryBlock::Text { text, .. } if text == "see this"));
+        let images = |entry: &coda_proto::history::HistoryEntry| -> Vec<String> {
+            entry
+                .blocks
+                .iter()
+                .filter_map(|b| match b {
+                    HistoryBlock::Image { media_type, byte_length: 16 } => Some(media_type.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(images(steered[0]), ["image/png", "image/gif"]);
+        assert_eq!(images(steered[1]), ["image/jpeg"], "an image-only message is still projected");
+    }
+
+    #[test]
     fn delivered_steering_is_in_the_live_projection_the_same_outcome_appears_in() {
         let state = test_state();
         state.begin_turn("t1", "start", active_config(), ActivityPhase::Responding);
         state.transact(|s| s.observed_text_delta("half a reply"));
-        state.steering_enqueued("m1", "operator correction");
+        state.steering_enqueued("m1", "operator correction", Vec::new());
         state.steering_delivered(&["m1".into()], Some("t1"));
 
         let snapshot = state.project("v1", limits());
@@ -2240,7 +2281,7 @@ pub(crate) mod tests {
     fn a_repeated_delivery_notification_does_not_double_the_text() {
         let state = test_state();
         state.begin_turn("t1", "start", active_config(), ActivityPhase::Responding);
-        state.steering_enqueued("m1", "operator correction");
+        state.steering_enqueued("m1", "operator correction", Vec::new());
         state.steering_delivered(&["m1".into()], Some("t1"));
         state.steering_delivered(&["m1".into()], Some("t1"));
 
@@ -2257,8 +2298,8 @@ pub(crate) mod tests {
     fn two_messages_delivered_together_keep_their_order_and_their_own_ids() {
         let state = test_state();
         state.begin_turn("t1", "start", active_config(), ActivityPhase::Responding);
-        state.steering_enqueued("m1", "first");
-        state.steering_enqueued("m2", "first");
+        state.steering_enqueued("m1", "first", Vec::new());
+        state.steering_enqueued("m2", "first", Vec::new());
         state.steering_delivered(&["m1".into(), "m2".into()], Some("t1"));
 
         assert_eq!(
@@ -2276,7 +2317,7 @@ pub(crate) mod tests {
     fn a_delivery_reported_for_another_turn_never_lands_in_this_ones_projection() {
         let state = test_state();
         state.begin_turn("t1", "start", active_config(), ActivityPhase::Responding);
-        state.steering_enqueued("m1", "meant for the previous turn");
+        state.steering_enqueued("m1", "meant for the previous turn", Vec::new());
         state.steering_delivered(&["m1".into()], Some("t0"));
 
         assert_eq!(live_user_entries(&state), vec![("start".to_string(), None)]);
@@ -2302,7 +2343,7 @@ pub(crate) mod tests {
         let state = test_state();
         state.begin_turn("t1", "start", active_config(), ActivityPhase::Responding);
         let long = "x".repeat(DEFAULT_STEERING_TEXT_CAP + 512);
-        state.steering_enqueued("m1", &long);
+        state.steering_enqueued("m1", &long, Vec::new());
         state.steering_delivered(&["m1".into()], Some("t1"));
 
         let live = state.history_view().live.expect("a turn is running");
@@ -2330,7 +2371,7 @@ pub(crate) mod tests {
     fn a_delivery_after_the_turn_ended_is_recorded_without_reopening_a_projection() {
         let state = test_state();
         state.begin_turn("t1", "start", active_config(), ActivityPhase::Responding);
-        state.steering_enqueued("m1", "operator correction");
+        state.steering_enqueued("m1", "operator correction", Vec::new());
         state.end_turn(ended("t1"));
         state.steering_delivered(&["m1".into()], Some("t1"));
 

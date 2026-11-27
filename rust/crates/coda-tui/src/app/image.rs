@@ -97,7 +97,79 @@ pub(super) fn images_for_draft(images: &[StagedImage], text: &str) -> Vec<messag
     ordered.into_iter().map(|(_, image)| image.to_wire()).collect()
 }
 
+/// The attachment ids of the image markers in `text`, distinct, in order of
+/// first appearance — the same order [`images_for_draft`] sends them in.
+fn marker_ids(text: &str) -> Vec<String> {
+    let prefix = format!("[{} coda-image-", glyphs::CAMERA);
+    let mut ids: Vec<String> = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(&prefix) {
+        rest = &rest[start + prefix.len()..];
+        let Some(end) = rest.find(']') else { break };
+        if let Some((id, _extension)) = rest[..end].rsplit_once('.') {
+            if !ids.iter().any(|known| known == id) {
+                ids.push(id.to_string());
+            }
+        }
+        rest = &rest[end..];
+    }
+    ids
+}
+
+/// Turns a message handed back by the engine (recall, recovery) into a draft
+/// whose images are staged again under the markers that referenced them.
+///
+/// The k-th image is re-bound to the k-th distinct marker when that marker
+/// names it exactly, which is how this client sent it; so resending the
+/// restored draft resolves every image to the same bytes in the same order.
+/// An image no marker names (a message from another client, or a marker
+/// edited away) gets a fresh marker appended, so it is visible and still
+/// part of the draft rather than silently attached or silently lost.
+pub(in crate::app) fn restage(text: &str, images: Vec<messages::WireImage>) -> (String, Vec<StagedImage>) {
+    let mut ids = marker_ids(text).into_iter();
+    let mut draft = text.to_string();
+    let mut staged = Vec::with_capacity(images.len());
+    for image in images {
+        let bound = ids.next().map(|id| StagedImage {
+            id,
+            media_type: image.media_type.clone(),
+            base64: image.base64.clone(),
+        });
+        let image = match bound {
+            Some(candidate) if draft.contains(&candidate.marker()) => candidate,
+            _ => {
+                let fresh = StagedImage {
+                    id: new_attachment_id(),
+                    media_type: image.media_type,
+                    base64: image.base64,
+                };
+                if !draft.is_empty() {
+                    draft.push(' ');
+                }
+                draft.push_str(&fresh.marker());
+                fresh
+            }
+        };
+        staged.push(image);
+    }
+    (draft, staged)
+}
+
+/// "1 image" / "3 images".
+pub(in crate::app) fn image_count_label(count: usize) -> String {
+    if count == 1 { "1 image".to_string() } else { format!("{count} images") }
+}
+
 impl App {
+    /// Puts a message back in the composer with its images staged again, so
+    /// sending it once more delivers the same text and the same bytes.
+    pub(in crate::app) fn restore_draft(&mut self, text: String, images: Vec<messages::WireImage>) {
+        let (text, staged) = restage(&text, images);
+        self.staged_images.retain(|existing| !staged.iter().any(|image| image.id == existing.id));
+        self.staged_images.extend(staged);
+        self.composer.set_text(text);
+    }
+
     /// Stages encoded image bytes as an attachment and inserts its
     /// placeholder token into the composer draft.
     ///
@@ -319,6 +391,49 @@ mod tests {
         assert_eq!(retry.len(), 1);
         assert_eq!(retry[0].base64, "payload-1");
         assert_eq!(retry[0].media_type, "image/png");
+    }
+
+    // -- Restaging a recalled message ------------------------------------
+
+    fn wire(media_type: &str, base64: &str) -> messages::WireImage {
+        messages::WireImage { media_type: media_type.into(), base64: base64.into() }
+    }
+
+    #[test]
+    fn a_recalled_draft_resends_the_same_images_in_the_same_order() {
+        let sent = vec![
+            staged("id-a", "image/png", "first"),
+            staged("id-b", "image/jpeg", "second"),
+        ];
+        let text = format!("look {} and {}", sent[1].marker(), sent[0].marker());
+        let outgoing = images_for_draft(&sent, &text);
+
+        let (draft, restaged) = restage(&text, outgoing.clone());
+        assert_eq!(draft, text, "the operator's text and markers come back unchanged");
+        assert_eq!(images_for_draft(&restaged, &draft), outgoing);
+    }
+
+    #[test]
+    fn an_image_no_marker_names_is_restored_visibly_rather_than_lost() {
+        let (draft, restaged) = restage("from another client", vec![wire("image/gif", "payload")]);
+        assert_eq!(restaged.len(), 1);
+        assert!(draft.starts_with("from another client "), "{draft}");
+        assert!(draft.ends_with(&restaged[0].marker()), "{draft}");
+        assert_eq!(images_for_draft(&restaged, &draft), vec![wire("image/gif", "payload")]);
+
+        let (image_only, restaged) = restage("", vec![wire("image/png", "p")]);
+        assert_eq!(image_only, restaged[0].marker());
+    }
+
+    #[test]
+    fn several_recalled_messages_keep_each_image_with_its_own_marker() {
+        let first = staged("id-1", "image/png", "one");
+        let second = staged("id-2", "image/png", "two");
+        let joined = format!("a {}\n\nb {}", first.marker(), second.marker());
+        let (draft, restaged) = restage(&joined, vec![wire("image/png", "one"), wire("image/png", "two")]);
+        assert_eq!(draft, joined);
+        let payloads: Vec<_> = images_for_draft(&restaged, &draft).into_iter().map(|w| w.base64).collect();
+        assert_eq!(payloads, ["one", "two"]);
     }
 
     // ── PNG encoding ────────────────────────────────────────────────────────

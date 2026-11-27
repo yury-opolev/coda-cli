@@ -367,6 +367,7 @@ impl AgentLoop {
         // is silently dropped (§MINOR 4).
         if let Some(steering) = &self.steering {
             steering.open_for_turn();
+            steering.set_accepts_images(self.client.accepts_image_input(&self.model));
         }
         // Pending post-sampling hook tasks — drained on EVERY exit path
         // (§8 item 27).  The inner function returns via the single exit point
@@ -528,12 +529,16 @@ impl AgentLoop {
                     // (§6.9): the model is shown what is, before it reads it.
                     let mut brief = self.live_task_brief().filter(|_| has_message);
                     for run in steers.chunk_by(|a, b| is_operator(a) == is_operator(b)) {
+                        let brief = if is_operator(&run[0]) { brief.take() } else { None };
+                        if run.iter().any(|e| !e.images.is_empty()) {
+                            history.push(Message::new(Role::User, crate::steering::steering_blocks(run, brief)));
+                            continue;
+                        }
                         let text = run
                             .iter()
                             .map(|e| e.text.as_str())
                             .collect::<Vec<_>>()
                             .join("\n\n");
-                        let brief = if is_operator(&run[0]) { brief.take() } else { None };
                         let text = match brief {
                             Some(brief) => format!("{brief}\n\n{text}"),
                             None => text,
@@ -1579,6 +1584,7 @@ mod tests {
         /// Each call to `stream` pops the next scripted sequence.
         sequences: Mutex<VecDeque<Vec<Result<StreamEvent, LlmError>>>>,
         requests: Mutex<Vec<ChatRequest>>,
+        refuses_images: std::sync::atomic::AtomicBool,
     }
 
     impl MockLlmClient {
@@ -1586,6 +1592,7 @@ mod tests {
             Arc::new(Self {
                 sequences: Mutex::new(sequences.into_iter().collect()),
                 requests: Mutex::new(Vec::new()),
+                refuses_images: std::sync::atomic::AtomicBool::new(false),
             })
         }
     }
@@ -1594,6 +1601,9 @@ mod tests {
     impl coda_llm::LlmClient for MockLlmClient {
         fn provider_id(&self) -> &str {
             "mock"
+        }
+        fn accepts_image_input(&self, _model: &str) -> bool {
+            !self.refuses_images.load(std::sync::atomic::Ordering::SeqCst)
         }
         async fn stream(&self, request: ChatRequest) -> Result<coda_llm::ResponseStream, LlmError> {
             self.requests.lock().unwrap().push(request);
@@ -2871,6 +2881,113 @@ mod tests {
             matches!(e, AgentEvent::ToolResult { status: ToolCallStatus::Skipped, .. })
         }).count();
         assert_eq!(skipped, 1, "tool_b should have exactly one Skipped result");
+    }
+
+    // ── Image steering ───────────────────────────────────────────────────────
+
+    fn png(payload: &str) -> crate::steering::SteeringImage {
+        crate::steering::SteeringImage { media_type: "image/png".into(), base64: payload.into() }
+    }
+
+    fn image_payloads(message: &Message) -> Vec<String> {
+        message
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                Content::Image { base64, .. } => Some(base64.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn steered_images_reach_the_next_request_with_their_text() {
+        let steering = Arc::new(SteeringInbox::new());
+        steering.enqueue_message("here is the failure", vec![png("IMG1"), png("IMG2")]).unwrap();
+        steering.enqueue_message("", vec![png("IMG3")]).unwrap();
+        let client = MockLlmClient::new(vec![vec![Ok(StreamEvent::TextDelta("ok".into())), Ok(done())]]);
+        let tools = Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
+        let agent = AgentLoopBuilder::new(client.clone(), Arc::new(AllowAll), tools)
+            .with_steering(steering)
+            .with_tool_max_duration(None)
+            .build();
+        let mut history = vec![Message::user("go")];
+        agent.run(&mut history, &NullSink, None, CancellationToken::new()).await.unwrap();
+
+        let request = client.requests.lock().unwrap()[0].clone();
+        let steered = request.messages.last().expect("the steering message is sent");
+        assert_eq!(steered.role, Role::User);
+        assert_eq!(image_payloads(steered), ["IMG1", "IMG2", "IMG3"], "message and image order are kept");
+        assert!(
+            matches!(&steered.content[0], Content::Text(t) if t == "here is the failure"),
+            "each message's text precedes its own images: {:?}",
+            steered.content
+        );
+        assert!(matches!(steered.content[1], Content::Image { .. }));
+    }
+
+    #[tokio::test]
+    async fn steered_images_mid_batch_follow_the_tool_results() {
+        struct ImageSteeringTool(Arc<SteeringInbox>);
+        #[async_trait]
+        impl crate::tool::Tool for ImageSteeringTool {
+            fn name(&self) -> &str { "tool_a" }
+            fn description(&self) -> &str { "tool_a" }
+            fn input_schema_json(&self) -> &str { "{}" }
+            fn is_read_only(&self) -> bool { true }
+            async fn execute(&self, _: &serde_json::Value, _: &ToolContext, _: CancellationToken) -> ToolOutcome {
+                self.0.enqueue_message("look at this", vec![png("SHOT")]).unwrap();
+                ToolResult::ok("done")
+            }
+        }
+        let steering = Arc::new(SteeringInbox::new());
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let client = MockLlmClient::new(vec![
+            vec![Ok(tool_use_event("t1", "tool_a")), Ok(tool_use_event("t2", "tool_b")), Ok(done())],
+            vec![Ok(StreamEvent::TextDelta("ok".into())), Ok(done())],
+        ]);
+        let tools = Arc::new(ToolRegistry::new([
+            Arc::new(ImageSteeringTool(steering.clone())) as Arc<dyn crate::tool::Tool>,
+            dyn_tool(MockTool::new("tool_b", true, log.clone())),
+        ]));
+        let agent = AgentLoopBuilder::new(client.clone(), Arc::new(AllowAll), tools)
+            .with_steering(steering)
+            .with_tool_max_duration(None)
+            .build();
+        let mut history = vec![Message::user("go")];
+        agent.run(&mut history, &NullSink, None, CancellationToken::new()).await.unwrap();
+
+        let request = client.requests.lock().unwrap()[1].clone();
+        let results = request.messages.last().unwrap();
+        let kinds: Vec<&str> = results
+            .content
+            .iter()
+            .map(|c| match c {
+                Content::ToolResult { .. } => "result",
+                Content::Text(_) => "text",
+                Content::Image { .. } => "image",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, ["result", "result", "text", "image"], "tool results stay first");
+        assert_eq!(image_payloads(results), ["SHOT"]);
+    }
+
+    #[tokio::test]
+    async fn a_model_without_image_input_never_receives_the_text_alone() {
+        let steering = Arc::new(SteeringInbox::new());
+        steering.enqueue_message("see screenshot", vec![png("IMG")]).unwrap();
+        let client = MockLlmClient::new(vec![vec![Ok(StreamEvent::TextDelta("ok".into())), Ok(done())]]);
+        client.refuses_images.store(true, std::sync::atomic::Ordering::SeqCst);
+        let tools = Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
+        let agent = AgentLoopBuilder::new(client.clone(), Arc::new(AllowAll), tools)
+            .with_steering(steering.clone())
+            .with_tool_max_duration(None)
+            .build();
+        let mut history = vec![Message::user("go")];
+        agent.run(&mut history, &NullSink, None, CancellationToken::new()).await.unwrap();
+        assert!(!history.iter().any(|m| m.text().contains("see screenshot")));
+        assert!(!steering.has_any());
     }
 
     // ── CRITICAL 1: cancellation tests ──────────────────────────────────────

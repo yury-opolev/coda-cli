@@ -39,7 +39,20 @@ impl SteeringStateObserver {
 
 impl SteeringObserver for SteeringStateObserver {
     fn on_enqueued(&self, entry: &SteeringEntry) {
-        self.state.steering_enqueued(&entry.id, &entry.text);
+        let images = entry
+            .images
+            .iter()
+            .map(|image| coda_proto::state::SteeringImageMeta {
+                media_type: image.media_type.clone(),
+                byte_length: image.byte_len() as i64,
+            })
+            .collect();
+        self.state.steering_enqueued(&entry.id, &entry.text, images);
+    }
+
+    fn on_undeliverable(&self, entries: &[SteeringEntry]) {
+        let ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
+        self.state.steering_undeliverable(&ids, self.turn_id().as_deref());
     }
 
     fn on_delivered(&self, entries: &[SteeringEntry]) {
@@ -75,6 +88,31 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let bus = Arc::new(EventBus::new(tx, "engine-1"));
         Arc::new(EngineState::new(bus, "s1", "/work", HashMap::new(), active_config()))
+    }
+
+    #[test]
+    fn images_the_model_cannot_take_are_reported_rejected_not_delivered() {
+        let state = state();
+        let observer = SteeringStateObserver::new(Arc::clone(&state));
+        let inbox = coda_agent::SteeringInbox::with_observer(Some(
+            observer.clone() as Arc<dyn SteeringObserver>
+        ));
+        let png = coda_agent::steering::SteeringImage { media_type: "image/png".into(), base64: "AAAA".into() };
+        inbox.enqueue_message("look", vec![png]).unwrap();
+        inbox.set_accepts_images(false);
+        assert!(inbox.take_all_for_delivery().is_empty());
+        let limits = coda_proto::state::Limits {
+            ring_envelopes: 1,
+            ring_bytes: 1,
+            live_bytes_cap: 1,
+            outcomes_retained: 4,
+            history_block_bytes_cap: 1,
+            max_history_page: 500,
+            max_session_page: 200,
+        };
+        let snap = state.project("v1", limits);
+        assert_eq!(snap.steering.pending_count, 0);
+        assert_eq!(snap.steering.outcomes[0].outcome, coda_proto::state::SteeringOutcomeKind::Rejected);
     }
 
     #[test]

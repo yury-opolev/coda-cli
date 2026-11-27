@@ -472,6 +472,7 @@ async fn the_queue_is_reconciled_from_the_engine_and_the_local_draft_survives() 
     state.apply(UiEvent::Queued {
         text: "  also check the tests  ".into(),
         id: Some(message_id.clone()),
+        images: Vec::new(),
     });
 
     let snapshot = api::get_state(&connection).await.expect("getState");

@@ -17,7 +17,15 @@
         "string",
         "null"
       ],
-      "description": "Rejection classification such as `noActiveTurn`, `turnEnding` or `emptyText`.",
+      "description": "Rejection classification: `noActiveTurn`, `turnEnding`, `emptyText`\n(neither text nor images), `invalidImage`, `imagesUnsupported` (the\nactive model cannot receive images) or `attachmentCapacity` (the\nqueue's aggregate image budget is exhausted).",
+      "default": null
+    },
+    "rejectedDetail": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Human-readable detail for a rejection; never contains image data.",
       "default": null
     }
   },

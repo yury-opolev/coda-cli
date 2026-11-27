@@ -3,11 +3,36 @@
   "properties": {
     "text": {
       "type": "string"
+    },
+    "images": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/WireImage"
+      },
+      "description": "Images delivered with `text` as one message (same representation and\nvalidation as `PromptParams.images`). Send only to an engine that\nadvertises [`STEERING_IMAGES_CAPABILITY`]: an older engine ignores the\nfield and would queue the text alone."
     }
   },
   "required": [
     "text"
   ],
   "title": "SteerParams",
-  "$schema": "https://json-schema.org/draft/2020-12/schema"
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "WireImage": {
+      "type": "object",
+      "properties": {
+        "mediaType": {
+          "type": "string",
+          "description": "`image/png`, `image/jpeg`, `image/gif` or `image/webp`."
+        },
+        "base64": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "mediaType",
+        "base64"
+      ]
+    }
+  }
 }

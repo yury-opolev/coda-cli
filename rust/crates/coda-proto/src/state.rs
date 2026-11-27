@@ -77,6 +77,20 @@ pub struct SteeringPendingDto {
     pub text: String,
     pub text_length: i64,
     pub text_truncated: bool,
+    /// The message's images, in order — metadata only. The payload is
+    /// handed back solely by `session/recallSteering`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<SteeringImageMeta>,
+}
+
+/// What a queued image is, without its bytes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SteeringImageMeta {
+    pub media_type: String,
+    /// Length of the base64 payload, in bytes.
+    pub byte_length: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

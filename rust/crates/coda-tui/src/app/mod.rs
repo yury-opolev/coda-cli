@@ -33,6 +33,8 @@ mod layout;
 mod link;
 mod models;
 #[cfg(test)]
+mod image_steering_tests;
+#[cfg(test)]
 mod paste_tests;
 #[cfg(test)]
 mod timeline_tests;
@@ -826,13 +828,15 @@ impl App {
             return;
         }
         if self.state.is_busy() {
-            if !images.is_empty() {
+            // An engine that predates image steering would ignore `images`
+            // and queue the text alone, so the whole draft stays here instead.
+            if !images.is_empty() && !self.view.steering_images_capable() {
                 self.composer.set_text(text);
-                self.notice("Images cannot be steered into a running turn. Send this draft after it finishes.", NoticeLevel::Warning);
+                self.notice(queue::IMAGES_NEED_NEWER_ENGINE, NoticeLevel::Warning);
                 return;
             }
             record_paste("steer");
-            self.steer(text).await;
+            self.steer(text, images).await;
             return;
         }
 

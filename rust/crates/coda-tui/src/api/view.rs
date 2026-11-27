@@ -176,6 +176,8 @@ pub struct ServeView {
     max_history_page: i64,
     /// The engine advertised `presentationTimeline`.
     presentation_capable: bool,
+    /// The engine advertised `steering.images`.
+    steering_images_capable: bool,
 }
 
 impl Default for ServeView {
@@ -199,6 +201,7 @@ impl ServeView {
             dropped: 0,
             max_history_page: 0,
             presentation_capable: false,
+            steering_images_capable: false,
         }
     }
 
@@ -267,18 +270,27 @@ impl ServeView {
     /// `initialize` returned. Taking it here rather than assuming `0` is what
     /// makes a resumed session's already-burned seqs not look like a gap.
     pub fn on_initialize(&mut self, result: &InitializeResult) {
-        let capable = result.capabilities.as_ref().is_some_and(|capabilities| {
-            capabilities
-                .get(coda_proto::presentation::PRESENTATION_CAPABILITY)
-                .is_some_and(|entry| entry.supported)
-        });
+        let supports = |name: &str| {
+            result.capabilities.as_ref().is_some_and(|capabilities| {
+                capabilities.get(name).is_some_and(|entry| entry.supported)
+            })
+        };
+        let capable = supports(coda_proto::presentation::PRESENTATION_CAPABILITY);
+        let steering_images = supports(coda_proto::messages::STEERING_IMAGES_CAPABILITY);
         self.on_initialize_inner(result);
         self.presentation_capable = capable;
+        self.steering_images_capable = steering_images;
     }
 
     /// Whether the engine keeps presentation records.
     pub fn presentation_capable(&self) -> bool {
         self.presentation_capable
+    }
+
+    /// Whether `session/steer` may carry images. An engine that does not say
+    /// so would ignore them and queue the text alone.
+    pub fn steering_images_capable(&self) -> bool {
+        self.steering_images_capable
     }
 
     fn on_initialize_inner(&mut self, result: &InitializeResult) {
