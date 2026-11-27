@@ -662,7 +662,10 @@ fullscreen and inline shells, the exact bare `/mcp` is intercepted before dispat
 is busy) and opens the browser without starting a prompt. `/MCP`, `/mcp list`, and `/mcp x` are not
 intercepted. When no MCP browser provider exists, bare `/mcp` remains textual. Plain mode
 surfaces use the textual list/detail fallback (`/mcp`, `/mcp info <name>`, and the existing add/edit/
-remove/start/stop/restart/enable/disable forms).
+remove/start/stop/restart/enable/disable forms). **`/mcp login <name>`** and **`/mcp logout <name>`**
+sign in to or out of one HTTP server (`oauth` or `entra-broker`) in every shell; a sign-in runs in the
+background, so the TUI stays usable while you complete it, and the browser's detail view shows each
+server's auth mode, account, token expiry and last auth error.
 
 **The agent restarts a stuck server itself.** A stdio server that stops responding (its process is
 alive but every call hangs) is usually fixed by a restart, so the model gets a `restart_mcp_server`
@@ -733,10 +736,28 @@ with an `auth` block:
 } } }
 ```
 
-`mode` is `oauth` (default), `bearer` (static `"token"`), or `none`. Headless runs
+`mode` is `oauth` (default), `bearer` (static `"token"`), `none`, or `entra-broker`. Headless runs
 (`coda run` and `coda serve`) reuse stored tokens but never open a browser; a server needing
 fresh sign-in is skipped with a note to stderr. Pre-authorize such servers once via the interactive
-TUI; the encrypted token is then reused by every process automatically.
+TUI (`/mcp login <name>`); the encrypted token is then reused by every process automatically.
+
+**Microsoft Entra ID servers: `entra-broker`.** On Windows, `"mode": "entra-broker"` gets Entra
+tokens from the Windows account broker (WAM) — silent single sign-on with your Windows account,
+with the broker's own dialog only when Entra requires interaction. It needs a public-client
+`clientId` whose registration has the redirect URI
+`ms-appx-web://microsoft.aad.brokerplugin/<clientId>`; `scopes`, `tenant` and `account` are
+optional and otherwise discovered from the server. Elsewhere (or with `CODA_DISABLE_WAM=1`) it
+falls back to the browser flow, which also follows Entra's rules in `oauth` mode:
+
+```json
+{ "mcpServers": { "contoso": {
+  "type": "http", "url": "https://mcp.contoso.com/mcp",
+  "auth": { "mode": "entra-broker", "clientId": "<public-client-app-id>", "scopes": ["api://<api-app-id>/.default"] }
+} } }
+```
+
+See **[docs/mcp-auth.md](docs/mcp-auth.md)** for every auth mode, the app registration,
+caching and refresh behaviour, `/mcp login|logout`, and troubleshooting.
 
 **Client id for direct HTTP OAuth.** The flow needs a client id from one of two places: a
 configured `auth.clientId`, or RFC 7591 dynamic client registration when the authorization server
