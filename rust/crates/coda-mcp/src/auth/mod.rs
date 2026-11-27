@@ -13,6 +13,8 @@ pub mod entra;
 pub mod metadata_client;
 pub mod oauth;
 pub mod provider;
+#[cfg(test)]
+pub(crate) mod test_http;
 pub mod types;
 
 pub use metadata_client::McpAuthMetadataClient;

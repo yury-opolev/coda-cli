@@ -7,7 +7,8 @@
 //!    well-known origin path).
 //! 2. Fetches RFC 8414 / OIDC authorization-server metadata.
 //! 3. Resolves a client id (configured → cached DCR → fresh DCR).
-//! 4. Builds the authorize URL with PKCE + RFC 8707 `resource` parameter.
+//! 4. Builds the authorize URL with PKCE + RFC 8707 `resource` parameter
+//!    (omitted for Entra v2.0 issuers, which reject it).
 //! 5. Opens a browser and waits for the loopback redirect.
 //! 6. Validates state (CSRF) and iss (RFC 9207) from the callback.
 //! 7. Exchanges the code for an access + refresh token.
@@ -32,11 +33,12 @@ use super::{
     metadata_client::McpAuthMetadataClient,
     provider::McpAuthProvider,
     types::{
-        AuthorizationServerMetadata, McpAuthConfig, McpAuthMode, McpAuthResult,
+        AuthorizationServerMetadata, McpAuthConfig, McpAuthMode, McpAuthResult, McpAuthStatus,
         McpClientIdResolution, McpClientRegistration, McpStoredToken,
         ProtectedResourceMetadata, WwwAuthenticateChallenge, canonical_resource_uri,
     },
 };
+use super::entra;
 
 // ── OAuthTokenResponse ────────────────────────────────────────────────────────
 
@@ -65,6 +67,10 @@ pub struct McpOAuthProvider {
     open_browser: Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>,
     /// Optional structured log callback (used by the TUI to show progress).
     log: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    /// Most recent user-facing failure, for status surfaces.
+    last_error: std::sync::Mutex<Option<String>>,
+    /// Expiry of the current access token (Unix seconds), when known.
+    expires_at: std::sync::Mutex<Option<i64>>,
 }
 
 impl McpOAuthProvider {
@@ -99,7 +105,27 @@ impl McpOAuthProvider {
             interactive,
             open_browser,
             log,
+            last_error: std::sync::Mutex::new(None),
+            expires_at: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Secret-free snapshot of this provider's auth state.
+    pub fn status_snapshot(&self) -> McpAuthStatus {
+        McpAuthStatus {
+            mode: self.config.mode,
+            account: None,
+            expires_at_unix: *lock(&self.expires_at),
+            last_error: lock(&self.last_error).clone(),
+        }
+    }
+
+    fn record_error(&self, msg: &str) {
+        *lock(&self.last_error) = Some(msg.to_owned());
+    }
+
+    fn record_expiry(&self, expires_at_unix: Option<i64>) {
+        *lock(&self.expires_at) = expires_at_unix.filter(|&v| v > 0);
     }
 
     fn token_key(&self) -> String {
@@ -122,13 +148,15 @@ impl McpOAuthProvider {
 
     fn failure(&self, msg: &str) -> McpAuthResult {
         self.log(msg);
+        self.record_error(msg);
         McpAuthResult { succeeded: false, error: Some(msg.to_owned()) }
     }
 
     /// Proactively force a fresh authorization without waiting for a 401.
     /// Cached DCR registrations are retained.
     pub async fn force_reauthorize(&self) -> McpAuthResult {
-        if self.config.mode != McpAuthMode::OAuth {
+        // The browser flow is also the fallback for `entra-broker` servers.
+        if !matches!(self.config.mode, McpAuthMode::OAuth | McpAuthMode::EntraBroker) {
             return self.failure("MCP OAuth reauthentication requires OAuth authentication mode.");
         }
         if !self.interactive {
@@ -142,20 +170,30 @@ impl McpOAuthProvider {
                 "MCP OAuth reauthentication could not clear the stored token. Please retry.",
             );
         }
+        self.record_expiry(None);
 
         match self.acquire_token(None, true).await {
             Ok(r) => r,
             Err(AcquireError::Cancelled) => {
-                McpAuthResult { succeeded: false, error: Some("MCP OAuth reauthentication was canceled.".into()) }
+                let msg = "MCP OAuth reauthentication was canceled.";
+                self.record_error(msg);
+                McpAuthResult { succeeded: false, error: Some(msg.into()) }
             }
-            Err(AcquireError::Other(msg)) => McpAuthResult { succeeded: false, error: Some(msg) },
+            Err(AcquireError::Other(msg)) => {
+                self.record_error(&msg);
+                McpAuthResult { succeeded: false, error: Some(msg) }
+            }
         }
     }
 
     /// Load a valid access token from the store, refreshing if needed.
     async fn load_token(&self) -> Option<McpStoredToken> {
-        let json = self.store.get(&self.token_key()).await.ok()??;
-        serde_json::from_str(&json).ok()
+        let loaded = match self.store.get(&self.token_key()).await {
+            Ok(Some(json)) => serde_json::from_str::<McpStoredToken>(&json).ok(),
+            _ => None,
+        };
+        self.record_expiry(loaded.as_ref().map(|t| t.expires_at_unix));
+        loaded
     }
 
     /// Attempt to refresh `stored` using its refresh token.
@@ -170,18 +208,19 @@ impl McpOAuthProvider {
             .get_authorization_server_metadata(&stored.issuer)
             .await?;
 
-        let form = vec![
+        let mut form = vec![
             ("grant_type".to_owned(), "refresh_token".to_owned()),
             ("refresh_token".to_owned(), refresh_token),
             ("client_id".to_owned(), stored.client_id.clone()),
-            ("resource".to_owned(), self.canonical_resource.clone()),
         ];
+        form.extend(resource_param(&stored.issuer, &self.canonical_resource));
 
         let token_resp = match self.token_request(&as_meta.token_endpoint, &form).await {
             Ok(t) => t,
             Err(_) => {
                 // Refresh rejected → delete so next request re-authorizes.
                 let _ = self.store.delete(&self.token_key()).await;
+                self.record_expiry(None);
                 return None;
             }
         };
@@ -230,6 +269,7 @@ impl McpOAuthProvider {
             coda_auth::AuthError::Serialization(e)
         })?;
         self.store.set(&self.token_key(), &json).await?;
+        self.record_expiry(Some(stored.expires_at_unix));
         Ok(stored)
     }
 
@@ -353,6 +393,8 @@ impl McpOAuthProvider {
             };
             return Ok(self.failure(&msg));
         }
+        let issuer_candidate = issuer_candidate_for(issuer_candidate, self.config.tenant.as_deref());
+        let issuer_candidate = issuer_candidate.as_str();
 
         // 2. Authorization-server metadata.
         let as_meta = self
@@ -369,9 +411,20 @@ impl McpOAuthProvider {
         };
 
         // 3. Bind the loopback listener first so DCR can register the exact redirect URI.
-        let listener = LoopbackListener::bind()
-            .await
-            .map_err(|e| AcquireError::Other(format!("loopback bind failed: {e}")))?;
+        let bound = match &self.config.redirect_uri {
+            Some(template) => LoopbackListener::bind_template(template).await,
+            None => LoopbackListener::bind().await,
+        };
+        let listener = match bound {
+            Ok(l) => l,
+            Err(coda_auth::AuthError::InvalidInput { detail, .. }) => {
+                return Ok(self.failure(&format!(
+                    "Invalid auth.redirectUri '{}': {detail}",
+                    self.config.redirect_uri.as_deref().unwrap_or_default()
+                )));
+            }
+            Err(e) => return Err(AcquireError::Other(format!("loopback bind failed: {e}"))),
+        };
         let redirect_uri = listener.redirect_uri();
 
         let resolution = self.resolve_client_id(&as_meta, &redirect_uri).await;
@@ -392,8 +445,11 @@ impl McpOAuthProvider {
             }
         };
 
-        // 4. Scope selection.
-        let scopes = select_scopes(challenge, &self.config, prm, &as_meta);
+        // 4. Scope selection (Entra only issues refresh tokens for offline_access).
+        let scopes = scopes_for_issuer(
+            select_scopes(challenge, &self.config, prm, &as_meta),
+            &as_meta.issuer,
+        );
 
         // 5. PKCE + authorize URL.
         let verifier = pkce::generate_code_verifier();
@@ -407,8 +463,8 @@ impl McpOAuthProvider {
             ("code_challenge".to_owned(), code_challenge),
             ("code_challenge_method".to_owned(), "S256".to_owned()),
             ("state".to_owned(), state.clone()),
-            ("resource".to_owned(), self.canonical_resource.clone()),
         ];
+        auth_params.extend(resource_param(&as_meta.issuer, &self.canonical_resource));
         if !scopes.is_empty() {
             auth_params.push(("scope".to_owned(), scopes.join(" ")));
         }
@@ -455,15 +511,12 @@ impl McpOAuthProvider {
                 "OAuth state mismatch (possible CSRF); aborting login.".into(),
             ));
         }
-        if let Some(iss) = &redirect.iss {
-            if iss != &as_meta.issuer {
-                return Err(AcquireError::Other("OAuth issuer (iss) mismatch; aborting login.".into()));
-            }
-        } else if as_meta.issuer_parameter_supported {
-            return Err(AcquireError::Other(
-                "Authorization response missing required iss parameter; aborting login.".into(),
-            ));
-        }
+        validate_callback_iss(
+            redirect.iss.as_deref(),
+            &as_meta.issuer,
+            as_meta.issuer_parameter_supported,
+        )
+        .map_err(AcquireError::Other)?;
         let code = match &redirect.code {
             Some(c) => c.clone(),
             None => {
@@ -474,14 +527,14 @@ impl McpOAuthProvider {
         };
 
         // 8. Exchange the code.
-        let form = vec![
+        let mut form = vec![
             ("grant_type".to_owned(), "authorization_code".to_owned()),
             ("code".to_owned(), code),
             ("redirect_uri".to_owned(), redirect_uri),
             ("client_id".to_owned(), client_id.clone()),
             ("code_verifier".to_owned(), verifier),
-            ("resource".to_owned(), self.canonical_resource.clone()),
         ];
+        form.extend(resource_param(&as_meta.issuer, &self.canonical_resource));
         let token_resp = match self.token_request(&as_meta.token_endpoint, &form).await {
             Ok(t) => t,
             Err(OAuthExchangeError::Status(s, body)) => {
@@ -532,6 +585,7 @@ impl McpOAuthProvider {
             format!("Authorized MCP server {}.", self.display_resource())
         };
         self.log(&done_msg);
+        *lock(&self.last_error) = None;
         Ok(McpAuthResult { succeeded: true, error: None })
     }
 }
@@ -553,24 +607,27 @@ impl McpAuthProvider for McpOAuthProvider {
         let challenge = WwwAuthenticateChallenge::parse(www_authenticate);
 
         if !self.interactive {
-            self.log(&format!(
+            let msg = format!(
                 "MCP server requires authorization. Run `coda` interactively to sign in to {}.",
                 self.display_resource()
-            ));
+            );
+            self.log(&msg);
+            self.record_error(&msg);
             return false;
         }
 
         match self.acquire_token(challenge.as_ref(), false).await {
             Ok(r) => r.succeeded,
             Err(AcquireError::Cancelled) => {
-                self.log(&format!(
-                    "Authorization canceled for {}.",
-                    self.display_resource()
-                ));
+                let msg = format!("Authorization canceled for {}.", self.display_resource());
+                self.log(&msg);
+                self.record_error(&msg);
                 false
             }
             Err(AcquireError::Other(msg)) => {
-                self.log(&format!("Authorization failed: {msg}"));
+                let msg = format!("Authorization failed: {msg}");
+                self.log(&msg);
+                self.record_error(&msg);
                 false
             }
         }
@@ -603,7 +660,7 @@ impl McpOAuthReauthenticator {
         url: &reqwest::Url,
         config: &McpAuthConfig,
     ) -> McpAuthResult {
-        if config.mode != McpAuthMode::OAuth {
+        if !matches!(config.mode, McpAuthMode::OAuth | McpAuthMode::EntraBroker) {
             return McpAuthResult {
                 succeeded: false,
                 error: Some(
@@ -725,6 +782,59 @@ fn append_offline_access(
         scopes.push("offline_access".to_owned());
     }
     scopes
+}
+
+/// The RFC 8707 `resource` parameter for authorize/token requests.
+///
+/// Entra v2.0 rejects `resource` (the resource is carried by the scopes), so it
+/// is omitted for Entra v2.0 issuers and sent unchanged everywhere else.
+pub(crate) fn resource_param(issuer: &str, canonical_resource: &str) -> Option<(String, String)> {
+    if entra::is_entra_v2_issuer(issuer) {
+        None
+    } else {
+        Some(("resource".to_owned(), canonical_resource.to_owned()))
+    }
+}
+
+/// Entra v2.0 only issues refresh tokens when `offline_access` is requested
+/// and does not always advertise it, so add it for Entra issuers.
+pub(crate) fn scopes_for_issuer(scopes: Vec<String>, issuer: &str) -> Vec<String> {
+    if entra::is_entra_v2_issuer(issuer) {
+        entra::ensure_offline_access(scopes)
+    } else {
+        scopes
+    }
+}
+
+/// Apply a configured tenant to an Entra authorization server advertised by
+/// the resource; other issuers are returned unchanged.
+pub(crate) fn issuer_candidate_for(advertised: &str, tenant: Option<&str>) -> String {
+    match (tenant, entra::EntraAuthority::parse(advertised)) {
+        (Some(t), Some(authority)) => authority.with_tenant(t).issuer_v2(),
+        _ => advertised.to_owned(),
+    }
+}
+
+/// RFC 9207 check of the `iss` callback parameter: when present it must equal
+/// the issuer; when absent it is only an error if the AS advertised support.
+pub(crate) fn validate_callback_iss(
+    received: Option<&str>,
+    issuer: &str,
+    advertised: bool,
+) -> Result<(), String> {
+    match received {
+        Some(iss) if iss != issuer => Err("OAuth issuer (iss) mismatch; aborting login.".into()),
+        Some(_) => Ok(()),
+        None if advertised => {
+            Err("Authorization response missing required iss parameter; aborting login.".into())
+        }
+        None => Ok(()),
+    }
+}
+
+/// Lock a std mutex, recovering the value if a holder panicked.
+fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Build an authorize URL with the given query parameters.
@@ -907,5 +1017,163 @@ mod tests {
             "got: {url}"
         );
         assert!(url.starts_with("https://mcp.example.com"), "got: {url}");
+    }
+
+    // ── Entra v2.0 adaptations ───────────────────────────────────────────────
+
+    const ENTRA_V2: &str = "https://login.microsoftonline.com/tid/v2.0";
+
+    #[test]
+    fn resource_param_is_omitted_for_entra_v2_only() {
+        assert_eq!(resource_param(ENTRA_V2, "https://mcp.example.com/mcp"), None);
+        assert_eq!(
+            resource_param("https://as.example.com", "https://mcp.example.com/mcp"),
+            Some(("resource".to_owned(), "https://mcp.example.com/mcp".to_owned()))
+        );
+        // Entra v1 issuers are not v2.0 endpoints; keep the generic behaviour.
+        assert!(resource_param("https://sts.windows.net/tid/", "https://r").is_some());
+    }
+
+    #[test]
+    fn scopes_for_issuer_adds_offline_access_for_entra_only() {
+        let scopes = vec!["api://x/.default".to_owned()];
+        assert_eq!(
+            scopes_for_issuer(scopes.clone(), ENTRA_V2),
+            vec!["api://x/.default", "offline_access"]
+        );
+        assert_eq!(scopes_for_issuer(scopes.clone(), "https://as.example.com"), scopes);
+        let with = vec!["a".to_owned(), "offline_access".to_owned()];
+        assert_eq!(scopes_for_issuer(with.clone(), ENTRA_V2), with);
+    }
+
+    #[test]
+    fn validate_callback_iss_keeps_rfc9207_semantics() {
+        let issuer = "https://as.example.com";
+        assert!(validate_callback_iss(Some(issuer), issuer, true).is_ok());
+        assert!(validate_callback_iss(Some(issuer), issuer, false).is_ok());
+        assert!(validate_callback_iss(Some("https://evil.example.com"), issuer, false).is_err());
+        assert!(validate_callback_iss(Some("https://evil.example.com"), issuer, true).is_err());
+        assert!(validate_callback_iss(None, issuer, false).is_ok());
+        let err = validate_callback_iss(None, issuer, true).unwrap_err();
+        assert!(err.contains("missing"), "got {err}");
+    }
+
+    #[test]
+    fn issuer_candidate_for_applies_tenant_override_to_entra_authorities() {
+        assert_eq!(
+            issuer_candidate_for("https://login.microsoftonline.com/common/v2.0", Some("contoso.com")),
+            "https://login.microsoftonline.com/contoso.com/v2.0"
+        );
+        assert_eq!(
+            issuer_candidate_for("https://login.microsoftonline.com/common/v2.0", None),
+            "https://login.microsoftonline.com/common/v2.0"
+        );
+        assert_eq!(
+            issuer_candidate_for("https://as.example.com", Some("contoso.com")),
+            "https://as.example.com"
+        );
+    }
+
+    fn provider(config: McpAuthConfig, interactive: bool, url: &str) -> McpOAuthProvider {
+        McpOAuthProvider::new(
+            reqwest::Client::new(),
+            &reqwest::Url::parse(url).unwrap(),
+            Arc::new(coda_auth::InMemoryStore::new()),
+            config,
+            interactive,
+            Some(Arc::new(|_: &str| Err("no browser in tests".to_owned()))),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn status_snapshot_records_failure_text() {
+        let p = provider(
+            McpAuthConfig { mode: McpAuthMode::Bearer, ..Default::default() },
+            true,
+            "https://mcp.example.com/mcp",
+        );
+        assert_eq!(p.status_snapshot().last_error, None);
+        let r = p.force_reauthorize().await;
+        assert!(!r.succeeded);
+        let status = p.status_snapshot();
+        assert_eq!(status.mode, McpAuthMode::Bearer);
+        assert_eq!(status.account, None);
+        assert_eq!(status.last_error, r.error);
+        assert!(status.last_error.unwrap().contains("requires OAuth"));
+    }
+
+    #[tokio::test]
+    async fn force_reauthorize_accepts_entra_broker_mode() {
+        let p = provider(
+            McpAuthConfig { mode: McpAuthMode::EntraBroker, ..Default::default() },
+            false,
+            "https://mcp.example.com/mcp",
+        );
+        let r = p.force_reauthorize().await;
+        assert!(r.error.unwrap().contains("interactive session"));
+    }
+
+    #[tokio::test]
+    async fn status_snapshot_tracks_token_expiry() {
+        let p = provider(McpAuthConfig::default(), false, "https://mcp.example.com/mcp");
+        assert_eq!(p.status_snapshot().expires_at_unix, None);
+        p.persist_token(Secret::new("at".into()), None, Some(3600), "https://as", "cid", "s")
+            .await
+            .unwrap();
+        let exp = p.status_snapshot().expires_at_unix.expect("expiry recorded");
+        assert!(exp > unix_now());
+        p.persist_token(Secret::new("at".into()), None, None, "https://as", "cid", "s")
+            .await
+            .unwrap();
+        assert_eq!(p.status_snapshot().expires_at_unix, None);
+
+        let fresh = provider(McpAuthConfig::default(), false, "https://mcp.example.com/mcp");
+        let fresh = McpOAuthProvider { store: Arc::clone(&p.store), ..fresh };
+        p.persist_token(Secret::new("at".into()), None, Some(60), "https://as", "cid", "s")
+            .await
+            .unwrap();
+        assert!(fresh.get_access_token().await.is_some());
+        assert!(fresh.status_snapshot().expires_at_unix.is_some());
+    }
+
+    #[tokio::test]
+    async fn invalid_redirect_uri_template_is_a_reported_failure() {
+        let server = crate::auth::test_http::spawn_server(Arc::new(|path: &str, port: u16| {
+            let origin = format!("http://127.0.0.1:{port}");
+            match path {
+                "/.well-known/oauth-protected-resource" => (
+                    200,
+                    serde_json::json!({
+                        "resource": format!("{origin}/mcp"),
+                        "authorization_servers": [origin],
+                    })
+                    .to_string(),
+                ),
+                "/.well-known/oauth-authorization-server" => (
+                    200,
+                    serde_json::json!({
+                        "issuer": origin,
+                        "authorization_endpoint": format!("{origin}/authorize"),
+                        "token_endpoint": format!("{origin}/token"),
+                    })
+                    .to_string(),
+                ),
+                _ => (404, "{}".to_owned()),
+            }
+        }))
+        .await;
+        let p = provider(
+            McpAuthConfig {
+                redirect_uri: Some("https://localhost/cb".into()),
+                client_id: Some("cid".into()),
+                ..Default::default()
+            },
+            true,
+            &format!("http://127.0.0.1:{server}/mcp"),
+        );
+        assert!(!p.handle_unauthorized(None).await);
+        let err = p.status_snapshot().last_error.expect("error recorded");
+        assert!(err.contains("Invalid auth.redirectUri"), "got {err}");
     }
 }
