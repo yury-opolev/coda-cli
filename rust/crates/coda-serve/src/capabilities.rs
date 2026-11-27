@@ -35,6 +35,11 @@ pub fn capability_catalog() -> HashMap<String, CapabilityEntry> {
     m.insert("state.turnEvents".into(), CapabilityEntry::supported());
     m.insert("steering.readOnlyQueue".into(), CapabilityEntry::supported());
     m.insert("steering.outcomes".into(), CapabilityEntry::supported());
+    // `session/steer` accepts `images` (validated like a prompt's, bounded in
+    // aggregate) and delivers them with their text as one message; recall
+    // hands them back. Older engines ignore the field, so clients must check
+    // this before sending images rather than risk text-only delivery.
+    m.insert(coda_proto::messages::STEERING_IMAGES_CAPABILITY.into(), CapabilityEntry::supported());
     m.insert("tools.stableIds".into(), CapabilityEntry::supported());
 
     // ── Stage D: wired and tested in this pass ────────────────────────────

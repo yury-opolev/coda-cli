@@ -161,6 +161,10 @@ pub struct PromptParams {
 pub struct SteerParams {
     #[serde(default)]
     pub text: String,
+    /// Optional images queued with `text` as one message (capability
+    /// `steering.images`).
+    #[serde(default)]
+    pub images: Option<Vec<Value>>,
 }
 
 #[derive(Debug, Deserialize, Default)]

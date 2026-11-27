@@ -1,5 +1,21 @@
 //! Image payload validation shared by prompts and question answers.
 
+/// The image types every prompt path accepts.
+pub(crate) const SUPPORTED_IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+/// Validates one wire image (`{ mediaType, base64 }`) exactly as a prompt
+/// does, returning its media type and payload. Errors never quote the
+/// payload.
+pub(crate) fn validate_wire_image(image: &serde_json::Value) -> Result<(String, String), String> {
+    let media_type = image["mediaType"].as_str().unwrap_or("");
+    if !SUPPORTED_IMAGE_TYPES.contains(&media_type) {
+        return Err(format!("unsupported image media type: {media_type}"));
+    }
+    let base64 = image["base64"].as_str().unwrap_or("");
+    validate_base64(base64).map_err(|e| format!("invalid base64 encoding: {e}"))?;
+    Ok((media_type.to_owned(), base64.to_owned()))
+}
+
 /// Lightweight base64 character-set + length validator.
 ///
 /// Does not actually decode; just checks that all characters are in the
