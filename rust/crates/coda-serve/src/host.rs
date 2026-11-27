@@ -4400,6 +4400,16 @@ impl ServeBackend for ServeHost {
     }
 
     async fn session_steer(&self, p: SteerParams) -> Result<Value, RpcError> {
+        // With no turn running there is nothing to steer, whatever the
+        // message holds; say that before judging its images. The serialized
+        // check below still decides the race with a turn ending.
+        let steerable = |host: &Self| {
+            *host.turn_active.lock().expect("turn_active poisoned")
+                && host.steering_observer.turn_id().is_some()
+        };
+        if !steerable(self) {
+            return steer_reply(SteerResponse::refused("noActiveTurn", None));
+        }
         // Images are checked before anything is queued, exactly as a prompt
         // checks them, so a refusal never leaves half a message (its text)
         // behind in the queue.
@@ -11585,6 +11595,8 @@ mod tests {
         #[tokio::test]
         async fn a_model_that_cannot_take_images_is_reported_before_anything_is_queued() {
             let host = make_host_in_dir(".", Arc::new(TextOnlyClient));
+            let idle = host.session_steer(steer("look", vec![image("image/png", PAYLOAD)])).await.unwrap();
+            assert_eq!(idle["rejectedReason"], "noActiveTurn", "no turn is the more fundamental refusal");
             let _turn = host.try_claim_turn("test-turn", "", TurnKind::Prompt).unwrap();
             let resp = host.session_steer(steer("look", vec![image("image/png", PAYLOAD)])).await.unwrap();
             assert_eq!(resp["rejectedReason"], "imagesUnsupported", "{resp}");

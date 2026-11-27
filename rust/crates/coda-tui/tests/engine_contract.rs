@@ -182,6 +182,37 @@ async fn interrupt_is_accepted_with_no_turn_running() {
     engine.shutdown(Duration::from_secs(5)).await.expect("shutdown");
 }
 
+#[tokio::test]
+async fn advertises_image_steering_and_refuses_images_with_no_turn_explicitly() {
+    let Some((engine, connection, _inbound, initialized)) = connect().await else {
+        eprintln!("skipping: no `coda` engine on PATH");
+        return;
+    };
+    let capabilities = initialized.capabilities.expect("a Rust engine advertises capabilities");
+    assert!(
+        capabilities
+            .get(coda_proto::messages::STEERING_IMAGES_CAPABILITY)
+            .is_some_and(|entry| entry.supported),
+        "the engine must advertise steering.images"
+    );
+
+    let value = tokio::time::timeout(
+        Duration::from_secs(30),
+        connection.request(
+            method::STEER,
+            Some(json!({ "text": "", "images": [{ "mediaType": "image/png", "base64": "AAAA" }] })),
+        ),
+    )
+    .await
+    .expect("steer timed out")
+    .expect("steer failed");
+    let result: coda_proto::messages::SteerResult = serde_json::from_value(value).expect("parse steer");
+    assert!(!result.ok);
+    assert_eq!(result.rejected_reason.as_deref(), Some("noActiveTurn"));
+
+    engine.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+}
+
 /// MINOR 6: the main path — a full streaming prompt turn — previously had no
 /// live coverage in the contract suite.  This test sends a prompt, collects
 /// at least one event, and verifies `event/turnComplete` arrives, which is the
