@@ -61,7 +61,7 @@ too (escape hatch and fallback testing).
 `BrokerTokenCache` is process-wide (`OnceLock`), injectable for tests. Key =
 `canonical resource URI` + `\n` + `account key` (configured account lower-cased,
 or `"<default>"`). Each entry holds the token, its expiry, the account the
-broker returned, a single-flight `tokio::sync::Mutex`, and an
+broker returned, a single-flight `Arc<tokio::sync::Mutex>`, and an
 `interaction_declined` flag. Being process-wide means a restarted MCP
 connection (new provider instance) reuses the token and the single-flight lock,
 so two sessions in one process never show two broker dialogs. Across
@@ -88,6 +88,11 @@ interactively. Tokens are not persisted — the broker owns refresh.
    console window (`GetAncestor(GetConsoleWindow(), GA_ROOTOWNER)`, which also
    works under Windows Terminal). Cancel / failure marks the key declined so
    the dialog is not re-shown on every request; `/mcp login <name>` clears it.
+   The acquisition (silent and interactive) runs in a spawned task that owns
+   the key's flight guard (`lock_owned`) and records the outcome in the shared
+   cache; callers await its `JoinHandle`. A caller dropped mid-dialog (tool
+   timeout, cancellation) therefore neither loses the token nor the declined
+   flag, and no second dialog opens while the first is up.
 4. **Caching.** `get_access_token` returns the cached token while it is valid
    for more than 5 minutes; inside that window it re-acquires silently and keeps
    serving the old token if silent refresh fails but the token has not expired.
@@ -100,8 +105,9 @@ interactively. Tokens are not persisted — the broker owns refresh.
    re-acquires once with `BrokerRequest::force_refresh` set, so the broker
    bypasses its own cache instead of returning the rejected token (the HTTP
    client already retries exactly once). Simultaneous 401s re-acquire once: a
-   handler that finds the token already replaced (cache generation changed)
-   just retries.
+   handler that finds the cached token's value differs from the token it saw
+   rejected just retries (an identical token is re-acquired with
+   `force_refresh`).
 6. **No hangs.** Every broker call is bounded, as are credential-store
    reads/writes (10 s) and protected-resource metadata discovery (30 s); the WAM implementation also polls
    the WinRT async op against the deadline and cancels it on expiry. Errors are
@@ -127,7 +133,10 @@ interactively. Tokens are not persisted — the broker owns refresh.
 - Status mapping: `Success` → token; `UserInteractionRequired` →
   `InteractionRequired`; `UserCancel` → `Cancelled`;
   `AccountProviderNotAvailable` → `Unavailable`; `ProviderError` → `Failed`
-  with the provider error code/message (AADSTS text).
+  with the provider error code/message (AADSTS text). Provider lookup: only a
+  null provider result is `Unavailable`; other WinRT/RPC errors are `Failed`.
+  `Unavailable` errors suggest `CODA_DISABLE_WAM=1` or `auth.mode 'oauth'`
+  (`/mcp login` cannot help).
 - Expiry: response property `TokenExpiresOn` (seconds since 1601-01-01, the
   Windows epoch, as observed from the Entra WAM plugin; plain unix seconds are
   accepted too) → JWT `exp` → now + 1 h.

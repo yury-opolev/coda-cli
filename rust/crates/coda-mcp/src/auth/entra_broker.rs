@@ -94,7 +94,7 @@ enum Trigger {
     User,
 }
 
-type FlightGuard<'a> = tokio::sync::MutexGuard<'a, ()>;
+type FlightGuard = tokio::sync::OwnedMutexGuard<()>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Target {
@@ -123,6 +123,11 @@ struct Fallback {
 
 /// `McpAuthProvider` for `auth.mode = "entra-broker"`.
 pub struct EntraBrokerProvider {
+    inner: Arc<Inner>,
+}
+
+/// The provider's state, shared with the acquisition tasks it spawns.
+struct Inner {
     metadata: McpAuthMetadataClient,
     canonical_resource: String,
     config: McpAuthConfig,
@@ -208,19 +213,23 @@ impl EntraBrokerProvider {
         });
 
         Ok(Self {
-            metadata: McpAuthMetadataClient::new(http),
-            canonical_resource,
-            config,
-            client_id,
-            opts,
-            entry,
-            target: std::sync::Mutex::new(target),
-            discovery: tokio::sync::Mutex::new(()),
-            persisted: tokio::sync::Mutex::new(None),
-            fallback,
+            inner: Arc::new(Inner {
+                metadata: McpAuthMetadataClient::new(http),
+                canonical_resource,
+                config,
+                client_id,
+                opts,
+                entry,
+                target: std::sync::Mutex::new(target),
+                discovery: tokio::sync::Mutex::new(()),
+                persisted: tokio::sync::Mutex::new(None),
+                fallback,
+            }),
         })
     }
+}
 
+impl Inner {
     fn name(&self) -> &str {
         &self.opts.server_name
     }
@@ -429,8 +438,8 @@ impl EntraBrokerProvider {
                 limit.as_secs()
             ),
             BrokerError::Unavailable(reason) => format!(
-                "Windows broker unavailable for MCP server '{name}': {reason}. Run \
-                 `/mcp login {name}` to retry."
+                "Windows broker unavailable for MCP server '{name}': {reason}. Set \
+                 CODA_DISABLE_WAM=1 to use the browser sign-in instead, or use auth.mode 'oauth'."
             ),
             BrokerError::InteractionRequired(detail) | BrokerError::Failed(detail) => format!(
                 "Windows broker sign-in for MCP server '{name}' failed: {detail}. Run \
@@ -439,11 +448,30 @@ impl EntraBrokerProvider {
         }
     }
 
+    /// Run [`Self::acquire_locked`] in a task that owns the flight guard, so
+    /// the outcome reaches the shared cache even when the caller is dropped
+    /// mid-prompt (e.g. a tool timeout), and no second prompt opens meanwhile.
+    async fn acquire(
+        self: &Arc<Self>,
+        flight: FlightGuard,
+        trigger: Trigger,
+    ) -> Result<BrokerToken, String> {
+        let this = Arc::clone(self);
+        let task = tokio::spawn(async move { this.acquire_locked(&flight, trigger).await });
+        match task.await {
+            Ok(result) => result,
+            Err(e) => Err(self.fail(format!(
+                "Sign-in to MCP server '{}' failed unexpectedly: {e}",
+                self.name()
+            ))),
+        }
+    }
+
     /// Acquire a token: cache re-check, then silent, then interactive when
     /// required and allowed. The caller holds `entry.flight`.
     async fn acquire_locked(
         &self,
-        _flight: &FlightGuard<'_>,
+        _flight: &FlightGuard,
         trigger: Trigger,
     ) -> Result<BrokerToken, String> {
         let name = self.name().to_owned();
@@ -547,7 +575,6 @@ impl EntraBrokerProvider {
                 state.account = token.account.clone();
             }
             state.token = Some(token.clone());
-            state.generation = state.generation.wrapping_add(1);
             state.interaction_declined = false;
             state.signed_out = false;
             state.last_error = None;
@@ -570,9 +597,14 @@ impl EntraBrokerProvider {
             return None;
         }
         let name = self.name();
+        let unavailable = if cfg!(windows) {
+            "the Windows broker is disabled by CODA_DISABLE_WAM"
+        } else {
+            "the OS account broker is not available on this platform"
+        };
         Some(format!(
-            "MCP server '{name}' requires sign-in and the Windows broker is unavailable. Run \
-             `/mcp login {name}` to sign in with your browser."
+            "MCP server '{name}' requires sign-in and {unavailable}. Run `/mcp login {name}` to \
+             sign in with your browser."
         ))
     }
 
@@ -602,6 +634,28 @@ impl EntraBrokerProvider {
 #[async_trait]
 impl McpAuthProvider for EntraBrokerProvider {
     async fn get_access_token(&self) -> Option<Secret<String>> {
+        self.inner.get_access_token().await
+    }
+
+    async fn handle_unauthorized(&self, www_authenticate: Option<&str>) -> bool {
+        self.inner.handle_unauthorized(www_authenticate).await
+    }
+
+    fn status(&self) -> Option<McpAuthStatus> {
+        self.inner.status()
+    }
+
+    async fn login(&self) -> McpAuthResult {
+        self.inner.login().await
+    }
+
+    async fn logout(&self) -> McpAuthResult {
+        self.inner.logout().await
+    }
+}
+
+impl Inner {
+    async fn get_access_token(self: &Arc<Self>) -> Option<Secret<String>> {
         if let Some(fallback) = &self.fallback {
             return fallback.headless.get_access_token().await;
         }
@@ -624,20 +678,20 @@ impl McpAuthProvider for EntraBrokerProvider {
         }
         let flight = if unexpired().is_some() {
             // Inside the refresh window: never wait for a refresh in flight.
-            match self.entry.flight.try_lock() {
+            match Arc::clone(&self.entry.flight).try_lock_owned() {
                 Ok(guard) => guard,
                 Err(_) => return unexpired(),
             }
         } else {
-            self.entry.flight.lock().await
+            Arc::clone(&self.entry.flight).lock_owned().await
         };
-        match self.acquire_locked(&flight, Trigger::Automatic).await {
+        match self.acquire(flight, Trigger::Automatic).await {
             Ok(token) => Some(token.access_token),
             Err(_) => unexpired(),
         }
     }
 
-    async fn handle_unauthorized(&self, www_authenticate: Option<&str>) -> bool {
+    async fn handle_unauthorized(self: &Arc<Self>, www_authenticate: Option<&str>) -> bool {
         if let Some(fallback) = &self.fallback {
             return self.fallback_unauthorized(fallback, www_authenticate).await;
         }
@@ -649,7 +703,7 @@ impl McpAuthProvider for EntraBrokerProvider {
         if self.ensure_target(challenge.as_ref()).await.is_err() {
             return false;
         }
-        let flight = self.entry.flight.lock().await;
+        let flight = Arc::clone(&self.entry.flight).lock_owned().await;
         let had_token = {
             let mut state = self.entry.state();
             // Another task replaced the rejected token while we waited.
@@ -665,7 +719,7 @@ impl McpAuthProvider for EntraBrokerProvider {
             // A 401 while a token was attached means the token is no good.
             state.token.take().is_some() || rejected.is_some()
         };
-        self.acquire_locked(&flight, Trigger::Unauthorized { force_refresh: had_token })
+        self.acquire(flight, Trigger::Unauthorized { force_refresh: had_token })
             .await
             .is_ok()
     }
@@ -685,7 +739,7 @@ impl McpAuthProvider for EntraBrokerProvider {
         })
     }
 
-    async fn login(&self) -> McpAuthResult {
+    async fn login(self: &Arc<Self>) -> McpAuthResult {
         if let Some(fallback) = &self.fallback {
             let result = fallback.interactive.login().await;
             match (&result.succeeded, &result.error) {
@@ -703,16 +757,14 @@ impl McpAuthProvider for EntraBrokerProvider {
         if let Err(msg) = self.ensure_target(None).await {
             return McpAuthResult { succeeded: false, error: Some(msg) };
         }
-        let flight = self.entry.flight.lock().await;
+        let flight = Arc::clone(&self.entry.flight).lock_owned().await;
         self.load_persisted().await;
         {
             let mut state = self.entry.state();
             state.interaction_declined = false;
             state.signed_out = false;
         }
-        let acquired = self.acquire_locked(&flight, Trigger::User).await;
-        drop(flight);
-        match acquired {
+        match self.acquire(flight, Trigger::User).await {
             Ok(token) => {
                 let who = token.account.map(|a| a.username).filter(|u| !u.is_empty());
                 self.log(&match who {

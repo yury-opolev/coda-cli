@@ -81,7 +81,9 @@ request. Otherwise it discovers them from the server first (below).
    bounded at **180 s**. If that dialog is cancelled or fails, Coda does **not** show it
    again automatically: further requests fail with a hint until you run
    `/mcp login <name>`. Without a console window (no terminal attached) it never prompts
-   and tells you to run `/mcp login <name>` from an interactive session. Because the very
+   and tells you to run `/mcp login <name>` from an interactive session. The sign-in runs
+   in the background, so if the request that started it gives up (e.g. a tool call times
+   out), the dialog's outcome is still recorded and no second dialog opens. Because the very
    first connection may wait for this dialog, an `entra-broker` server's connect timeout
    is extended by those 180 s.
 4. **Caching.** Tokens are cached in memory, process-wide, keyed by the server's canonical
@@ -155,7 +157,9 @@ rejected (omit the port instead).
 
 **Signing in.** The engine's own connections are headless: they reuse a stored token but
 never open a browser. A server that needs a sign-in reports
-"… requires sign-in and the Windows broker is unavailable. Run `/mcp login <name>` …";
+"… requires sign-in and the Windows broker is disabled by CODA_DISABLE_WAM" (on other
+platforms: "… the OS account broker is not available on this platform") followed by
+"Run `/mcp login <name>` …";
 `/mcp login <name>` then opens your browser and waits up to 5 minutes for the callback.
 
 ## `/mcp login` and `/mcp logout`
@@ -202,5 +206,5 @@ marks a token past its expiry. The account is shown when the broker reported one
 | "… did not respond within 30s/180s" | The broker hung or the dialog was left open. Run `/mcp login <name>` to try again. |
 | "Could not discover OAuth protected-resource metadata …" / "Could not determine the scopes …" | The server does not publish RFC 9728 metadata. Set `auth.tenant` and `auth.scopes`. |
 | "… does not advertise a Microsoft Entra authorization server" | The server is not Entra-protected; use `auth.mode: "oauth"`. |
-| "Windows broker unavailable …" | The Entra account provider could not be found (e.g. an unusual Windows edition or policy). Set `CODA_DISABLE_WAM=1` to use the browser flow instead. |
+| "Windows broker unavailable … Set CODA_DISABLE_WAM=1 …" | The Entra account provider could not be found (e.g. an unusual Windows edition or policy); `/mcp login` cannot help. Set `CODA_DISABLE_WAM=1` to use the browser sign-in instead, or use `auth.mode: "oauth"`. |
 | You want the browser flow on Windows | Set `CODA_DISABLE_WAM=1` before starting Coda. |

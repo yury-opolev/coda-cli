@@ -411,13 +411,13 @@ async fn unauthorized_after_a_refresh_to_the_same_token_forces_reacquire() {
     assert_eq!(token_of(&p).await.as_deref(), Some("t1"));
 
     let p = &p;
-    let guard = p.entry.flight.lock().await;
+    let guard = p.inner.entry.flight.lock().await;
     let refresh = async move {
         for _ in 0..4 {
             tokio::task::yield_now().await;
         }
         // An automatic (non-forced) refresh that returned the rejected token again.
-        p.accept(tok("t1", 3600).unwrap()).await;
+        p.inner.accept(tok("t1", 3600).unwrap()).await;
         drop(guard);
     };
     let (ok, ()) = tokio::join!(p.handle_unauthorized(None), refresh);
@@ -644,10 +644,66 @@ fn fallback_only_replaces_the_needs_interactive_error() {
         options(Arc::new(UnavailableBroker::new("not Windows")), &cache),
     );
     let headless = "MCP server requires authorization. Run `coda` interactively to sign in to x.";
-    let hint = p.fallback_hint(Some(headless)).expect("replaced");
+    let hint = p.inner.fallback_hint(Some(headless)).expect("replaced");
     assert!(hint.contains("`/mcp login contoso`"), "{hint}");
-    assert_eq!(p.fallback_hint(Some("Invalid auth.redirectUri 'x': bad")), None);
-    assert_eq!(p.fallback_hint(Some("Could not discover OAuth protected-resource metadata.")), None);
+    if cfg!(windows) {
+        assert!(hint.contains("Windows broker"), "{hint}");
+    } else {
+        assert!(hint.contains("not available on this platform"), "{hint}");
+        assert!(!hint.contains("Windows"), "{hint}");
+    }
+    assert_eq!(p.inner.fallback_hint(Some("Invalid auth.redirectUri 'x': bad")), None);
+    assert_eq!(p.inner.fallback_hint(Some("Could not discover OAuth protected-resource metadata.")), None);
+}
+
+#[tokio::test]
+async fn unavailable_broker_error_suggests_disabling_wam_not_login() {
+    let broker = FakeBroker::new();
+    broker.silent(Err(BrokerError::Unavailable("no provider".into())));
+    let p = provider(&broker);
+    assert_eq!(token_of(&p).await, None);
+    let err = last_error(&p);
+    assert!(err.contains("no provider"), "{err}");
+    assert!(err.contains("CODA_DISABLE_WAM=1"), "{err}");
+    assert!(err.contains("auth.mode 'oauth'"), "{err}");
+    assert!(!err.contains("/mcp login"), "{err}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropped_request_still_caches_the_interactive_token() {
+    let broker = FakeBroker::with_interactive_delay(Duration::from_secs(10));
+    broker.silent(interaction_required()).interactive(tok("t1", 3600));
+    let p = provider(&broker);
+
+    let dropped = tokio::time::timeout(Duration::from_secs(1), token_of(&p)).await;
+    assert!(dropped.is_err(), "the caller gave up mid-dialog");
+    assert_eq!(broker.interactive_calls(), 1);
+
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    assert_eq!(token_of(&p).await.as_deref(), Some("t1"));
+    assert_eq!(broker.interactive_calls(), 1, "no second dialog");
+    assert_eq!(broker.silent_calls(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropped_request_still_records_a_declined_dialog() {
+    let broker = FakeBroker::with_interactive_delay(Duration::from_secs(10));
+    broker
+        .silent(interaction_required())
+        .silent(interaction_required())
+        .interactive(Err(BrokerError::Cancelled));
+    let p = provider(&broker);
+
+    let dropped = tokio::time::timeout(Duration::from_secs(1), token_of(&p)).await;
+    assert!(dropped.is_err());
+
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    assert!(last_error(&p).contains("cancelled"), "{}", last_error(&p));
+
+    tokio::time::sleep(FAILURE_COOL_DOWN).await;
+    assert_eq!(token_of(&p).await, None);
+    assert_eq!(broker.silent_calls(), 2);
+    assert_eq!(broker.interactive_calls(), 1, "a declined dialog is not shown again");
 }
 
 #[tokio::test]

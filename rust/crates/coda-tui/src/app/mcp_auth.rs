@@ -113,7 +113,8 @@ impl App {
                 Ok(Err(coda_client::ClientError::Rpc(error))) => Err(error.message),
                 Ok(Err(error)) => Err(error.to_string()),
                 Err(_) => Err(format!(
-                    "the engine did not answer within {} s",
+                    "the engine did not answer within {} s; the sign-in may still complete — \
+                     check /mcp",
                     MCP_AUTH_CLIENT_TIMEOUT.as_secs()
                 )),
             };

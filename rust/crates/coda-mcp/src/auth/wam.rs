@@ -212,25 +212,19 @@ fn find_provider(
     deadline: Instant,
     budget: Duration,
 ) -> Result<WebAccountProvider, BrokerError> {
-    let unavailable = |detail: String| {
-        BrokerError::Unavailable(format!("Microsoft Entra account provider: {detail}"))
-    };
     let wam_authority = authority_for(authority);
     let op = WebAuthenticationCoreManager::FindAccountProviderWithAuthorityAsync(
         &HSTRING::from(ENTRA_PROVIDER_ID),
         &HSTRING::from(wam_authority.as_str()),
     )
-    .map_err(|e| unavailable(e.message()))?;
-    let found = match wait_raw(&op, deadline, budget) {
-        Err(BrokerError::Failed(detail)) => return Err(unavailable(detail)),
-        other => other?,
-    };
-    match found {
+    .map_err(|e| win_failure("account provider lookup", &e))?;
+    match wait_raw(&op, deadline, budget)? {
         Ok(provider) => Ok(provider),
+        // Only "no such provider" means the broker cannot serve this authority.
         Err(e) if is_null_result(&e) => Err(BrokerError::Unavailable(format!(
             "no Microsoft account provider found for authority {wam_authority}"
         ))),
-        Err(e) => Err(unavailable(failure_detail(&e))),
+        Err(e) => Err(win_failure("account provider lookup", &e)),
     }
 }
 

@@ -182,7 +182,8 @@ impl BrokerTokenCache {
 /// only held briefly and never across an `.await`.
 #[derive(Default)]
 pub struct CacheEntry {
-    pub flight: tokio::sync::Mutex<()>,
+    /// Shared so an acquisition task can own the guard (`lock_owned`).
+    pub flight: Arc<tokio::sync::Mutex<()>>,
     pub state: std::sync::Mutex<CachedState>,
 }
 
@@ -207,8 +208,6 @@ pub struct CachedState {
     /// When the last broker acquisition failed; automatic refreshes are
     /// skipped for a cool-down after it.
     pub last_failure_at: Option<tokio::time::Instant>,
-    /// Incremented whenever a new token is cached.
-    pub generation: u64,
 }
 
 #[cfg(test)]
