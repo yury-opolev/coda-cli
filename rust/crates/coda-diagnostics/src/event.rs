@@ -274,6 +274,40 @@ pub enum Event {
     /// many it placed by anchor, sent to the historical area, kept as local
     /// blocks, or held back until a turn boundary.
     TimelineRebuild { records: u32, placed: u32, historical: u32, local: u32, held: u32 },
+
+    /// One Windows account broker (WAM) token call made for an MCP server's
+    /// `entra-broker` sign-in. `mode` is `silent` or `interactive`; `status`
+    /// is a closed label (`success`, `account_switch`, `user_cancel`,
+    /// `user_interaction_required`, `account_provider_not_available`,
+    /// `provider_error`, `timeout`, `winrt_error`, `no_console`). Only numbers
+    /// come from the broker: its provider error code and the `AADSTS` number
+    /// parsed from its message — never the message, a token or an account.
+    /// `account_known` tells whether a specific Windows account was used
+    /// rather than the Windows default account.
+    McpBrokerCall {
+        mode: &'static str,
+        duration_ms: u64,
+        status: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider_error_code: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        aadsts: Option<u32>,
+        console_window: bool,
+        account_known: bool,
+    },
+    /// One `entra-broker` token acquisition for an MCP server and how it
+    /// ended. `trigger` is `automatic`, `unauthorized` or `user`; `outcome`
+    /// is a closed label (`cached`, `silent`, `interactive`,
+    /// `interaction_required`, `declined`, `no_console`, `cancelled`,
+    /// `timeout`, `unavailable`, `failed`, `signed_out`, `cool_down`,
+    /// `no_target`).
+    McpBrokerAcquire {
+        trigger: &'static str,
+        outcome: &'static str,
+        interactive_attempted: bool,
+        duration_ms: u64,
+        console_window: bool,
+    },
 }
 
 impl Event {
@@ -398,6 +432,84 @@ mod tests {
         let mut keys: Vec<_> = value.as_object().unwrap().keys().cloned().collect();
         keys.sort();
         assert_eq!(keys, ["held", "historical", "kind", "local", "placed", "records"]);
+    }
+
+    fn sorted_keys(value: &serde_json::Value) -> Vec<String> {
+        let mut keys: Vec<_> = value.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
+    #[test]
+    fn mcp_broker_call_carries_codes_and_flags_only() {
+        let value = serde_json::to_value(Event::McpBrokerCall {
+            mode: "silent",
+            duration_ms: 40,
+            status: "provider_error",
+            provider_error_code: Some(0xcaa2_0005),
+            aadsts: Some(50020),
+            console_window: true,
+            account_known: false,
+        })
+        .unwrap();
+        assert_eq!(value["kind"], "mcp_broker_call");
+        assert_eq!(
+            sorted_keys(&value),
+            [
+                "aadsts",
+                "account_known",
+                "console_window",
+                "duration_ms",
+                "kind",
+                "mode",
+                "provider_error_code",
+                "status"
+            ]
+        );
+        assert_eq!(value["aadsts"], 50020);
+        assert_eq!(value["provider_error_code"], 0xcaa2_0005_u32);
+
+        let value = serde_json::to_value(Event::McpBrokerCall {
+            mode: "interactive",
+            duration_ms: 1,
+            status: "success",
+            provider_error_code: None,
+            aadsts: None,
+            console_window: true,
+            account_known: true,
+        })
+        .unwrap();
+        assert!(value.get("aadsts").is_none());
+        assert!(value.get("provider_error_code").is_none());
+    }
+
+    #[test]
+    fn mcp_broker_acquire_carries_labels_and_flags_only() {
+        let value = serde_json::to_value(Event::McpBrokerAcquire {
+            trigger: "automatic",
+            outcome: "no_console",
+            interactive_attempted: false,
+            duration_ms: 12,
+            console_window: false,
+        })
+        .unwrap();
+        assert_eq!(value["kind"], "mcp_broker_acquire");
+        assert_eq!(
+            sorted_keys(&value),
+            ["console_window", "duration_ms", "interactive_attempted", "kind", "outcome", "trigger"]
+        );
+        assert_eq!(value["outcome"], "no_console");
+        assert_eq!(
+            Event::McpBrokerAcquire {
+                trigger: "user",
+                outcome: "interactive",
+                interactive_attempted: true,
+                duration_ms: 1,
+                console_window: true,
+            }
+            .minimum_verbosity(),
+            Verbosity::Normal
+        );
     }
 
     #[test]

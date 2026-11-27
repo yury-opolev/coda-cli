@@ -32,6 +32,14 @@ pub trait McpAuthProvider: Send + Sync {
         None
     }
 
+    /// Why a request must not be sent, when `get_access_token` returned
+    /// `None` although the server is known to require a token (its sign-in
+    /// failed). `None` (the default) lets the request go out without a token,
+    /// e.g. to discover the server's authorization requirements from its 401.
+    fn required_auth_error(&self) -> Option<String> {
+        None
+    }
+
     /// User-initiated sign-in (`/mcp login <name>`).
     async fn login(&self) -> McpAuthResult {
         unsupported("Sign-in")

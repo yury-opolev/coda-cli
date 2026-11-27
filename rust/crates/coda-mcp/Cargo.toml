@@ -16,6 +16,7 @@ test-support = []
 coda-proto.workspace = true
 coda-tool.workspace = true
 coda-auth.workspace = true
+coda-diagnostics.workspace = true
 
 anyhow.workspace = true
 thiserror.workspace = true

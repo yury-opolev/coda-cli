@@ -72,13 +72,28 @@ request. Otherwise it discovers them from the server first (below).
    configured `tenant` replaces its tenant) and derives the scopes as described above.
    Discovery is bounded at 30 s. A server that advertises no Entra authorization server is
    refused with a hint to use `auth.mode: "oauth"`.
-2. **Silent first.** Coda asks the broker for a token without any UI (bounded at **30 s**),
-   using the remembered account if there is one, else the configured `account` hint, else
-   the Windows default account.
+2. **Silent first.** Coda asks the broker for a token without any UI (bounded at **30 s**).
+   It picks the account like this:
+   - the account remembered from an earlier sign-in (see *What is stored*), if Windows
+     still has it;
+   - else, when `account` is configured, the Windows account with that user name
+     (case-insensitive) among the accounts the broker reports for the app's `clientId`,
+     then among all of the provider's accounts;
+   - else the Windows default account. When `account` is configured but no such
+     Windows account is found (or the broker does not allow listing accounts), it is
+     still sent as a login hint, but the broker then signs in the **default** account,
+     which may belong to another tenant — Entra answers `AADSTS50020` and Coda goes on to
+     the dialog (step 3) so you can pick the right account.
 3. **Interactive only when needed.** Only when Entra says interaction is required (first
    consent, MFA, a new account) does Coda show the broker's own sign-in dialog, parented
    to the console window (its root owner, so it also works under Windows Terminal),
-   bounded at **180 s**. If that dialog is cancelled or fails, Coda does **not** show it
+   bounded at **180 s**. Besides the broker's own "interaction required" status, a broker
+   provider error counts as interaction required when it carries `AADSTS50020`, `50055`,
+   `50058`, `50072`, `50074`, `50076`, `50079`, `50133`, `50158`, `50173`, `53000`,
+   `65001`, `65004`, `70043`, `160021` or `700082`, or (without one of those codes)
+   `interaction_required`, `consent_required`, `login_required` or `invalid_grant`. Codes a
+   dialog cannot fix (`AADSTS53003` Conditional Access block, `50011`, `50105`, `90002`,
+   `700016`, `7000218`, `901002`) fail straight away. If that dialog is cancelled or fails, Coda does **not** show it
    again automatically: further requests fail with a hint until you run
    `/mcp login <name>`. Without a console window (no terminal attached) it never prompts
    and tells you to run `/mcp login <name>` from an interactive session. The sign-in runs
@@ -86,19 +101,26 @@ request. Otherwise it discovers them from the server first (below).
    out), the dialog's outcome is still recorded and no second dialog opens. Because the very
    first connection may wait for this dialog, an `entra-broker` server's connect timeout
    is extended by those 180 s.
-4. **Caching.** Tokens are cached in memory, process-wide, keyed by the server's canonical
+4. **No unauthenticated requests after a failed sign-in.** Once the authority and scopes
+   are known (configured, or discovered in step 1), a request is never sent without a
+   token: if sign-in failed, the request fails locally with the sign-in error (e.g.
+   "request not sent because sign-in failed: Windows broker sign-in for MCP server '…'
+   failed: … Run `/mcp login …` to retry."). If the server rejects a token and the
+   re-acquisition fails, the error reads "HTTP 401 from MCP server; sign-in failed: …".
+   The same error is the server's last error in `/mcp` and its `auth error` line.
+5. **Caching.** Tokens are cached in memory, process-wide, keyed by the server's canonical
    resource URI plus the configured `account` (lower-cased, or the default account), so a
    restarted connection reuses the token and two connections never show two dialogs. A
    token is refreshed silently once it is valid for less than **5 minutes**; while that
    refresh runs, or if it fails, requests keep using the old token until it actually
    expires.
-5. **401 with a token.** If the server rejects a token, Coda drops it and re-acquires
+6. **401 with a token.** If the server rejects a token, Coda drops it and re-acquires
    **once**, asking the broker to bypass its own cache; simultaneous 401s share that one
    re-acquisition.
-6. **Cool-down.** After a failed acquisition, automatic refreshes are skipped for **60 s**
+7. **Cool-down.** After a failed acquisition, automatic refreshes are skipped for **60 s**
    (an unexpired token is still used), so a failing broker does not slow every request.
    `/mcp login` and the 401 path ignore the cool-down.
-7. **What is stored.** Only the account the broker returned (its id and username — no
+8. **What is stored.** Only the account the broker returned (its id and username — no
    tokens) is written to Coda's credential store, under
    `mcp-broker-account:<resource>#<account>`, so a restart silently reuses an account you
    picked interactively. The broker owns the tokens and their refresh. Credential-store
@@ -208,3 +230,31 @@ marks a token past its expiry. The account is shown when the broker reported one
 | "… does not advertise a Microsoft Entra authorization server" | The server is not Entra-protected; use `auth.mode: "oauth"`. |
 | "Windows broker unavailable … Set CODA_DISABLE_WAM=1 …" | The Entra account provider could not be found (e.g. an unusual Windows edition or policy); `/mcp login` cannot help. Set `CODA_DISABLE_WAM=1` to use the browser sign-in instead, or use `auth.mode: "oauth"`. |
 | You want the browser flow on Windows | Set `CODA_DISABLE_WAM=1` before starting Coda. |
+| `AADSTS50020` (account does not exist in tenant) | The broker used an account of another tenant — usually the Windows default account, because the configured `account` is not among the Windows accounts the broker reports (see *Silent first*). Coda escalates to the dialog where you can pick the right account; once you signed in there, the account is remembered. Without a console, run `/mcp login <name>`. |
+| "request not sent because sign-in failed: …" / "HTTP 401 from MCP server; sign-in failed: …" | Sign-in failed, so Coda refused to send requests without a token (or the server rejected the token and re-acquiring failed). The rest of the message is the broker's error; fix that and run `/mcp login <name>`. |
+
+### Diagnostics
+
+Every broker sign-in is recorded in the always-on diagnostics log of the engine
+(`~/.coda/logs/diagnostics`, respecting `CODA_HOME`; `/log` shows the path). The records
+hold labels, numbers and flags only — never a token, an account or user name, or an
+error message:
+
+- `mcp_broker_acquire` — one per acquisition: `trigger` (`automatic`, `unauthorized`,
+  `user`), `outcome` (`cached`, `silent`, `interactive`, `interaction_required` — prompts
+  disabled, `declined` — a dialog was cancelled earlier, `no_console`, `cancelled`,
+  `timeout`, `unavailable`, `failed`, `signed_out`, `cool_down`, `no_target`),
+  `interactive_attempted`, `duration_ms` and `console_window`.
+- `mcp_broker_call` — one per Windows broker token call: `mode` (`silent`,
+  `interactive`), `status` (`success`, `account_switch`, `user_cancel`,
+  `user_interaction_required`, `account_provider_not_available`, `provider_error`,
+  `timeout`, `winrt_error`, `no_console`), `provider_error_code`, the `aadsts` error
+  number, `console_window`, and `account_known` (`true` when a specific Windows account
+  was used, `false` for the Windows default account).
+
+For example, `mcp_broker_call` with `status: user_interaction_required`, `aadsts: 50020`
+and `account_known: false`, followed by `mcp_broker_acquire` with `outcome: no_console`,
+means the default account belongs to another tenant and no dialog could be shown. With
+[telemetry logging](../README.md#telemetry--logging) enabled, the engine log also has an
+`info`/`warn` line with the same fields for every call and acquisition, and a `warn` line
+saying why an interactive sign-in was skipped.

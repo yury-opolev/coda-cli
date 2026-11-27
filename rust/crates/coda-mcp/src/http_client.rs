@@ -359,6 +359,12 @@ impl McpHttpClient {
                 let recovered = auth.handle_unauthorized(www_auth.as_deref()).await;
                 if recovered {
                     response = self.send_once(message).await?;
+                } else if let Some(error) = auth.status().and_then(|s| s.last_error) {
+                    // The sign-in failure explains the 401 better than the
+                    // server's own body does.
+                    return Err(HttpCallError::Auth(format!(
+                        "HTTP 401 from MCP server; sign-in failed: {error}"
+                    )));
                 }
             }
         }
@@ -437,8 +443,19 @@ impl McpHttpClient {
 
         // Auth token — never logged (Secret<T> redacts Debug).
         if let Some(auth) = &self.auth {
-            if let Some(token) = auth.get_access_token().await {
-                req = req.header("Authorization", format!("Bearer {}", token.expose()));
+            match auth.get_access_token().await {
+                Some(token) => {
+                    req = req.header("Authorization", format!("Bearer {}", token.expose()));
+                }
+                // A token is known to be required and sign-in failed: never
+                // send the request without one.
+                None => {
+                    if let Some(error) = auth.required_auth_error() {
+                        return Err(HttpCallError::Auth(format!(
+                            "request not sent because sign-in failed: {error}"
+                        )));
+                    }
+                }
             }
         }
 
@@ -595,6 +612,8 @@ pub(crate) enum HttpCallError {
     Http(u16, String),
     McpError(String),
     Protocol(String),
+    /// Authentication failed; the message says why and how to fix it.
+    Auth(String),
     Stopped,
 }
 
@@ -605,6 +624,7 @@ impl std::fmt::Display for HttpCallError {
             Self::Http(s, b) => write!(f, "HTTP {s}: {b}"),
             Self::McpError(m) => write!(f, "MCP error: {m}"),
             Self::Protocol(m) => write!(f, "protocol error: {m}"),
+            Self::Auth(m) => f.write_str(m),
             Self::Stopped => write!(f, "MCP server was stopped"),
         }
     }
