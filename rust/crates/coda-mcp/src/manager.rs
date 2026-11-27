@@ -28,7 +28,11 @@ use tokio_util::sync::CancellationToken;
 use coda_auth::store::CredentialStore;
 use coda_tool::{Tool, ToolSource};
 
-use crate::auth::{McpAuthMode, McpAuthProvider, McpOAuthProvider, StaticBearerAuthProvider};
+use crate::auth::entra_broker::INTERACTIVE_TIMEOUT;
+use crate::auth::{
+    EntraBrokerOptions, EntraBrokerProvider, McpAuthMode, McpAuthProvider, McpAuthStatus, McpOAuthProvider,
+    StaticBearerAuthProvider,
+};
 use crate::client::{McpClient, McpServerInfo, McpToolCallError, McpToolInfo, DEFAULT_CONNECT_TIMEOUT};
 use crate::config::{self, McpConnectable, McpHttpConnectable};
 use crate::error::{McpConnectError, McpError};
@@ -38,6 +42,9 @@ use crate::tool::McpTool;
 
 /// Default shutdown grace period when the manager is dropped.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+
+/// Per-request bound for auth HTTP traffic (metadata discovery, token endpoints).
+const AUTH_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Unified client handle: either a stdio or HTTP MCP client.
 enum AnyClient {
@@ -183,6 +190,13 @@ pub struct McpServerStatus {
     pub tool_count: usize,
 }
 
+/// Secret-free auth state of one HTTP server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServerAuthStatus {
+    pub name: String,
+    pub status: McpAuthStatus,
+}
+
 /// A configured server that is not currently connected, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpServerFault {
@@ -270,6 +284,9 @@ struct ServerSlot {
     /// Bumped on every successful (re)connect so a stale failure report
     /// cannot undo a newer connection.
     generation: u64,
+    /// HTTP auth provider, kept after a failed connect so its status and
+    /// login/logout stay reachable.
+    auth: Option<Arc<dyn McpAuthProvider>>,
 }
 
 /// Connects configured MCP servers and exposes their tools.
@@ -305,20 +322,32 @@ impl McpClientManager {
         *self.tool_snapshot.write().unwrap_or_else(|e| e.into_inner()) = snapshot;
     }
 
-    fn record_connected(map: &mut HashMap<String, ServerSlot>, name: String, spec: ServerSpec, entry: ServerEntry) {
+    fn record_connected(
+        map: &mut HashMap<String, ServerSlot>,
+        name: String,
+        spec: ServerSpec,
+        entry: ServerEntry,
+        auth: Option<Arc<dyn McpAuthProvider>>,
+    ) {
         let generation = map.get(&name).map_or(0, |slot| slot.generation) + 1;
         let tools = entry.client.tools().to_vec();
         map.insert(
             name,
-            ServerSlot { spec, live: Some(entry), last_error: None, tools, generation },
+            ServerSlot { spec, live: Some(entry), last_error: None, tools, generation, auth },
         );
     }
 
-    fn record_failed(map: &mut HashMap<String, ServerSlot>, name: String, spec: ServerSpec, error: String) {
+    fn record_failed(
+        map: &mut HashMap<String, ServerSlot>,
+        name: String,
+        spec: ServerSpec,
+        error: String,
+        auth: Option<Arc<dyn McpAuthProvider>>,
+    ) {
         let generation = map.get(&name).map_or(0, |slot| slot.generation);
         map.insert(
             name,
-            ServerSlot { spec, live: None, last_error: Some(error), tools: Vec::new(), generation },
+            ServerSlot { spec, live: None, last_error: Some(error), tools: Vec::new(), generation, auth },
         );
     }
 
@@ -439,11 +468,11 @@ impl McpClientManager {
                         tools = entry.client.tools().len(),
                         "MCP stdio server connected"
                     );
-                    Self::record_connected(&mut guard, name, spec, entry);
+                    Self::record_connected(&mut guard, name, spec, entry, None);
                 }
                 Err(error) => {
                     tracing::warn!(server = %name, %error, "MCP stdio server failed to start");
-                    Self::record_failed(&mut guard, name.clone(), spec, error.to_string());
+                    Self::record_failed(&mut guard, name.clone(), spec, error.to_string(), None);
                     errors.push(McpConnectError { server_name: name, error });
                 }
             }
@@ -473,8 +502,8 @@ impl McpClientManager {
                 let name = cfg.name.clone();
                 let store = credential_store.clone();
                 async move {
-                    let result = connect_one_http(&cfg, connect_timeout, tool_timeout, store.as_ref()).await;
-                    (name, ServerSpec::Http(Box::new(cfg), store), result)
+                    let (auth, result) = build_and_connect_http(&cfg, connect_timeout, tool_timeout, store.as_ref()).await;
+                    (name, ServerSpec::Http(Box::new(cfg), store), auth, result)
                 }
             })
             .collect();
@@ -483,7 +512,7 @@ impl McpClientManager {
         let mut errors = Vec::new();
         let mut guard = self.servers.write().await;
 
-        for (name, spec, result) in results {
+        for (name, spec, auth, result) in results {
             match result {
                 Ok(entry) => {
                     tracing::info!(
@@ -492,11 +521,11 @@ impl McpClientManager {
                         tools = entry.client.tools().len(),
                         "MCP HTTP server connected"
                     );
-                    Self::record_connected(&mut guard, name, spec, entry);
+                    Self::record_connected(&mut guard, name, spec, entry, auth);
                 }
                 Err(error) => {
                     tracing::warn!(server = %name, %error, "MCP HTTP server failed to start");
-                    Self::record_failed(&mut guard, name.clone(), spec, error.to_string());
+                    Self::record_failed(&mut guard, name.clone(), spec, error.to_string(), auth);
                     errors.push(McpConnectError { server_name: name, error });
                 }
             }
@@ -736,14 +765,14 @@ impl McpClientManager {
         let reconnect = async {
             match &spec {
                 ServerSpec::Stdio(cfg) => {
-                    connect_one_stdio(cfg, connect_timeout, tool_timeout).await
+                    (None, connect_one_stdio(cfg, connect_timeout, tool_timeout).await)
                 }
                 ServerSpec::Http(cfg, store) => {
-                    connect_one_http(cfg, connect_timeout, tool_timeout, store.as_ref()).await
+                    build_and_connect_http(cfg, connect_timeout, tool_timeout, store.as_ref()).await
                 }
             }
         };
-        let reconnected = self.until_shutdown(reconnect).await?;
+        let (auth, reconnected) = self.until_shutdown(reconnect).await?;
 
         let mut guard = self.servers.write().await;
         match reconnected {
@@ -767,12 +796,14 @@ impl McpClientManager {
                 slot.live = Some(entry);
                 slot.last_error = None;
                 slot.generation += 1;
+                slot.auth = auth;
                 self.rebuild_snapshot(&guard);
                 Ok(RestartReport { tool_count, old_process })
             }
             Err(e) => {
                 if let Some(slot) = guard.get_mut(server_name) {
                     slot.last_error = Some(e.to_string());
+                    slot.auth = auth;
                 }
                 Err(format!(
                     "failed to restart '{server_name}': {e}. The server stays configured; \
@@ -780,6 +811,115 @@ impl McpClientManager {
                 ))
             }
         }
+    }
+
+    /// Auth state of every HTTP server that has an auth provider, sorted by
+    /// name. Reads only in-memory provider state.
+    pub async fn auth_status(&self) -> Vec<McpServerAuthStatus> {
+        let guard = self.servers.read().await;
+        let mut statuses: Vec<McpServerAuthStatus> = guard
+            .iter()
+            .filter_map(|(name, slot)| {
+                let status = slot.auth.as_ref()?.status()?;
+                Some(McpServerAuthStatus { name: name.clone(), status })
+            })
+            .collect();
+        statuses.sort_by(|a, b| a.name.cmp(&b.name));
+        statuses
+    }
+
+    /// Launch spec, credential store, live state and current provider of an
+    /// HTTP server that supports sign-in.
+    async fn sign_in_target(
+        &self,
+        name: &str,
+    ) -> Result<(McpHttpConnectable, Option<Arc<dyn CredentialStore>>, bool, Option<Arc<dyn McpAuthProvider>>), String>
+    {
+        let guard = self.servers.read().await;
+        let Some(slot) = guard.get(name) else {
+            return Err(Self::unknown_server(name, &guard));
+        };
+        let ServerSpec::Http(cfg, store) = &slot.spec else {
+            return Err(format!("MCP server '{name}' is a stdio server; it has no sign-in."));
+        };
+        match cfg.auth.mode {
+            McpAuthMode::None => Err(format!(
+                "MCP server '{name}' does not use authentication (auth.mode 'none'); there is nothing to sign in to."
+            )),
+            McpAuthMode::Bearer => Err(format!(
+                "MCP server '{name}' uses a static bearer token (auth.mode 'bearer'); \
+                 change the token in the MCP configuration instead."
+            )),
+            McpAuthMode::OAuth | McpAuthMode::EntraBroker => {
+                Ok(((**cfg).clone(), store.clone(), slot.live.is_some(), slot.auth.clone()))
+            }
+        }
+    }
+
+    /// Signs in to an HTTP server (`/mcp login`): the browser flow for
+    /// `oauth`, the OS broker (silent, then interactive) for `entra-broker`.
+    /// A server that is not connected is restarted afterwards.
+    pub async fn auth_login(&self, name: &str) -> Result<String, String> {
+        let (cfg, store, connected, _) = self.sign_in_target(name).await?;
+        let provider = build_http_auth(&cfg, store.as_ref(), true)?
+            .ok_or_else(|| format!("MCP server '{name}' has an invalid URL; fix it in the MCP configuration."))?;
+        let result = self.until_shutdown(provider.login()).await?;
+        if !result.succeeded {
+            return Err(result.error.unwrap_or_else(|| format!("Sign-in to MCP server '{name}' failed.")));
+        }
+
+        let mut message = match provider.status().and_then(|s| s.account) {
+            Some(account) => format!("Signed in to MCP server '{name}' as {account}."),
+            None => format!("Signed in to MCP server '{name}'."),
+        };
+        let needs_restart = !connected && {
+            let mut guard = self.servers.write().await;
+            match guard.get_mut(name) {
+                Some(slot) if slot.live.is_none() => {
+                    slot.auth = Some(provider);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if needs_restart {
+            match self.restart_server(name).await {
+                Ok(report) => {
+                    message.push(' ');
+                    message.push_str(&report.summary(name));
+                }
+                Err(error) => {
+                    message.push_str(&format!(" The server could not be reconnected: {error}"));
+                }
+            }
+        }
+        Ok(message)
+    }
+
+    /// Signs out of an HTTP server (`/mcp logout`). The live connection is
+    /// kept; its next request needs a new sign-in.
+    pub async fn auth_logout(&self, name: &str) -> Result<String, String> {
+        let (cfg, store, _, current) = self.sign_in_target(name).await?;
+        let provider = match current {
+            Some(provider) => provider,
+            None => build_http_auth(&cfg, store.as_ref(), false)?.ok_or_else(|| {
+                format!("MCP server '{name}' has an invalid URL; fix it in the MCP configuration.")
+            })?,
+        };
+        let result = provider.logout().await;
+        if !result.succeeded {
+            return Err(result.error.unwrap_or_else(|| format!("Sign-out of MCP server '{name}' failed.")));
+        }
+        Ok(match cfg.auth.mode {
+            McpAuthMode::EntraBroker => format!(
+                "Signed out of MCP server '{name}'. Your Windows account itself stays signed in; \
+                 automatic sign-in is paused until you run /mcp login {name}."
+            ),
+            _ => format!(
+                "Signed out of MCP server '{name}'; its stored token was removed. \
+                 Run /mcp login {name} to sign in again."
+            ),
+        })
     }
 
     /// Gracefully shut down all servers.
@@ -863,70 +1003,103 @@ fn is_transport_loss(error: &crate::error::McpTransportError) -> bool {
     }
 }
 
-async fn connect_one_http(
+fn auth_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(AUTH_HTTP_TIMEOUT)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// Builds the auth provider for one HTTP server.
+///
+/// `interactive` lets the browser OAuth flow open a browser (`/mcp login`);
+/// the engine's own connections are headless. Entra-broker providers may
+/// always prompt through the OS broker when a console window is available.
+/// `Ok(None)` for `auth.mode = "none"` and for an unparsable URL (the
+/// connect reports the URL error).
+fn build_http_auth(
+    config: &McpHttpConnectable,
+    credential_store: Option<&Arc<dyn CredentialStore>>,
+    interactive: bool,
+) -> Result<Option<Arc<dyn McpAuthProvider>>, String> {
+    match config.auth.mode {
+        McpAuthMode::None => Ok(None),
+        McpAuthMode::Bearer => {
+            match config.auth.bearer_token.as_ref().filter(|t| !t.expose().is_empty()) {
+                Some(token) => Ok(Some(Arc::new(StaticBearerAuthProvider::new(token.expose().clone())))),
+                None => Err("auth.mode is 'bearer' but no token is configured or the token \
+                     resolved to an empty value; check the auth.token field or the \
+                     credential store entry it references"
+                    .into()),
+            }
+        }
+        McpAuthMode::OAuth => {
+            let Some(store) = credential_store else {
+                return Err("auth.mode is 'oauth' but no credential store is available; \
+                     authenticate via `coda auth` or the /mcp commands first, then \
+                     restart the engine"
+                    .into());
+            };
+            // URL errors are reported by McpHttpClient::connect.
+            let Ok(url) = reqwest::Url::parse(&config.url) else {
+                return Ok(None);
+            };
+            // Headless providers use cached tokens only: a 401 that cannot be
+            // resolved silently fails and the user signs in with /mcp login.
+            let provider = McpOAuthProvider::new(
+                auth_http_client(),
+                &url,
+                Arc::clone(store),
+                config.auth.clone(),
+                interactive,
+                None,
+                None,
+            );
+            Ok(Some(Arc::new(provider)))
+        }
+        McpAuthMode::EntraBroker => {
+            let Ok(url) = reqwest::Url::parse(&config.url) else {
+                return Ok(None);
+            };
+            let opts = EntraBrokerOptions {
+                store: credential_store.cloned(),
+                allow_interactive: true,
+                ..EntraBrokerOptions::defaults(config.name.as_str())
+            };
+            let provider = EntraBrokerProvider::new(auth_http_client(), &url, config.auth.clone(), opts)?;
+            Ok(Some(Arc::new(provider)))
+        }
+    }
+}
+
+/// Builds the server's auth provider and connects. The provider is returned
+/// even when the connection fails so its status stays visible.
+async fn build_and_connect_http(
     config: &McpHttpConnectable,
     connect_timeout: Duration,
     tool_timeout: Duration,
     credential_store: Option<&Arc<dyn CredentialStore>>,
-) -> Result<ServerEntry, McpError> {
-    let auth: Option<Arc<dyn McpAuthProvider>> = match config.auth.mode {
-        McpAuthMode::None => None,
-        McpAuthMode::Bearer => {
-            match config.auth.bearer_token.as_ref().filter(|t| !t.expose().is_empty()) {
-                Some(token) => {
-                    Some(Arc::new(StaticBearerAuthProvider::new(token.expose().clone())))
-                }
-                None => {
-                    return Err(McpError::Http(
-                        "auth.mode is 'bearer' but no token is configured or the token \
-                         resolved to an empty value; check the auth.token field or the \
-                         credential store entry it references"
-                            .into(),
-                    ));
-                }
-            }
+) -> (Option<Arc<dyn McpAuthProvider>>, Result<ServerEntry, McpError>) {
+    match build_http_auth(config, credential_store, false) {
+        Ok(auth) => {
+            let result = connect_one_http(config, connect_timeout, tool_timeout, auth.clone()).await;
+            (auth, result)
         }
-        // Entra-broker servers use the browser OAuth provider until the broker
-        // provider is wired in; the browser flow is its fallback anyway.
-        McpAuthMode::OAuth | McpAuthMode::EntraBroker => {
-            match credential_store {
-                Some(store) => {
-                    // Non-interactive: use cached tokens from the credential store.
-                    // A 401 that cannot be resolved silently fails without opening a
-                    // browser; the user must authenticate via /mcp or `coda auth`.
-                    match reqwest::Url::parse(&config.url) {
-                        Ok(url) => {
-                            let http = reqwest::Client::new();
-                            let provider = McpOAuthProvider::new(
-                                http,
-                                &url,
-                                Arc::clone(store),
-                                config.auth.clone(),
-                                false, // headless: no browser
-                                None,
-                                None,
-                            );
-                            Some(Arc::new(provider) as Arc<dyn McpAuthProvider>)
-                        }
-                        Err(_) => {
-                            // URL will be validated (and will fail) in McpHttpClient::connect;
-                            // skip building the provider rather than duplicating the error.
-                            None
-                        }
-                    }
-                }
-                None => {
-                    return Err(McpError::Http(
-                        "auth.mode is 'oauth' but no credential store is available; \
-                         authenticate via `coda auth` or the /mcp commands first, then \
-                         restart the engine"
-                            .into(),
-                    ));
-                }
-            }
-        }
-    };
+        Err(message) => (None, Err(McpError::Http(message))),
+    }
+}
 
+async fn connect_one_http(
+    config: &McpHttpConnectable,
+    connect_timeout: Duration,
+    tool_timeout: Duration,
+    auth: Option<Arc<dyn McpAuthProvider>>,
+) -> Result<ServerEntry, McpError> {
+    // The handshake may wait for an interactive broker sign-in.
+    let connect_timeout = match config.auth.mode {
+        McpAuthMode::EntraBroker => connect_timeout + INTERACTIVE_TIMEOUT,
+        _ => connect_timeout,
+    };
     let client = McpHttpClient::connect(
         &config.name,
         &config.url,
@@ -1018,6 +1191,7 @@ pub mod test_support {
                 env: Default::default(),
             })),
             ServerEntry { client: AnyClient::Stdio(client), _process: None },
+            None,
         );
         manager.rebuild_snapshot(&guard);
 
@@ -1161,6 +1335,7 @@ mod tests {
                 env: Default::default(),
             })),
             ServerEntry { client: AnyClient::Stdio(client), _process: None },
+            None,
         );
         manager.rebuild_snapshot(&guard);
     }
@@ -1684,5 +1859,113 @@ mod tests {
         let errors = manager.connect_many(vec![], None).await;
         assert!(errors.is_empty());
         assert!(manager.tools().await.is_empty());
+    }
+
+    // ── Auth status and sign-in ──────────────────────────────────────────
+
+    /// Nothing listens on the discard port, so the connect fails fast.
+    const UNREACHABLE_URL: &str = "http://127.0.0.1:9/mcp";
+
+    fn http_server(name: &str, auth: crate::auth::McpAuthConfig) -> McpHttpConnectable {
+        McpHttpConnectable {
+            name: name.into(),
+            url: UNREACHABLE_URL.into(),
+            headers: Default::default(),
+            auth,
+        }
+    }
+
+    fn auth_config(mode: McpAuthMode) -> crate::auth::McpAuthConfig {
+        crate::auth::McpAuthConfig { mode, ..Default::default() }
+    }
+
+    fn memory_store() -> Arc<dyn CredentialStore> {
+        Arc::new(coda_auth::InMemoryStore::new())
+    }
+
+    #[tokio::test]
+    async fn a_failed_http_server_keeps_its_auth_status() {
+        let manager = McpClientManager::new();
+        let bearer = crate::auth::McpAuthConfig {
+            bearer_token: Some(coda_auth::secret::Secret::new("token".to_string())),
+            ..auth_config(McpAuthMode::Bearer)
+        };
+        let errors = manager
+            .connect_http_many(
+                vec![http_server("b", bearer), http_server("o", auth_config(McpAuthMode::OAuth))],
+                Some(Duration::from_secs(5)),
+                Some(memory_store()),
+            )
+            .await;
+        assert_eq!(errors.len(), 2, "{errors:?}");
+
+        let statuses = manager.auth_status().await;
+        let summary: Vec<(&str, McpAuthMode)> =
+            statuses.iter().map(|s| (s.name.as_str(), s.status.mode)).collect();
+        assert_eq!(summary, [("b", McpAuthMode::Bearer), ("o", McpAuthMode::OAuth)]);
+    }
+
+    #[tokio::test]
+    async fn an_entra_broker_server_without_client_id_fails_naming_the_setting() {
+        let manager = McpClientManager::new();
+        let errors = manager
+            .connect_http_many(
+                vec![http_server("e", auth_config(McpAuthMode::EntraBroker))],
+                Some(Duration::from_secs(5)),
+                Some(memory_store()),
+            )
+            .await;
+        assert_eq!(errors.len(), 1);
+        let error = errors[0].error.to_string();
+        assert!(error.contains("auth.clientId"), "{error}");
+        assert!(manager.server_faults().await[0].last_error.contains("auth.clientId"));
+    }
+
+    #[tokio::test]
+    async fn login_and_logout_reject_servers_without_sign_in() {
+        let manager = McpClientManager::new();
+        inject_client(&manager, "stdio", make_client(json!([])).await).await;
+        let bearer = crate::auth::McpAuthConfig {
+            bearer_token: Some(coda_auth::secret::Secret::new("token".to_string())),
+            ..auth_config(McpAuthMode::Bearer)
+        };
+        manager
+            .connect_http_many(
+                vec![http_server("bearer", bearer), http_server("open", auth_config(McpAuthMode::None))],
+                Some(Duration::from_secs(5)),
+                None,
+            )
+            .await;
+
+        let error = manager.auth_login("nope").await.unwrap_err();
+        assert!(error.contains("unknown MCP server 'nope'"), "{error}");
+        let error = manager.auth_login("stdio").await.unwrap_err();
+        assert!(error.contains("stdio server"), "{error}");
+        let error = manager.auth_logout("stdio").await.unwrap_err();
+        assert!(error.contains("stdio server"), "{error}");
+        let error = manager.auth_login("bearer").await.unwrap_err();
+        assert!(error.contains("bearer"), "{error}");
+        let error = manager.auth_logout("open").await.unwrap_err();
+        assert!(error.contains("'none'"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn logout_of_an_oauth_server_removes_its_stored_token() {
+        let store = memory_store();
+        let url = reqwest::Url::parse(UNREACHABLE_URL).unwrap();
+        let key = format!("mcp-token:{}", crate::auth::canonical_resource_uri(&url));
+        store.set(&key, "{}").await.unwrap();
+
+        let manager = McpClientManager::new();
+        manager
+            .connect_http_many(
+                vec![http_server("o", auth_config(McpAuthMode::OAuth))],
+                Some(Duration::from_secs(5)),
+                Some(Arc::clone(&store)),
+            )
+            .await;
+        let message = manager.auth_logout("o").await.unwrap();
+        assert!(message.contains("Signed out of MCP server 'o'"), "{message}");
+        assert_eq!(store.get(&key).await.unwrap(), None);
     }
 }
