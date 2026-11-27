@@ -202,10 +202,11 @@ impl McpOAuthProvider {
     /// trigger a fresh 401 → full flow.
     async fn refresh_token(&self, stored: &McpStoredToken) -> Option<McpStoredToken> {
         let refresh_token = stored.refresh_token.as_ref()?.expose().clone();
+        let discovery = stored.discovery_url();
 
         let as_meta = self
             .metadata
-            .get_authorization_server_metadata(&stored.issuer)
+            .get_authorization_server_metadata(discovery)
             .await?;
 
         let mut form = vec![
@@ -213,7 +214,10 @@ impl McpOAuthProvider {
             ("refresh_token".to_owned(), refresh_token),
             ("client_id".to_owned(), stored.client_id.clone()),
         ];
-        form.extend(resource_param(&stored.issuer, &self.canonical_resource));
+        form.extend(resource_param(
+            is_entra_flow(&as_meta.issuer, discovery),
+            &self.canonical_resource,
+        ));
 
         let token_resp = match self.token_request(&as_meta.token_endpoint, &form).await {
             Ok(t) => t,
@@ -233,21 +237,25 @@ impl McpOAuthProvider {
             access,
             new_refresh,
             token_resp.expires_in,
-            &stored.issuer,
-            &stored.client_id,
+            TokenOrigin {
+                issuer: &stored.issuer,
+                discovery_issuer: discovery,
+                client_id: &stored.client_id,
+            },
             token_resp.scope.as_deref().unwrap_or(&stored.scope),
         )
         .await
         .ok()
     }
 
+    /// Persist a token. Every successful acquisition or refresh goes through
+    /// here, so it also clears any previously recorded failure.
     async fn persist_token(
         &self,
         access_token: Secret<String>,
         refresh_token: Option<Secret<String>>,
         expires_in: Option<i64>,
-        issuer: &str,
-        client_id: &str,
+        origin: TokenOrigin<'_>,
         scope: &str,
     ) -> Result<McpStoredToken, coda_auth::AuthError> {
         let now_unix = unix_now();
@@ -261,8 +269,10 @@ impl McpOAuthProvider {
             refresh_token,
             expires_at_unix,
             scope: scope.to_owned(),
-            issuer: issuer.to_owned(),
-            client_id: client_id.to_owned(),
+            issuer: origin.issuer.to_owned(),
+            client_id: origin.client_id.to_owned(),
+            discovery_issuer: Some(origin.discovery_issuer.to_owned())
+                .filter(|d| !d.is_empty() && d != origin.issuer),
         };
 
         let json = serde_json::to_string(&stored).map_err(|e| {
@@ -270,6 +280,7 @@ impl McpOAuthProvider {
         })?;
         self.store.set(&self.token_key(), &json).await?;
         self.record_expiry(Some(stored.expires_at_unix));
+        *lock(&self.last_error) = None;
         Ok(stored)
     }
 
@@ -364,6 +375,15 @@ impl McpOAuthProvider {
         challenge: Option<&WwwAuthenticateChallenge>,
         redact_messages: bool,
     ) -> Result<McpAuthResult, AcquireError> {
+        if let Some(tenant) = self.config.tenant.as_deref() {
+            if !is_valid_tenant(tenant) {
+                return Ok(self.failure(&format!(
+                    "Invalid auth.tenant '{tenant}': expected a tenant id, domain, \
+                     'organizations', 'common' or 'consumers' (letters, digits, '.' and '-')."
+                )));
+            }
+        }
+
         // 1. Protected-resource metadata (from challenge or well-known path).
         let metadata_url =
             resolve_resource_metadata_url(challenge, &self.canonical_resource);
@@ -445,10 +465,15 @@ impl McpOAuthProvider {
             }
         };
 
-        // 4. Scope selection (Entra only issues refresh tokens for offline_access).
-        let scopes = scopes_for_issuer(
-            select_scopes(challenge, &self.config, prm, &as_meta),
-            &as_meta.issuer,
+        // 4. Scope selection.
+        let entra_flow = is_entra_flow(&as_meta.issuer, issuer_candidate);
+        let scopes = scopes_for_request(
+            challenge,
+            &self.config,
+            prm,
+            &as_meta,
+            &self.canonical_resource,
+            entra_flow,
         );
 
         // 5. PKCE + authorize URL.
@@ -464,7 +489,7 @@ impl McpOAuthProvider {
             ("code_challenge_method".to_owned(), "S256".to_owned()),
             ("state".to_owned(), state.clone()),
         ];
-        auth_params.extend(resource_param(&as_meta.issuer, &self.canonical_resource));
+        auth_params.extend(resource_param(entra_flow, &self.canonical_resource));
         if !scopes.is_empty() {
             auth_params.push(("scope".to_owned(), scopes.join(" ")));
         }
@@ -534,7 +559,7 @@ impl McpOAuthProvider {
             ("client_id".to_owned(), client_id.clone()),
             ("code_verifier".to_owned(), verifier),
         ];
-        form.extend(resource_param(&as_meta.issuer, &self.canonical_resource));
+        form.extend(resource_param(entra_flow, &self.canonical_resource));
         let token_resp = match self.token_request(&as_meta.token_endpoint, &form).await {
             Ok(t) => t,
             Err(OAuthExchangeError::Status(s, body)) => {
@@ -572,8 +597,11 @@ impl McpOAuthProvider {
             access_token,
             token_resp.refresh_token,
             token_resp.expires_in,
-            &as_meta.issuer,
-            &client_id,
+            TokenOrigin {
+                issuer: &as_meta.issuer,
+                discovery_issuer: issuer_candidate,
+                client_id: &client_id,
+            },
             &scope,
         )
         .await
@@ -585,7 +613,6 @@ impl McpOAuthProvider {
             format!("Authorized MCP server {}.", self.display_resource())
         };
         self.log(&done_msg);
-        *lock(&self.last_error) = None;
         Ok(McpAuthResult { succeeded: true, error: None })
     }
 }
@@ -690,6 +717,16 @@ enum AcquireError {
     Other(String),
 }
 
+/// Where a token came from, as persisted alongside it.
+#[derive(Debug, Clone, Copy)]
+struct TokenOrigin<'a> {
+    /// Issuer advertised in the AS metadata (used for `iss` checks).
+    issuer: &'a str,
+    /// URL the AS metadata was discovered from (used again on refresh).
+    discovery_issuer: &'a str,
+    client_id: &'a str,
+}
+
 #[derive(Debug)]
 enum OAuthExchangeError {
     Transport(String),
@@ -787,23 +824,52 @@ fn append_offline_access(
 /// The RFC 8707 `resource` parameter for authorize/token requests.
 ///
 /// Entra v2.0 rejects `resource` (the resource is carried by the scopes), so it
-/// is omitted for Entra v2.0 issuers and sent unchanged everywhere else.
-pub(crate) fn resource_param(issuer: &str, canonical_resource: &str) -> Option<(String, String)> {
-    if entra::is_entra_v2_issuer(issuer) {
+/// is omitted for Entra v2.0 flows and sent unchanged everywhere else.
+pub(crate) fn resource_param(entra_flow: bool, canonical_resource: &str) -> Option<(String, String)> {
+    if entra_flow {
         None
     } else {
         Some(("resource".to_owned(), canonical_resource.to_owned()))
     }
 }
 
-/// Entra v2.0 only issues refresh tokens when `offline_access` is requested
-/// and does not always advertise it, so add it for Entra issuers.
-pub(crate) fn scopes_for_issuer(scopes: Vec<String>, issuer: &str) -> Vec<String> {
-    if entra::is_entra_v2_issuer(issuer) {
-        entra::ensure_offline_access(scopes)
-    } else {
-        scopes
+/// Whether the authorization server is Entra v2.0, judged by either the
+/// advertised issuer or the URL its metadata was discovered from (Entra
+/// `common`/`organizations` advertise a templated `{tenantid}` issuer).
+pub(crate) fn is_entra_flow(as_issuer: &str, discovery_issuer: &str) -> bool {
+    entra::is_entra_v2_issuer(as_issuer) || entra::is_entra_v2_issuer(discovery_issuer)
+}
+
+/// Scopes for the authorization request.
+///
+/// Entra v2.0 flows never fall back to the AS `scopes_supported` (that would
+/// yield a Microsoft Graph token); they derive a resource scope instead and
+/// always request `offline_access`, without which Entra issues no refresh
+/// token. Other servers use [`select_scopes`].
+pub(crate) fn scopes_for_request(
+    challenge: Option<&WwwAuthenticateChallenge>,
+    config: &McpAuthConfig,
+    prm: Option<&ProtectedResourceMetadata>,
+    as_meta: &AuthorizationServerMetadata,
+    canonical_resource: &str,
+    entra_flow: bool,
+) -> Vec<String> {
+    if !entra_flow {
+        return select_scopes(challenge, config, prm, as_meta);
     }
+    entra::ensure_offline_access(entra::derive_scopes(
+        &config.scopes,
+        challenge.and_then(|c| c.scope.as_deref()),
+        prm.map(|p| p.scopes_supported.as_slice()).unwrap_or_default(),
+        canonical_resource,
+    ))
+}
+
+/// A tenant must be a single path segment: a GUID, domain or alias.
+pub(crate) fn is_valid_tenant(tenant: &str) -> bool {
+    !tenant.is_empty()
+        && tenant.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        && tenant.bytes().any(|b| b != b'.')
 }
 
 /// Apply a configured tenant to an Entra authorization server advertised by
@@ -1024,26 +1090,246 @@ mod tests {
     const ENTRA_V2: &str = "https://login.microsoftonline.com/tid/v2.0";
 
     #[test]
-    fn resource_param_is_omitted_for_entra_v2_only() {
-        assert_eq!(resource_param(ENTRA_V2, "https://mcp.example.com/mcp"), None);
+    fn resource_param_is_omitted_for_entra_flows_only() {
+        assert_eq!(resource_param(true, "https://mcp.example.com/mcp"), None);
         assert_eq!(
-            resource_param("https://as.example.com", "https://mcp.example.com/mcp"),
+            resource_param(false, "https://mcp.example.com/mcp"),
             Some(("resource".to_owned(), "https://mcp.example.com/mcp".to_owned()))
         );
+        assert!(is_entra_flow(ENTRA_V2, "https://as.example.com"));
+        assert!(is_entra_flow(
+            "https://login.microsoftonline.com/{tenantid}/v2.0",
+            "http://127.0.0.1:1/common/v2.0"
+        ));
+        assert!(is_entra_flow("https://as.example.com", ENTRA_V2));
         // Entra v1 issuers are not v2.0 endpoints; keep the generic behaviour.
-        assert!(resource_param("https://sts.windows.net/tid/", "https://r").is_some());
+        assert!(!is_entra_flow("https://sts.windows.net/tid/", "https://sts.windows.net/tid/"));
+        assert!(!is_entra_flow("https://as.example.com", "https://as.example.com"));
     }
 
     #[test]
-    fn scopes_for_issuer_adds_offline_access_for_entra_only() {
-        let scopes = vec!["api://x/.default".to_owned()];
+    fn entra_scopes_never_fall_back_to_as_scopes_supported() {
+        let config = McpAuthConfig::oauth_default();
+        let as_meta = make_as_meta(vec!["openid", "profile", "User.Read", "offline_access"]);
+        let resource = "https://mcp.example.com/mcp";
         assert_eq!(
-            scopes_for_issuer(scopes.clone(), ENTRA_V2),
+            scopes_for_request(None, &config, None, &as_meta, resource, true),
+            vec!["https://mcp.example.com/.default", "offline_access"]
+        );
+        let prm = ProtectedResourceMetadata {
+            resource: None,
+            authorization_servers: Vec::new(),
+            scopes_supported: vec!["api://x/.default".into()],
+        };
+        assert_eq!(
+            scopes_for_request(None, &config, Some(&prm), &as_meta, resource, true),
             vec!["api://x/.default", "offline_access"]
         );
-        assert_eq!(scopes_for_issuer(scopes.clone(), "https://as.example.com"), scopes);
-        let with = vec!["a".to_owned(), "offline_access".to_owned()];
-        assert_eq!(scopes_for_issuer(with.clone(), ENTRA_V2), with);
+        let challenge = WwwAuthenticateChallenge {
+            resource_metadata: None,
+            scope: Some("api://c/read".into()),
+            error: None,
+        };
+        assert_eq!(
+            scopes_for_request(Some(&challenge), &config, Some(&prm), &as_meta, resource, true),
+            vec!["api://c/read", "offline_access"]
+        );
+        // Non-Entra servers keep the generic selection, AS fallback included.
+        assert_eq!(
+            scopes_for_request(None, &config, None, &as_meta, resource, false),
+            select_scopes(None, &config, None, &as_meta)
+        );
+        assert_eq!(
+            scopes_for_request(None, &config, None, &as_meta, resource, false),
+            vec!["openid", "profile", "User.Read", "offline_access"]
+        );
+    }
+
+    #[test]
+    fn tenant_must_be_a_single_safe_segment() {
+        for ok in ["contoso.com", "organizations", "72f988bf-86f1-41af-91ab-2d7cd011db47"] {
+            assert!(is_valid_tenant(ok), "{ok:?} should be valid");
+        }
+        for bad in ["", "a/b", "..", ".", "con toso", "x?y", "t%2F", "tenant#"] {
+            assert!(!is_valid_tenant(bad), "{bad:?} should be invalid");
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_tenant_is_a_reported_failure() {
+        let p = provider(
+            McpAuthConfig { tenant: Some("contoso/evil".into()), ..Default::default() },
+            true,
+            "http://127.0.0.1:9/mcp",
+        );
+        assert!(!p.handle_unauthorized(None).await);
+        let err = p.status_snapshot().last_error.expect("error recorded");
+        assert!(err.contains("Invalid auth.tenant"), "got {err}");
+    }
+
+    #[tokio::test]
+    async fn persist_token_clears_last_error() {
+        let p = provider(McpAuthConfig::default(), false, "https://mcp.example.com/mcp");
+        p.record_error("earlier failure");
+        p.persist_token(Secret::new("at".into()), None, None, origin("https://as"), "s")
+            .await
+            .unwrap();
+        assert_eq!(p.status_snapshot().last_error, None);
+    }
+
+    const TEMPLATED_ISSUER: &str = "https://login.microsoftonline.com/{tenantid}/v2.0";
+
+    /// An Entra-`common`-shaped AS: metadata lives under `/common/v2.0` but
+    /// advertises the templated `{tenantid}` issuer.
+    async fn entra_common_server() -> (u16, crate::auth::test_http::Requests) {
+        crate::auth::test_http::spawn_recording_server(Arc::new(|path: &str, port: u16| {
+            let origin = format!("http://127.0.0.1:{port}");
+            match path {
+                "/.well-known/oauth-protected-resource" => (
+                    200,
+                    serde_json::json!({
+                        "resource": format!("{origin}/mcp"),
+                        "authorization_servers": [format!("{origin}/common/v2.0")],
+                    })
+                    .to_string(),
+                ),
+                "/common/v2.0/.well-known/openid-configuration" => (
+                    200,
+                    serde_json::json!({
+                        "issuer": TEMPLATED_ISSUER,
+                        "authorization_endpoint": format!("{origin}/common/oauth2/v2.0/authorize"),
+                        "token_endpoint": format!("{origin}/common/oauth2/v2.0/token"),
+                        "scopes_supported": ["openid", "profile", "email", "offline_access"],
+                    })
+                    .to_string(),
+                ),
+                "/common/oauth2/v2.0/token" => (
+                    200,
+                    serde_json::json!({
+                        "access_token": "refreshed",
+                        "refresh_token": "rotated",
+                        "expires_in": 3600,
+                    })
+                    .to_string(),
+                ),
+                _ => (404, "{}".to_owned()),
+            }
+        }))
+        .await
+    }
+
+    fn token_bodies(requests: &crate::auth::test_http::Requests) -> Vec<String> {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| path.ends_with("/token"))
+            .map(|(_, body)| body.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn refresh_rediscovers_from_the_discovery_url_not_the_templated_issuer() {
+        let (port, requests) = entra_common_server().await;
+        let discovery = format!("http://127.0.0.1:{port}/common/v2.0");
+        let p = provider(McpAuthConfig::default(), false, &format!("http://127.0.0.1:{port}/mcp"));
+        p.record_error("earlier failure");
+        let expired = McpStoredToken {
+            access_token: Secret::new("old".into()),
+            refresh_token: Some(Secret::new("r1".into())),
+            expires_at_unix: 1,
+            scope: "s offline_access".into(),
+            issuer: TEMPLATED_ISSUER.into(),
+            client_id: "cid".into(),
+            discovery_issuer: Some(discovery.clone()),
+        };
+        p.store.set(&p.token_key(), &serde_json::to_string(&expired).unwrap()).await.unwrap();
+
+        let token = p.get_access_token().await.expect("refresh succeeds");
+        assert_eq!(token.expose(), "refreshed");
+
+        let bodies = token_bodies(&requests);
+        assert_eq!(bodies.len(), 1, "token endpoint reached once: {bodies:?}");
+        assert!(bodies[0].contains("grant_type=refresh_token"), "got {}", bodies[0]);
+        assert!(!bodies[0].contains("resource="), "Entra refresh must omit resource: {}", bodies[0]);
+
+        let stored: McpStoredToken =
+            serde_json::from_str(&p.store.get(&p.token_key()).await.unwrap().unwrap()).unwrap();
+        assert_eq!(stored.issuer, TEMPLATED_ISSUER);
+        assert_eq!(stored.discovery_url(), discovery);
+        assert_eq!(stored.refresh_token.unwrap().expose(), "rotated");
+        assert_eq!(p.status_snapshot().last_error, None);
+    }
+
+    #[tokio::test]
+    async fn refresh_of_a_legacy_token_uses_its_issuer_and_keeps_resource() {
+        let server = crate::auth::test_http::spawn_recording_server(Arc::new(
+            |path: &str, port: u16| {
+                let origin = format!("http://127.0.0.1:{port}");
+                match path {
+                    "/.well-known/oauth-authorization-server" => (
+                        200,
+                        serde_json::json!({
+                            "issuer": origin,
+                            "authorization_endpoint": format!("{origin}/authorize"),
+                            "token_endpoint": format!("{origin}/token"),
+                        })
+                        .to_string(),
+                    ),
+                    "/token" => (200, r#"{"access_token":"new","expires_in":60}"#.to_owned()),
+                    _ => (404, "{}".to_owned()),
+                }
+            },
+        ))
+        .await;
+        let (port, requests) = server;
+        let p = provider(McpAuthConfig::default(), false, &format!("http://127.0.0.1:{port}/mcp"));
+        let legacy = serde_json::json!({
+            "access_token": "old",
+            "refresh_token": "r1",
+            "expires_at_unix": 1,
+            "scope": "s",
+            "issuer": format!("http://127.0.0.1:{port}"),
+            "client_id": "cid",
+        });
+        p.store.set(&p.token_key(), &legacy.to_string()).await.unwrap();
+
+        assert_eq!(p.get_access_token().await.expect("refresh").expose(), "new");
+        let bodies = token_bodies(&requests);
+        assert_eq!(bodies.len(), 1);
+        assert!(bodies[0].contains("resource="), "got {}", bodies[0]);
+    }
+
+    #[tokio::test]
+    async fn entra_authorize_url_omits_resource_and_requests_offline_access() {
+        let (port, _) = entra_common_server().await;
+        let captured: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
+        let sink = Arc::clone(&captured);
+        let p = McpOAuthProvider::new(
+            reqwest::Client::new(),
+            &reqwest::Url::parse(&format!("http://127.0.0.1:{port}/mcp")).unwrap(),
+            Arc::new(coda_auth::InMemoryStore::new()),
+            McpAuthConfig { client_id: Some("cid".into()), ..Default::default() },
+            true,
+            Some(Arc::new(move |url: &str| {
+                *sink.lock().unwrap() = Some(url.to_owned());
+                Err("captured".to_owned())
+            })),
+            None,
+        );
+        assert!(!p.handle_unauthorized(None).await);
+
+        let url = captured.lock().unwrap().clone().expect("authorize URL opened");
+        let url = reqwest::Url::parse(&url).unwrap();
+        assert_eq!(url.path(), "/common/oauth2/v2.0/authorize");
+        let params: std::collections::HashMap<String, String> =
+            url.query_pairs().into_owned().collect();
+        assert!(!params.contains_key("resource"), "got {url}");
+        assert_eq!(
+            params.get("scope").map(String::as_str),
+            Some(format!("http://127.0.0.1:{port}/.default offline_access").as_str())
+        );
+        assert_eq!(params.get("client_id").map(String::as_str), Some("cid"));
     }
 
     #[test]
@@ -1072,6 +1358,10 @@ mod tests {
             issuer_candidate_for("https://as.example.com", Some("contoso.com")),
             "https://as.example.com"
         );
+    }
+
+    fn origin(issuer: &str) -> TokenOrigin<'_> {
+        TokenOrigin { issuer, discovery_issuer: issuer, client_id: "cid" }
     }
 
     fn provider(config: McpAuthConfig, interactive: bool, url: &str) -> McpOAuthProvider {
@@ -1118,19 +1408,19 @@ mod tests {
     async fn status_snapshot_tracks_token_expiry() {
         let p = provider(McpAuthConfig::default(), false, "https://mcp.example.com/mcp");
         assert_eq!(p.status_snapshot().expires_at_unix, None);
-        p.persist_token(Secret::new("at".into()), None, Some(3600), "https://as", "cid", "s")
+        p.persist_token(Secret::new("at".into()), None, Some(3600), origin("https://as"), "s")
             .await
             .unwrap();
         let exp = p.status_snapshot().expires_at_unix.expect("expiry recorded");
         assert!(exp > unix_now());
-        p.persist_token(Secret::new("at".into()), None, None, "https://as", "cid", "s")
+        p.persist_token(Secret::new("at".into()), None, None, origin("https://as"), "s")
             .await
             .unwrap();
         assert_eq!(p.status_snapshot().expires_at_unix, None);
 
         let fresh = provider(McpAuthConfig::default(), false, "https://mcp.example.com/mcp");
         let fresh = McpOAuthProvider { store: Arc::clone(&p.store), ..fresh };
-        p.persist_token(Secret::new("at".into()), None, Some(60), "https://as", "cid", "s")
+        p.persist_token(Secret::new("at".into()), None, Some(60), origin("https://as"), "s")
             .await
             .unwrap();
         assert!(fresh.get_access_token().await.is_some());

@@ -233,9 +233,19 @@ pub struct McpStoredToken {
     pub scope: String,
     pub issuer: String,
     pub client_id: String,
+    /// URL whose well-known metadata was discovered successfully. Differs from
+    /// `issuer` for Entra `common`/`organizations`, whose metadata advertises a
+    /// templated `{tenantid}` issuer. Absent in tokens stored before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery_issuer: Option<String>,
 }
 
 impl McpStoredToken {
+    /// URL to rediscover authorization-server metadata from on refresh.
+    pub fn discovery_url(&self) -> &str {
+        self.discovery_issuer.as_deref().filter(|d| !d.is_empty()).unwrap_or(&self.issuer)
+    }
+
     /// `true` when the token is expired or within a 30 s safety window.
     pub fn is_expired(&self, now_unix: i64) -> bool {
         self.expires_at_unix > 0 && now_unix >= self.expires_at_unix - 30
@@ -598,6 +608,7 @@ mod tests {
             scope: String::new(),
             issuer: String::new(),
             client_id: String::new(),
+            discovery_issuer: None,
         };
         assert!(token.is_expired(now), "token within 30 s window must be considered expired");
     }
@@ -612,6 +623,7 @@ mod tests {
             scope: String::new(),
             issuer: String::new(),
             client_id: String::new(),
+            discovery_issuer: None,
         };
         assert!(!token.is_expired(now));
     }
@@ -625,8 +637,26 @@ mod tests {
             scope: String::new(),
             issuer: String::new(),
             client_id: String::new(),
+            discovery_issuer: None,
         };
         assert!(!token.is_expired(i64::MAX));
+    }
+
+    #[test]
+    fn stored_token_without_discovery_issuer_still_deserializes() {
+        let old = r#"{"access_token":"a","refresh_token":"r","expires_at_unix":1,
+            "scope":"s","issuer":"https://as.example.com","client_id":"c"}"#;
+        let token: McpStoredToken = serde_json::from_str(old).expect("old token parses");
+        assert_eq!(token.discovery_issuer, None);
+        assert_eq!(token.discovery_url(), "https://as.example.com");
+
+        let token = McpStoredToken {
+            discovery_issuer: Some("https://login.microsoftonline.com/common/v2.0".into()),
+            ..token
+        };
+        let json = serde_json::to_string(&token).unwrap();
+        let back: McpStoredToken = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.discovery_url(), "https://login.microsoftonline.com/common/v2.0");
     }
 
     /// Token's access token must NEVER appear in Debug output.
@@ -639,6 +669,7 @@ mod tests {
             scope: String::new(),
             issuer: String::new(),
             client_id: String::new(),
+            discovery_issuer: None,
         };
         let debug = format!("{token:?}");
         assert!(!debug.contains("my_super_secret_access_token"), "access token must be redacted");

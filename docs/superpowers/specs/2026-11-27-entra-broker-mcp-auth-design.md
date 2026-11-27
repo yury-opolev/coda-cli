@@ -135,11 +135,20 @@ authorization server is an Entra v2.0 authority (so `oauth` mode against Entra
 also works; non-Entra servers are untouched):
 
 - The RFC 8707 `resource` parameter is omitted on authorize, token and refresh
-  requests.
-- `offline_access` is always appended to the scopes.
-- A configured `tenant` rewrites the advertised Entra issuer.
+  requests. A flow counts as Entra v2.0 when either the advertised issuer or
+  the discovery URL is an Entra v2.0 authority.
+- Scopes come from `entra::derive_scopes` (config → challenge → PRM →
+  `<resource origin>/.default`); the AS `scopes_supported` is never used, since
+  that would yield a Microsoft Graph token. `offline_access` is always appended.
+- A configured `tenant` rewrites the advertised Entra issuer; it must be a
+  single segment of `[A-Za-z0-9.-]` (else "Invalid auth.tenant …").
+- The stored token records the URL its metadata was discovered from
+  (`discovery_issuer`), and refresh rediscovers from it: `common`/
+  `organizations` advertise a templated `{tenantid}` issuer that cannot be
+  rediscovered. Tokens stored without the field fall back to `issuer`.
 - `redirectUri` template: `http://localhost/callback` → bound on a random port,
-  port substituted; an explicit port is bound as given; path is honoured by the
+  port substituted; an explicit port is bound as given (`:80` is rejected, as
+  URL parsing erases it); path is honoured by the
   listener; only `http` + loopback hosts are accepted (invalid template → clear
   error).
 - Discovery already falls back to `<issuer>/.well-known/openid-configuration`;

@@ -129,8 +129,9 @@ impl LoopbackListener {
     /// Only `http` with host `localhost`, `127.0.0.1` or `[::1]` is accepted;
     /// query, fragment and userinfo are rejected. Without a port a random free
     /// port is chosen and substituted into [`LoopbackListener::redirect_uri`];
-    /// an explicit port is bound as given. The socket always binds the loopback
-    /// interface (`127.0.0.1`, or `::1` for `[::1]`).
+    /// an explicit port is bound as given, except `:80`, which is rejected
+    /// (URL parsing cannot tell it apart from "no port"). The socket always
+    /// binds the loopback interface (`127.0.0.1`, or `::1` for `[::1]`).
     pub async fn bind_template(template: &str) -> Result<Self, AuthError> {
         let invalid = |detail: &str| AuthError::InvalidInput {
             field: "redirect URI".into(),
@@ -159,6 +160,13 @@ impl LoopbackListener {
             }
             _ => return Err(invalid("host must be localhost, 127.0.0.1 or [::1]")),
         };
+        // `url` normalises an explicit default port away (`port()` is `None`),
+        // which would silently bind a random port instead of the one asked for.
+        if url.port().is_none() && has_explicit_port(template.trim()) {
+            return Err(invalid(
+                "explicit port 80 is not supported; omit the port to use a random free port",
+            ));
+        }
         let port = url.port().unwrap_or(0);
         Self::bind_addr(&format!("{bind_ip}:{port}"), host, url.path().to_owned()).await
     }
@@ -253,6 +261,18 @@ impl LoopbackListener {
             }
         }
     }
+}
+
+/// Whether the authority of an absolute URL spells out a non-empty port.
+fn has_explicit_port(url: &str) -> bool {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let after_host = match host_port.rsplit_once(']') {
+        Some((_, tail)) => tail,
+        None => host_port,
+    };
+    after_host.split_once(':').is_some_and(|(_, port)| !port.is_empty())
 }
 
 /// Reads one HTTP request from an accepted connection.
@@ -669,6 +689,19 @@ mod tests {
             .expect("bind");
         assert_eq!(listener.port, port);
         assert_eq!(listener.redirect_uri(), format!("http://localhost:{port}/cb"));
+    }
+
+    #[tokio::test]
+    async fn template_with_explicit_default_port_is_rejected() {
+        for bad in ["http://localhost:80/cb", "http://127.0.0.1:80/cb", "http://[::1]:80/cb"] {
+            let err = match LoopbackListener::bind_template(bad).await {
+                Err(e) => e.to_string(),
+                Ok(l) => panic!("{bad:?} bound port {}", l.port),
+            };
+            assert!(err.contains("port 80"), "{bad:?}: {err}");
+        }
+        // Without an explicit port a random one is still chosen.
+        assert!(LoopbackListener::bind_template("http://localhost/cb").await.is_ok());
     }
 
     #[tokio::test]
