@@ -72,11 +72,21 @@ pub struct CheckpointInboxItem {
 }
 
 /// One image of an undelivered inbox message.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckpointImage {
     pub media_type: String,
     pub base64: String,
+}
+
+/// Never prints the payload.
+impl std::fmt::Debug for CheckpointImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CheckpointImage")
+            .field("media_type", &self.media_type)
+            .field("base64_len", &self.base64.len())
+            .finish()
+    }
 }
 
 impl CheckpointInboxItem {

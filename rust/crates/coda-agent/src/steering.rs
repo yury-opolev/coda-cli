@@ -122,6 +122,8 @@ pub enum SteerRejectReason {
     EmptyText,
     /// Accepting the message's images would exceed [`MAX_QUEUED_IMAGE_BYTES`].
     AttachmentCapacity,
+    /// The model the running turn uses cannot receive images.
+    ImagesUnsupported,
 }
 
 /// Synchronous observer for steering-queue transitions.
@@ -143,8 +145,8 @@ pub trait SteeringObserver: Send + Sync {
     fn on_turn_ended_dropped(&self, _entries: &[SteeringEntry]) {}
     /// An `enqueue` was refused.
     fn on_rejected(&self, _reason: SteerRejectReason) {}
-    /// Image-bearing messages were withdrawn instead of delivered because the
-    /// active model cannot receive images (never called with an empty slice).
+    /// Image-bearing messages were withdrawn because the model the running
+    /// turn uses cannot receive images (never called with an empty slice).
     /// They are kept for explicit recovery; their text is never delivered
     /// alone.
     fn on_undeliverable(&self, _entries: &[SteeringEntry]) {}
@@ -161,14 +163,17 @@ pub struct SteeringInbox {
     observer: Option<Arc<dyn SteeringObserver>>,
     /// Signalled whenever an item is accepted, so a parked agent wakes up.
     arrived: tokio::sync::Notify,
-    /// Whether the model this inbox delivers to receives image blocks. Set by
-    /// the agent at the start of each run; `true` until told otherwise.
-    accepts_images: std::sync::atomic::AtomicBool,
 }
 
 struct SteeringInboxInner {
     pending: Vec<SteeringEntry>,
     sealed_empty: bool,
+    /// Whether the model this inbox delivers to receives image blocks. Set
+    /// by the agent at the start of each run; `true` until told otherwise.
+    /// While `false` no image-bearing message is ever pending, so nothing
+    /// that waits on the queue can be woken by a message that cannot be
+    /// delivered.
+    accepts_images: bool,
 }
 
 impl SteeringInbox {
@@ -180,18 +185,36 @@ impl SteeringInbox {
     /// docs for the lock-order contract).
     pub fn with_observer(observer: Option<Arc<dyn SteeringObserver>>) -> Self {
         Self {
-            gate: Mutex::new(SteeringInboxInner { pending: Vec::new(), sealed_empty: false }),
+            gate: Mutex::new(SteeringInboxInner {
+                pending: Vec::new(),
+                sealed_empty: false,
+                accepts_images: true,
+            }),
             observer,
             arrived: tokio::sync::Notify::new(),
-            accepts_images: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
-    /// Records whether delivery may hand images to the model. When it may
-    /// not, image-bearing messages are withdrawn at delivery (see
-    /// [`SteeringObserver::on_undeliverable`]) rather than sent as text alone.
+    /// Records whether the model receives images. When it does not, image
+    /// messages already queued are withdrawn at once (see
+    /// [`SteeringObserver::on_undeliverable`]) and new ones are refused with
+    /// [`SteerRejectReason::ImagesUnsupported`]: their text is never
+    /// delivered alone.
     pub fn set_accepts_images(&self, accepts: bool) {
-        self.accepts_images.store(accepts, std::sync::atomic::Ordering::SeqCst);
+        let mut inner = self.gate.lock().unwrap();
+        inner.accepts_images = accepts;
+        if accepts {
+            return;
+        }
+        let (withheld, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut inner.pending)
+            .into_iter()
+            .partition(|e| e.kind == InboxItemKind::Message && !e.images.is_empty());
+        inner.pending = kept;
+        if !withheld.is_empty() {
+            if let Some(obs) = &self.observer {
+                obs.on_undeliverable(&withheld);
+            }
+        }
     }
 
     /// Resolves once any undelivered item (message, completion, deadline) is
@@ -296,6 +319,12 @@ impl SteeringInbox {
             return Err(SteerRejectReason::Sealed);
         }
         let offered: usize = images.iter().map(SteeringImage::byte_len).sum();
+        if !images.is_empty() && !inner.accepts_images {
+            if let Some(obs) = &self.observer {
+                obs.on_rejected(SteerRejectReason::ImagesUnsupported);
+            }
+            return Err(SteerRejectReason::ImagesUnsupported);
+        }
         if offered > 0 {
             let queued: usize = inner.pending.iter().map(SteeringEntry::image_bytes).sum();
             if queued.saturating_add(offered) > MAX_QUEUED_IMAGE_BYTES {
@@ -328,30 +357,12 @@ impl SteeringInbox {
     }
 
     /// Atomically drain all pending entries for delivery.
-    ///
-    /// When the model cannot receive images, image-bearing messages are
-    /// withdrawn in the same step and reported via
-    /// [`SteeringObserver::on_undeliverable`] instead of being delivered.
     pub fn take_all_for_delivery(&self) -> Vec<SteeringEntry> {
         let mut inner = self.gate.lock().unwrap();
         if inner.pending.is_empty() {
             return Vec::new();
         }
-        let mut entries = std::mem::take(&mut inner.pending);
-        if !self.accepts_images.load(std::sync::atomic::Ordering::SeqCst) {
-            let (withheld, deliverable): (Vec<_>, Vec<_>) = entries
-                .into_iter()
-                .partition(|e| e.kind == InboxItemKind::Message && !e.images.is_empty());
-            entries = deliverable;
-            if !withheld.is_empty() {
-                if let Some(obs) = &self.observer {
-                    obs.on_undeliverable(&withheld);
-                }
-            }
-            if entries.is_empty() {
-                return entries;
-            }
-        }
+        let entries = std::mem::take(&mut inner.pending);
         if let Some(obs) = &self.observer {
             obs.on_delivered(&entries);
         }
@@ -769,13 +780,29 @@ mod tests {
         inbox.enqueue_message("see screenshot", vec![image("image/png", "AAAA")]).unwrap();
         inbox.enqueue("plain").unwrap();
         inbox.set_accepts_images(false);
-        let delivered = inbox.take_all_for_delivery();
-        assert_eq!(delivered.len(), 1);
-        assert_eq!(delivered[0].text, "plain");
         let withheld = obs.undeliverable.lock().unwrap().clone();
         assert_eq!(withheld.len(), 1);
         assert_eq!(withheld[0][0].text, "see screenshot");
-        assert!(!inbox.has_any(), "the withheld message left the queue for explicit recovery");
+        assert!(!inbox.try_seal_empty() && inbox.has_pending(), "only the deliverable text is pending");
+        assert_eq!(
+            inbox.enqueue_message("another", vec![image("image/png", "AAAA")]).err(),
+            Some(SteerRejectReason::ImagesUnsupported)
+        );
+        let delivered = inbox.take_all_for_delivery();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].text, "plain");
+        assert!(!inbox.has_any());
+    }
+
+    #[test]
+    fn a_withheld_image_message_never_keeps_an_agent_awake() {
+        let inbox = SteeringInbox::new();
+        inbox.enqueue_message("see screenshot", vec![image("image/png", "AAAA")]).unwrap();
+        inbox.push_item(InboxItemKind::TaskCompleted, "[task-completed] task-1");
+        inbox.set_accepts_images(false);
+        assert!(!inbox.has_pending(), "no operator message remains to pre-empt a tool batch");
+        assert_eq!(inbox.take_all_for_delivery().len(), 1);
+        assert!(inbox.try_seal_empty(), "nothing undeliverable blocks a natural stop");
     }
 
     #[test]

@@ -40,23 +40,26 @@ new keyboard gesture.
   aggregate cap on queued image payload (`MAX_QUEUED_IMAGE_BYTES` = 32 MiB of
   base64 across all pending entries, including the new one) and refuses with
   `AttachmentCapacity`.
-- `session/steer` validation order, all before the TURN lock: per-image media
-  type + base64 validation (shared with prompts) → provider capability
-  (`LlmClient::accepts_image_input(current model)`) → then the existing
-  serialized busy-check + enqueue (lock order TURN → INBOX → STATE → BUS
-  unchanged). Every failure returns `ok:false` + reason; nothing is enqueued.
+- `session/steer` order: no running turn → `noActiveTurn`; per-image media
+  type + base64 validation (shared with prompts, plus a non-empty payload) →
+  `invalidImage`; then the existing serialized busy-check + enqueue (lock
+  order TURN → INBOX → STATE → BUS unchanged), where the inbox refuses
+  `imagesUnsupported` / `attachmentCapacity`. Every failure returns
+  `ok:false` + reason; nothing is enqueued.
 - Delivery: at the loop's iteration boundary a run of operator messages with
   no images is joined exactly as today; a run with images becomes one user
   message whose blocks are, per entry in FIFO order, `Text` then that entry's
   `Image` blocks. In the mid-batch pre-empt path the skipped tools' results
   stay first and the steering text/images follow, so tool results remain in
   provider-valid order.
-- Capability drift: the agent tells the inbox at run start whether its
-  client/model accepts images. If not, image-bearing messages are withdrawn
-  instead of delivered (observer `on_undeliverable` → outcome `rejected`), so
-  the client keeps them for explicit recovery; text is never delivered alone.
-- Planned restart: recalled steering keeps its text in the restart note and
-  says how many images were not carried over; the TUI keeps the payloads
+- Provider capability: the agent tells the inbox at run start whether the
+  running turn's client/model accepts images (`set_accepts_images`). If not,
+  image messages still queued are withdrawn at once (observer
+  `on_undeliverable` → outcome `rejected`) and new ones are refused
+  `imagesUnsupported`, so no undeliverable message ever sits in the queue
+  and text is never delivered alone.
+- Planned restart: an image message is described in the restart note
+  without quoting its text; the TUI keeps the payloads
   (outcome `recalled` → recovery list). Subagent checkpoints serialize inbox
   images (optional field) so nothing is silently dropped there either.
 

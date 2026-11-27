@@ -179,11 +179,12 @@ images. Every refusal queues nothing — never the text without its images:
 Queue status (`steering.pending[].images` in `session/getState` and
 `event/steeringQueue`) carries `{ mediaType, byteLength }` metadata only; the live
 history projection of a delivered message carries `image` blocks with the same metadata.
-The payload is handed back only by `session/recallSteering` (`messages[].images`). If the
-model can no longer receive images when delivery comes, the message is withdrawn with
-outcome `rejected` rather than delivered as text alone. A planned restart reports queued
-images in the restart note (`[N images not carried over the restart]`); the client that sent
-them keeps the payload, as recalled steering is reported `recalled`.
+The payload is handed back only by `session/recallSteering` (`messages[].images`). The
+`imagesUnsupported` check is against the model the running turn uses: when a run starts on a
+model that cannot receive images, image messages still queued are withdrawn with outcome
+`rejected` (never delivered as text alone). A planned restart describes a queued image message
+in the restart note without quoting its text; the client that sent it keeps the whole
+message, as recalled steering is reported `recalled`.
 
 An engine without `steering.images` ignores unknown fields, so a client must not send
 `images` to it: keep the draft and explain instead.

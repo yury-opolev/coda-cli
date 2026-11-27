@@ -156,7 +156,7 @@ pub struct PromptParams {
     pub images: Option<Vec<Value>>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SteerParams {
     #[serde(default)]
@@ -165,6 +165,16 @@ pub struct SteerParams {
     /// `steering.images`).
     #[serde(default)]
     pub images: Option<Vec<Value>>,
+}
+
+/// Never prints image payloads.
+impl std::fmt::Debug for SteerParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SteerParams")
+            .field("text", &self.text)
+            .field("images", &self.images.as_ref().map(Vec::len))
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]

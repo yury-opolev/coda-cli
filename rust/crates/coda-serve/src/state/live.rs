@@ -176,7 +176,13 @@ impl LiveTurnAccumulator {
         self.flush_assistant();
         let before = self.entries.len();
         self.push_user_block(text, upstream_full_length, Some(message_id), None);
-        if images.is_empty() || !self.charge(images.len() * BLOCK_OVERHEAD) {
+        let text_projected = self.entries.len() > before;
+        // Images never appear without the text they belong to.
+        if images.is_empty() || (!text.is_empty() && !text_projected) {
+            return;
+        }
+        let charge = images.len() * BLOCK_OVERHEAD + if text_projected { 0 } else { ENTRY_OVERHEAD };
+        if !self.charge(charge) {
             return;
         }
         // Metadata only: the projection says an image was there, never what
@@ -185,7 +191,7 @@ impl LiveTurnAccumulator {
             media_type: image.media_type.clone(),
             byte_length: image.byte_length,
         });
-        if self.entries.len() > before {
+        if text_projected {
             let last = self.entries.pop().expect("the text entry was just pushed");
             let mut entry = Arc::unwrap_or_clone(last);
             entry.blocks.extend(image_blocks);

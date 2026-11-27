@@ -4415,24 +4415,25 @@ impl ServeBackend for ServeHost {
         // behind in the queue.
         let mut images = Vec::new();
         for (index, image) in p.images.as_deref().unwrap_or(&[]).iter().enumerate() {
-            match crate::images::validate_wire_image(image) {
-                Ok((media_type, base64)) => {
-                    images.push(coda_agent::steering::SteeringImage { media_type, base64 })
+            let checked = crate::images::validate_wire_image(image).and_then(|(media_type, base64)| {
+                // A prompt tolerates this, but an empty image in steering
+                // would fail the running turn at the provider instead of
+                // this request.
+                if base64.is_empty() {
+                    Err("the image has no data".to_owned())
+                } else {
+                    Ok(coda_agent::steering::SteeringImage { media_type, base64 })
                 }
+            });
+            match checked {
+                Ok(image) => images.push(image),
                 Err(e) => {
                     let detail = format!("image {}: {e}; nothing was queued", index + 1);
                     return steer_reply(SteerResponse::refused("invalidImage", Some(detail)));
                 }
             }
         }
-        if !images.is_empty() {
-            let client = self.client.lock().await.clone();
-            let model = self.current_model();
-            if client.is_some_and(|c| !c.accepts_image_input(&model)) {
-                let detail = format!("the active model ({model}) cannot receive images; nothing was queued");
-                return steer_reply(SteerResponse::refused("imagesUnsupported", Some(detail)));
-            }
-        }
+        let offered: usize = images.iter().map(|i| i.byte_len()).sum();
         // I5: the busy check and the enqueue are performed on **one**
         // serialized path. Previously `turn_active` was read under its own
         // lock and `enqueue` then ran under the inbox's, so a turn could end
@@ -4454,12 +4455,29 @@ impl ServeBackend for ServeHost {
                     Ok(entry) => SteerResponse::accepted(entry.id),
                     Err(Reject::Sealed) => SteerResponse::refused("turnEnding", None),
                     Err(Reject::EmptyText) => SteerResponse::refused("emptyText", None),
-                    Err(Reject::AttachmentCapacity) => SteerResponse::refused(
-                        "attachmentCapacity",
-                        Some(format!(
-                            "queued images may total at most {} MiB until earlier messages are delivered or reclaimed; nothing was queued",
-                            coda_agent::steering::MAX_QUEUED_IMAGE_BYTES / (1024 * 1024)
-                        )),
+                    Err(Reject::AttachmentCapacity) => {
+                        const MIB: usize = 1024 * 1024;
+                        let cap = coda_agent::steering::MAX_QUEUED_IMAGE_BYTES;
+                        let detail = if offered > cap {
+                            format!(
+                                "this message's images total {} MiB, more than the {} MiB the queue can hold; nothing was queued",
+                                offered.div_ceil(MIB),
+                                cap / MIB
+                            )
+                        } else {
+                            format!(
+                                "queued images may total at most {} MiB until earlier messages are delivered or reclaimed; nothing was queued",
+                                cap / MIB
+                            )
+                        };
+                        SteerResponse::refused("attachmentCapacity", Some(detail))
+                    }
+                    // The inbox knows what the running turn's model accepts
+                    // (the agent tells it when the run starts); a model
+                    // chosen for the next turn does not matter here.
+                    Err(Reject::ImagesUnsupported) => SteerResponse::refused(
+                        "imagesUnsupported",
+                        Some("the model this turn is using cannot receive images; nothing was queued".to_owned()),
                     ),
                 }
             }
@@ -7863,17 +7881,16 @@ fn steer_reply(resp: SteerResponse) -> Result<Value, RpcError> {
     serde_json::to_value(&resp).map_err(|e| RpcError::internal(e.to_string()))
 }
 
-/// How undelivered steering is named in the restart file. The restart file
-/// keeps text only, so a message's images are said to exist rather than
-/// silently vanish; the client that sent them keeps the payload, since the
-/// recall reports these messages `recalled`.
+/// How undelivered steering is named in the restart file, which the next
+/// engine shows the model. A message with images is described rather than
+/// quoted: its text must never reach the model without its images. The
+/// client that sent it keeps the whole message, since the recall reports it
+/// `recalled`.
 fn restart_steering_text(entry: &coda_agent::steering::SteeringEntry) -> String {
     match entry.images.len() {
         0 => entry.text.clone(),
-        n => {
-            let images = if n == 1 { "1 image".to_owned() } else { format!("{n} images") };
-            format!("{} [{images} not carried over the restart]", entry.text).trim_start().to_owned()
-        }
+        1 => "[a message with 1 image; not carried over the restart, still held by the operator's client]".to_owned(),
+        n => format!("[a message with {n} images; not carried over the restart, still held by the operator's client]"),
     }
 }
 
@@ -11519,23 +11536,6 @@ mod tests {
             SteerParams { text: text.into(), images: Some(images) }
         }
 
-        struct TextOnlyClient;
-        #[async_trait::async_trait]
-        impl LlmClient for TextOnlyClient {
-            fn provider_id(&self) -> &str {
-                "text-only"
-            }
-            async fn stream(
-                &self,
-                _: coda_llm::ChatRequest,
-            ) -> Result<coda_llm::ResponseStream, coda_llm::LlmError> {
-                unreachable!("no request is made by these tests")
-            }
-            fn accepts_image_input(&self, _model: &str) -> bool {
-                false
-            }
-        }
-
         #[tokio::test]
         async fn text_and_images_queue_as_one_message_and_status_carries_metadata_only() {
             let host = make_host();
@@ -11578,7 +11578,7 @@ mod tests {
         async fn an_invalid_image_refuses_the_whole_message() {
             let host = make_host();
             let _turn = host.try_claim_turn("test-turn", "", TurnKind::Prompt).unwrap();
-            for bad in [image("image/bmp", "AAAA"), image("image/png", "not valid base64!!")] {
+            for bad in [image("image/bmp", "AAAA"), image("image/png", "not valid base64!!"), image("image/png", "")] {
                 let resp = host
                     .session_steer(steer("explain", vec![image("image/png", PAYLOAD), bad]))
                     .await
@@ -11594,10 +11594,12 @@ mod tests {
 
         #[tokio::test]
         async fn a_model_that_cannot_take_images_is_reported_before_anything_is_queued() {
-            let host = make_host_in_dir(".", Arc::new(TextOnlyClient));
+            let host = make_host();
             let idle = host.session_steer(steer("look", vec![image("image/png", PAYLOAD)])).await.unwrap();
             assert_eq!(idle["rejectedReason"], "noActiveTurn", "no turn is the more fundamental refusal");
             let _turn = host.try_claim_turn("test-turn", "", TurnKind::Prompt).unwrap();
+            // What the agent does when its run starts on a text-only model.
+            host.session.steering.set_accepts_images(false);
             let resp = host.session_steer(steer("look", vec![image("image/png", PAYLOAD)])).await.unwrap();
             assert_eq!(resp["rejectedReason"], "imagesUnsupported", "{resp}");
             assert!(!host.session.steering.has_any());
@@ -11619,6 +11621,13 @@ mod tests {
             assert!(resp["rejectedDetail"].as_str().unwrap().contains("MiB"));
             let state = host.session_get_state(GetStateParams::default()).await.unwrap();
             assert_eq!(state["steering"]["pendingCount"], 2);
+
+            host.session_recall_steering().await.unwrap();
+            let whole = "A".repeat(coda_agent::steering::MAX_QUEUED_IMAGE_BYTES + 4);
+            let resp = host.session_steer(steer("too big", vec![image("image/png", &whole)])).await.unwrap();
+            assert_eq!(resp["rejectedReason"], "attachmentCapacity");
+            let detail = resp["rejectedDetail"].as_str().unwrap();
+            assert!(detail.contains("this message's images"), "an empty queue is not blamed: {detail}");
         }
 
         #[tokio::test]
@@ -11656,8 +11665,12 @@ mod tests {
             let one = inbox.enqueue_message("see this", vec![png()]).unwrap();
             let two = inbox.enqueue_message("", vec![png(), png()]).unwrap();
             let plain = inbox.enqueue("plain").unwrap();
-            assert_eq!(restart_steering_text(&one), "see this [1 image not carried over the restart]");
-            assert_eq!(restart_steering_text(&two), "[2 images not carried over the restart]");
+            assert_eq!(
+                restart_steering_text(&one),
+                "[a message with 1 image; not carried over the restart, still held by the operator's client]"
+            );
+            assert!(!restart_steering_text(&one).contains("see this"), "its text never reaches the model alone");
+            assert!(restart_steering_text(&two).starts_with("[a message with 2 images;"));
             assert_eq!(restart_steering_text(&plain), "plain");
         }
     }

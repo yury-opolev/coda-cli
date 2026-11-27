@@ -40,11 +40,12 @@ fn refusal_text(reason: Option<&str>, detail: Option<&str>) -> String {
              sent without them."
                 .to_string()
         }
-        Some("attachmentCapacity") => {
-            "the queue already holds as many images as it can. Send it once the queued messages \
-             have reached the model, or reclaim them first."
-                .to_string()
-        }
+        Some("attachmentCapacity") => match detail {
+            Some(detail) => format!("its images could not be queued ({detail})."),
+            None => "the queue already holds as many images as it can. Send it once the queued \
+                     messages have reached the model, or reclaim them first."
+                .to_string(),
+        },
         Some(other) => {
             return format!(
                 "The engine refused to queue the message ({other}); it was not sent. Your text \
@@ -216,9 +217,11 @@ mod tests {
         assert!(invalid.contains("image 2: unsupported"), "{invalid}");
         let unsupported = refusal_text(Some("imagesUnsupported"), None);
         assert!(unsupported.contains("cannot receive images"), "{unsupported}");
-        let full = refusal_text(Some("attachmentCapacity"), Some("at most 32 MiB"));
+        let full = refusal_text(Some("attachmentCapacity"), None);
         assert!(full.contains("as many images as it can"), "{full}");
-        for text in [invalid, unsupported, full] {
+        let oversized = refusal_text(Some("attachmentCapacity"), Some("this message's images total 40 MiB"));
+        assert!(oversized.contains("40 MiB"), "{oversized}");
+        for text in [invalid, unsupported, full, oversized] {
             assert!(text.contains("nothing was queued") || text.contains("not queued"), "{text}");
             assert!(text.contains("back in the message box"), "{text}");
         }
