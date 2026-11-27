@@ -106,9 +106,8 @@ interactively. Tokens are not persisted — the broker owns refresh.
 
 - Provider: `FindAccountProviderWithAuthorityAsync("https://login.microsoft.com", authority)`
   where authority is `organizations` or the tenant authority URL.
-- `WebTokenRequest(provider, scopes joined by space, clientId)` (interactive:
-  `WebTokenRequestPromptType::ForceAuthentication` only when no account yet,
-  else `Default`), properties: `wam_compat=2.0`, `api-version=2.0`,
+- `WebTokenRequest(provider, scopes joined by space, clientId)` with prompt type
+  `Default` (the broker shows its own picker/consent only when needed), properties: `wam_compat=2.0`, `api-version=2.0`,
   `authority=<authority URL>`, `LoginHint=<account>` when configured.
 - Silent: with a known `WebAccount` (from the cache / persisted id via
   `FindAccountAsync`) → `GetTokenSilentlyWithWebAccountAsync`; otherwise
