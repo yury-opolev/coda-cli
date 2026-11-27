@@ -69,9 +69,10 @@ impl WamBroker {
     where
         F: FnOnce(Instant) -> Result<BrokerToken, BrokerError> + Send + 'static,
     {
+        let deadline = Instant::now() + budget;
         tokio::task::spawn_blocking(move || {
             ensure_mta()?;
-            op(Instant::now() + budget)
+            op(deadline)
         })
         .await
         .unwrap_or_else(|e| {
@@ -158,9 +159,11 @@ fn interactive(
         WebAuthenticationCoreManager,
         IWebAuthenticationCoreManagerInterop,
     >()
-    .map_err(|e| win_failure("broker interop", &e))?;
-    // SAFETY: `hwnd` is a live top-level window of this process's console and
-    // `token_request` is a valid `WebTokenRequest`.
+    .map_err(|e| win_failure("interop", &e))?;
+    // SAFETY: `hwnd` is a valid window handle (the console window or its root
+    // owner, which under Windows Terminal belongs to the terminal's process)
+    // used only as the dialog's owner, and `token_request` is a valid
+    // `WebTokenRequest`.
     let op = unsafe {
         interop.RequestTokenForWindowAsync::<_, IAsyncOperation<WebTokenRequestResult>>(
             hwnd,
@@ -212,20 +215,29 @@ fn find_provider(
     let unavailable = |detail: String| {
         BrokerError::Unavailable(format!("Microsoft Entra account provider: {detail}"))
     };
+    let wam_authority = authority_for(authority);
     let op = WebAuthenticationCoreManager::FindAccountProviderWithAuthorityAsync(
         &HSTRING::from(ENTRA_PROVIDER_ID),
-        &HSTRING::from(authority_for(authority)),
+        &HSTRING::from(wam_authority.as_str()),
     )
     .map_err(|e| unavailable(e.message()))?;
-    match wait(&op, deadline, budget) {
+    let found = match wait_raw(&op, deadline, budget) {
+        Err(BrokerError::Failed(detail)) => return Err(unavailable(detail)),
+        other => other?,
+    };
+    match found {
         Ok(provider) => Ok(provider),
-        Err(BrokerError::Failed(detail)) => Err(unavailable(detail)),
-        Err(e) => Err(e),
+        Err(e) if is_null_result(&e) => Err(BrokerError::Unavailable(format!(
+            "no Microsoft account provider found for authority {wam_authority}"
+        ))),
+        Err(e) => Err(unavailable(failure_detail(&e))),
     }
 }
 
-/// A remembered account, from the cache or looked up by id. `None` when the
-/// account no longer exists (the caller then uses the default account).
+/// A remembered account, from the cache or looked up by id. `None` only when
+/// the account no longer exists (the caller then uses the default account);
+/// a failed lookup is an error, so a transient failure never switches
+/// accounts.
 fn find_account(
     provider: &WebAccountProvider,
     id: &str,
@@ -240,11 +252,9 @@ fn find_account(
     {
         return Ok(Some(account.clone()));
     }
-    let Ok(op) = WebAuthenticationCoreManager::FindAccountAsync(provider, &HSTRING::from(id))
-    else {
-        return Ok(None);
-    };
-    match wait(&op, deadline, budget) {
+    let op = WebAuthenticationCoreManager::FindAccountAsync(provider, &HSTRING::from(id))
+        .map_err(|e| win_failure("account lookup", &e))?;
+    match wait_raw(&op, deadline, budget)? {
         Ok(account) => {
             accounts
                 .lock()
@@ -252,9 +262,8 @@ fn find_account(
                 .insert(id.to_owned(), account.clone());
             Ok(Some(account))
         }
-        Err(BrokerError::Timeout(t)) => Err(BrokerError::Timeout(t)),
-        // A null result (account removed) or a lookup error.
-        Err(_) => Ok(None),
+        Err(e) if is_null_result(&e) => Ok(None),
+        Err(e) => Err(win_failure("account lookup", &e)),
     }
 }
 
@@ -330,20 +339,33 @@ fn wait<T: RuntimeType + 'static>(
     deadline: Instant,
     budget: Duration,
 ) -> Result<T, BrokerError> {
+    wait_raw(op, deadline, budget)?.map_err(|e| win_failure("call", &e))
+}
+
+/// Like [`wait`], but hands back the raw `GetResults()` outcome of a
+/// completed operation so callers can tell a null result from an error.
+fn wait_raw<T: RuntimeType + 'static>(
+    op: &IAsyncOperation<T>,
+    deadline: Instant,
+    budget: Duration,
+) -> Result<windows::core::Result<T>, BrokerError> {
     loop {
-        let status = op.Status().map_err(|e| win_failure("broker call", &e))?;
+        let status = op.Status().map_err(|e| win_failure("call", &e))?;
         if status == AsyncStatus::Completed {
-            return op.GetResults().map_err(|e| win_failure("broker call", &e));
+            return Ok(op.GetResults());
         }
         if status == AsyncStatus::Canceled {
             return Err(BrokerError::Cancelled);
         }
         if status == AsyncStatus::Error {
-            let code = op.ErrorCode().map(|c| c.0).unwrap_or(0);
-            return Err(BrokerError::Failed(format!(
-                "WAM call failed: 0x{:08x}",
-                code as u32
-            )));
+            // `GetResults` reports the failure HRESULT with its message.
+            return Err(match op.GetResults() {
+                Err(e) => win_failure("call", &e),
+                Ok(_) => {
+                    let code = op.ErrorCode().map(|c| c.0).unwrap_or(0);
+                    BrokerError::Failed(format!("Windows broker call failed: 0x{:08x}", code as u32))
+                }
+            });
         }
         if Instant::now() >= deadline {
             let _ = op.Cancel();
@@ -510,17 +532,26 @@ fn parse_expires_on(value: &str, now: i64) -> Option<i64> {
     (unix > 0 && unix <= now + MAX_PLAUSIBLE_LIFETIME_SECS).then_some(unix)
 }
 
-fn win_failure(what: &str, e: &windows::core::Error) -> BrokerError {
+/// A WinRT method returned a null object (`windows-core` reports it as an
+/// error carrying `S_OK`).
+fn is_null_result(e: &windows::core::Error) -> bool {
+    e.code().is_ok()
+}
+
+/// `0x…` HRESULT plus the system message, if any.
+fn failure_detail(e: &windows::core::Error) -> String {
     let message = e.message();
     let message = message.trim();
     let code = e.code().0 as u32;
     if message.is_empty() {
-        BrokerError::Failed(format!("Windows broker {what} failed: 0x{code:08x}"))
+        format!("0x{code:08x}")
     } else {
-        BrokerError::Failed(format!(
-            "Windows broker {what} failed: 0x{code:08x}: {message}"
-        ))
+        format!("0x{code:08x}: {message}")
     }
+}
+
+fn win_failure(what: &str, e: &windows::core::Error) -> BrokerError {
+    BrokerError::Failed(format!("Windows broker {what} failed: {}", failure_detail(e)))
 }
 
 fn unix_now() -> i64 {
@@ -709,6 +740,18 @@ mod tests {
             failure(WebTokenRequestStatus(42), 7, " "),
             BrokerError::Failed("WAM error 0x00000007".into())
         );
+    }
+
+    #[test]
+    fn null_results_are_told_apart_from_failures() {
+        use windows::Win32::Foundation::E_FAIL;
+        assert!(is_null_result(&windows::core::Error::empty()));
+        let failure = windows::core::Error::from_hresult(E_FAIL);
+        assert!(!is_null_result(&failure));
+        assert!(matches!(
+            win_failure("call", &failure),
+            BrokerError::Failed(m) if m.starts_with("Windows broker call failed: 0x80004005")
+        ));
     }
 
     #[test]

@@ -228,7 +228,7 @@ async fn cancelled_prompt_is_not_reshown_until_login() {
     assert_eq!(broker.interactive_calls(), 2);
     assert_eq!(token_of(&p).await.as_deref(), Some("t2"));
     assert_eq!(p.status().unwrap().last_error, None);
-    assert!(broker.request(0).force_refresh, "the 401 path bypasses the broker cache");
+    assert!(!broker.request(0).force_refresh, "no token was rejected, so no forced refresh");
     assert!(!broker.request(3).force_refresh, "login does not force a refresh");
     assert!(!broker.request(4).force_refresh);
 }
@@ -368,6 +368,63 @@ async fn simultaneous_unauthorized_reacquire_once() {
     assert!(a && b);
     assert_eq!(broker.silent_calls(), 2, "the second 401 reuses the first re-acquisition");
     assert_eq!(token_of(&p).await.as_deref(), Some("t2"));
+}
+
+#[tokio::test]
+async fn unauthorized_without_token_does_not_force_refresh() {
+    let broker = FakeBroker::new();
+    broker.silent(tok("t1", 3600));
+    let p = provider(&broker);
+
+    assert!(p.handle_unauthorized(None).await);
+    assert_eq!(broker.silent_calls(), 1);
+    assert!(!broker.request(0).force_refresh, "nothing was rejected, the broker cache may serve");
+}
+
+#[tokio::test(start_paused = true)]
+async fn concurrent_unauthorized_against_hung_broker_call_it_once() {
+    let broker = FakeBroker::with_delay(Duration::from_secs(3600));
+    let p = provider(&broker);
+
+    let results = futures::future::join_all((0..4).map(|_| p.handle_unauthorized(None))).await;
+    assert!(results.iter().all(|ok| !ok), "{results:?}");
+    assert_eq!(broker.silent_calls(), 1, "queued 401s must not retry a broker that just failed");
+}
+
+#[tokio::test(start_paused = true)]
+async fn concurrent_unauthorized_against_failing_broker_call_it_once() {
+    let broker = FakeBroker::with_delay(Duration::from_secs(1));
+    broker.silent(tok("t1", 3600)).silent(Err(BrokerError::Failed("down".into())));
+    let p = provider(&broker);
+    assert_eq!(token_of(&p).await.as_deref(), Some("t1"));
+
+    let results = futures::future::join_all((0..4).map(|_| p.handle_unauthorized(None))).await;
+    assert!(results.iter().all(|ok| !ok), "{results:?}");
+    assert_eq!(broker.silent_calls(), 2, "one re-acquisition for all queued 401s");
+}
+
+#[tokio::test]
+async fn unauthorized_after_a_refresh_to_the_same_token_forces_reacquire() {
+    let broker = FakeBroker::new();
+    broker.silent(tok("t1", 3600)).silent(tok("t2", 3600));
+    let p = provider(&broker);
+    assert_eq!(token_of(&p).await.as_deref(), Some("t1"));
+
+    let p = &p;
+    let guard = p.entry.flight.lock().await;
+    let refresh = async move {
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        // An automatic (non-forced) refresh that returned the rejected token again.
+        p.accept(tok("t1", 3600).unwrap()).await;
+        drop(guard);
+    };
+    let (ok, ()) = tokio::join!(p.handle_unauthorized(None), refresh);
+    assert!(ok);
+    assert_eq!(broker.silent_calls(), 2, "the same rejected token must not be reused");
+    assert!(broker.request(1).force_refresh);
+    assert_eq!(token_of(p).await.as_deref(), Some("t2"));
 }
 
 #[tokio::test]
@@ -551,6 +608,32 @@ async fn hung_discovery_is_bounded() {
     let err = r.error.unwrap_or_default();
     assert!(err.contains("within 30s"), "{err}");
     assert_eq!(broker.silent_calls(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn discovery_in_progress_does_not_block_requests() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    let broker = FakeBroker::new();
+    let cache = Arc::new(BrokerTokenCache::new());
+    let p = http_provider(port, discovered(), options(broker.clone(), &cache));
+
+    let request = async {
+        tokio::task::yield_now().await;
+        let start = tokio::time::Instant::now();
+        let token = token_of(&p).await;
+        (token, start.elapsed())
+    };
+    let (ok, (token, elapsed)) = tokio::join!(p.handle_unauthorized(None), request);
+    assert!(!ok);
+    assert_eq!(token, None);
+    assert_eq!(elapsed, Duration::ZERO, "must not wait for discovery");
 }
 
 #[test]

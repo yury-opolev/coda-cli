@@ -87,8 +87,9 @@ impl EntraBrokerOptions {
 enum Trigger {
     /// A request needs a token; honours the cache and the failure cool-down.
     Automatic,
-    /// The server rejected the token; bypasses both caches.
-    Unauthorized,
+    /// The server rejected a request; bypasses the provider cache, and the
+    /// broker cache too when `force_refresh` (a token was rejected).
+    Unauthorized { force_refresh: bool },
     /// `/mcp login`; may always prompt.
     User,
 }
@@ -128,7 +129,10 @@ pub struct EntraBrokerProvider {
     client_id: String,
     opts: EntraBrokerOptions,
     entry: Arc<CacheEntry>,
-    target: tokio::sync::Mutex<Option<Target>>,
+    /// Only ever held briefly (never across an await).
+    target: std::sync::Mutex<Option<Target>>,
+    /// Serialises protected-resource metadata discovery.
+    discovery: tokio::sync::Mutex<()>,
     /// `None` until loaded from the store.
     persisted: tokio::sync::Mutex<Option<PersistedAccount>>,
     fallback: Option<Fallback>,
@@ -210,7 +214,8 @@ impl EntraBrokerProvider {
             client_id,
             opts,
             entry,
-            target: tokio::sync::Mutex::new(target),
+            target: std::sync::Mutex::new(target),
+            discovery: tokio::sync::Mutex::new(()),
             persisted: tokio::sync::Mutex::new(None),
             fallback,
         })
@@ -222,6 +227,25 @@ impl EntraBrokerProvider {
 
     fn display_resource(&self) -> &str {
         self.canonical_resource.split('?').next().unwrap_or(&self.canonical_resource)
+    }
+
+    fn target(&self) -> Option<Target> {
+        self.target.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    /// Discover the target unless it is known. Discovery runs without holding
+    /// the `target` lock, so requests never wait for it.
+    async fn ensure_target(&self, challenge: Option<&WwwAuthenticateChallenge>) -> Result<(), String> {
+        if self.target().is_some() {
+            return Ok(());
+        }
+        let _discovery = self.discovery.lock().await;
+        if self.target().is_some() {
+            return Ok(());
+        }
+        let target = self.resolve_target(challenge).await.map_err(|msg| self.fail(msg))?;
+        *self.target.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(target);
+        Ok(())
     }
 
     fn log(&self, msg: &str) {
@@ -423,7 +447,7 @@ impl EntraBrokerProvider {
         trigger: Trigger,
     ) -> Result<BrokerToken, String> {
         let name = self.name().to_owned();
-        let Some(target) = self.target.lock().await.clone() else {
+        let Some(target) = self.target() else {
             return Err(self.fail(format!(
                 "The Microsoft Entra authority for MCP server '{name}' is not known yet. Set \
                  auth.tenant and auth.scopes, or connect to the server first."
@@ -465,7 +489,7 @@ impl EntraBrokerProvider {
             scopes: target.scopes,
             login_hint: self.config.account.clone(),
             account_id,
-            force_refresh: trigger == Trigger::Unauthorized,
+            force_refresh: matches!(trigger, Trigger::Unauthorized { force_refresh: true }),
         };
 
         let silent =
@@ -595,7 +619,7 @@ impl McpAuthProvider for EntraBrokerProvider {
                 .filter(|t| t.expires_at_unix > unix_now())
                 .map(|t| t.access_token.clone())
         };
-        if cooling || self.target.lock().await.is_none() {
+        if cooling || self.target().is_none() {
             return unexpired();
         }
         let flight = if unexpired().is_some() {
@@ -617,32 +641,33 @@ impl McpAuthProvider for EntraBrokerProvider {
         if let Some(fallback) = &self.fallback {
             return self.fallback_unauthorized(fallback, www_authenticate).await;
         }
-        let seen = self.entry.state().generation;
+        let (rejected, failure_seen) = {
+            let state = self.entry.state();
+            (state.token.as_ref().map(|t| t.access_token.clone()), state.last_failure_at)
+        };
         let challenge = WwwAuthenticateChallenge::parse(www_authenticate);
-        {
-            let mut target = self.target.lock().await;
-            if target.is_none() {
-                match self.resolve_target(challenge.as_ref()).await {
-                    Ok(t) => *target = Some(t),
-                    Err(msg) => {
-                        drop(target);
-                        self.fail(msg);
-                        return false;
-                    }
-                }
-            }
+        if self.ensure_target(challenge.as_ref()).await.is_err() {
+            return false;
         }
         let flight = self.entry.flight.lock().await;
-        {
+        let had_token = {
             let mut state = self.entry.state();
-            // Another 401 already replaced the token while we waited.
-            if state.generation != seen && state.token.is_some() {
-                return true;
+            // Another task replaced the rejected token while we waited.
+            if let Some(token) = &state.token {
+                if rejected.as_ref().is_none_or(|r| r.expose() != token.access_token.expose()) {
+                    return true;
+                }
+            }
+            // ...or asked the broker and failed: do not ask it again right away.
+            if state.last_failure_at.is_some() && state.last_failure_at != failure_seen {
+                return false;
             }
             // A 401 while a token was attached means the token is no good.
-            state.token = None;
-        }
-        self.acquire_locked(&flight, Trigger::Unauthorized).await.is_ok()
+            state.token.take().is_some() || rejected.is_some()
+        };
+        self.acquire_locked(&flight, Trigger::Unauthorized { force_refresh: had_token })
+            .await
+            .is_ok()
     }
 
     fn status(&self) -> Option<McpAuthStatus> {
@@ -675,18 +700,8 @@ impl McpAuthProvider for EntraBrokerProvider {
             return result;
         }
 
-        {
-            let mut target = self.target.lock().await;
-            if target.is_none() {
-                match self.resolve_target(None).await {
-                    Ok(t) => *target = Some(t),
-                    Err(msg) => {
-                        drop(target);
-                        let msg = self.fail(msg);
-                        return McpAuthResult { succeeded: false, error: Some(msg) };
-                    }
-                }
-            }
+        if let Err(msg) = self.ensure_target(None).await {
+            return McpAuthResult { succeeded: false, error: Some(msg) };
         }
         let flight = self.entry.flight.lock().await;
         self.load_persisted().await;
