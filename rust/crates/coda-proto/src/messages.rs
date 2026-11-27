@@ -467,13 +467,23 @@ impl PromptParams {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WireImage {
     /// `image/png`, `image/jpeg`, `image/gif` or `image/webp`.
     pub media_type: String,
     pub base64: String,
+}
+
+/// Never prints the payload: image bytes have no place in diagnostics.
+impl std::fmt::Debug for WireImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WireImage")
+            .field("media_type", &self.media_type)
+            .field("base64_len", &self.base64.len())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -515,7 +525,16 @@ pub struct WireGoalStatus {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SteerParams {
     pub text: String,
+    /// Images delivered with `text` as one message (same representation and
+    /// validation as `PromptParams.images`). Send only to an engine that
+    /// advertises [`STEERING_IMAGES_CAPABILITY`]: an older engine ignores the
+    /// field and would queue the text alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<WireImage>,
 }
+
+/// Capability an engine advertises when `session/steer` accepts `images`.
+pub const STEERING_IMAGES_CAPABILITY: &str = "steering.images";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -525,9 +544,15 @@ pub struct SteerResult {
     pub ok: bool,
     #[serde(default)]
     pub message_id: Option<String>,
-    /// Rejection classification such as `noActiveTurn`, `turnEnding` or `emptyText`.
+    /// Rejection classification: `noActiveTurn`, `turnEnding`, `emptyText`
+    /// (neither text nor images), `invalidImage`, `imagesUnsupported` (the
+    /// active model cannot receive images) or `attachmentCapacity` (the
+    /// queue's aggregate image budget is exhausted).
     #[serde(default)]
     pub rejected_reason: Option<String>,
+    /// Human-readable detail for a rejection; never contains image data.
+    #[serde(default)]
+    pub rejected_detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -545,6 +570,10 @@ pub struct RecalledSteeringMessage {
     pub text: String,
     #[serde(default)]
     pub enqueued_at: Option<String>,
+    /// The message's images, in order. Recall is the one place the payload
+    /// is handed back; queue status only ever carries metadata.
+    #[serde(default)]
+    pub images: Vec<WireImage>,
 }
 
 // ---------------------------------------------------------------------------

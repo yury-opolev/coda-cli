@@ -26,11 +26,35 @@
             "null"
           ],
           "default": null
+        },
+        "images": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WireImage"
+          },
+          "description": "The message's images, in order. Recall is the one place the payload\nis handed back; queue status only ever carries metadata.",
+          "default": []
         }
       },
       "required": [
         "id",
         "text"
+      ]
+    },
+    "WireImage": {
+      "type": "object",
+      "properties": {
+        "mediaType": {
+          "type": "string",
+          "description": "`image/png`, `image/jpeg`, `image/gif` or `image/webp`."
+        },
+        "base64": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "mediaType",
+        "base64"
       ]
     }
   }

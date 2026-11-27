@@ -237,6 +237,20 @@ mod tests {
     }
 
     #[test]
+    fn steering_schemas_carry_optional_images_and_metadata_only_queue_state() {
+        let schemas = documents();
+        let steer = &schemas["SteerParams.json"];
+        assert!(steer["properties"].get("images").is_some(), "{steer}");
+        assert!(!steer["required"].as_array().is_some_and(|r| r.iter().any(|n| n == "images")));
+        assert!(schemas["SteerResult.json"]["properties"].get("rejectedDetail").is_some());
+        let recall = schemas["RecallSteeringResult.json"].to_string();
+        assert!(recall.contains("\"images\""), "{recall}");
+        let snapshot = schemas["StateSnapshot.json"].to_string();
+        assert!(snapshot.contains("SteeringImageMeta"), "pending steering exposes image metadata");
+        assert!(snapshot.contains("byteLength"));
+    }
+
+    #[test]
     fn legacy_event_payloads_keep_sequence_and_correlation_fields() {
         let schemas = documents();
         for name in [

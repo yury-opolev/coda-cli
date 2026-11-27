@@ -769,7 +769,7 @@ impl SubagentHost {
         )?;
         let inbox = Arc::new(SteeringInbox::new());
         for item in &cp.steering {
-            inbox.push_item(item.inbox_kind(), item.text.clone());
+            inbox.push_item_with_images(item.inbox_kind(), item.text.clone(), item.steering_images());
         }
         task.attach_steering(inbox);
         let request = SubagentRequest {
@@ -3286,10 +3286,18 @@ mod tests {
                 steps_used: 2,
                 parked: true,
                 steering: vec![
-                    CheckpointInboxItem { kind: "message".into(), text: "check logs".into() },
+                    CheckpointInboxItem {
+                        kind: "message".into(),
+                        text: "check logs".into(),
+                        images: vec![crate::subagents::checkpoint::CheckpointImage {
+                            media_type: "image/png".into(),
+                            base64: "AAAA".into(),
+                        }],
+                    },
                     CheckpointInboxItem {
                         kind: "taskCompleted".into(),
                         text: "[task-completed] task-00000004".into(),
+                        images: Vec::new(),
                     },
                 ],
                 explicitly_suspended: true,

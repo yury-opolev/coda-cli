@@ -760,6 +760,13 @@
         },
         "textTruncated": {
           "type": "boolean"
+        },
+        "images": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SteeringImageMeta"
+          },
+          "description": "The message's images, in order — metadata only. The payload is\nhanded back solely by `session/recallSteering`."
         }
       },
       "required": [
@@ -769,6 +776,24 @@
         "textLength",
         "textTruncated"
       ]
+    },
+    "SteeringImageMeta": {
+      "type": "object",
+      "properties": {
+        "mediaType": {
+          "type": "string"
+        },
+        "byteLength": {
+          "type": "integer",
+          "format": "int64",
+          "description": "Length of the base64 payload, in bytes."
+        }
+      },
+      "required": [
+        "mediaType",
+        "byteLength"
+      ],
+      "description": "What a queued image is, without its bytes."
     },
     "SteeringOutcomeDto": {
       "type": "object",

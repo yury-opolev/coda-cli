@@ -60,12 +60,55 @@ impl InboxItemKind {
     }
 }
 
+/// One image carried by an operator message.
+///
+/// `Debug` reports the media type and size only: image bytes never belong in
+/// diagnostics.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SteeringImage {
+    pub media_type: String,
+    pub base64: String,
+}
+
+impl SteeringImage {
+    /// Size of the base64 payload; what the queue budget charges.
+    pub fn byte_len(&self) -> usize {
+        self.base64.len()
+    }
+}
+
+impl std::fmt::Debug for SteeringImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SteeringImage")
+            .field("media_type", &self.media_type)
+            .field("base64_len", &self.base64.len())
+            .finish()
+    }
+}
+
+/// Aggregate base64 bytes of images that may wait in one inbox at a time.
+///
+/// Every pending image counts, including the one being offered; a message
+/// that would exceed it is refused with [`SteerRejectReason::AttachmentCapacity`]
+/// rather than queued partially.
+pub const MAX_QUEUED_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+
 /// A single item queued for delivery.
+///
+/// `images` is an immutable snapshot taken at acceptance; runtime items
+/// (`TaskCompleted`, `Deadline`) never carry any.
 #[derive(Debug, Clone)]
 pub struct SteeringEntry {
     pub id: String,
     pub text: String,
     pub kind: InboxItemKind,
+    pub images: Arc<[SteeringImage]>,
+}
+
+impl SteeringEntry {
+    fn image_bytes(&self) -> usize {
+        self.images.iter().map(SteeringImage::byte_len).sum()
+    }
 }
 
 /// Why an `enqueue` was refused. Distinguishes "no turn is running" (sealed)
@@ -75,8 +118,10 @@ pub struct SteeringEntry {
 pub enum SteerRejectReason {
     /// The queue is sealed — no turn is currently accepting steering.
     Sealed,
-    /// The text was empty (or all whitespace).
+    /// Neither text (beyond whitespace) nor images.
     EmptyText,
+    /// Accepting the message's images would exceed [`MAX_QUEUED_IMAGE_BYTES`].
+    AttachmentCapacity,
 }
 
 /// Synchronous observer for steering-queue transitions.
@@ -98,6 +143,11 @@ pub trait SteeringObserver: Send + Sync {
     fn on_turn_ended_dropped(&self, _entries: &[SteeringEntry]) {}
     /// An `enqueue` was refused.
     fn on_rejected(&self, _reason: SteerRejectReason) {}
+    /// Image-bearing messages were withdrawn instead of delivered because the
+    /// active model cannot receive images (never called with an empty slice).
+    /// They are kept for explicit recovery; their text is never delivered
+    /// alone.
+    fn on_undeliverable(&self, _entries: &[SteeringEntry]) {}
 }
 
 /// Thread-safe FIFO queue for operator steering injections.
@@ -111,6 +161,9 @@ pub struct SteeringInbox {
     observer: Option<Arc<dyn SteeringObserver>>,
     /// Signalled whenever an item is accepted, so a parked agent wakes up.
     arrived: tokio::sync::Notify,
+    /// Whether the model this inbox delivers to receives image blocks. Set by
+    /// the agent at the start of each run; `true` until told otherwise.
+    accepts_images: std::sync::atomic::AtomicBool,
 }
 
 struct SteeringInboxInner {
@@ -130,7 +183,15 @@ impl SteeringInbox {
             gate: Mutex::new(SteeringInboxInner { pending: Vec::new(), sealed_empty: false }),
             observer,
             arrived: tokio::sync::Notify::new(),
+            accepts_images: std::sync::atomic::AtomicBool::new(true),
         }
+    }
+
+    /// Records whether delivery may hand images to the model. When it may
+    /// not, image-bearing messages are withdrawn at delivery (see
+    /// [`SteeringObserver::on_undeliverable`]) rather than sent as text alone.
+    pub fn set_accepts_images(&self, accepts: bool) {
+        self.accepts_images.store(accepts, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Resolves once any undelivered item (message, completion, deadline) is
@@ -171,10 +232,22 @@ impl SteeringInbox {
     /// after sealing (see the parked state in `agent::park`). The observer
     /// is not told: it mirrors operator steering only.
     pub fn push_item(&self, kind: InboxItemKind, text: impl Into<String>) -> SteeringEntry {
+        self.push_item_with_images(kind, text, Vec::new())
+    }
+
+    /// [`Self::push_item`] for an item restored with its images (a planned
+    /// restart re-queues a suspended agent's inbox exactly as it was).
+    pub fn push_item_with_images(
+        &self,
+        kind: InboxItemKind,
+        text: impl Into<String>,
+        images: Vec<SteeringImage>,
+    ) -> SteeringEntry {
         let entry = SteeringEntry {
             id: uuid::Uuid::new_v4().to_string().replace('-', ""),
             text: text.into(),
             kind,
+            images: images.into(),
         };
         self.gate.lock().unwrap().pending.push(entry.clone());
         self.arrived.notify_waiters();
@@ -195,8 +268,21 @@ impl SteeringInbox {
         &self,
         text: impl Into<String>,
     ) -> Result<SteeringEntry, SteerRejectReason> {
+        self.enqueue_message(text, Vec::new())
+    }
+
+    /// Enqueue an operator message with its images as one indivisible item.
+    ///
+    /// Refused only when there is neither text nor an image, when the inbox
+    /// is sealed, or when the images would exceed the aggregate budget
+    /// ([`MAX_QUEUED_IMAGE_BYTES`]); a refusal queues nothing at all.
+    pub fn enqueue_message(
+        &self,
+        text: impl Into<String>,
+        images: Vec<SteeringImage>,
+    ) -> Result<SteeringEntry, SteerRejectReason> {
         let text = text.into();
-        if text.trim().is_empty() {
+        if text.trim().is_empty() && images.is_empty() {
             if let Some(obs) = &self.observer {
                 obs.on_rejected(SteerRejectReason::EmptyText);
             }
@@ -209,10 +295,21 @@ impl SteeringInbox {
             }
             return Err(SteerRejectReason::Sealed);
         }
+        let offered: usize = images.iter().map(SteeringImage::byte_len).sum();
+        if offered > 0 {
+            let queued: usize = inner.pending.iter().map(SteeringEntry::image_bytes).sum();
+            if queued.saturating_add(offered) > MAX_QUEUED_IMAGE_BYTES {
+                if let Some(obs) = &self.observer {
+                    obs.on_rejected(SteerRejectReason::AttachmentCapacity);
+                }
+                return Err(SteerRejectReason::AttachmentCapacity);
+            }
+        }
         let entry = SteeringEntry {
             id: uuid::Uuid::new_v4().to_string().replace('-', ""),
             text,
             kind: InboxItemKind::Message,
+            images: images.into(),
         };
         inner.pending.push(entry.clone());
         // Observer runs while `inner` is still held (INBOX -> STATE -> BUS).
@@ -226,23 +323,35 @@ impl SteeringInbox {
 
     /// Every undelivered item, oldest first, without removing anything
     /// (a planned restart copies the inbox of a suspended agent).
-    pub fn snapshot_items(&self) -> Vec<(InboxItemKind, String)> {
-        self.gate
-            .lock()
-            .unwrap()
-            .pending
-            .iter()
-            .map(|e| (e.kind, e.text.clone()))
-            .collect()
+    pub fn snapshot_items(&self) -> Vec<SteeringEntry> {
+        self.gate.lock().unwrap().pending.clone()
     }
 
     /// Atomically drain all pending entries for delivery.
+    ///
+    /// When the model cannot receive images, image-bearing messages are
+    /// withdrawn in the same step and reported via
+    /// [`SteeringObserver::on_undeliverable`] instead of being delivered.
     pub fn take_all_for_delivery(&self) -> Vec<SteeringEntry> {
         let mut inner = self.gate.lock().unwrap();
         if inner.pending.is_empty() {
             return Vec::new();
         }
-        let entries = std::mem::take(&mut inner.pending);
+        let mut entries = std::mem::take(&mut inner.pending);
+        if !self.accepts_images.load(std::sync::atomic::Ordering::SeqCst) {
+            let (withheld, deliverable): (Vec<_>, Vec<_>) = entries
+                .into_iter()
+                .partition(|e| e.kind == InboxItemKind::Message && !e.images.is_empty());
+            entries = deliverable;
+            if !withheld.is_empty() {
+                if let Some(obs) = &self.observer {
+                    obs.on_undeliverable(&withheld);
+                }
+            }
+            if entries.is_empty() {
+                return entries;
+            }
+        }
         if let Some(obs) = &self.observer {
             obs.on_delivered(&entries);
         }
@@ -313,6 +422,30 @@ impl Default for SteeringInbox {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Content blocks for a run of delivered entries that carries images: per
+/// entry in arrival order, its text and then its own images, so each image
+/// stays beside the words that explain it. `prefix` (the live-task brief)
+/// opens the first entry's text.
+pub(crate) fn steering_blocks(entries: &[SteeringEntry], prefix: Option<String>) -> Vec<coda_llm::Content> {
+    let mut prefix = prefix;
+    let mut blocks = Vec::new();
+    for entry in entries {
+        let text = match prefix.take() {
+            Some(prefix) if entry.text.is_empty() => prefix,
+            Some(prefix) => format!("{prefix}\n\n{}", entry.text),
+            None => entry.text.clone(),
+        };
+        if !text.is_empty() {
+            blocks.push(coda_llm::Content::Text(text));
+        }
+        blocks.extend(entry.images.iter().map(|image| coda_llm::Content::Image {
+            media_type: image.media_type.clone(),
+            base64: image.base64.clone(),
+        }));
+    }
+    blocks
 }
 
 #[cfg(test)]
@@ -446,9 +579,13 @@ mod tests {
         recalled: Mutex<Vec<Vec<SteeringEntry>>>,
         dropped: Mutex<Vec<Vec<SteeringEntry>>>,
         rejected: Mutex<Vec<SteerRejectReason>>,
+        undeliverable: Mutex<Vec<Vec<SteeringEntry>>>,
     }
 
     impl SteeringObserver for RecordingObserver {
+        fn on_undeliverable(&self, entries: &[SteeringEntry]) {
+            self.undeliverable.lock().unwrap().push(entries.to_vec());
+        }
         fn on_enqueued(&self, entry: &SteeringEntry) {
             self.enqueued.lock().unwrap().push(entry.clone());
         }
@@ -540,7 +677,7 @@ mod tests {
         let inbox = SteeringInbox::new();
         inbox.enqueue("check the logs").unwrap();
         inbox.push_item(InboxItemKind::TaskCompleted, "[task-completed] task-00000002");
-        let items = inbox.snapshot_items();
+        let items: Vec<_> = inbox.snapshot_items().into_iter().map(|e| (e.kind, e.text)).collect();
         assert_eq!(
             items,
             vec![
@@ -575,5 +712,105 @@ mod tests {
         assert_eq!(inbox.enqueue_with_reason("").err(), Some(SteerRejectReason::EmptyText));
         assert!(inbox.try_seal_empty());
         assert_eq!(inbox.enqueue_with_reason("hi").err(), Some(SteerRejectReason::Sealed));
+    }
+
+    // ── Image steering ───────────────────────────────────────────────────────
+
+    fn image(media_type: &str, base64: &str) -> SteeringImage {
+        SteeringImage { media_type: media_type.into(), base64: base64.into() }
+    }
+
+    #[test]
+    fn an_image_only_message_is_accepted_but_nothing_at_all_is_not() {
+        let inbox = SteeringInbox::new();
+        let entry = inbox.enqueue_message("", vec![image("image/png", "AAAA")]).unwrap();
+        assert_eq!(entry.text, "");
+        assert_eq!(entry.images.len(), 1);
+        assert_eq!(inbox.enqueue_message("  ", Vec::new()).err(), Some(SteerRejectReason::EmptyText));
+    }
+
+    #[test]
+    fn fifo_order_and_each_messages_image_order_survive_delivery() {
+        let inbox = SteeringInbox::new();
+        inbox.enqueue_message("one", vec![image("image/png", "AAA1"), image("image/gif", "AAA2")]).unwrap();
+        inbox.enqueue("two").unwrap();
+        inbox.enqueue_message("three", vec![image("image/jpeg", "AAA3")]).unwrap();
+        let delivered = inbox.take_all_for_delivery();
+        let texts: Vec<_> = delivered.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(texts, ["one", "two", "three"]);
+        let payloads: Vec<Vec<&str>> = delivered
+            .iter()
+            .map(|e| e.images.iter().map(|i| i.base64.as_str()).collect())
+            .collect();
+        assert_eq!(payloads, vec![vec!["AAA1", "AAA2"], vec![], vec!["AAA3"]]);
+    }
+
+    #[test]
+    fn the_aggregate_image_budget_refuses_explicitly_and_frees_on_removal() {
+        let obs = Arc::new(RecordingObserver::default());
+        let inbox = SteeringInbox::with_observer(Some(obs.clone() as Arc<dyn SteeringObserver>));
+        let half = "A".repeat(MAX_QUEUED_IMAGE_BYTES / 2);
+        inbox.enqueue_message("a", vec![image("image/png", &half)]).unwrap();
+        inbox.enqueue_message("b", vec![image("image/png", &half)]).unwrap();
+        assert_eq!(
+            inbox.enqueue_message("c", vec![image("image/png", "AAAA")]).err(),
+            Some(SteerRejectReason::AttachmentCapacity)
+        );
+        assert_eq!(obs.rejected.lock().unwrap().last().copied(), Some(SteerRejectReason::AttachmentCapacity));
+        assert!(inbox.enqueue("text still fits").is_some(), "text is not charged against the image budget");
+        assert_eq!(inbox.recall_all().len(), 3);
+        assert!(inbox.enqueue_message("c", vec![image("image/png", "AAAA")]).is_ok(), "recall frees capacity");
+    }
+
+    #[test]
+    fn a_model_that_cannot_take_images_never_gets_their_text_alone() {
+        let obs = Arc::new(RecordingObserver::default());
+        let inbox = SteeringInbox::with_observer(Some(obs.clone() as Arc<dyn SteeringObserver>));
+        inbox.enqueue_message("see screenshot", vec![image("image/png", "AAAA")]).unwrap();
+        inbox.enqueue("plain").unwrap();
+        inbox.set_accepts_images(false);
+        let delivered = inbox.take_all_for_delivery();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].text, "plain");
+        let withheld = obs.undeliverable.lock().unwrap().clone();
+        assert_eq!(withheld.len(), 1);
+        assert_eq!(withheld[0][0].text, "see screenshot");
+        assert!(!inbox.has_any(), "the withheld message left the queue for explicit recovery");
+    }
+
+    #[test]
+    fn recall_and_delivery_with_images_are_mutually_exclusive() {
+        for _ in 0..50 {
+            let inbox = Arc::new(SteeringInbox::new());
+            let id = inbox.enqueue_message("x", vec![image("image/png", "AAAA")]).unwrap().id;
+            let other = Arc::clone(&inbox);
+            let deliver = std::thread::spawn(move || other.take_all_for_delivery());
+            let recalled = inbox.recall_all();
+            let delivered = deliver.join().unwrap();
+            let seen: Vec<_> = recalled.iter().chain(delivered.iter()).collect();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].id, id);
+            assert_eq!(seen[0].images.len(), 1, "the images travel with whichever side won");
+        }
+    }
+
+    #[test]
+    fn debug_output_never_contains_image_bytes() {
+        let inbox = SteeringInbox::new();
+        let entry = inbox.enqueue_message("t", vec![image("image/png", "SECRETPAYLOAD")]).unwrap();
+        let printed = format!("{entry:?}");
+        assert!(!printed.contains("SECRETPAYLOAD"), "{printed}");
+        assert!(printed.contains("image/png"), "{printed}");
+    }
+
+    #[test]
+    fn runtime_items_never_carry_images_and_snapshots_keep_them() {
+        let inbox = SteeringInbox::new();
+        inbox.enqueue_message("m", vec![image("image/png", "AAAA")]).unwrap();
+        let item = inbox.push_item(InboxItemKind::TaskCompleted, "done");
+        assert!(item.images.is_empty());
+        let snapshot = inbox.snapshot_items();
+        assert_eq!(snapshot[0].images.len(), 1);
+        assert!(snapshot[1].images.is_empty());
     }
 }
