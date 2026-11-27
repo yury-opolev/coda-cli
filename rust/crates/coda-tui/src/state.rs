@@ -234,12 +234,20 @@ impl Usage {
 }
 
 /// A user message queued while the agent is busy.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct QueuedMessage {
     pub id: Option<String>,
     pub text: String,
     /// When this was queued, for display and for ordering recovery.
     pub queued_at: String,
+    /// The images accepted with this message — an immutable copy taken when
+    /// the engine acknowledged it, so later drafts or clipboard changes
+    /// never alter what was queued. Empty when this client never held them.
+    pub images: Vec<coda_proto::messages::WireImage>,
+    /// How many images the message carries, as far as anyone has said: the
+    /// local copy or, for a message this client did not send, the engine's
+    /// metadata.
+    pub image_count: usize,
 }
 
 /// Where in the conversation a delivered message is being put, relative to
@@ -346,7 +354,7 @@ pub enum UiEvent {
     /// The user submitted text.
     Submitted { text: String },
     /// The submission was queued because a turn was already running.
-    Queued { text: String, id: Option<String> },
+    Queued { text: String, id: Option<String>, images: Vec<coda_proto::messages::WireImage> },
     /// The engine atomically withdrew these entries before delivery.
     SteeringRecalled { message_ids: Vec<String> },
     /// Delivery is confirmed, but its user text is already in rehydrated history.
@@ -815,10 +823,12 @@ impl UiState {
     /// a claim that it was never sent — and the alternative is the only full
     /// copy of it existing nowhere at all.
     pub fn recall_unsent(&mut self) -> Option<String> {
-        self.unsent
-            .pop()
-            .or_else(|| self.delivered_local.pop())
-            .map(|m| m.text)
+        self.recall_unsent_message().map(|m| m.text)
+    }
+
+    /// [`Self::recall_unsent`], keeping the message's images with its text.
+    pub fn recall_unsent_message(&mut self) -> Option<QueuedMessage> {
+        self.unsent.pop().or_else(|| self.delivered_local.pop())
     }
 
     /// Closes whatever block is open, then appends any transcript inserts
@@ -1072,6 +1082,7 @@ impl UiState {
                 id: Some(id),
                 text,
                 queued_at: timestamp,
+                ..QueuedMessage::default()
             });
         }
         if kept > 0 {
@@ -1257,7 +1268,7 @@ impl UiState {
                 // would make the next snapshot look like a different turn.
                 self.turn_id = None;
             }
-            UiEvent::Queued { text, id } => {
+            UiEvent::Queued { text, id, images } => {
                 // Kept only here — never mirrored into the transcript as a
                 // pending bubble. The old behaviour pushed a pending `User`
                 // block immediately, which became the new tail and split
@@ -1268,6 +1279,8 @@ impl UiState {
                     id,
                     text,
                     queued_at: (self.clock)(),
+                    image_count: images.len(),
+                    images,
                 });
             }
             UiEvent::SteeringRecalled { message_ids }
@@ -2511,6 +2524,8 @@ impl UiState {
                 queued_at: local
                     .map(|l| l.queued_at.clone())
                     .unwrap_or_else(|| (self.clock)()),
+                images: local.map(|l| l.images.clone()).unwrap_or_default(),
+                image_count: entry.images.len().max(local.map_or(0, |l| l.images.len())),
             });
         }
 
@@ -3472,6 +3487,7 @@ mod tests {
         state.apply(UiEvent::Queued {
             text: "later".into(),
             id: Some("s1".into()),
+            images: Vec::new(),
         });
 
         assert_eq!(state.queued.len(), 1);
@@ -3488,6 +3504,7 @@ mod tests {
         state.apply(UiEvent::Queued {
             text: "later".into(),
             id: Some("s1".into()),
+            images: Vec::new(),
         });
         state.apply(UiEvent::Engine(Event::SteeringDelivered {
             message_ids: vec!["s1".into()],
@@ -3506,6 +3523,7 @@ mod tests {
         state.apply(UiEvent::Queued {
             text: "later".into(),
             id: Some("s1".into()),
+            images: Vec::new(),
         });
         state.apply(UiEvent::Engine(Event::SteeringDelivered {
             message_ids: vec!["s1".into()],
@@ -3532,6 +3550,7 @@ mod tests {
         state.apply(UiEvent::Queued {
             text: "steered".into(),
             id: Some("s1".into()),
+            images: Vec::new(),
         });
         // Delivered while the assistant block is still open.
         state.apply(UiEvent::Engine(Event::SteeringDelivered {
@@ -3815,6 +3834,7 @@ mod tests {
         state.apply(UiEvent::Queued {
             text: "later".into(),
             id: None,
+            images: Vec::new(),
         });
         state.apply(UiEvent::Cleared);
 
@@ -4187,7 +4207,7 @@ mod tests {
         state.apply(UiEvent::Submitted { text: "go".into() });
         state.apply(UiEvent::Engine(Event::AssistantText { delta: "a".into() }));
         for id in ["delivered", "recalled", "still-pending"] {
-            state.apply(UiEvent::Queued { text: id.into(), id: Some(id.into()) });
+            state.apply(UiEvent::Queued { text: id.into(), id: Some(id.into()), images: Vec::new() });
         }
         state.apply(UiEvent::Engine(Event::SteeringDelivered { message_ids: vec!["delivered".into()] }));
         state.apply(UiEvent::SteeringRecalled { message_ids: vec!["recalled".into()] });
@@ -4208,7 +4228,7 @@ mod tests {
         let mut state = state();
         for text in ["first unsent", "second unsent"] {
             state.apply(UiEvent::Submitted { text: "go".into() });
-            state.apply(UiEvent::Queued { text: text.into(), id: Some(text.into()) });
+            state.apply(UiEvent::Queued { text: text.into(), id: Some(text.into()), images: Vec::new() });
             state.apply(UiEvent::TurnFinished { interrupted: false, error: None });
         }
         assert_eq!(state.unsent.len(), 2);
@@ -4224,6 +4244,7 @@ mod tests {
         state.apply(UiEvent::Queued {
             text: "never delivered".into(),
             id: Some("s1".into()),
+            images: Vec::new(),
         });
         state.apply(UiEvent::Engine(Event::TurnComplete {
             stop_reason: Some("end_turn".into()),
@@ -4261,8 +4282,8 @@ mod tests {
     fn recall_unsent_pops_the_most_recent_message_first() {
         let mut state = state();
         state.unsent = vec![
-            QueuedMessage { id: None, text: "first".into(), queued_at: String::new() },
-            QueuedMessage { id: None, text: "second".into(), queued_at: String::new() },
+            QueuedMessage { id: None, text: "first".into(), queued_at: String::new(), ..Default::default() },
+            QueuedMessage { id: None, text: "second".into(), queued_at: String::new(), ..Default::default() },
         ];
         assert_eq!(state.recall_unsent().as_deref(), Some("second"));
         assert_eq!(state.recall_unsent().as_deref(), Some("first"));
@@ -4277,6 +4298,7 @@ mod tests {
             state.apply(UiEvent::Queued {
                 text: id.to_string(),
                 id: Some(id.to_string()),
+                images: Vec::new(),
             });
         }
 
@@ -4303,6 +4325,7 @@ mod tests {
         state.apply(UiEvent::Queued {
             text: "queued".into(),
             id: Some("s1".into()),
+            images: Vec::new(),
         });
         state.apply(UiEvent::Engine(Event::SteeringDelivered {
             message_ids: vec!["other".into()],
@@ -5458,10 +5481,54 @@ mod tests {
         }
 
         #[test]
+        fn a_reconnect_keeps_the_local_image_payload_and_counts_images_it_never_held() {
+            let mut state = state();
+            let png = coda_proto::messages::WireImage { media_type: "image/png".into(), base64: "AAAA".into() };
+            state.apply(UiEvent::Queued { text: "mine".into(), id: Some("m1".into()), images: vec![png.clone()] });
+
+            let meta = || coda_proto::state::SteeringImageMeta { media_type: "image/png".into(), byte_length: 4 };
+            let pending = |id: &str, text: &str, images| SteeringPendingDto {
+                message_id: id.into(),
+                enqueued_at: "now".into(),
+                text: text.into(),
+                text_length: text.len() as i64,
+                text_truncated: false,
+                images,
+            };
+            let mut snapshot = snapshot(EngineLifecycle::Busy);
+            snapshot.steering = SteeringQueueState {
+                pending_count: 2,
+                pending: vec![pending("m1", "mine", vec![meta()]), pending("m2", "theirs", vec![meta(), meta()])],
+                outcomes: Vec::new(),
+                outcomes_truncated: false,
+                retained_outcomes: 64,
+            };
+            state.apply(UiEvent::Snapshot(Box::new(snapshot)));
+
+            assert_eq!(state.queued[0].images, vec![png], "the accepted payload is never dropped by a resync");
+            assert_eq!(state.queued[0].image_count, 1);
+            assert!(state.queued[1].images.is_empty(), "status never carries image bytes");
+            assert_eq!(state.queued[1].image_count, 2);
+        }
+
+        #[test]
+        fn an_interrupted_turn_keeps_queued_images_recoverable_with_their_text() {
+            let mut state = state();
+            state.apply(UiEvent::Submitted { text: "go".into() });
+            let png = coda_proto::messages::WireImage { media_type: "image/png".into(), base64: "AAAA".into() };
+            state.apply(UiEvent::Queued { text: "look".into(), id: Some("m1".into()), images: vec![png.clone()] });
+            state.apply(UiEvent::TurnFinished { interrupted: true, error: None });
+
+            let recovered = state.recall_unsent_message().expect("recoverable");
+            assert_eq!(recovered.text, "look");
+            assert_eq!(recovered.images, vec![png]);
+        }
+
+        #[test]
         fn the_queue_comes_from_the_engine_and_keeps_the_users_own_full_text() {
             let mut state = state();
-            state.apply(UiEvent::Queued { text: "one".into(), id: Some("m1".into()) });
-            state.apply(UiEvent::Queued { text: "two".into(), id: Some("m2".into()) });
+            state.apply(UiEvent::Queued { text: "one".into(), id: Some("m1".into()), images: Vec::new() });
+            state.apply(UiEvent::Queued { text: "two".into(), id: Some("m2".into()), images: Vec::new() });
 
             // The engine says only m2 is still pending: m1 was delivered.
             let mut snapshot = snapshot(EngineLifecycle::Busy);
@@ -5473,6 +5540,7 @@ mod tests {
                     text: "two".into(),
                     text_length: 3,
                     text_truncated: false,
+                    images: Vec::new(),
                 }],
                 outcomes: Vec::new(),
                 outcomes_truncated: false,
@@ -5492,7 +5560,7 @@ mod tests {
             // back when they recall it.
             let mut state = state();
             let long = "x".repeat(200);
-            state.apply(UiEvent::Queued { text: long.clone(), id: Some("m1".into()) });
+            state.apply(UiEvent::Queued { text: long.clone(), id: Some("m1".into()), images: Vec::new() });
 
             let mut snapshot = snapshot(EngineLifecycle::Busy);
             snapshot.steering = SteeringQueueState {
@@ -5503,6 +5571,7 @@ mod tests {
                     text: "x".repeat(50),
                     text_length: 200,
                     text_truncated: true,
+                    images: Vec::new(),
                 }],
                 outcomes: Vec::new(),
                 outcomes_truncated: false,
@@ -5515,7 +5584,7 @@ mod tests {
         #[test]
         fn a_message_the_engine_has_not_acknowledged_yet_is_not_dropped() {
             let mut state = state();
-            state.apply(UiEvent::Queued { text: "in flight".into(), id: None });
+            state.apply(UiEvent::Queued { text: "in flight".into(), id: None, images: Vec::new() });
             state.apply(UiEvent::Snapshot(Box::new(snapshot(EngineLifecycle::Busy))));
             assert_eq!(state.queued.len(), 1);
             assert_eq!(state.queued[0].text, "in flight");
@@ -5526,7 +5595,7 @@ mod tests {
             // `unsent` is the user's own recoverable text. The engine has no
             // opinion about it and must not be able to erase it.
             let mut state = state();
-            state.apply(UiEvent::Queued { text: "lost".into(), id: Some("m1".into()) });
+            state.apply(UiEvent::Queued { text: "lost".into(), id: Some("m1".into()), images: Vec::new() });
             state.apply(UiEvent::TurnFinished { interrupted: true, error: None });
             assert_eq!(state.unsent.len(), 1);
 
@@ -5752,7 +5821,7 @@ mod tests {
         #[test]
         fn a_queued_message_the_engine_reports_as_delivered_is_not_kept_as_unsent() {
             let mut state = state();
-            state.apply(UiEvent::Queued { text: "one".into(), id: Some("m1".into()) });
+            state.apply(UiEvent::Queued { text: "one".into(), id: Some("m1".into()), images: Vec::new() });
 
             let mut snapshot = snapshot(EngineLifecycle::Busy);
             snapshot.steering = SteeringQueueState {
@@ -5777,6 +5846,7 @@ mod tests {
             state.apply(UiEvent::Queued {
                 text: "  the whole draft  ".into(),
                 id: Some("m1".into()),
+                images: Vec::new(),
             });
 
             let mut snapshot = snapshot(EngineLifecycle::Ready);
@@ -5803,7 +5873,7 @@ mod tests {
             // genuinely unknown. Claiming "not sent" would be a guess, and
             // resending it would be a guess with consequences.
             let mut state = state();
-            state.apply(UiEvent::Queued { text: "ambiguous".into(), id: Some("m1".into()) });
+            state.apply(UiEvent::Queued { text: "ambiguous".into(), id: Some("m1".into()), images: Vec::new() });
 
             let mut snapshot = snapshot(EngineLifecycle::Busy);
             snapshot.steering = SteeringQueueState {
@@ -5939,7 +6009,7 @@ mod tests {
             // rebuild of the conversation must therefore neither lose it nor
             // turn it into a bubble that the next rebuild would wipe.
             let mut state = state();
-            state.apply(UiEvent::Queued { text: "send this next".into(), id: Some("m1".into()) });
+            state.apply(UiEvent::Queued { text: "send this next".into(), id: Some("m1".into()), images: Vec::new() });
             assert_eq!(state.queued.len(), 1);
 
             state.apply(UiEvent::Rehydrated {

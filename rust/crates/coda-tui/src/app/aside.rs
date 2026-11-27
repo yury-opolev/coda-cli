@@ -139,7 +139,7 @@ impl App {
     pub(super) async fn promote_aside(&mut self, question: String) {
         self.surfaces.pop();
         if self.state.is_busy() {
-            self.steer(question).await;
+            self.steer(question, Vec::new()).await;
         } else {
             self.submit_programmatic(question).await;
         }

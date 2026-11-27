@@ -417,8 +417,8 @@ pub(crate) fn draw_with_layout(
 }
 
 fn draw_pending(frame: &mut Frame, area: Rect, state: &UiState, theme: &Theme) {
-    let entries: Vec<_> = state.queued.iter().map(|message| ("pending", &message.text))
-        .chain(state.unsent.iter().map(|message| ("recoverable", &message.text)))
+    let entries: Vec<_> = state.queued.iter().map(|message| ("pending", message))
+        .chain(state.unsent.iter().map(|message| ("recoverable", message)))
         .collect();
     let preview_count = if entries.len() > area.height as usize && area.height > 1 {
         area.height as usize - 1
@@ -426,9 +426,14 @@ fn draw_pending(frame: &mut Frame, area: Rect, state: &UiState, theme: &Theme) {
         area.height as usize
     };
     let mut lines: Vec<_> = entries.iter().take(preview_count).map(|(status, message)| {
-        let preview = text::sanitize(message).split_whitespace().collect::<Vec<_>>().join(" ");
+        let preview = text::sanitize(&message.text).split_whitespace().collect::<Vec<_>>().join(" ");
+        let label = match message.image_count {
+            0 => status.to_string(),
+            1 => format!("{status} · 1 image"),
+            n => format!("{status} · {n} images"),
+        };
         Line::from(Span::styled(
-            text::truncate_with_ellipsis(&format!("[{status}] {preview}"), area.width as usize),
+            text::truncate_with_ellipsis(&format!("[{label}] {preview}"), area.width as usize),
             theme.style(Role::PendingUser),
         ))
     }).collect();
@@ -1729,7 +1734,7 @@ mod tests {
     fn compose_activity_mentions_the_queue_once_something_is_queued() {
         let mut state = UiState::new();
         state.apply(crate::state::UiEvent::Submitted { text: "go".into() });
-        state.apply(crate::state::UiEvent::Queued { text: "later".into(), id: Some("s1".into()) });
+        state.apply(crate::state::UiEvent::Queued { text: "later".into(), id: Some("s1".into()), images: Vec::new() });
         let text = compose_activity(&state, Instant::now()).expect("busy");
         assert!(text.contains("1 queued"), "{text:?}");
     }

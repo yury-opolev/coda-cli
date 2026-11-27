@@ -624,6 +624,7 @@ fn the_status_bar_reports_queued_messages() {
     state.apply(UiEvent::Queued {
         text: "and then this".into(),
         id: Some("s1".into()),
+        images: Vec::new(),
     });
 
     let rows = render(&state, &Composer::new(), 80, 24);
@@ -632,6 +633,23 @@ fn the_status_bar_reports_queued_messages() {
         "status: {:?}",
         rows.last()
     );
+}
+
+#[test]
+fn a_queued_message_with_images_shows_their_count_and_markers() {
+    let mut state = session();
+    state.apply(UiEvent::Submitted { text: "go".into() });
+    let png = coda_proto::messages::WireImage { media_type: "image/png".into(), base64: "AAAA".into() };
+    state.apply(UiEvent::Queued {
+        text: "the failing screen [\u{1F4F7} coda-image-abc.png]".into(),
+        id: Some("s1".into()),
+        images: vec![png.clone(), png],
+    });
+
+    let rows = render(&state, &Composer::new(), 100, 24);
+    let pending = rows.iter().find(|r| r.contains("[pending")).expect("a pending row");
+    assert!(pending.contains("[pending · 2 images]"), "{pending:?}");
+    assert!(pending.contains("coda-image-abc.png"), "the marker stays recognisable: {pending:?}");
 }
 
 #[test]
@@ -1350,7 +1368,7 @@ fn a_long_silence_advances_the_pinned_elapsed_clock_then_late_thinking_changes_t
 fn the_pinned_row_names_the_queue_instead_of_a_transcript_bubble() {
     let mut state = session();
     state.apply(UiEvent::Submitted { text: "go".into() });
-    state.apply(UiEvent::Queued { text: "steer this in".into(), id: Some("s1".into()) });
+    state.apply(UiEvent::Queued { text: "steer this in".into(), id: Some("s1".into()), images: Vec::new() });
     let composer = Composer::new();
 
     let screen = draw_at(&state, &composer, 80, 24, false, std::time::Instant::now());
@@ -1377,7 +1395,7 @@ fn a_delayed_delivery_mid_stream_renders_as_one_assistant_block_then_the_deliver
     let mut state = session();
     state.apply(UiEvent::Submitted { text: "go".into() });
     state.apply(UiEvent::Engine(Event::AssistantText { delta: "a".into() }));
-    state.apply(UiEvent::Queued { text: "steered".into(), id: Some("s1".into()) });
+    state.apply(UiEvent::Queued { text: "steered".into(), id: Some("s1".into()), images: Vec::new() });
     state.apply(UiEvent::Engine(Event::SteeringDelivered { message_ids: vec!["s1".into()] }));
     state.apply(UiEvent::Engine(Event::AssistantText { delta: "b".into() }));
     state.apply(UiEvent::Engine(Event::TurnComplete {
@@ -1503,7 +1521,7 @@ fn pending_text_is_visible_without_splitting_streaming_reply() {
     let mut state = session();
     state.apply(UiEvent::Submitted { text: "question".into() });
     state.apply(UiEvent::Engine(Event::AssistantText { delta: "first ".into() }));
-    state.apply(UiEvent::Queued { text: "please adjust the title".into(), id: Some("q1".into()) });
+    state.apply(UiEvent::Queued { text: "please adjust the title".into(), id: Some("q1".into()), images: Vec::new() });
     state.apply(UiEvent::Engine(Event::AssistantText { delta: "second".into() }));
     let screen = render(&state, &Composer::new(), 80, 24);
     assert!(screen.iter().any(|line| line.contains("[pending] please adjust the title")), "{}", screen.join("\n"));
@@ -1529,6 +1547,7 @@ fn pending_queue_sits_below_activity_with_one_blank_line_above_and_below() {
                 state.apply(UiEvent::Queued {
                     text: format!("follow up {index}"),
                     id: Some(format!("q{index}")),
+                    images: Vec::new(),
                 });
             }
             let screen = render(&state, &Composer::new(), 80, 24);
@@ -1551,7 +1570,7 @@ fn pending_queue_sits_below_activity_with_one_blank_line_above_and_below() {
 fn recovery_previews_do_not_claim_an_unknown_delivery_was_not_sent() {
     let mut state = session();
     state.apply(UiEvent::Submitted { text: "question".into() });
-    state.apply(UiEvent::Queued { text: "recover this".into(), id: Some("q1".into()) });
+    state.apply(UiEvent::Queued { text: "recover this".into(), id: Some("q1".into()), images: Vec::new() });
     state.apply(UiEvent::TurnFinished { interrupted: true, error: None });
     let screen = render(&state, &Composer::new(), 80, 24);
     assert!(screen.iter().any(|line| line.contains("[recoverable] recover this")));
@@ -1565,6 +1584,7 @@ fn pending_previews_are_bounded_and_keep_activity_visible() {
         state.apply(UiEvent::Queued {
             text: format!("message {n}\nwith a second line and 日本語"),
             id: Some(format!("q{n}")),
+            images: Vec::new(),
         });
     }
     let screen = render(&state, &Composer::new(), 80, 24);

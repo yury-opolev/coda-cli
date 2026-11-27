@@ -107,7 +107,7 @@ fn mid_turn() -> UiState {
     let mut state = UiState::new();
     state.apply(UiEvent::Submitted { text: "start".into() });
     state.apply(UiEvent::Engine(Event::AssistantText { delta: "answer".into() }));
-    state.apply(UiEvent::Queued { text: FOLLOW_UP.into(), id: Some("queued-1".into()) });
+    state.apply(UiEvent::Queued { text: FOLLOW_UP.into(), id: Some("queued-1".into()), images: Vec::new() });
     state
 }
 
@@ -252,8 +252,8 @@ fn two_identical_follow_ups_are_two_messages() {
     let mut state = UiState::new();
     state.apply(UiEvent::Submitted { text: "start".into() });
     state.apply(UiEvent::Engine(Event::AssistantText { delta: "answer".into() }));
-    state.apply(UiEvent::Queued { text: FOLLOW_UP.into(), id: Some("queued-1".into()) });
-    state.apply(UiEvent::Queued { text: FOLLOW_UP.into(), id: Some("queued-2".into()) });
+    state.apply(UiEvent::Queued { text: FOLLOW_UP.into(), id: Some("queued-1".into()), images: Vec::new() });
+    state.apply(UiEvent::Queued { text: FOLLOW_UP.into(), id: Some("queued-2".into()), images: Vec::new() });
 
     let steering = SteeringQueueState {
         outcomes: vec![delivered("queued-1"), delivered("queued-2")],
@@ -289,7 +289,7 @@ fn the_local_copy_is_shown_even_when_the_engines_preview_was_truncated() {
     let long = format!("{FOLLOW_UP} {}", "and more ".repeat(16));
     let mut state = UiState::new();
     state.apply(UiEvent::Submitted { text: "start".into() });
-    state.apply(UiEvent::Queued { text: long.clone(), id: Some("queued-1".into()) });
+    state.apply(UiEvent::Queued { text: long.clone(), id: Some("queued-1".into()), images: Vec::new() });
 
     let steering = SteeringQueueState {
         pending: vec![SteeringPendingDto {
@@ -298,6 +298,7 @@ fn the_local_copy_is_shown_even_when_the_engines_preview_was_truncated() {
             text: FOLLOW_UP.into(),
             text_length: long.len() as i64,
             text_truncated: true,
+            images: Vec::new(),
         }],
         pending_count: 1,
         ..Default::default()
@@ -497,8 +498,8 @@ fn one_identical_message_already_committed_and_one_just_delivered_are_two_messag
     let mut state = UiState::new();
     state.apply(UiEvent::Submitted { text: "start".into() });
     state.apply(UiEvent::Engine(Event::AssistantText { delta: "answer".into() }));
-    state.apply(UiEvent::Queued { text: FOLLOW_UP.into(), id: Some("queued-1".into()) });
-    state.apply(UiEvent::Queued { text: FOLLOW_UP.into(), id: Some("queued-2".into()) });
+    state.apply(UiEvent::Queued { text: FOLLOW_UP.into(), id: Some("queued-1".into()), images: Vec::new() });
+    state.apply(UiEvent::Queued { text: FOLLOW_UP.into(), id: Some("queued-2".into()), images: Vec::new() });
     state.apply(UiEvent::TurnFinished { interrupted: false, error: None });
     state.apply(UiEvent::Rehydrated {
         blocks: committed_conversation(),
@@ -659,7 +660,7 @@ fn a_previous_turns_late_confirmation_is_placed_honestly_rather_than_silently() 
     let mut state = UiState::with_clock(ticking);
     state.apply(UiEvent::Submitted { text: "start".into() });
     state.apply(UiEvent::Engine(Event::AssistantText { delta: "answer".into() }));
-    state.apply(UiEvent::Queued { text: FOLLOW_UP.into(), id: Some("queued-1".into()) });
+    state.apply(UiEvent::Queued { text: FOLLOW_UP.into(), id: Some("queued-1".into()), images: Vec::new() });
     let sent_at = state.queued[0].queued_at.clone();
     state.apply(UiEvent::TurnFinished { interrupted: false, error: None });
     assert_eq!(state.unsent.len(), 1, "with no news, an unsent message is kept recoverable");
@@ -747,7 +748,7 @@ fn a_delivered_message_the_live_view_had_no_room_for_survives_a_rebuild() {
     let mut state = UiState::new();
     state.apply(UiEvent::Submitted { text: "start".into() });
     state.apply(UiEvent::Engine(Event::AssistantText { delta: "answer".into() }));
-    state.apply(UiEvent::Queued { text: long.clone(), id: Some("queued-1".into()) });
+    state.apply(UiEvent::Queued { text: long.clone(), id: Some("queued-1".into()), images: Vec::new() });
     // Reported delivered while the reply is still streaming, so the message
     // waits behind the open block rather than splitting it.
     state.apply(UiEvent::Snapshot(Box::new(delivery_snapshot())));
@@ -887,6 +888,7 @@ fn pending_dto(id: &str) -> SteeringPendingDto {
         text: batch_text(id),
         text_length: batch_text(id).len() as i64,
         text_truncated: false,
+        images: Vec::new(),
     }
 }
 
@@ -921,7 +923,7 @@ fn a_whole_queue_of_follow_ups_survives_being_delivered_in_waves() {
     state.apply(UiEvent::Submitted { text: "start".into() });
     state.apply(UiEvent::Engine(Event::AssistantText { delta: "answer".into() }));
     for id in &ids {
-        state.apply(UiEvent::Queued { text: batch_text(id), id: Some(id.clone()) });
+        state.apply(UiEvent::Queued { text: batch_text(id), id: Some(id.clone()), images: Vec::new() });
     }
     assert_eq!(state.queued.len(), ids.len(), "the engine acknowledged every one of them");
 
@@ -999,7 +1001,7 @@ fn a_committed_queue_is_not_re_appended_when_the_conversation_is_rebuilt() {
     let mut state = UiState::new();
     state.apply(UiEvent::Submitted { text: "start".into() });
     for id in &ids {
-        state.apply(UiEvent::Queued { text: batch_text(id), id: Some(id.clone()) });
+        state.apply(UiEvent::Queued { text: batch_text(id), id: Some(id.clone()), images: Vec::new() });
     }
     // The turn ends before any delivery news at all: every one of them is
     // stranded in the recovery list.
@@ -1058,7 +1060,7 @@ fn a_queue_the_engine_stopped_explaining_is_kept_recoverable_rather_than_claimed
     let mut state = UiState::new();
     state.apply(UiEvent::Submitted { text: "start".into() });
     for id in &ids {
-        state.apply(UiEvent::Queued { text: batch_text(id), id: Some(id.clone()) });
+        state.apply(UiEvent::Queued { text: batch_text(id), id: Some(id.clone()), images: Vec::new() });
     }
 
     // The engine holds none of them any more and reports outcomes for only
@@ -1129,7 +1131,7 @@ fn a_delivery_parked_behind_a_reasoning_burst_lands_when_the_burst_ends() {
     let mut state = UiState::new();
     state.apply(UiEvent::Submitted { text: "start".into() });
     state.apply(UiEvent::Engine(Event::Thinking { delta: "weighing it up".into() }));
-    state.apply(UiEvent::Queued { text: FOLLOW_UP.into(), id: Some("queued-1".into()) });
+    state.apply(UiEvent::Queued { text: FOLLOW_UP.into(), id: Some("queued-1".into()), images: Vec::new() });
     state.apply(UiEvent::Snapshot(Box::new(delivery_snapshot())));
     assert_eq!(visible(&state, FOLLOW_UP), 0, "it waits rather than cutting the burst in half");
 
@@ -1151,7 +1153,7 @@ fn a_whole_queue_delivered_mid_reply_appears_the_moment_the_reply_ends() {
     state.apply(UiEvent::Submitted { text: "start".into() });
     state.apply(UiEvent::Engine(Event::AssistantText { delta: "answer".into() }));
     for id in &ids {
-        state.apply(UiEvent::Queued { text: batch_text(id), id: Some(id.clone()) });
+        state.apply(UiEvent::Queued { text: batch_text(id), id: Some(id.clone()), images: Vec::new() });
     }
     state.apply(UiEvent::Engine(Event::SteeringDelivered { message_ids: ids.clone() }));
     assert!(state.queued.is_empty(), "the engine delivered all of them");

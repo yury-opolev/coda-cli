@@ -5141,7 +5141,7 @@ pub(in crate::app) mod tests {
     async fn history_fence_acknowledges_delivery_without_duplicating_user_text() {
         let mut harness = app_with(crate::local::AccessMode::TrustedLocal, |_, _| json!({}));
         let app = &mut harness.app;
-        app.apply(UiEvent::Queued { text: "already delivered".into(), id: Some("queued-1".into()) });
+        app.apply(UiEvent::Queued { text: "already delivered".into(), id: Some("queued-1".into()), images: Vec::new() });
         app.apply(UiEvent::Rehydrated {
             blocks: vec![Block::User {
                 text: "already delivered".into(),
@@ -5183,6 +5183,7 @@ pub(in crate::app) mod tests {
         app.apply(UiEvent::Queued {
             text: "already delivered".into(),
             id: Some("queued-1".into()),
+            images: Vec::new(),
         });
         app.apply(UiEvent::TurnFinished { interrupted: false, error: None });
         assert_eq!(app.state.unsent.len(), 1, "with no news, it is kept recoverable");
@@ -5442,7 +5443,7 @@ pub(in crate::app) mod tests {
         // engine acknowledged it into its queue.
         app.apply(UiEvent::Submitted { text: "start".into() });
         app.apply(UiEvent::Engine(coda_proto::Event::AssistantText { delta: "answer".into() }));
-        app.apply(UiEvent::Queued { text: FOLLOW_UP.into(), id: Some("m1".into()) });
+        app.apply(UiEvent::Queued { text: FOLLOW_UP.into(), id: Some("m1".into()), images: Vec::new() });
 
         // The engine's events 5..9 never arrived — `event/steeringDelivered`
         // was among them — so the notification is simply gone.
@@ -5551,6 +5552,7 @@ pub(in crate::app) mod tests {
         app.apply(UiEvent::Queued {
             text: "operator correction".into(),
             id: Some("q1".into()),
+            images: Vec::new(),
         });
 
         // The engine announces that its queue moved; this client re-reads.
@@ -5746,7 +5748,7 @@ pub(in crate::app) mod tests {
             delta: "half a reply".into(),
         }));
         for id in &ids {
-            app.apply(UiEvent::Queued { text: queue_text(id), id: Some(id.clone()) });
+            app.apply(UiEvent::Queued { text: queue_text(id), id: Some(id.clone()), images: Vec::new() });
         }
         assert_eq!(app.state.queued.len(), ids.len(), "every one was acknowledged");
 
@@ -6858,10 +6860,10 @@ pub(in crate::app) mod tests {
         let mut harness = silent_engine();
         harness
             .app
-            .apply(UiEvent::Queued { text: "queued".into(), id: Some("m1".into()) });
+            .apply(UiEvent::Queued { text: "queued".into(), id: Some("m1".into()), images: Vec::new() });
         harness.app.set_engine_connected(false);
 
-        within("steering after a logout", harness.app.steer("my draft".into())).await;
+        within("steering after a logout", harness.app.steer("my draft".into(), Vec::new())).await;
         assert_eq!(harness.app.composer.text(), "my draft", "the draft was lost");
 
         harness.app.composer.set_text("");

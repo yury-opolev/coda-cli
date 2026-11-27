@@ -278,9 +278,9 @@ impl App {
         if !self.composer.is_empty() {
             return false;
         }
-        match self.state.recall_unsent() {
-            Some(text) => {
-                self.composer.set_text(text);
+        match self.state.recall_unsent_message() {
+            Some(message) => {
+                self.restore_draft(message.text, message.images);
                 true
             }
             None => false,
