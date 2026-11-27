@@ -14,6 +14,7 @@ pub use coda_proto::requests::{
     HooksInfoParams, HooksTrustParams, ForkParams, RewindParams, TaskIdParams, TaskSendParams, AskAsideParams,
     PrepareRestartParams,
 };
+pub use coda_proto::mcp::McpAuthParams;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Error
@@ -102,6 +103,10 @@ impl RpcError {
     /// New work refused because the engine is draining for a planned restart.
     pub fn restart_pending() -> Self {
         Self { code: error_code::RESTART_PENDING, message: "restart pending".to_owned() }
+    }
+    /// An MCP action on an engine that has no MCP manager.
+    pub fn mcp_not_running() -> Self {
+        Self { code: -32600, message: "MCP is not running in this engine".to_owned() }
     }
 }
 
@@ -491,6 +496,10 @@ pub trait ServeBackend: Send + Sync {
     async fn config_set(&self, p: ConfigSetParams) -> Result<Value, RpcError>;
     /// Read-only, secret-free MCP inventory. Valid before `initialize`.
     async fn mcp_list(&self) -> Result<Value, RpcError>;
+    /// Sign in to or out of an HTTP MCP server. Requires initialization.
+    /// A failed action is `ok: false` with a message; only a missing MCP
+    /// manager is an RPC error.
+    async fn mcp_auth(&self, p: McpAuthParams) -> Result<Value, RpcError>;
     /// Non-destructive recovery of engine-owned user notifications (Stage 2
     /// `notify_user`). Public and valid before `initialize` (§ same
     /// discovery rationale as `session/getHistory`/`session/listSessions`).
@@ -677,6 +686,7 @@ pub async fn dispatch(
             backend.session_list_tasks(p).await
         }
         "mcp/list" => backend.mcp_list().await,
+        "mcp/auth" => backend.mcp_auth(required(params)?).await,
         "session/pendingMessages" => {
             let mut p: PendingMessagesParams = optional_strict(params)?;
             p.normalise()?;
@@ -867,6 +877,9 @@ mod tests {
         async fn mcp_list(&self) -> Result<Value, RpcError> {
             Ok(json!({ "servers": [], "enabled": true, "managerAvailable": false }))
         }
+        async fn mcp_auth(&self, p: McpAuthParams) -> Result<Value, RpcError> {
+            Ok(json!({ "ok": true, "message": format!("{:?} {}", p.action, p.server) }))
+        }
         async fn session_list_tasks(&self, _p: ListTasksParams) -> Result<Value, RpcError> {
             Ok(json!({"sessionId": "test", "tasks": []}))
         }
@@ -1047,6 +1060,9 @@ mod tests {
         }
         async fn mcp_list(&self) -> Result<Value, RpcError> {
             self.0.mcp_list().await
+        }
+        async fn mcp_auth(&self, p: McpAuthParams) -> Result<Value, RpcError> {
+            self.0.mcp_auth(p).await
         }
         async fn session_list_tasks(&self, p: ListTasksParams) -> Result<Value, RpcError> {
             self.0.session_list_tasks(p).await
@@ -1286,10 +1302,26 @@ mod tests {
     async fn an_initialized_backend_passes_the_gate() {
         for method in INITIALIZATION_GATED_METHODS {
             let result =
-                dispatch(method, Some(json!({ "requestId": "req-x-1", "key": "model", "taskId": "task-0001", "text": "hi", "question": "q" })), &FakeBackend)
+                dispatch(method, Some(json!({ "requestId": "req-x-1", "key": "model", "taskId": "task-0001", "text": "hi", "question": "q", "server": "s", "action": "login" })), &FakeBackend)
                     .await;
             assert!(result.is_ok(), "{method} must be routed once initialized: {result:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn dispatches_mcp_auth_with_required_params() {
+        let r = dispatch("mcp/auth", Some(json!({ "server": "docs", "action": "logout" })), &FakeBackend)
+            .await
+            .unwrap();
+        assert_eq!(r["message"], "Logout docs");
+        for params in [None, Some(json!({ "server": "docs" })), Some(json!({ "server": "docs", "action": "nope" }))] {
+            let err = dispatch("mcp/auth", params.clone(), &FakeBackend).await.unwrap_err();
+            assert_eq!(err.code, -32602, "{params:?}");
+        }
+        let err = dispatch("mcp/auth", Some(json!({ "server": "docs", "action": "login" })), &UninitialisedBackend(FakeBackend))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, coda_proto::messages::error_code::NOT_INITIALIZED);
     }
 
     #[tokio::test]
@@ -1826,6 +1858,9 @@ mod tests {
             Err(RpcError { code: self.0, message: self.1.into() })
         }
         async fn mcp_list(&self) -> Result<Value, RpcError> {
+            Err(RpcError { code: self.0, message: self.1.into() })
+        }
+        async fn mcp_auth(&self, _p: McpAuthParams) -> Result<Value, RpcError> {
             Err(RpcError { code: self.0, message: self.1.into() })
         }
         async fn session_list_tasks(&self, _p: ListTasksParams) -> Result<Value, RpcError> {

@@ -1405,6 +1405,7 @@ mod tests {
                 env_var_names: vec!["TOKEN_NAME".into()],
                 secret_refs: vec![McpSecretRefDto { name: "TOKEN_NAME".into(), resolved: None }],
                                 last_error: None,
+                                auth: None,
                             }],
                         };
 
@@ -1447,6 +1448,7 @@ mod tests {
             env_var_names: Vec::new(),
             secret_refs: Vec::new(),
             last_error: last_error.map(str::to_string),
+            auth: None,
         };
         let result = McpListResult {
             enabled: true,

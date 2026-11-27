@@ -202,6 +202,7 @@ An engine without `steering.images` ignores unknown fields, so a client must not
 | `config/describe` | `{}` | `{ entries: ConfigEntry[] }` |
 | `config/set` | `{ key, value }` | `{ ok, key, appliedAt, effective?, error? }` |
 | `mcp/list` | `{}` | `{ servers: McpServer[], enabled, managerAvailable }` |
+| `mcp/auth` | `{ server, action: "login" \| "logout" }` | `{ ok, message }` |
 | `session/import` | `{ path }` | `{ ok, sessionId }` |
 | `session/backgroundAll` | `{}` | `{ ok, count }` |
 | `session/stopAllTasks` | `{}` | `{ ok, count }` |
@@ -219,7 +220,7 @@ An engine without `steering.images` ignores unknown fields, so a client must not
 `session/resolveRequest`, `session/cancelRequest`, `config/set`, the nine task controls
 (`session/backgroundAll`, `session/stopAllTasks`, `task/background`, `task/stop`, `task/send`,
 `task/suspend`, `task/resume`, `session/suspendAllTasks`, `session/resumeAllTasks`),
-`session/askAside` and `session/prepareRestart` require a completed
+`session/askAside`, `session/prepareRestart` and `mcp/auth` require a completed
 `initialize` and otherwise return `-32011`. Read-only discovery — `session/listSessions`,
 `session/listTasks`, `config/describe`, `mcp/list`, `session/getState`, `session/getEvents` — is valid **before**
 `initialize`, so a client can choose a session before resuming one. Every route that shipped
@@ -430,7 +431,20 @@ absence means "this call did not determine it". Reporting `false` would assert a
 reference does not resolve, which is a different — and unverified — claim. Only a fact the
 engine already holds may ever populate it; a read must not probe an auth store or wake a keyring
 prompt to find out. `lastError` is optional: the sanitised last connection error for an enabled
-server that is not connected; restart it via the agent's `restart_mcp_server` tool.
+server that is not connected; restart it via the agent's `restart_mcp_server` tool. `auth` is
+optional: for an HTTP server the manager holds an auth provider for, `{ mode, account?,
+expiresAtUnix?, lastError? }` (`mode` is `none`/`bearer`/`oauth`/`entra-broker`, `lastError`
+sanitised) — never a token.
+
+**`mcp/auth` signs in or out.** `{ server, action }` with `action` `login` or `logout`.
+Login runs the browser OAuth flow for `oauth` servers and the Windows account broker (silent,
+then interactive) for `entra-broker`; a server that was not connected is restarted afterwards
+and the message says how that went. Logout removes the stored token (`oauth`) or drops the
+cached token and pauses automatic sign-in until the next login (`entra-broker`; the Windows
+account itself stays signed in). Unknown servers, stdio servers, `none`/`bearer` servers and
+failed sign-ins answer `ok: false` with an actionable `message`; an engine without an MCP
+manager answers `-32600` "MCP is not running in this engine". Login may take minutes (it waits
+for the user), so clients should use a long request timeout.
 
 **`config/describe` names the authority for open value sets.** Where the accepted values are
 provider- or model-dependent, the entry carries `allowedValuesFrom` — the RPC that owns the live

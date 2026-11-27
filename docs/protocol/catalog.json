@@ -383,6 +383,15 @@
       "availability": "reusable"
     },
     {
+      "method": "mcp/auth",
+      "paramsSchema": "schemas/McpAuthParams.json",
+      "resultSchema": "schemas/McpAuthActionResult.json",
+      "paramsContract": "sharedParser",
+      "resultContract": "sharedServerDto",
+      "requiresInitialize": true,
+      "availability": "reusable"
+    },
+    {
       "method": "session/pendingMessages",
       "paramsSchema": "schemas/PendingMessagesParams.json",
       "resultSchema": "schemas/PendingMessagesResult.json",

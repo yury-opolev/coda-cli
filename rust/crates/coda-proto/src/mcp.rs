@@ -104,6 +104,59 @@ pub struct McpServerDto {
     /// connected. Never a secret.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// Auth state of an HTTP server the running manager holds a provider
+    /// for. Never a token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<McpAuthStatusDto>,
+}
+
+/// Secret-free auth state of one HTTP server.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct McpAuthStatusDto {
+    /// `"none" | "bearer" | "oauth" | "entra-broker"`.
+    pub mode: String,
+    /// Signed-in account name, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// Expiry of the current access token (Unix seconds), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix: Option<i64>,
+    /// Sanitised most recent auth failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+/// `mcp/auth` action.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub enum McpAuthAction {
+    /// Sign in: the browser flow for `oauth`, the OS account broker for
+    /// `entra-broker`. A server that is not connected is restarted after a
+    /// successful sign-in.
+    Login,
+    /// Sign out: forget the stored or cached token.
+    Logout,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct McpAuthParams {
+    /// Configured server name.
+    pub server: String,
+    pub action: McpAuthAction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct McpAuthActionResult {
+    pub ok: bool,
+    /// User-facing outcome (or failure reason with a next step).
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -185,14 +238,21 @@ mod tests {
             tool_count: Some(4),
             env_var_names: vec!["API_TOKEN".into()],
             secret_refs: vec![McpSecretRefDto { name: "API_TOKEN".into(), resolved: Some(true) }],
-                        last_error: Some("connection refused".into()),
-                    };
+            last_error: Some("connection refused".into()),
+            auth: Some(McpAuthStatusDto {
+                mode: "oauth".into(),
+                account: None,
+                expires_at_unix: None,
+                last_error: None,
+            }),
+        };
         let v = serde_json::to_value(&dto).unwrap();
         let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
         keys.sort_unstable();
         assert_eq!(
             keys,
             vec![
+                "auth",
                 "configured",
                 "envVarNames",
                 "lastError",
@@ -225,10 +285,34 @@ mod tests {
             env_var_names: Vec::new(),
             secret_refs: Vec::new(),
             last_error: None,
+            auth: None,
         };
         let v = serde_json::to_value(&dto).unwrap();
         assert!(v.get("toolCount").is_none());
         assert!(v.get("lastError").is_none());
+        assert!(v.get("auth").is_none());
         assert_eq!(v["runtimeStatus"], "notAttempted");
+    }
+
+    #[test]
+    fn the_auth_status_never_grows_a_token_field() {
+        let dto = McpAuthStatusDto {
+            mode: "entra-broker".into(),
+            account: Some("user@contoso.com".into()),
+            expires_at_unix: Some(1_700_000_000),
+            last_error: Some("interaction required".into()),
+        };
+        let v = serde_json::to_value(&dto).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["account", "expiresAtUnix", "lastError", "mode"]);
+    }
+
+    #[test]
+    fn auth_params_use_camel_case_actions() {
+        let params: McpAuthParams =
+            serde_json::from_value(serde_json::json!({ "server": "docs", "action": "logout" })).unwrap();
+        assert_eq!(params, McpAuthParams { server: "docs".into(), action: McpAuthAction::Logout });
+        assert_eq!(serde_json::to_value(McpAuthAction::Login).unwrap(), "login");
     }
 }

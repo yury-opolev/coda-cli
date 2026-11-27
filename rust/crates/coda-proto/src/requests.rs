@@ -24,6 +24,7 @@ pub const INITIALIZATION_GATED_METHODS: &[&str] = &[
     crate::messages::method::TASK_RESUME,
     crate::messages::method::SUSPEND_ALL_TASKS,
     crate::messages::method::RESUME_ALL_TASKS,
+    crate::messages::method::MCP_AUTH,
 ];
 
 /// Which tasks `session/listTasks` (and the model's `task_list`) return.

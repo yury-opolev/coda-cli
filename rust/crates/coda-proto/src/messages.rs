@@ -85,6 +85,8 @@ pub mod method {
     pub const CONFIG_SET: &str = "config/set";
     /// Read-only, secret-free MCP server inventory.
     pub const MCP_LIST: &str = "mcp/list";
+    /// Sign in to or out of an HTTP MCP server (`McpAuthParams`).
+    pub const MCP_AUTH: &str = "mcp/auth";
     /// Non-destructive recovery of engine-owned user notifications
     /// (Stage 2 `notify_user`), paged by the bus's own cursor — distinct
     /// from the `EventBus` seq used by `session/getEvents`. Public and

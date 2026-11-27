@@ -64,6 +64,7 @@ might infer from its name. Unsupported operations are listed separately.
 | `config/describe` | Reusable | Describe ownership, mutability, applicability and safe effective values. Available before initialize. |
 | `config/set` | Reusable | Delegate supported session settings to their validated setters. Refuse startup-only, file-owned and client-local settings. |
 | `mcp/list` | Reusable | Read-only, secret-free configuration/runtime inventory on the engine host. Available before initialize. |
+| `mcp/auth` | Reusable | Sign in to (`login`) or out of (`logout`) an HTTP MCP server on the engine host: browser OAuth for `oauth`, the Windows account broker for `entra-broker`. A failed action is `ok: false` with a message; an engine without MCP returns an error. Requires initialize. |
 | `session/scheduleList` | Reusable | List this engine's scheduled-task definitions; not fleet inventory. Reports live `state`, `runsStarted`, configured bounds and any retirement reason. |
 | `session/scheduleCreate` | Reusable | Create a scheduled-task definition in the engine's scope. Accepts the optional `maxRuns` / `expiresAt` / `expiresIn` bounds only when `schedules.bounds` is advertised. |
 | `session/scheduleDelete` | Reusable | Delete a scheduled-task definition in the engine's scope. Stops future runs; does not interrupt a run already executing. |

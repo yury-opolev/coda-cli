@@ -71,7 +71,7 @@ use crate::dispatch::{
     ServeBackend, SetEffortParams, SetGoalParams, SetModelParams, SetPermissionModeParams,
     SetSystemPromptParams, SteerParams,
 };
-use crate::dispatch::AdjustEffortParams;
+use crate::dispatch::{AdjustEffortParams, McpAuthParams};
 use crate::prompts::{ImageAwareQuestion, PromptChannel, WirePermissionPrompt, WirePlanApprover, WireUserQuestion};
 use crate::mcp::McpBundle;
 use crate::session::Session;
@@ -5606,6 +5606,24 @@ impl ServeBackend for ServeHost {
         serde_json::to_value(&result).map_err(|e| RpcError::internal(e.to_string()))
     }
 
+    /// `/mcp login|logout`. An unknown server or a failed sign-in is
+    /// `ok: false` with the manager's message.
+    async fn mcp_auth(&self, p: McpAuthParams) -> Result<Value, RpcError> {
+        use coda_proto::mcp::{McpAuthAction, McpAuthActionResult};
+        let Some(manager) = &self.mcp_manager else {
+            return Err(RpcError::mcp_not_running());
+        };
+        let outcome = match p.action {
+            McpAuthAction::Login => manager.auth_login(&p.server).await,
+            McpAuthAction::Logout => manager.auth_logout(&p.server).await,
+        };
+        let result = match outcome {
+            Ok(message) => McpAuthActionResult { ok: true, message },
+            Err(message) => McpAuthActionResult { ok: false, message },
+        };
+        serde_json::to_value(&result).map_err(|e| RpcError::internal(e.to_string()))
+    }
+
     /// Non-blocking runtime: stop waiting on every foreground task. The
     /// agent loop that was waiting gets a task handle; the work continues.
     async fn session_background_all(&self) -> Result<Value, RpcError> {
@@ -6107,9 +6125,10 @@ impl ServeHost {
             Some(manager) => {
                 let status = manager.connected_status().await;
                 let faults = manager.server_faults().await;
-                crate::mcp_list::build(&configured, Some(&status), &faults, enabled)
+                let auth = manager.auth_status().await;
+                crate::mcp_list::build(&configured, Some(&status), &faults, &auth, enabled)
             }
-            None => crate::mcp_list::build(&configured, None, &[], enabled),
+            None => crate::mcp_list::build(&configured, None, &[], &[], enabled),
         }
     }
 

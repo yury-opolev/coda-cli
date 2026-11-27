@@ -563,6 +563,13 @@ async fn mcp_list_is_honest_when_mcp_is_disabled() {
     let text = serde_json::to_string(&listed).expect("serialisable");
     assert!(!text.contains("MUST-NOT-LEAK"), "SECURITY: {text}");
     assert!(!text.contains("mcp/fs/token"), "SECURITY: {text}");
+
+    // Without a manager there is nothing to sign in to: an error, not a fake outcome.
+    let error = connection
+        .request(method::MCP_AUTH, Some(json!({ "server": "fs", "action": "login" })))
+        .await
+        .expect_err("mcp/auth needs a running MCP manager");
+    assert!(error.to_string().contains("MCP is not running in this engine"), "{error}");
 }
 
 /// With MCP enabled but no manager (the servers all failed / none started),
@@ -623,6 +630,8 @@ async fn mcp_list_describes_configured_servers_without_secrets() {
     assert_eq!(remote["transport"], "http");
     assert_eq!(remote["targetKind"], "url");
     assert_eq!(remote["targetDisplay"], "https://mcp.example.com/sse");
+    // The failed server keeps its (default oauth) auth provider, so its state is reported.
+    assert_eq!(remote["auth"]["mode"], "oauth", "{remote}");
 
     let off = servers.iter().find(|s| s["name"] == "off").expect("disabled server listed");
     assert_eq!(off["configured"], "disabled");
@@ -634,6 +643,22 @@ async fn mcp_list_describes_configured_servers_without_secrets() {
         "names are published, values are not"
     );
     assert_eq!(off["envVarNames"][0], "SECRET_ENV");
+
+    // An action that cannot be carried out is `ok: false` with a reason.
+    let outcome = connection
+        .request(method::MCP_AUTH, Some(json!({ "server": "nope", "action": "logout" })))
+        .await
+        .expect("mcp/auth answers");
+    assert_eq!(outcome["ok"], false);
+    assert!(
+        outcome["message"].as_str().is_some_and(|m| m.contains("unknown MCP server 'nope'")),
+        "{outcome}"
+    );
+    let invalid = connection
+        .request(method::MCP_AUTH, Some(json!({ "server": "remote", "action": "reboot" })))
+        .await
+        .expect_err("an unknown action is invalid params");
+    assert!(invalid.to_string().contains("unknown variant"), "{invalid}");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

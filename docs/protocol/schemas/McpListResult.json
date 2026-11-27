@@ -79,6 +79,17 @@
             "null"
           ],
           "description": "Sanitised last connection error of a configured server that is not\nconnected. Never a secret."
+        },
+        "auth": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpAuthStatusDto"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Auth state of an HTTP server the running manager holds a provider\nfor. Never a token."
         }
       },
       "required": [
@@ -153,6 +164,41 @@
         "name"
       ],
       "description": "A named reference to a stored secret, and whether it resolved.\n\n`name` is the *variable or header name* the reference is bound to. The\nstorage target (`coda-secret:<target>`) is deliberately absent: it names a\nkeyring entry, which is a credential locator, not a label.\n\n`resolved` is a **tri-state**. `None` (the field omitted) means \"this call\ndid not determine it\", which is the honest answer for any read that must\nnot touch the credential store — and is emphatically not the same claim as\n`false` (\"this reference does not resolve\"). Set it only from a fact the\nengine already holds, never by probing during a read."
+    },
+    "McpAuthStatusDto": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "description": "`\"none\" | \"bearer\" | \"oauth\" | \"entra-broker\"`."
+        },
+        "account": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Signed-in account name, when known."
+        },
+        "expiresAtUnix": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "description": "Expiry of the current access token (Unix seconds), when known."
+        },
+        "lastError": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Sanitised most recent auth failure."
+        }
+      },
+      "required": [
+        "mode"
+      ],
+      "description": "Secret-free auth state of one HTTP server."
     }
   }
 }
