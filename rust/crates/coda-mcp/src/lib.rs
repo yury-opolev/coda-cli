@@ -42,8 +42,9 @@ pub use tool::McpTool;
 
 // Auth re-exports for consumers that need to configure HTTP servers.
 pub use auth::{
-    McpAuthConfig, McpAuthMode, McpAuthProvider, McpOAuthProvider,
-    McpOAuthReauthenticator, McpAuthResult, StaticBearerAuthProvider,
+    EntraBrokerOptions, EntraBrokerProvider, McpAuthConfig, McpAuthMode, McpAuthProvider,
+    McpAuthStatus, McpOAuthProvider, McpOAuthReauthenticator, McpAuthResult,
+    StaticBearerAuthProvider, TokenBroker,
 };
 
 /// Hard cap on tool result text forwarded to the model, matching the built-in

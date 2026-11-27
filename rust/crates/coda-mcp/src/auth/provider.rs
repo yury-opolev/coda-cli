@@ -5,6 +5,8 @@
 use async_trait::async_trait;
 use coda_auth::secret::Secret;
 
+use super::types::{McpAuthMode, McpAuthResult, McpAuthStatus};
+
 /// Supplies and refreshes the bearer token an `McpHttpClient` attaches to its
 /// requests.
 ///
@@ -24,6 +26,28 @@ pub trait McpAuthProvider: Send + Sync {
     /// `www_authenticate` is the value of the `WWW-Authenticate` response
     /// header (if present).
     async fn handle_unauthorized(&self, www_authenticate: Option<&str>) -> bool;
+
+    /// Secret-free auth state for status surfaces; `None` when not tracked.
+    fn status(&self) -> Option<McpAuthStatus> {
+        None
+    }
+
+    /// User-initiated sign-in (`/mcp login <name>`).
+    async fn login(&self) -> McpAuthResult {
+        unsupported("Sign-in")
+    }
+
+    /// User-initiated sign-out (`/mcp logout <name>`).
+    async fn logout(&self) -> McpAuthResult {
+        unsupported("Sign-out")
+    }
+}
+
+fn unsupported(action: &str) -> McpAuthResult {
+    McpAuthResult {
+        succeeded: false,
+        error: Some(format!("{action} is not supported for this server's auth mode.")),
+    }
 }
 
 // ── StaticBearerAuthProvider ──────────────────────────────────────────────────
@@ -54,6 +78,15 @@ impl McpAuthProvider for StaticBearerAuthProvider {
         // A static bearer token cannot be refreshed; the caller must reconfigure.
         false
     }
+
+    fn status(&self) -> Option<McpAuthStatus> {
+        Some(McpAuthStatus {
+            mode: McpAuthMode::Bearer,
+            account: None,
+            expires_at_unix: None,
+            last_error: None,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -71,6 +104,16 @@ mod tests {
     async fn static_bearer_cannot_recover_from_401() {
         let p = StaticBearerAuthProvider::new("tok");
         assert!(!p.handle_unauthorized(Some("Bearer error=\"invalid_token\"")).await);
+    }
+
+    #[tokio::test]
+    async fn static_bearer_reports_bearer_status_and_no_login() {
+        let p = StaticBearerAuthProvider::new("tok");
+        assert_eq!(p.status().unwrap().mode, McpAuthMode::Bearer);
+        let r = p.login().await;
+        assert!(!r.succeeded);
+        assert!(r.error.unwrap().contains("not supported"));
+        assert!(!p.logout().await.succeeded);
     }
 
     /// The token must never appear in `Debug` output.

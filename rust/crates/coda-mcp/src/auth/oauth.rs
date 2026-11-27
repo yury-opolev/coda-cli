@@ -120,8 +120,12 @@ impl McpOAuthProvider {
         }
     }
 
-    fn record_error(&self, msg: &str) {
+    pub(crate) fn record_error(&self, msg: &str) {
         *lock(&self.last_error) = Some(msg.to_owned());
+    }
+
+    pub(crate) fn clear_error(&self) {
+        *lock(&self.last_error) = None;
     }
 
     fn record_expiry(&self, expires_at_unix: Option<i64>) {
@@ -658,6 +662,24 @@ impl McpAuthProvider for McpOAuthProvider {
                 false
             }
         }
+    }
+
+    fn status(&self) -> Option<McpAuthStatus> {
+        Some(self.status_snapshot())
+    }
+
+    async fn login(&self) -> McpAuthResult {
+        self.force_reauthorize().await
+    }
+
+    async fn logout(&self) -> McpAuthResult {
+        if let Err(e) = self.store.delete(&self.token_key()).await {
+            tracing::debug!(error = %e, "failed to delete stored MCP token on logout");
+            return self.failure("Could not remove the stored token. Please retry.");
+        }
+        self.record_expiry(None);
+        self.clear_error();
+        McpAuthResult { succeeded: true, error: None }
     }
 }
 
@@ -1465,5 +1487,24 @@ mod tests {
         assert!(!p.handle_unauthorized(None).await);
         let err = p.status_snapshot().last_error.expect("error recorded");
         assert!(err.contains("Invalid auth.redirectUri"), "got {err}");
+    }
+
+    #[tokio::test]
+    async fn logout_deletes_the_stored_token_and_login_reauthorizes() {
+        let p = provider(McpAuthConfig::default(), false, "https://mcp.example.com/mcp");
+        p.persist_token(Secret::new("at".into()), None, Some(3600), origin("https://as"), "s")
+            .await
+            .unwrap();
+        assert!(p.status().unwrap().expires_at_unix.is_some());
+
+        assert!(p.logout().await.succeeded);
+        assert!(p.get_access_token().await.is_none());
+        let status = p.status().unwrap();
+        assert_eq!(status.expires_at_unix, None);
+        assert_eq!(status.last_error, None);
+
+        // `login` is `force_reauthorize`, which needs an interactive session.
+        let r = p.login().await;
+        assert!(r.error.unwrap().contains("interactive session"));
     }
 }
