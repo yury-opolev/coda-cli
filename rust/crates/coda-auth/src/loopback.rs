@@ -4,8 +4,9 @@
 //! and waits for the authorization server to redirect the browser to
 //! `http://localhost:<port>/callback?code=...&state=...`.
 //!
-//! The listener answers exactly one `/callback` request. Two shapes are
-//! available:
+//! The listener answers exactly one `/callback` request (or the path of the
+//! redirect-URI template given to [`LoopbackListener::bind_template`]). Two
+//! shapes are available:
 //!
 //! - [`LoopbackListener::wait_for_callback`] — capture the redirect and send a
 //!   neutral acknowledgement immediately. The page never claims the sign-in
@@ -108,6 +109,10 @@ pub struct LoopbackListener {
     listener: TcpListener,
     /// The port the OS assigned.
     pub port: u16,
+    /// Host as it appears in the redirect URI (`localhost`, `127.0.0.1`, `[::1]`).
+    host: String,
+    /// Path the authorization server redirects to (e.g. `/callback`).
+    path: String,
 }
 
 impl LoopbackListener {
@@ -115,7 +120,51 @@ impl LoopbackListener {
     pub async fn bind() -> Result<Self, AuthError> {
         // Explicitly bind to 127.0.0.1 so the socket is not reachable from
         // the network — only the local browser can complete the redirect.
-        let listener = TcpListener::bind("127.0.0.1:0")
+        Self::bind_addr("127.0.0.1:0", "localhost".into(), "/callback".into()).await
+    }
+
+    /// Bind for a redirect-URI template such as `http://localhost/callback` or
+    /// `http://127.0.0.1:8400/auth/cb`.
+    ///
+    /// Only `http` with host `localhost`, `127.0.0.1` or `[::1]` is accepted;
+    /// query, fragment and userinfo are rejected. Without a port a random free
+    /// port is chosen and substituted into [`LoopbackListener::redirect_uri`];
+    /// an explicit port is bound as given. The socket always binds the loopback
+    /// interface (`127.0.0.1`, or `::1` for `[::1]`).
+    pub async fn bind_template(template: &str) -> Result<Self, AuthError> {
+        let invalid = |detail: &str| AuthError::InvalidInput {
+            field: "redirect URI".into(),
+            detail: detail.into(),
+        };
+        let url = url::Url::parse(template.trim())
+            .map_err(|e| invalid(&format!("not an absolute URL ({e})")))?;
+        if url.scheme() != "http" {
+            return Err(invalid("only http loopback redirect URIs are supported"));
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(invalid("must not contain user information"));
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err(invalid("must not contain a query or fragment"));
+        }
+        let (host, bind_ip) = match url.host() {
+            Some(url::Host::Domain(d)) if d.eq_ignore_ascii_case("localhost") => {
+                ("localhost".to_owned(), "127.0.0.1")
+            }
+            Some(url::Host::Ipv4(ip)) if ip == std::net::Ipv4Addr::LOCALHOST => {
+                ("127.0.0.1".to_owned(), "127.0.0.1")
+            }
+            Some(url::Host::Ipv6(ip)) if ip == std::net::Ipv6Addr::LOCALHOST => {
+                ("[::1]".to_owned(), "[::1]")
+            }
+            _ => return Err(invalid("host must be localhost, 127.0.0.1 or [::1]")),
+        };
+        let port = url.port().unwrap_or(0);
+        Self::bind_addr(&format!("{bind_ip}:{port}"), host, url.path().to_owned()).await
+    }
+
+    async fn bind_addr(addr: &str, host: String, path: String) -> Result<Self, AuthError> {
+        let listener = TcpListener::bind(addr)
             .await
             .map_err(|e| AuthError::Transport(format!("failed to bind loopback listener: {e}")))?;
 
@@ -123,12 +172,12 @@ impl LoopbackListener {
             AuthError::Transport(format!("failed to get listener address: {e}"))
         })?.port();
 
-        Ok(Self { listener, port })
+        Ok(Self { listener, port, host, path })
     }
 
     /// The full `redirect_uri` to use in the authorization URL.
     pub fn redirect_uri(&self) -> String {
-        format!("http://localhost:{}/callback", self.port)
+        format!("http://{}:{}{}", self.host, self.port, self.path)
     }
 
     /// Wait up to `timeout` for the browser to hit `/callback`, acknowledging
@@ -195,7 +244,8 @@ impl LoopbackListener {
             // connection. On expiry we drop this connection and go back to
             // accepting; the caller's overall timeout still bounds the whole
             // wait.
-            match tokio::time::timeout(PER_CONNECTION_READ_TIMEOUT, read_request(stream)).await {
+            let read = read_request(stream, &self.path);
+            match tokio::time::timeout(PER_CONNECTION_READ_TIMEOUT, read).await {
                 Ok(Some((result, writer))) => return Ok(PendingCallback { result, writer }),
                 // Wrong path (already answered with 404), unreadable, or the
                 // read budget expired: keep accepting.
@@ -207,11 +257,12 @@ impl LoopbackListener {
 
 /// Reads one HTTP request from an accepted connection.
 ///
-/// Returns `None` for anything that is not a `/callback` request (answering
-/// 404 where appropriate), so the caller can keep waiting for the real
-/// redirect.
+/// Returns `None` for anything that is not a request for `expected_path`
+/// (answering 404 where appropriate), so the caller can keep waiting for the
+/// real redirect.
 async fn read_request(
     stream: tokio::net::TcpStream,
+    expected_path: &str,
 ) -> Option<(RedirectResult, OwnedWriteHalf)> {
     let (reader, mut writer) = stream.into_split();
     // Bound the request line and every header line: a peer that opens a
@@ -243,7 +294,7 @@ async fn read_request(
     let (_, path_and_query) = method_path.split_once(' ').unwrap_or(("", method_path));
     let (path, query) = path_and_query.split_once('?').unwrap_or((path_and_query, ""));
 
-    if path != "/callback" {
+    if path != expected_path {
         let _ = writer.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").await;
         return None;
     }
@@ -562,5 +613,78 @@ mod tests {
             .expect("the later callback must still be served");
         silent.abort();
         assert_eq!(result.code.as_deref(), Some("late"));
+    }
+
+    #[tokio::test]
+    async fn template_without_port_gets_a_random_port() {
+        let listener = LoopbackListener::bind_template("http://localhost/callback")
+            .await
+            .expect("bind");
+        assert_ne!(listener.port, 0);
+        assert_eq!(listener.redirect_uri(), format!("http://localhost:{}/callback", listener.port));
+        let addr = listener.listener.local_addr().expect("addr");
+        assert_eq!(addr.ip().to_string(), "127.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn template_with_custom_path_serves_only_that_path() {
+        let listener = LoopbackListener::bind_template("http://127.0.0.1/auth/cb")
+            .await
+            .expect("bind");
+        let port = listener.port;
+        assert_eq!(listener.redirect_uri(), format!("http://127.0.0.1:{port}/auth/cb"));
+
+        let client = tokio::spawn(async move {
+            let mut s = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+                .await
+                .expect("connect");
+            s.write_all(b"GET /callback?code=wrong&state=s HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .await
+                .expect("write");
+            let mut reply = String::new();
+            let _ = s.read_to_string(&mut reply).await;
+            let mut s = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+                .await
+                .expect("connect");
+            s.write_all(b"GET /auth/cb?code=c&state=s HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .await
+                .expect("write");
+            reply
+        });
+
+        let result = listener.wait_for_callback(Duration::from_secs(5)).await.expect("callback");
+        assert_eq!(result.code.as_deref(), Some("c"));
+        assert_eq!(result.state.as_deref(), Some("s"));
+        let first_reply = client.await.expect("client");
+        assert!(first_reply.starts_with("HTTP/1.1 404"), "got {first_reply:?}");
+    }
+
+    #[tokio::test]
+    async fn template_with_explicit_port_is_honoured() {
+        let free = TcpListener::bind("127.0.0.1:0").await.expect("probe");
+        let port = free.local_addr().expect("addr").port();
+        drop(free);
+        let listener = LoopbackListener::bind_template(&format!("http://localhost:{port}/cb"))
+            .await
+            .expect("bind");
+        assert_eq!(listener.port, port);
+        assert_eq!(listener.redirect_uri(), format!("http://localhost:{port}/cb"));
+    }
+
+    #[tokio::test]
+    async fn template_rejects_non_loopback_or_decorated_uris() {
+        for bad in [
+            "https://localhost/cb",
+            "http://example.com/cb",
+            "http://localhost/cb?x=1",
+            "http://localhost/cb#frag",
+            "http://user@localhost/cb",
+            "not a url",
+        ] {
+            assert!(
+                LoopbackListener::bind_template(bad).await.is_err(),
+                "template {bad:?} must be rejected"
+            );
+        }
     }
 }
